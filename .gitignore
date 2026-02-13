@@ -1,0 +1,10 @@
+/bin/
+.cache/
+frontend/node_modules/
+e2e/node_modules/
+e2e/samples/
+e2e/test-results/
+*.log
+.env
+.env.test
+samples/*.png
