@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"runtime/debug"
 	"strconv"
 	"strings"
 
@@ -38,7 +39,7 @@ func (s *Server) Router() http.Handler {
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
 	r.Use(middleware.RealIP)
-	r.Use(middleware.Recoverer)
+	r.Use(recovererWithLog)
 	r.Use(middleware.Logger)
 
 	r.Get("/healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -59,7 +60,7 @@ func (s *Server) Router() http.Handler {
 	staticHandler := web.Handler()
 	r.NotFound(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(r.URL.Path, "/api/") {
-			writeError(w, http.StatusNotFound, "NOT_FOUND", "resource not found")
+			writeError(w, r, http.StatusNotFound, "NOT_FOUND", "resource not found")
 			return
 		}
 		staticHandler.ServeHTTP(w, r)
@@ -79,12 +80,12 @@ type createAlbumRequest struct {
 func (s *Server) createAlbum(w http.ResponseWriter, r *http.Request) {
 	var req createAlbumRequest
 	if err := jsonBody(r, &req); err != nil {
-		writeError(w, http.StatusBadRequest, "INVALID_REQUEST", err.Error())
+		writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", err.Error())
 		return
 	}
 	res, err := s.albums.CreateUpload(r.Context(), req.Filename, req.SizeBytes)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "INVALID_REQUEST", err.Error())
+		writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", err.Error())
 		return
 	}
 
@@ -106,13 +107,13 @@ func (s *Server) uploadAlbumSource(w http.ResponseWriter, r *http.Request) {
 	albumID := chi.URLParam(r, "albumId")
 	file, header, err := r.FormFile("file")
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "INVALID_REQUEST", "missing file form field")
+		writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", "missing file form field")
 		return
 	}
 	defer file.Close()
 
 	if err := s.albums.UploadSource(r.Context(), albumID, header.Filename, file); err != nil {
-		writeError(w, http.StatusInternalServerError, "INTERNAL", err.Error())
+		writeError(w, r, http.StatusInternalServerError, "INTERNAL", err.Error())
 		return
 	}
 
@@ -132,7 +133,7 @@ func (s *Server) finalizeAlbum(w http.ResponseWriter, r *http.Request) {
 		if errors.Is(err, albums.ErrNoValidImages) {
 			status = http.StatusUnprocessableEntity
 		}
-		writeError(w, status, code, err.Error())
+		writeError(w, r, status, code, err.Error())
 		return
 	}
 
@@ -146,7 +147,7 @@ func (s *Server) getAlbum(w http.ResponseWriter, r *http.Request) {
 	albumID := chi.URLParam(r, "albumId")
 	idx, err := s.albums.GetAlbum(r.Context(), albumID)
 	if err != nil {
-		writeError(w, http.StatusNotFound, "NOT_FOUND", "album not found")
+		writeError(w, r, http.StatusNotFound, "NOT_FOUND", "album not found")
 		return
 	}
 	writeJSON(w, http.StatusOK, idx)
@@ -155,7 +156,7 @@ func (s *Server) getAlbum(w http.ResponseWriter, r *http.Request) {
 func (s *Server) listAlbums(w http.ResponseWriter, r *http.Request) {
 	albumsList, err := s.albums.ListAlbums(r.Context())
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "INTERNAL", err.Error())
+		writeError(w, r, http.StatusInternalServerError, "INTERNAL", err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"albums": albumsList})
@@ -166,7 +167,7 @@ func (s *Server) getFeed(w http.ResponseWriter, r *http.Request) {
 	if raw := r.URL.Query().Get("limit"); raw != "" {
 		n, err := strconv.Atoi(raw)
 		if err != nil {
-			writeError(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid limit")
+			writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", "invalid limit")
 			return
 		}
 		limit = n
@@ -179,7 +180,7 @@ func (s *Server) getFeed(w http.ResponseWriter, r *http.Request) {
 		r.URL.Query().Get("seed"),
 	)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "INVALID_REQUEST", err.Error())
+		writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, resp)
@@ -190,7 +191,7 @@ func (s *Server) getImage(w http.ResponseWriter, r *http.Request) {
 	idxRaw := chi.URLParam(r, "index")
 	idx, err := strconv.Atoi(idxRaw)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid image index")
+		writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", "invalid image index")
 		return
 	}
 	mode := r.URL.Query().Get("mode")
@@ -214,7 +215,7 @@ func (s *Server) getImage(w http.ResponseWriter, r *http.Request) {
 			status = http.StatusNotFound
 			code = "NOT_FOUND"
 		}
-		writeError(w, status, code, err.Error())
+		writeError(w, r, status, code, err.Error())
 		return
 	}
 
@@ -224,6 +225,19 @@ func (s *Server) getImage(w http.ResponseWriter, r *http.Request) {
 	if _, err := w.Write(result.Bytes); err != nil {
 		log.Printf("write image response failed: %v", err)
 	}
+}
+
+func recovererWithLog(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if rec := recover(); rec != nil {
+				reqID := middleware.GetReqID(r.Context())
+				log.Printf("[panic] request_id=%s method=%s path=%s query=%q remote=%s panic=%v stack=%s", reqID, r.Method, r.URL.Path, r.URL.RawQuery, r.RemoteAddr, rec, strings.TrimSpace(string(debug.Stack())))
+				writeError(w, r, http.StatusInternalServerError, "INTERNAL", "internal server error")
+			}
+		}()
+		next.ServeHTTP(w, r)
+	})
 }
 
 func jsonBody(r *http.Request, out any) error {

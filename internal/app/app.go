@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"fmt"
+	"log"
 	"net/http"
 	"time"
 
@@ -19,6 +20,7 @@ func Run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	log.Printf("viewer: config loaded on port=%d cache_dir=%s zip_cache_dir=%s", cfg.Port, cfg.CacheDir, cfg.ZipCacheDir)
 
 	store, err := storage.NewS3Store(ctx, cfg)
 	if err != nil {
@@ -40,6 +42,7 @@ func Run(ctx context.Context) error {
 		Handler:           h,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
+	log.Printf("viewer: starting HTTP server on %s", srv.Addr)
 
 	return srv.ListenAndServe()
 }

@@ -19,3 +19,13 @@ At minimum configure S3 values:
 ## Commands
 - `make build` builds frontend and backend into `bin/viewer`.
 - `make test` runs Playwright e2e and saves screenshots to `samples/`.
+
+## Observability
+- The server logs to stdout/stderr via Go's standard logger.
+- Request-scoped 500 errors now include request context including:
+  - request method/path
+  - request ID (Chi request ID middleware)
+  - remote IP
+  - raw query
+  - detailed internal error message
+- Panics are logged with stack traces before the 500 response is returned.
