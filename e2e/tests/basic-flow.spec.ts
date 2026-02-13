@@ -25,10 +25,12 @@ test('basic upload -> wall -> album flow', async ({ page }) => {
   await expect(page.getByTestId('album-grid')).toBeVisible()
   await expect(page.getByTestId('album-tile').first()).toBeVisible()
   await expect(page.getByTestId('album-columns-4')).toBeVisible()
+  await expect(page.getByTestId('album-columns-6')).toBeVisible()
   await page.screenshot({ path: path.join(samplesDir, '02-album.png'), fullPage: true })
 
   await page.getByTestId('album-back').click()
   await expect(page.getByTestId('wall-grid')).toBeVisible()
+  await expect(page.getByTestId('columns-6')).toBeVisible()
   await page.screenshot({ path: path.join(samplesDir, '03-wall.png'), fullPage: true })
 
   await page.getByTestId('upload-input').setInputFiles(zip2)

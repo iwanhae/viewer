@@ -1,8 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { AlbumIndex, fetchAlbum } from '../api/client'
+import { readColumnPreference, writeColumnPreference } from '../utils/columnPreference'
 
-const COLUMN_OPTIONS = [1, 2, 3, 4]
+const COLUMN_OPTIONS = [1, 2, 3, 4, 5, 6]
+const VIEWER_COLUMNS_KEY = 'viewer_columns'
+const DEFAULT_COLUMNS = 3
 
 export function ViewerPage() {
   const { albumId = '' } = useParams()
@@ -11,7 +14,9 @@ export function ViewerPage() {
   const initialIndex = Number.isFinite(initialIndexValue) ? initialIndexValue : 0
 
   const [album, setAlbum] = useState<AlbumIndex | null>(null)
-  const [columnCount, setColumnCount] = useState(3)
+  const [columnCount, setColumnCount] = useState(() =>
+    readColumnPreference(VIEWER_COLUMNS_KEY, COLUMN_OPTIONS, DEFAULT_COLUMNS),
+  )
   const [error, setError] = useState<string | null>(null)
 
   const anchorRef = useRef<HTMLDivElement | null>(null)
@@ -98,7 +103,10 @@ export function ViewerPage() {
             <button
               key={value}
               className={value === columnCount ? 'active' : ''}
-              onClick={() => setColumnCount(value)}
+              onClick={() => {
+                setColumnCount(value)
+                writeColumnPreference(VIEWER_COLUMNS_KEY, value)
+              }}
               data-testid={`album-columns-${value}`}
             >
               {value}

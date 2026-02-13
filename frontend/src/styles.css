@@ -1,7 +1,7 @@
 :root {
   font-family: "Space Grotesk", "Segoe UI", sans-serif;
-  color: #f7f9f8;
-  background: #0d1113;
+  color: #1f2933;
+  background: #f8fbfd;
 }
 
 * {
@@ -15,9 +15,9 @@ body,
   width: 100%;
   min-height: 100%;
   background:
-    radial-gradient(circle at 20% 20%, #20303a, transparent 40%),
-    radial-gradient(circle at 80% 10%, #394a2c, transparent 35%),
-    #090b0c;
+    radial-gradient(circle at 16% 18%, #e8f4ff, transparent 42%),
+    radial-gradient(circle at 82% 10%, #f6efe3, transparent 38%),
+    #f8fbfd;
 }
 
 .wall-page {
@@ -25,25 +25,27 @@ body,
 }
 
 .wall-grid {
-  column-gap: 0;
+  column-gap: 8px;
   min-height: 100vh;
 }
 
 .tile {
   display: block;
   width: 100%;
-  margin: 0;
+  margin: 0 0 8px;
   padding: 0;
   border: 0;
   background: transparent;
   break-inside: avoid;
   cursor: pointer;
+  overflow: hidden;
 }
 
 .tile img {
   width: 100%;
   display: block;
   object-fit: cover;
+  border-radius: 14px;
   transition: transform 180ms ease;
 }
 
@@ -66,8 +68,8 @@ body,
   gap: 12px;
   align-items: center;
   backdrop-filter: blur(16px);
-  background: rgba(8, 9, 11, 0.68);
-  border: 1px solid rgba(255, 255, 255, 0.15);
+  background: rgba(255, 255, 255, 0.84);
+  border: 1px solid rgba(31, 41, 51, 0.14);
 }
 
 .columns {
@@ -81,15 +83,15 @@ body,
   border-radius: 999px;
   min-width: 32px;
   min-height: 32px;
-  background: rgba(255, 255, 255, 0.14);
-  color: #f7f9f8;
+  background: rgba(31, 41, 51, 0.1);
+  color: #1f2933;
   font-weight: 600;
   cursor: pointer;
 }
 
 .columns button.active {
-  background: #dce5d6;
-  color: #081019;
+  background: #1f2933;
+  color: #f8fbfd;
 }
 
 .upload {
@@ -102,19 +104,20 @@ body,
   top: 16px;
   left: 50%;
   transform: translateX(-50%);
-  background: rgba(0, 0, 0, 0.65);
+  background: rgba(255, 255, 255, 0.9);
+  border: 1px solid rgba(31, 41, 51, 0.14);
   border-radius: 999px;
   padding: 8px 14px;
 }
 
 .status.error {
-  color: #ffd5d5;
+  color: #a01f28;
 }
 
 .viewer {
   position: fixed;
   inset: 0;
-  background: #000;
+  background: #f8fbfd;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -150,8 +153,8 @@ body,
   border: 0;
   border-radius: 999px;
   padding: 8px 12px;
-  background: rgba(0, 0, 0, 0.55);
-  color: #fff;
+  background: rgba(255, 255, 255, 0.85);
+  color: #1f2933;
 }
 
 .progress {
@@ -172,8 +175,8 @@ body,
   min-height: 100vh;
   display: grid;
   place-items: center;
-  background: #090b0c;
-  color: #fff;
+  background: #f8fbfd;
+  color: #1f2933;
 }
 
 .album-page {

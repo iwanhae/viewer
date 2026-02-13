@@ -1,15 +1,20 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { createAlbum, fetchFeed, FeedItem, finalizeAlbum, uploadZip, uploadZipFallback } from '../api/client'
+import { readColumnPreference, writeColumnPreference } from '../utils/columnPreference'
 
-const columnOptions = [1, 2, 3, 4]
+const columnOptions = [1, 2, 3, 4, 5, 6]
+const WALL_COLUMNS_KEY = 'wall_columns'
+const DEFAULT_COLUMNS = 3
 
 export function WallPage() {
   const [items, setItems] = useState<FeedItem[]>([])
   const [cursor, setCursor] = useState<string | undefined>(undefined)
   const [loading, setLoading] = useState(false)
   const [hasMore, setHasMore] = useState(true)
-  const [columns, setColumns] = useState(3)
+  const [columns, setColumns] = useState(() =>
+    readColumnPreference(WALL_COLUMNS_KEY, columnOptions, DEFAULT_COLUMNS),
+  )
   const [error, setError] = useState<string | null>(null)
   const [uploading, setUploading] = useState(false)
 
@@ -110,7 +115,10 @@ export function WallPage() {
             <button
               key={option}
               className={option === columns ? 'active' : ''}
-              onClick={() => setColumns(option)}
+              onClick={() => {
+                setColumns(option)
+                writeColumnPreference(WALL_COLUMNS_KEY, option)
+              }}
               data-testid={`columns-${option}`}
             >
               {option}
