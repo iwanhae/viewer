@@ -10,6 +10,7 @@ import (
 	"runtime/debug"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
@@ -254,7 +255,40 @@ func jsonBody(r *http.Request, out any) error {
 }
 
 func Warmup(ctx context.Context, albumsService *albums.Service) {
-	if err := albumsService.RefreshFromStorage(ctx); err != nil {
+	startedAt := time.Now()
+	log.Printf("album cache warmup started")
+
+	loadedCount := 0
+	failedCount := 0
+	if err := albumsService.RefreshFromStorageWithProgress(ctx, func(progress albums.RefreshProgress) {
+		if progress.Err != nil {
+			failedCount++
+			log.Printf(
+				"album cache warmup progress=%d/%d status=failed key=%s err=%v",
+				progress.Done,
+				progress.Total,
+				progress.Key,
+				progress.Err,
+			)
+			return
+		}
+
+		loadedCount++
+		log.Printf(
+			"album cache warmup progress=%d/%d status=ok album_id=%s",
+			progress.Done,
+			progress.Total,
+			progress.AlbumID,
+		)
+	}); err != nil {
 		log.Printf("album cache warmup skipped: %v", err)
+		return
 	}
+
+	log.Printf(
+		"album cache warmup finished loaded=%d failed=%d duration=%s",
+		loadedCount,
+		failedCount,
+		time.Since(startedAt).Round(time.Millisecond),
+	)
 }

@@ -27,6 +27,14 @@ type Service struct {
 	uploadHints map[string]string
 }
 
+type RefreshProgress struct {
+	Done    int
+	Total   int
+	AlbumID string
+	Key     string
+	Err     error
+}
+
 func NewService(cfg cfgpkg.Config, store *storage.S3Store, indexer *Indexer) *Service {
 	return &Service{
 		cfg:         cfg,
@@ -157,24 +165,59 @@ func (s *Service) Finalize(ctx context.Context, albumID string) (*models.AlbumIn
 }
 
 func (s *Service) RefreshFromStorage(ctx context.Context) error {
+	return s.refreshFromStorage(ctx, nil)
+}
+
+func (s *Service) RefreshFromStorageWithProgress(ctx context.Context, onProgress func(RefreshProgress)) error {
+	return s.refreshFromStorage(ctx, onProgress)
+}
+
+func (s *Service) refreshFromStorage(ctx context.Context, onProgress func(RefreshProgress)) error {
 	keys, err := s.store.ListAlbumIndexKeys(ctx)
 	if err != nil {
 		return err
 	}
 
 	next := make(map[string]*models.AlbumIndex, len(keys))
-	for _, key := range keys {
+	for i, key := range keys {
 		var idx models.AlbumIndex
 		if err := s.store.ReadJSON(ctx, key, &idx); err != nil {
+			if onProgress != nil {
+				onProgress(RefreshProgress{
+					Done:  i + 1,
+					Total: len(keys),
+					Key:   key,
+					Err:   err,
+				})
+			}
 			continue
 		}
 		if idx.AlbumID == "" {
 			parts := strings.Split(filepath.Dir(key), "/")
-			if len(parts) > 1 {
+			if len(parts) > 0 {
 				idx.AlbumID = parts[len(parts)-1]
 			}
 		}
+		if idx.AlbumID == "" {
+			if onProgress != nil {
+				onProgress(RefreshProgress{
+					Done:  i + 1,
+					Total: len(keys),
+					Key:   key,
+					Err:   fmt.Errorf("missing album id"),
+				})
+			}
+			continue
+		}
 		next[idx.AlbumID] = &idx
+		if onProgress != nil {
+			onProgress(RefreshProgress{
+				Done:    i + 1,
+				Total:   len(keys),
+				AlbumID: idx.AlbumID,
+				Key:     key,
+			})
+		}
 	}
 
 	s.mu.Lock()
