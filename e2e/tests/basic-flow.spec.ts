@@ -31,6 +31,15 @@ test('basic upload -> wall -> album flow', async ({ page }) => {
   await expect(page.getByTestId('upload-button')).toHaveText('+', { timeout: 90_000 })
 
   await expect(page.getByTestId('wall-tile').first()).toBeVisible({ timeout: 60_000 })
+  const firstWallImage = page.getByTestId('wall-tile').first().locator('img')
+  const wallSrc = await firstWallImage.getAttribute('src')
+  expect(wallSrc).toBeTruthy()
+  const wallResponse = await page.request.get(wallSrc!)
+  expect(wallResponse.ok()).toBeTruthy()
+  const originalResponse = await page.request.get(wallSrc!.split('?')[0])
+  expect(originalResponse.ok()).toBeTruthy()
+  expect(wallResponse.headers()['content-type']).toBe(originalResponse.headers()['content-type'])
+  expect(await wallResponse.body()).toEqual(await originalResponse.body())
   await page.screenshot({ path: path.join(samplesDir, '01-upload-finalize.png'), fullPage: true })
 
   await page.getByTestId('wall-tile').first().click()

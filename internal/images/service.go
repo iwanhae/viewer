@@ -2,20 +2,15 @@ package images
 
 import (
 	"archive/zip"
-	"bytes"
 	"context"
 	"fmt"
-	"image"
-	"image/jpeg"
 	_ "image/jpeg"
 	_ "image/png"
 	"io"
 	"mime"
 	"path/filepath"
-	"strconv"
 	"strings"
 
-	"golang.org/x/image/draw"
 	_ "golang.org/x/image/webp"
 	"viewer/internal/albums"
 	"viewer/internal/cache"
@@ -90,53 +85,7 @@ func (s *Service) GetImage(ctx context.Context, albumID string, idx int, mode st
 		return ImageResult{}, err
 	}
 
-	if mode != "wall" {
-		return ImageResult{Bytes: data, ContentType: contentType}, nil
-	}
-
-	if wallWidth <= 0 {
-		wallWidth = 480
-	}
-	if wallWidth < 64 {
-		wallWidth = 64
-	}
-	if wallWidth > 2048 {
-		wallWidth = 2048
-	}
-
-	cacheKey := strings.Join([]string{albumID, strconv.Itoa(idx), "wall", strconv.Itoa(wallWidth)}, ":")
-	if cached, ok := s.cache.Get(cacheKey); ok {
-		return ImageResult{Bytes: cached, ContentType: "image/jpeg"}, nil
-	}
-
-	img, _, err := image.Decode(bytes.NewReader(data))
-	if err != nil {
-		return ImageResult{}, fmt.Errorf("decode image: %w", err)
-	}
-
-	b := img.Bounds()
-	origW := b.Dx()
-	origH := b.Dy()
-	if origW <= 0 || origH <= 0 {
-		return ImageResult{}, fmt.Errorf("invalid image dimensions")
-	}
-
-	targetH := int(float64(origH) * float64(wallWidth) / float64(origW))
-	if targetH < 1 {
-		targetH = 1
-	}
-
-	dst := image.NewRGBA(image.Rect(0, 0, wallWidth, targetH))
-	draw.CatmullRom.Scale(dst, dst.Bounds(), img, b, draw.Over, nil)
-
-	var out bytes.Buffer
-	if err := jpeg.Encode(&out, dst, &jpeg.Options{Quality: 82}); err != nil {
-		return ImageResult{}, fmt.Errorf("encode jpeg: %w", err)
-	}
-	encoded := out.Bytes()
-	_ = s.cache.Set(cacheKey, encoded)
-
-	return ImageResult{Bytes: encoded, ContentType: "image/jpeg"}, nil
+	return ImageResult{Bytes: data, ContentType: contentType}, nil
 }
 
 func (s *Service) readEntryBytes(ctx context.Context, albumID string, entryName string) ([]byte, string, error) {
