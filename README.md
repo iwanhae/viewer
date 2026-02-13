@@ -19,6 +19,7 @@ At minimum configure S3 values:
 ## Commands
 - `make build` builds frontend and backend into `bin/viewer`.
 - `make test` runs Playwright e2e and saves screenshots to `samples/`.
+- `make test` binds the app to `TEST_PORT` (default `18080`) and sets `E2E_BASE_URL` automatically.
 
 ## Observability
 - The server logs to stdout/stderr via Go's standard logger.

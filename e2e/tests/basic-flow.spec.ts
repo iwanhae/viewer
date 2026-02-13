@@ -6,11 +6,23 @@ import { fileURLToPath } from 'node:url'
 const here = path.dirname(fileURLToPath(import.meta.url))
 const rootDir = path.resolve(here, '..', '..')
 const samplesDir = process.env.SCREENSHOT_DIR ?? path.join(rootDir, 'samples')
-const zip1 = path.join(rootDir, 'samples', '2a03f38ddcdc7281d8e53a3c.zip')
-const zip2 = path.join(rootDir, 'samples', '5b4c3cc15ee5190007a11d0b.zip')
+const fixturesDir = path.join(rootDir, 'e2e', 'fixtures')
+const zip1 = path.join(rootDir, 'e2e', 'fixtures', 'album-a.zip')
+const zip2 = path.join(rootDir, 'e2e', 'fixtures', 'album-b.zip')
+const zip1Base64 =
+  'UEsDBBQAAAAIAA+ETVzTNyprPwAAAEQAAAAHABwAMDAxLnBuZ1VUCQADHVKPaR1Sj2l1eAsAAQToAwAABOgDAADrDPBz5+WS4mJgYOD19HAJAtKMIMzBAiS3yvAwASluTxfHkIpbyX/+yzMwMzMxvLtafhIozODp6ueyzimhCQBQSwMEFAAAAAgAD4RNXKnVyORAAAAARAAAAAcAHAAwMDIucG5nVVQJAAMdUo9pHVKPaXV4CwABBOgDAAAE6AMAAOsM8HPn5ZLiYmBg4PX0cAkC0kxAzMjBAiT/1EzJAVLcni6OIRW3kv+cP8DAyszYsPJ9ciFQmMHT1c9lnVNCEwBQSwECHgMUAAAACAAPhE1c0zcqaz8AAABEAAAABwAYAAAAAAAAAAAApIEAAAAAMDAxLnBuZ1VUBQADHVKPaXV4CwABBOgDAAAE6AMAAFBLAQIeAxQAAAAIAA+ETVyp1cjkQAAAAEQAAAAHABgAAAAAAAAAAACkgYAAAAAwMDIucG5nVVQFAAMdUo9pdXgLAAEE6AMAAAToAwAAUEsFBgAAAAACAAIAmgAAAAEBAAAAAA=='
+const zip2Base64 =
+  'UEsDBBQAAAAIAA+ETVxw8BtLQAAAAEQAAAAHABwAMDAxLnBuZ1VUCQADHVKPaR1Sj2l1eAsAAQToAwAABOgDAADrDPBz5+WS4mJgYOD19HAJAtKMQMzEwQIkXTP+igEpbk8Xx5CKW8l//s9nYGZmYnjP5jgFKMzg6ernss4poQkAUEsDBBQAAAAIAA+ETVynezQxPgAAAEQAAAAHABwAMDAyLnBuZ1VUCQADHVKPaR1Sj2l1eAsAAQToAwAABOgDAADrDPBz5+WS4mJgYOD19HAJAtJMIMzBAiT/1EzJAVLcni6OIRW3kv+cB0owMzL+V43OAgozeLr6uaxzSmgCAFBLAQIeAxQAAAAIAA+ETVxw8BtLQAAAAEQAAAAHABgAAAAAAAAAAACkgQAAAAAwMDEucG5nVVQFAAMdUo9pdXgLAAEE6AMAAAToAwAAUEsBAh4DFAAAAAgAD4RNXKd7NDE+AAAARAAAAAcAGAAAAAAAAAAAAKSBgQAAADAwMi5wbmdVVAUAAx1Sj2l1eAsAAQToAwAABOgDAABQSwUGAAAAAAIAAgCaAAAAAAEAAAAA'
+
+async function ensureFixtureZips() {
+  await fs.mkdir(fixturesDir, { recursive: true })
+  await fs.writeFile(zip1, Buffer.from(zip1Base64, 'base64'))
+  await fs.writeFile(zip2, Buffer.from(zip2Base64, 'base64'))
+}
 
 test('basic upload -> wall -> album flow', async ({ page }) => {
   await fs.mkdir(samplesDir, { recursive: true })
+  await ensureFixtureZips()
 
   await page.goto('/')
   await expect(page.getByTestId('wall-grid')).toBeVisible()

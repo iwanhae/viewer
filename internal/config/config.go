@@ -15,6 +15,7 @@ type Config struct {
 	S3AccessKey     string
 	S3SecretKey     string
 	S3UsePathStyle  bool
+	SkipWarmup      bool
 	PresignTTL      time.Duration
 	MaxUploadBytes  int64
 	CacheDir        string
@@ -37,6 +38,7 @@ func Load() (Config, error) {
 		S3AccessKey:     os.Getenv("S3_ACCESS_KEY"),
 		S3SecretKey:     os.Getenv("S3_SECRET_KEY"),
 		S3UsePathStyle:  getenvBool("S3_USE_PATH_STYLE", true),
+		SkipWarmup:      getenvBool("SKIP_WARMUP", false),
 		PresignTTL:      time.Duration(presignTTLSeconds) * time.Second,
 		MaxUploadBytes:  maxUploadBytes,
 		CacheDir:        cacheDir,

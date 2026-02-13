@@ -28,7 +28,11 @@ func Run(ctx context.Context) error {
 	}
 
 	albumService := albums.NewService(cfg, store, albums.NewIndexer())
-	httpapi.Warmup(ctx, albumService)
+	if cfg.SkipWarmup {
+		log.Printf("viewer: startup warmup skipped")
+	} else {
+		httpapi.Warmup(ctx, albumService)
+	}
 
 	feedService := feed.NewService(albumService)
 	imageService, err := images.NewService(albumService, store, cfg.CacheDir, cfg.ZipCacheDir)

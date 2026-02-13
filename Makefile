@@ -31,18 +31,29 @@ test: build e2e-install
 	: "$${S3_BUCKET:?S3_BUCKET is required in .env.test}"; \
 	: "$${S3_ACCESS_KEY:?S3_ACCESS_KEY is required in .env.test}"; \
 	: "$${S3_SECRET_KEY:?S3_SECRET_KEY is required in .env.test}"; \
-	: "$${PORT:=8080}"; \
-	: "$${E2E_BASE_URL:=http://127.0.0.1:$${PORT}}"; \
+	: "$${TEST_PORT:=18080}"; \
+	PORT="$${TEST_PORT}"; \
+	E2E_BASE_URL="http://127.0.0.1:$${TEST_PORT}"; \
 	: "$${SCREENSHOT_DIR:=./samples}"; \
 	if [[ "$${SCREENSHOT_DIR}" != /* ]]; then SCREENSHOT_DIR="$$(pwd)/$${SCREENSHOT_DIR}"; fi; \
 	mkdir -p "$${SCREENSHOT_DIR}"; \
-	./$(BIN) > .cache/e2e-server.log 2>&1 & \
+	SKIP_WARMUP=true ./$(BIN) > .cache/e2e-server.log 2>&1 & \
 	SERVER_PID=$$!; \
 	trap 'kill $$SERVER_PID >/dev/null 2>&1 || true' EXIT; \
 	for i in $$(seq 1 60); do \
+		if ! kill -0 $$SERVER_PID >/dev/null 2>&1; then \
+			echo "viewer server exited before healthcheck"; \
+			sed -n '1,200p' .cache/e2e-server.log; \
+			exit 1; \
+		fi; \
 		if curl -fsS "http://127.0.0.1:$${PORT}/healthz" >/dev/null; then break; fi; \
 		sleep 1; \
 	done; \
+	if ! kill -0 $$SERVER_PID >/dev/null 2>&1; then \
+		echo "viewer server exited before tests"; \
+		sed -n '1,200p' .cache/e2e-server.log; \
+		exit 1; \
+	fi; \
 	curl -fsS "http://127.0.0.1:$${PORT}/healthz" >/dev/null; \
 	E2E_BASE_URL="$${E2E_BASE_URL}" SCREENSHOT_DIR="$${SCREENSHOT_DIR}" npm --prefix e2e test
 

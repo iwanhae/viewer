@@ -4,6 +4,7 @@ frontend/node_modules/
 e2e/node_modules/
 e2e/samples/
 e2e/test-results/
+e2e/fixtures/*.zip
 *.log
 .env
 .env.test
