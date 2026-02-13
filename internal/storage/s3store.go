@@ -101,6 +101,57 @@ func (s *S3Store) GetObject(ctx context.Context, key string) (io.ReadCloser, str
 	return out.Body, ct, nil
 }
 
+func (s *S3Store) GetObjectRange(ctx context.Context, key string, start int64, end int64) (io.ReadCloser, string, error) {
+	if start < 0 {
+		return nil, "", fmt.Errorf("invalid range start: %d", start)
+	}
+	if end < start {
+		return nil, "", fmt.Errorf("invalid range end: %d", end)
+	}
+
+	rangeValue := fmt.Sprintf("bytes=%d-%d", start, end)
+	out, err := s.client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(s.bucket),
+		Key:    aws.String(key),
+		Range:  aws.String(rangeValue),
+	})
+	if err != nil {
+		return nil, "", fmt.Errorf("get object range %s %s: %w", key, rangeValue, err)
+	}
+
+	if out.ContentRange == nil || !strings.HasPrefix(*out.ContentRange, fmt.Sprintf("bytes %d-%d/", start, end)) {
+		out.Body.Close()
+		return nil, "", fmt.Errorf("range response mismatch for %s: expected bytes %d-%d, got %q", key, start, end, aws.ToString(out.ContentRange))
+	}
+	if out.ContentLength == nil || *out.ContentLength != (end-start+1) {
+		out.Body.Close()
+		return nil, "", fmt.Errorf("range response length mismatch for %s: expected %d, got %d", key, end-start+1, aws.ToInt64(out.ContentLength))
+	}
+	if out.AcceptRanges != nil {
+		accept := strings.ToLower(strings.TrimSpace(*out.AcceptRanges))
+		if accept != "" && accept != "bytes" {
+			out.Body.Close()
+			return nil, "", fmt.Errorf("range response does not advertise byte ranges for %s: %q", key, *out.AcceptRanges)
+		}
+	}
+	if out.ContentType == nil {
+		out.ContentType = aws.String("application/octet-stream")
+	}
+	if out.ContentLength != nil && *out.ContentLength <= 0 {
+		out.Body.Close()
+		return nil, "", fmt.Errorf("range response empty for %s", key)
+	}
+	if out.DeleteMarker != nil && *out.DeleteMarker {
+		out.Body.Close()
+		return nil, "", fmt.Errorf("range response points to delete marker for %s", key)
+	}
+	ct := "application/octet-stream"
+	if out.ContentType != nil {
+		ct = *out.ContentType
+	}
+	return out.Body, ct, nil
+}
+
 func (s *S3Store) ReadJSON(ctx context.Context, key string, out any) error {
 	body, _, err := s.GetObject(ctx, key)
 	if err != nil {
