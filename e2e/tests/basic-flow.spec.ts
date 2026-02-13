@@ -36,6 +36,18 @@ test('basic upload -> wall -> album flow', async ({ page }) => {
   await page.getByTestId('wall-tile').first().click()
   await expect(page.getByTestId('album-grid')).toBeVisible()
   await expect(page.getByTestId('album-tile').first()).toBeVisible()
+  const albumPath = new URL(page.url()).pathname
+  const albumId = albumPath.split('/').at(-1)
+  expect(albumId).toBeTruthy()
+
+  const firstOriginalLink = page.getByTestId('album-original-link').first()
+  await expect(firstOriginalLink).toBeVisible()
+  await expect(firstOriginalLink).toHaveAttribute('target', '_blank')
+  await expect(firstOriginalLink).toHaveAttribute('rel', 'noopener noreferrer')
+  await expect(firstOriginalLink).toHaveAttribute('href', /^\/api\/image\/[^/]+\/\d+$/)
+  expect(await firstOriginalLink.getAttribute('href')).not.toContain('mode=wall')
+  expect(await firstOriginalLink.getAttribute('href')).toContain(`/api/image/${albumId}/`)
+
   await expect(page.getByTestId('album-columns-4')).toBeVisible()
   await expect(page.getByTestId('album-columns-6')).toBeVisible()
   await page.screenshot({ path: path.join(samplesDir, '02-album.png'), fullPage: true })

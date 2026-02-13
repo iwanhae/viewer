@@ -188,6 +188,14 @@ body,
   min-height: 100vh;
 }
 
+.album-original-link {
+  display: block;
+  width: 100%;
+  text-decoration: none;
+  color: inherit;
+  cursor: pointer;
+}
+
 .album-tile {
   cursor: default;
 }

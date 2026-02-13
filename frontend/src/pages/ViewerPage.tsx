@@ -87,12 +87,21 @@ export function ViewerPage() {
             data-testid="album-tile"
             ref={photo.i === anchorIndex ? anchorRef : null}
           >
-            <img
-              src={`/api/image/${album.albumId}/${photo.i}?mode=wall&w=${imageWidth}`}
-              alt=""
-              loading="lazy"
-              style={{ aspectRatio: `${photo.w} / ${photo.h}` }}
-            />
+            <a
+              className="album-original-link"
+              href={`/api/image/${album.albumId}/${photo.i}`}
+              target="_blank"
+              rel="noopener noreferrer"
+              aria-label={`Open original image ${photo.i + 1}`}
+              data-testid="album-original-link"
+            >
+              <img
+                src={`/api/image/${album.albumId}/${photo.i}?mode=wall&w=${imageWidth}`}
+                alt=""
+                loading="lazy"
+                style={{ aspectRatio: `${photo.w} / ${photo.h}` }}
+              />
+            </a>
           </div>
         ))}
       </div>
