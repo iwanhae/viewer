@@ -176,6 +176,33 @@ body,
   color: #fff;
 }
 
+.album-page {
+  min-height: 100vh;
+  padding-bottom: 86px;
+}
+
+.album-grid {
+  min-height: 100vh;
+}
+
+.album-tile {
+  cursor: default;
+}
+
+.album-tile img {
+  transition: none;
+}
+
+.album-tile:hover img {
+  transform: none;
+}
+
+.album-back {
+  padding: 0 14px;
+  min-width: 70px;
+  font-size: 14px;
+}
+
 @media (max-width: 640px) {
   .bottom-bar {
     width: calc(100vw - 20px);

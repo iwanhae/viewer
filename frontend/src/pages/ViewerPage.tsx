@@ -2,35 +2,33 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { AlbumIndex, fetchAlbum } from '../api/client'
 
-type TouchPoint = {
-  x: number
-  y: number
-  t: number
-}
+const COLUMN_OPTIONS = [1, 2, 3, 4]
 
 export function ViewerPage() {
   const { albumId = '' } = useParams()
   const [params] = useSearchParams()
-  const initialIndex = Number(params.get('i') ?? '0')
+  const initialIndexValue = Number(params.get('i') ?? '0')
+  const initialIndex = Number.isFinite(initialIndexValue) ? initialIndexValue : 0
 
   const [album, setAlbum] = useState<AlbumIndex | null>(null)
-  const [index, setIndex] = useState(Number.isFinite(initialIndex) ? initialIndex : 0)
-  const [showOverlay, setShowOverlay] = useState(true)
+  const [columnCount, setColumnCount] = useState(3)
   const [error, setError] = useState<string | null>(null)
 
-  const startRef = useRef<TouchPoint | null>(null)
+  const anchorRef = useRef<HTMLDivElement | null>(null)
+  const anchoredRef = useRef(false)
   const navigate = useNavigate()
 
   useEffect(() => {
+    setAlbum(null)
+    setError(null)
+    anchoredRef.current = false
+
     let cancelled = false
     void (async () => {
       try {
         const fetched = await fetchAlbum(albumId)
         if (!cancelled) {
           setAlbum(fetched)
-          if (index < 0 || index >= fetched.photoCount) {
-            setIndex(0)
-          }
         }
       } catch (err) {
         if (!cancelled) setError((err as Error).message)
@@ -41,39 +39,31 @@ export function ViewerPage() {
     }
   }, [albumId])
 
-  const src = useMemo(() => {
-    if (!album) return ''
-    return `/api/image/${album.albumId}/${index}?mode=viewer&max=0`
-  }, [album, index])
+  const anchorIndex = useMemo(() => {
+    if (!album) return null
+    if (initialIndex < 0 || initialIndex >= album.photoCount) return 0
+    return initialIndex
+  }, [album, initialIndex])
 
-  const onTouchStart = (ev: React.TouchEvent<HTMLDivElement>) => {
-    const touch = ev.changedTouches[0]
-    startRef.current = { x: touch.clientX, y: touch.clientY, t: Date.now() }
-  }
+  useEffect(() => {
+    if (!album || anchoredRef.current || anchorIndex === null) return
+    const target = anchorRef.current
+    if (!target) return
 
-  const onTouchEnd = (ev: React.TouchEvent<HTMLDivElement>) => {
-    const start = startRef.current
-    if (!start || !album) return
+    requestAnimationFrame(() => {
+      target.scrollIntoView({ block: 'nearest', inline: 'nearest' })
+      anchoredRef.current = true
+    })
+  }, [album, anchorIndex])
 
-    const touch = ev.changedTouches[0]
-    const dx = touch.clientX - start.x
-    const dy = touch.clientY - start.y
-    const dt = Date.now() - start.t
+  const imageWidth = useMemo(() => {
+    if (typeof window === 'undefined') return 480
 
-    if (dt > 600) return
-
-    if (Math.abs(dx) > Math.abs(dy) && Math.abs(dx) > 40) {
-      if (dx < 0 && index < album.photoCount - 1) setIndex((v) => v + 1)
-      if (dx > 0 && index > 0) setIndex((v) => v - 1)
-      return
-    }
-
-    if (dy > 70 && Math.abs(dy) > Math.abs(dx)) {
-      navigate(-1)
-    }
-  }
-
-  const onClickViewer = () => setShowOverlay((v) => !v)
+    const estimated = Math.floor(window.innerWidth / Math.max(1, columnCount))
+    if (estimated < 64) return 64
+    if (estimated > 2048) return 2048
+    return estimated
+  }, [columnCount])
 
   if (error) {
     return <div className="viewer-error">{error}</div>
@@ -83,23 +73,42 @@ export function ViewerPage() {
   }
 
   return (
-    <div className="viewer" onTouchStart={onTouchStart} onTouchEnd={onTouchEnd} onClick={onClickViewer}>
-      {showOverlay && (
-        <div className="viewer-overlay top" data-testid="viewer-overlay">
-          <button onClick={() => navigate(-1)} data-testid="viewer-close">Close</button>
-          <span>{index + 1} / {album.photoCount}</span>
-        </div>
-      )}
-
-      <img src={src} alt="" className="viewer-image" data-testid="viewer-image" />
-
-      {showOverlay && (
-        <div className="viewer-overlay bottom">
-          <div className="progress">
-            <div className="progress-bar" style={{ width: `${((index + 1) / album.photoCount) * 100}%` }} />
+    <div className="album-page">
+      <div className="album-grid wall-grid" style={{ columnCount }} data-testid="album-grid">
+        {album.photos.map((photo) => (
+          <div
+            key={photo.i}
+            className="tile album-tile"
+            data-testid="album-tile"
+            ref={photo.i === anchorIndex ? anchorRef : null}
+          >
+            <img
+              src={`/api/image/${album.albumId}/${photo.i}?mode=wall&w=${imageWidth}`}
+              alt=""
+              loading="lazy"
+              style={{ aspectRatio: `${photo.w} / ${photo.h}` }}
+            />
           </div>
+        ))}
+      </div>
+
+      <div className="bottom-bar">
+        <div className="columns">
+          {COLUMN_OPTIONS.map((value) => (
+            <button
+              key={value}
+              className={value === columnCount ? 'active' : ''}
+              onClick={() => setColumnCount(value)}
+              data-testid={`album-columns-${value}`}
+            >
+              {value}
+            </button>
+          ))}
         </div>
-      )}
+        <button className="upload album-back" onClick={() => navigate(-1)} data-testid="album-back">
+          Back
+        </button>
+      </div>
     </div>
   )
 }
