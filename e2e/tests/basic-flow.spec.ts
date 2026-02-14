@@ -26,6 +26,7 @@ test('basic upload -> wall -> album flow', async ({ page }) => {
 
   await page.goto('/')
   await expect(page.getByTestId('wall-grid')).toBeVisible()
+  await expect(page.getByTestId('masonry-column')).toHaveCount(3)
 
   await page.getByTestId('upload-input').setInputFiles(zip1)
   await expect(page.getByTestId('upload-button')).toHaveText('+', { timeout: 90_000 })
@@ -44,6 +45,7 @@ test('basic upload -> wall -> album flow', async ({ page }) => {
 
   await page.getByTestId('wall-tile').first().click()
   await expect(page.getByTestId('album-grid')).toBeVisible()
+  await expect(page.getByTestId('masonry-column')).toHaveCount(3)
   await expect(page.getByTestId('album-tile').first()).toBeVisible()
   const albumPath = new URL(page.url()).pathname
   const albumId = albumPath.split('/').at(-1)
@@ -59,6 +61,8 @@ test('basic upload -> wall -> album flow', async ({ page }) => {
 
   await expect(page.getByTestId('album-columns-4')).toBeVisible()
   await expect(page.getByTestId('album-columns-6')).toBeVisible()
+  await page.getByTestId('album-columns-6').click()
+  await expect(page.getByTestId('masonry-column')).toHaveCount(6)
   await page.screenshot({ path: path.join(samplesDir, '02-album.png'), fullPage: true })
 
   await page.getByTestId('album-back').click()

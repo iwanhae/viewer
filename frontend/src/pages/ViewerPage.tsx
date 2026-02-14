@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { AlbumIndex, fetchAlbum } from '../api/client'
 import { readColumnPreference, writeColumnPreference } from '../utils/columnPreference'
+import { distributeMasonry } from '../utils/masonry'
 
 const COLUMN_OPTIONS = [1, 2, 3, 4, 5, 6]
 const VIEWER_COLUMNS_KEY = 'viewer_columns'
@@ -69,9 +70,9 @@ export function ViewerPage() {
     if (estimated > 2048) return 2048
     return estimated
   }, [columnCount])
-  const gridStyle = useMemo(
-    () => ({ gridTemplateColumns: `repeat(${columnCount}, minmax(0, 1fr))` }),
-    [columnCount],
+  const masonryColumns = useMemo(
+    () => distributeMasonry(album?.photos ?? [], columnCount, (photo) => photo.h / Math.max(photo.w, 1)),
+    [album?.photos, columnCount],
   )
 
   if (error) {
@@ -83,29 +84,33 @@ export function ViewerPage() {
 
   return (
     <div className="album-page">
-      <div className="album-grid wall-grid" style={gridStyle} data-testid="album-grid">
-        {album.photos.map((photo) => (
-          <div
-            key={photo.i}
-            className="tile album-tile"
-            data-testid="album-tile"
-            ref={photo.i === anchorIndex ? anchorRef : null}
-          >
-            <a
-              className="album-original-link"
-              href={`/api/image/${album.albumId}/${photo.i}`}
-              target="_blank"
-              rel="noopener noreferrer"
-              aria-label={`Open original image ${photo.i + 1}`}
-              data-testid="album-original-link"
-            >
-              <img
-                src={`/api/image/${album.albumId}/${photo.i}?mode=wall&w=${imageWidth}`}
-                alt=""
-                loading="lazy"
-                style={{ aspectRatio: `${photo.w} / ${photo.h}` }}
-              />
-            </a>
+      <div className="album-grid wall-grid" data-testid="album-grid">
+        {masonryColumns.map((columnPhotos, columnIndex) => (
+          <div className="masonry-column" data-testid="masonry-column" key={columnIndex}>
+            {columnPhotos.map((photo) => (
+              <div
+                key={photo.i}
+                className="tile album-tile"
+                data-testid="album-tile"
+                ref={photo.i === anchorIndex ? anchorRef : null}
+              >
+                <a
+                  className="album-original-link"
+                  href={`/api/image/${album.albumId}/${photo.i}`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  aria-label={`Open original image ${photo.i + 1}`}
+                  data-testid="album-original-link"
+                >
+                  <img
+                    src={`/api/image/${album.albumId}/${photo.i}?mode=wall&w=${imageWidth}`}
+                    alt=""
+                    loading="lazy"
+                    style={{ aspectRatio: `${photo.w} / ${photo.h}` }}
+                  />
+                </a>
+              </div>
+            ))}
           </div>
         ))}
       </div>

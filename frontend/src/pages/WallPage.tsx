@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { createAlbum, fetchFeed, FeedItem, finalizeAlbum, uploadZip, uploadZipFallback } from '../api/client'
 import { readColumnPreference, writeColumnPreference } from '../utils/columnPreference'
+import { distributeMasonry } from '../utils/masonry'
 
 const columnOptions = [1, 2, 3, 4, 5, 6]
 const WALL_COLUMNS_KEY = 'wall_columns'
@@ -22,9 +23,14 @@ export function WallPage() {
   const fileInputRef = useRef<HTMLInputElement | null>(null)
   const navigate = useNavigate()
 
-  const gridStyle = useMemo(
-    () => ({ gridTemplateColumns: `repeat(${columns}, minmax(0, 1fr))` }),
-    [columns],
+  const masonryColumns = useMemo(
+    () =>
+      distributeMasonry(
+        items.map((item, idx) => ({ item, idx })),
+        columns,
+        ({ item }) => item.h / Math.max(item.w, 1),
+      ),
+    [columns, items],
   )
 
   const loadMore = useCallback(async () => {
@@ -92,21 +98,25 @@ export function WallPage() {
 
   return (
     <div className="wall-page">
-      <div className="wall-grid" style={gridStyle} data-testid="wall-grid">
-        {items.map((item, idx) => (
-          <button
-            className="tile"
-            key={`${item.albumId}-${item.i}-${idx}`}
-            onClick={() => navigate(`/album/${item.albumId}?i=${item.i}`)}
-            data-testid="wall-tile"
-          >
-            <img
-              src={item.src}
-              alt=""
-              loading="lazy"
-              style={{ aspectRatio: `${item.w} / ${item.h}` }}
-            />
-          </button>
+      <div className="wall-grid" data-testid="wall-grid">
+        {masonryColumns.map((columnItems, columnIndex) => (
+          <div className="masonry-column" data-testid="masonry-column" key={columnIndex}>
+            {columnItems.map(({ item, idx }) => (
+              <button
+                className="tile"
+                key={`${item.albumId}-${item.i}-${idx}`}
+                onClick={() => navigate(`/album/${item.albumId}?i=${item.i}`)}
+                data-testid="wall-tile"
+              >
+                <img
+                  src={item.src}
+                  alt=""
+                  loading="lazy"
+                  style={{ aspectRatio: `${item.w} / ${item.h}` }}
+                />
+              </button>
+            ))}
+          </div>
         ))}
       </div>
 

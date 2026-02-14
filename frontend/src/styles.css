@@ -25,9 +25,18 @@ body,
 }
 
 .wall-grid {
-  display: grid;
+  display: flex;
   gap: 8px;
+  align-items: flex-start;
   min-height: 100vh;
+}
+
+.masonry-column {
+  display: flex;
+  flex: 1 1 0;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
 }
 
 .tile {
