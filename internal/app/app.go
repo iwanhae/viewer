@@ -35,7 +35,7 @@ func Run(ctx context.Context) error {
 	}
 
 	feedService := feed.NewService(albumService)
-	imageService, err := images.NewService(albumService, store, cfg.CacheDir, cfg.ZipCacheDir)
+	imageService, err := images.NewService(albumService, store, cfg.CacheDir, cfg.ZipCacheDir, cfg.RangeChunkSize)
 	if err != nil {
 		return err
 	}

@@ -16,10 +16,14 @@ At minimum configure S3 values:
 - `S3_ACCESS_KEY`
 - `S3_SECRET_KEY`
 
+Optional tuning:
+- `RANGE_CHUNK_SIZE_BYTES` controls S3 byte-range cache chunk size for ZIP reads (default `131072`).
+
 ## Commands
 - `make build` builds frontend and backend into `bin/viewer`.
 - `make test` runs Playwright e2e and saves screenshots to `samples/`.
 - `make test` binds the app to `TEST_PORT` (default `18080`) and sets `E2E_BASE_URL` automatically.
+- `scripts/chunk_bench.sh` runs a chunk-size benchmark and writes CSV outputs to `.cache/bench/...`.
 
 ## Observability
 - The server logs to stdout/stderr via Go's standard logger.

@@ -156,6 +156,61 @@ func TestManagerFailsWhenRangeBodyTooLong(t *testing.T) {
 	if _, err := h.ReadAt(buf, 0); err == nil {
 		t.Fatalf("expected ReadAt to fail for oversized range body")
 	}
+
+	stats := m.Stats()
+	if got, want := stats.ReadErrors, int64(1); got != want {
+		t.Fatalf("ReadErrors=%d want=%d", got, want)
+	}
+}
+
+func TestManagerStatsCounters(t *testing.T) {
+	t.Parallel()
+
+	backing := []byte("0123456789abcdef")
+	m, err := NewManager(
+		filepath.Join(t.TempDir(), "range"),
+		Config{
+			ChunkSize: 4,
+			MaxBytes:  64,
+			Fetch: func(ctx context.Context, key string, start int64, end int64) (io.ReadCloser, error) {
+				return io.NopCloser(bytes.NewReader(backing[start : end+1])), nil
+			},
+		},
+	)
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+
+	h, err := m.Open(context.Background(), "albums/a/source.zip", int64(len(backing)))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer h.Close()
+
+	buf := make([]byte, 2)
+	if _, err := h.ReadAt(buf, 0); err != nil {
+		t.Fatalf("ReadAt first: %v", err)
+	}
+	if _, err := h.ReadAt(buf[:1], 1); err != nil {
+		t.Fatalf("ReadAt second: %v", err)
+	}
+
+	stats := m.Stats()
+	if got, want := stats.FetchRequests, int64(1); got != want {
+		t.Fatalf("FetchRequests=%d want=%d", got, want)
+	}
+	if got, want := stats.FetchBytes, int64(4); got != want {
+		t.Fatalf("FetchBytes=%d want=%d", got, want)
+	}
+	if got, want := stats.CacheMisses, int64(1); got != want {
+		t.Fatalf("CacheMisses=%d want=%d", got, want)
+	}
+	if got := stats.CacheHits; got < 1 {
+		t.Fatalf("CacheHits=%d want>=1", got)
+	}
+	if got, want := stats.ReadErrors, int64(0); got != want {
+		t.Fatalf("ReadErrors=%d want=%d", got, want)
+	}
 }
 
 func rangeKey(start int64, end int64) string {

@@ -41,6 +41,20 @@ type Manager struct {
 
 	mu          sync.Mutex
 	loadedBytes atomic.Int64
+	fetchReqs   atomic.Int64
+	fetchBytes  atomic.Int64
+	cacheHits   atomic.Int64
+	cacheMisses atomic.Int64
+	readErrors  atomic.Int64
+}
+
+type Stats struct {
+	FetchRequests int64 `json:"fetchRequests"`
+	FetchBytes    int64 `json:"fetchBytes"`
+	CacheHits     int64 `json:"cacheHits"`
+	CacheMisses   int64 `json:"cacheMisses"`
+	ReadErrors    int64 `json:"readErrors"`
+	LoadedBytes   int64 `json:"loadedBytes"`
 }
 
 type Handle struct {
@@ -222,6 +236,7 @@ func (m *Manager) readAt(ctx context.Context, e *entry, p []byte, off int64) (in
 	endChunk := (off + maxRead - 1) / e.chunkSize
 	for idx := startChunk; idx <= endChunk; idx++ {
 		if err := m.ensureChunk(ctx, e, int(idx)); err != nil {
+			m.readErrors.Add(1)
 			return 0, err
 		}
 	}
@@ -259,6 +274,7 @@ func (m *Manager) ensureChunk(ctx context.Context, e *entry, idx int) error {
 			return fmt.Errorf("chunk index out of range: %d", idx)
 		}
 		if e.loaded[idx] {
+			m.cacheHits.Add(1)
 			e.mu.Unlock()
 			return nil
 		}
@@ -274,6 +290,7 @@ func (m *Manager) ensureChunk(ctx context.Context, e *entry, idx int) error {
 
 		st := &chunkLoad{done: make(chan struct{})}
 		e.loading[idx] = st
+		m.cacheMisses.Add(1)
 		e.mu.Unlock()
 
 		err := m.fetchChunk(ctx, e, idx)
@@ -301,6 +318,8 @@ func (m *Manager) fetchChunk(ctx context.Context, e *entry, idx int) error {
 
 	start, end := e.chunkRange(idx)
 	expected := end - start + 1
+	m.fetchReqs.Add(1)
+	m.fetchBytes.Add(expected)
 	body, err := m.fetch(ctx, e.key, start, end)
 	if err != nil {
 		return fmt.Errorf("fetch chunk key=%s range=%d-%d: %w", e.key, start, end, err)
@@ -326,6 +345,20 @@ func (m *Manager) fetchChunk(ctx context.Context, e *entry, idx int) error {
 	}
 
 	return nil
+}
+
+func (m *Manager) Stats() Stats {
+	if m == nil {
+		return Stats{}
+	}
+	return Stats{
+		FetchRequests: m.fetchReqs.Load(),
+		FetchBytes:    m.fetchBytes.Load(),
+		CacheHits:     m.cacheHits.Load(),
+		CacheMisses:   m.cacheMisses.Load(),
+		ReadErrors:    m.readErrors.Load(),
+		LoadedBytes:   m.loadedBytes.Load(),
+	}
 }
 
 func (m *Manager) evictIfNeeded() {

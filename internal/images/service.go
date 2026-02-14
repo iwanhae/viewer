@@ -31,14 +31,17 @@ type ImageResult struct {
 }
 
 const (
-	rangeChunkSize = int64(1 << 20) // 1 MiB
-	rangeMaxBytes  = int64(8 << 30) // 8 GiB
+	defaultRangeChunkSize = int64(1 << 17) // 128 KiB
+	rangeMaxBytes         = int64(8 << 30) // 8 GiB
 )
 
-func NewService(albumsService *albums.Service, store *storage.S3Store, cacheDir string, zipCacheDir string) (*Service, error) {
+func NewService(albumsService *albums.Service, store *storage.S3Store, cacheDir string, zipCacheDir string, rangeChunkSize int64) (*Service, error) {
 	dc, err := cache.NewDiskCache(cacheDir)
 	if err != nil {
 		return nil, err
+	}
+	if rangeChunkSize <= 0 {
+		rangeChunkSize = defaultRangeChunkSize
 	}
 	rc, err := rangecache.NewManager(
 		filepath.Join(zipCacheDir, "range"),
@@ -64,6 +67,13 @@ func NewService(albumsService *albums.Service, store *storage.S3Store, cacheDir 
 		cache:      dc,
 		rangeCache: rc,
 	}, nil
+}
+
+func (s *Service) RangeCacheStats() rangecache.Stats {
+	if s == nil || s.rangeCache == nil {
+		return rangecache.Stats{}
+	}
+	return s.rangeCache.Stats()
 }
 
 func sourceKey(albumID string) string {

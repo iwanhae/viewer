@@ -56,6 +56,7 @@ func (s *Server) Router() http.Handler {
 		r.Get("/albums/{albumId}", s.getAlbum)
 		r.Get("/feed", s.getFeed)
 		r.Get("/image/{albumId}/{index}", s.getImage)
+		r.Get("/debug/range-cache-stats", s.getRangeCacheStats)
 	})
 
 	staticHandler := web.Handler()
@@ -226,6 +227,18 @@ func (s *Server) getImage(w http.ResponseWriter, r *http.Request) {
 	if _, err := w.Write(result.Bytes); err != nil {
 		log.Printf("write image response failed: %v", err)
 	}
+}
+
+func (s *Server) getRangeCacheStats(w http.ResponseWriter, r *http.Request) {
+	stats := s.images.RangeCacheStats()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"fetchRequests": stats.FetchRequests,
+		"fetchBytes":    stats.FetchBytes,
+		"cacheHits":     stats.CacheHits,
+		"cacheMisses":   stats.CacheMisses,
+		"readErrors":    stats.ReadErrors,
+		"loadedBytes":   stats.LoadedBytes,
+	})
 }
 
 func recovererWithLog(next http.Handler) http.Handler {
