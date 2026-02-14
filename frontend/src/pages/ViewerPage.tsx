@@ -69,6 +69,10 @@ export function ViewerPage() {
     if (estimated > 2048) return 2048
     return estimated
   }, [columnCount])
+  const gridStyle = useMemo(
+    () => ({ gridTemplateColumns: `repeat(${columnCount}, minmax(0, 1fr))` }),
+    [columnCount],
+  )
 
   if (error) {
     return <div className="viewer-error">{error}</div>
@@ -79,7 +83,7 @@ export function ViewerPage() {
 
   return (
     <div className="album-page">
-      <div className="album-grid wall-grid" style={{ columnCount }} data-testid="album-grid">
+      <div className="album-grid wall-grid" style={gridStyle} data-testid="album-grid">
         {album.photos.map((photo) => (
           <div
             key={photo.i}

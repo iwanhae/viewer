@@ -25,18 +25,18 @@ body,
 }
 
 .wall-grid {
-  column-gap: 8px;
+  display: grid;
+  gap: 8px;
   min-height: 100vh;
 }
 
 .tile {
   display: block;
   width: 100%;
-  margin: 0 0 8px;
+  margin: 0;
   padding: 0;
   border: 0;
   background: transparent;
-  break-inside: avoid;
   cursor: pointer;
   overflow: hidden;
 }

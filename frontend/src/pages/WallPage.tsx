@@ -22,7 +22,10 @@ export function WallPage() {
   const fileInputRef = useRef<HTMLInputElement | null>(null)
   const navigate = useNavigate()
 
-  const columnStyle = useMemo(() => ({ columnCount: columns }), [columns])
+  const gridStyle = useMemo(
+    () => ({ gridTemplateColumns: `repeat(${columns}, minmax(0, 1fr))` }),
+    [columns],
+  )
 
   const loadMore = useCallback(async () => {
     if (loading || !hasMore) return
@@ -89,7 +92,7 @@ export function WallPage() {
 
   return (
     <div className="wall-page">
-      <div className="wall-grid" style={columnStyle} data-testid="wall-grid">
+      <div className="wall-grid" style={gridStyle} data-testid="wall-grid">
         {items.map((item, idx) => (
           <button
             className="tile"
