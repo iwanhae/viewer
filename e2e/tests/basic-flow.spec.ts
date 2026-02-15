@@ -27,6 +27,7 @@ test('basic upload -> wall -> album flow', async ({ page }) => {
   await page.goto('/')
   await expect(page.getByTestId('wall-grid')).toBeVisible()
   await expect(page.getByTestId('masonry-column')).toHaveCount(3)
+  await expect(page.getByTestId('wall-refresh')).toBeVisible()
 
   await page.getByTestId('upload-input').setInputFiles(zip1)
   await expect(page.getByTestId('upload-button')).toHaveText('+', { timeout: 90_000 })
@@ -67,11 +68,10 @@ test('basic upload -> wall -> album flow', async ({ page }) => {
 
   await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight))
   const refreshButton = page.getByTestId('wall-refresh')
-  await expect(refreshButton).toBeVisible()
-
   const seedBeforeRefresh = new URL(page.url()).searchParams.get('seed')
   expect(seedBeforeRefresh).toBeTruthy()
   await refreshButton.click()
+  await expect.poll(() => page.evaluate(() => window.scrollY)).toBe(0)
   await expect.poll(() => new URL(page.url()).searchParams.get('seed')).not.toBe(seedBeforeRefresh)
   await expect(page.getByTestId('wall-tile').first()).toBeVisible({ timeout: 60_000 })
 

@@ -25,9 +25,7 @@ export function WallPage() {
   )
   const [error, setError] = useState<string | null>(null)
   const [uploading, setUploading] = useState(false)
-  const [isAtBottom, setIsAtBottom] = useState(false)
 
-  const sentinelRef = useRef<HTMLDivElement | null>(null)
   const fileInputRef = useRef<HTMLInputElement | null>(null)
   const loadingRef = useRef(false)
   const navigate = useNavigate()
@@ -73,21 +71,10 @@ export function WallPage() {
     void loadFeed(seed)
   }, [loadFeed, seed, setSearchParams])
 
-  useEffect(() => {
-    const target = sentinelRef.current
-    if (!target) return
-
-    const observer = new IntersectionObserver((entries) => {
-      for (const entry of entries) {
-        if (entry.target === target) setIsAtBottom(entry.isIntersecting)
-      }
-    })
-
-    observer.observe(target)
-    return () => observer.disconnect()
-  }, [])
-
   const onRefresh = () => {
+    if (typeof window !== 'undefined') {
+      window.scrollTo({ top: 0, behavior: 'auto' })
+    }
     const nextSeed = nextTimestampSeed(seed)
     setSearchParams((prev) => {
       const next = new URLSearchParams(prev)
@@ -153,8 +140,6 @@ export function WallPage() {
         ))}
       </div>
 
-      <div ref={sentinelRef} className="sentinel" />
-
       <div className="bottom-bar">
         <div className="columns">
           {columnOptions.map((option) => (
@@ -171,16 +156,14 @@ export function WallPage() {
             </button>
           ))}
         </div>
-        {isAtBottom && (
-          <button
-            className="upload wall-refresh"
-            onClick={onRefresh}
-            disabled={loading || uploading}
-            data-testid="wall-refresh"
-          >
-            Refresh
-          </button>
-        )}
+        <button
+          className="upload wall-refresh"
+          onClick={onRefresh}
+          disabled={loading || uploading}
+          data-testid="wall-refresh"
+        >
+          Refresh
+        </button>
         <button className="upload" onClick={() => fileInputRef.current?.click()} disabled={uploading} data-testid="upload-button">
           {uploading ? 'Uploading...' : '+'}
         </button>
