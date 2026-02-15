@@ -287,6 +287,15 @@ func (s *Service) AllAlbums() []*models.AlbumIndex {
 		dup.Photos = append([]models.PhotoMeta(nil), idx.Photos...)
 		out = append(out, &dup)
 	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].AlbumID != out[j].AlbumID {
+			return out[i].AlbumID < out[j].AlbumID
+		}
+		if out[i].CreatedAt != out[j].CreatedAt {
+			return out[i].CreatedAt < out[j].CreatedAt
+		}
+		return out[i].OriginalFilename < out[j].OriginalFilename
+	})
 	return out
 }
 
