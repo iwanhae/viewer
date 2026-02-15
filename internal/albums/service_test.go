@@ -1,6 +1,7 @@
 package albums
 
 import (
+	"context"
 	"reflect"
 	"testing"
 
@@ -62,3 +63,41 @@ func TestAllAlbumsReturnsCopies(t *testing.T) {
 	}
 }
 
+func TestListAlbumsDoesNotBlockOnEmptyCache(t *testing.T) {
+	s := &Service{
+		albumCache: map[string]*models.AlbumIndex{},
+	}
+
+	albumsList, err := s.ListAlbums(context.Background())
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if len(albumsList) != 0 {
+		t.Fatalf("expected empty albums list, got %d", len(albumsList))
+	}
+}
+
+func TestMergeAlbumCachesPreservesExistingAndOverwritesScanned(t *testing.T) {
+	existing := map[string]*models.AlbumIndex{
+		"from-memory": {AlbumID: "from-memory", CreatedAt: "2026-02-15T00:00:01Z"},
+		"shared":      {AlbumID: "shared", CreatedAt: "old"},
+	}
+	scanned := map[string]*models.AlbumIndex{
+		"from-storage": {AlbumID: "from-storage", CreatedAt: "2026-02-15T00:00:02Z"},
+		"shared":       {AlbumID: "shared", CreatedAt: "new"},
+	}
+
+	merged := mergeAlbumCaches(existing, scanned)
+	if len(merged) != 3 {
+		t.Fatalf("expected merged size 3, got %d", len(merged))
+	}
+	if _, ok := merged["from-memory"]; !ok {
+		t.Fatalf("expected merged cache to keep existing in-memory album")
+	}
+	if _, ok := merged["from-storage"]; !ok {
+		t.Fatalf("expected merged cache to include scanned storage album")
+	}
+	if merged["shared"].CreatedAt != "new" {
+		t.Fatalf("expected scanned album to overwrite shared key, got %q", merged["shared"].CreatedAt)
+	}
+}

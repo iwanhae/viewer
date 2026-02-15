@@ -221,9 +221,20 @@ func (s *Service) refreshFromStorage(ctx context.Context, onProgress func(Refres
 	}
 
 	s.mu.Lock()
-	s.albumCache = next
+	s.albumCache = mergeAlbumCaches(s.albumCache, next)
 	s.mu.Unlock()
 	return nil
+}
+
+func mergeAlbumCaches(existing map[string]*models.AlbumIndex, scanned map[string]*models.AlbumIndex) map[string]*models.AlbumIndex {
+	merged := make(map[string]*models.AlbumIndex, len(existing)+len(scanned))
+	for albumID, idx := range existing {
+		merged[albumID] = idx
+	}
+	for albumID, idx := range scanned {
+		merged[albumID] = idx
+	}
+	return merged
 }
 
 func (s *Service) GetAlbum(ctx context.Context, albumID string) (*models.AlbumIndex, error) {
@@ -251,15 +262,8 @@ func (s *Service) GetAlbum(ctx context.Context, albumID string) (*models.AlbumIn
 }
 
 func (s *Service) ListAlbums(ctx context.Context) ([]models.AlbumSummary, error) {
+	_ = ctx
 	s.mu.RLock()
-	if len(s.albumCache) == 0 {
-		s.mu.RUnlock()
-		if err := s.RefreshFromStorage(ctx); err != nil {
-			return nil, err
-		}
-		s.mu.RLock()
-	}
-
 	out := make([]models.AlbumSummary, 0, len(s.albumCache))
 	for _, idx := range s.albumCache {
 		out = append(out, models.AlbumSummary{

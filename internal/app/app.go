@@ -28,11 +28,6 @@ func Run(ctx context.Context) error {
 	}
 
 	albumService := albums.NewService(cfg, store, albums.NewIndexer())
-	if cfg.SkipWarmup {
-		log.Printf("viewer: startup warmup skipped")
-	} else {
-		httpapi.Warmup(ctx, albumService)
-	}
 
 	feedService := feed.NewService(albumService)
 	imageService, err := images.NewService(albumService, store, cfg.CacheDir, cfg.ZipCacheDir, cfg.RangeChunkSize)
@@ -47,6 +42,12 @@ func Run(ctx context.Context) error {
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	log.Printf("viewer: starting HTTP server on %s", srv.Addr)
+	if cfg.SkipWarmup {
+		log.Printf("viewer: startup warmup skipped")
+	} else {
+		log.Printf("viewer: startup warmup running in background")
+		go httpapi.Warmup(ctx, albumService)
+	}
 
 	return srv.ListenAndServe()
 }
