@@ -178,7 +178,6 @@ func (s *Service) refreshFromStorage(ctx context.Context, onProgress func(Refres
 		return err
 	}
 
-	next := make(map[string]*models.AlbumIndex, len(keys))
 	for i, key := range keys {
 		var idx models.AlbumIndex
 		if err := s.store.ReadJSON(ctx, key, &idx); err != nil {
@@ -209,7 +208,13 @@ func (s *Service) refreshFromStorage(ctx context.Context, onProgress func(Refres
 			}
 			continue
 		}
-		next[idx.AlbumID] = &idx
+		cached := new(models.AlbumIndex)
+		*cached = idx
+
+		s.mu.Lock()
+		s.albumCache[idx.AlbumID] = cached
+		s.mu.Unlock()
+
 		if onProgress != nil {
 			onProgress(RefreshProgress{
 				Done:    i + 1,
@@ -220,9 +225,6 @@ func (s *Service) refreshFromStorage(ctx context.Context, onProgress func(Refres
 		}
 	}
 
-	s.mu.Lock()
-	s.albumCache = mergeAlbumCaches(s.albumCache, next)
-	s.mu.Unlock()
 	return nil
 }
 
