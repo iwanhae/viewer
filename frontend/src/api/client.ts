@@ -28,9 +28,10 @@ export type AlbumIndex = {
   photos: PhotoMeta[]
 }
 
-export async function fetchFeed(cursor?: string): Promise<FeedResponse> {
+export async function fetchFeed(params?: { cursor?: string; seed?: string }): Promise<FeedResponse> {
   const query = new URLSearchParams({ limit: '80' })
-  if (cursor) query.set('cursor', cursor)
+  if (params?.cursor) query.set('cursor', params.cursor)
+  if (params?.seed) query.set('seed', params.seed)
   const res = await fetch(`/api/feed?${query.toString()}`)
   if (!res.ok) throw new Error(`feed failed: ${res.status}`)
   return (await res.json()) as FeedResponse

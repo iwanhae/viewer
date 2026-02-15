@@ -41,13 +41,49 @@ test('basic upload -> wall -> album flow', async ({ page }) => {
   expect(originalResponse.ok()).toBeTruthy()
   expect(wallResponse.headers()['content-type']).toBe(originalResponse.headers()['content-type'])
   expect(await wallResponse.body()).toEqual(await originalResponse.body())
+
+  const initialSeed = new URL(page.url()).searchParams.get('seed')
+  expect(initialSeed).toBeTruthy()
+
+  const seededWallImages = page.getByTestId('wall-tile').locator('img')
+  const sampleCount = Math.min(10, await seededWallImages.count())
+  const seededWallSrcs: string[] = []
+  for (let i = 0; i < sampleCount; i++) {
+    const src = await seededWallImages.nth(i).getAttribute('src')
+    expect(src).toBeTruthy()
+    seededWallSrcs.push(src!)
+  }
+
+  await page.goto(`/?seed=${initialSeed}`)
+  await expect(page.getByTestId('wall-tile').first()).toBeVisible({ timeout: 60_000 })
+  const replayWallImages = page.getByTestId('wall-tile').locator('img')
+  const replayWallSrcs: string[] = []
+  for (let i = 0; i < sampleCount; i++) {
+    const src = await replayWallImages.nth(i).getAttribute('src')
+    expect(src).toBeTruthy()
+    replayWallSrcs.push(src!)
+  }
+  expect(replayWallSrcs).toEqual(seededWallSrcs)
+
+  await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight))
+  const refreshButton = page.getByTestId('wall-refresh')
+  await expect(refreshButton).toBeVisible()
+
+  const seedBeforeRefresh = new URL(page.url()).searchParams.get('seed')
+  expect(seedBeforeRefresh).toBeTruthy()
+  await refreshButton.click()
+  await expect.poll(() => new URL(page.url()).searchParams.get('seed')).not.toBe(seedBeforeRefresh)
+  await expect(page.getByTestId('wall-tile').first()).toBeVisible({ timeout: 60_000 })
+
   await page.screenshot({ path: path.join(samplesDir, '01-upload-finalize.png'), fullPage: true })
 
   await page.getByTestId('wall-tile').first().click()
   await expect(page.getByTestId('album-grid')).toBeVisible()
   await expect(page.getByTestId('masonry-column')).toHaveCount(3)
   await expect(page.getByTestId('album-tile').first()).toBeVisible()
-  const albumPath = new URL(page.url()).pathname
+  const albumURL = new URL(page.url())
+  expect(albumURL.searchParams.get('i')).toBeNull()
+  const albumPath = albumURL.pathname
   const albumId = albumPath.split('/').at(-1)
   expect(albumId).toBeTruthy()
 

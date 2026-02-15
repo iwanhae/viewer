@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate, useSearchParams } from 'react-router-dom'
 import { createAlbum, fetchFeed, FeedItem, finalizeAlbum, uploadZip, uploadZipFallback } from '../api/client'
 import { readColumnPreference, writeColumnPreference } from '../utils/columnPreference'
 import { distributeMasonry } from '../utils/masonry'
@@ -8,20 +8,31 @@ const columnOptions = [1, 2, 3, 4, 5, 6]
 const WALL_COLUMNS_KEY = 'wall_columns'
 const DEFAULT_COLUMNS = 3
 
+function nextTimestampSeed(currentSeed?: string): string {
+  const now = Date.now()
+  const parsedCurrent = Number.parseInt(currentSeed ?? '', 10)
+  if (Number.isFinite(parsedCurrent) && parsedCurrent >= now) {
+    return String(parsedCurrent + 1)
+  }
+  return String(now)
+}
+
 export function WallPage() {
   const [items, setItems] = useState<FeedItem[]>([])
-  const [cursor, setCursor] = useState<string | undefined>(undefined)
   const [loading, setLoading] = useState(false)
-  const [hasMore, setHasMore] = useState(true)
   const [columns, setColumns] = useState(() =>
     readColumnPreference(WALL_COLUMNS_KEY, columnOptions, DEFAULT_COLUMNS),
   )
   const [error, setError] = useState<string | null>(null)
   const [uploading, setUploading] = useState(false)
+  const [isAtBottom, setIsAtBottom] = useState(false)
 
   const sentinelRef = useRef<HTMLDivElement | null>(null)
   const fileInputRef = useRef<HTMLInputElement | null>(null)
+  const loadingRef = useRef(false)
   const navigate = useNavigate()
+  const [searchParams, setSearchParams] = useSearchParams()
+  const seed = searchParams.get('seed') ?? ''
 
   const masonryColumns = useMemo(
     () =>
@@ -33,25 +44,34 @@ export function WallPage() {
     [columns, items],
   )
 
-  const loadMore = useCallback(async () => {
-    if (loading || !hasMore) return
+  const loadFeed = useCallback(async (seedValue: string) => {
+    if (loadingRef.current) return
+    loadingRef.current = true
     setLoading(true)
     setError(null)
     try {
-      const data = await fetchFeed(cursor)
-      setItems((prev) => [...prev, ...data.items])
-      setCursor(data.nextCursor)
-      setHasMore(Boolean(data.nextCursor))
+      const data = await fetchFeed({ seed: seedValue })
+      setItems(data.items)
     } catch (err) {
       setError((err as Error).message)
     } finally {
+      loadingRef.current = false
       setLoading(false)
     }
-  }, [cursor, loading, hasMore])
+  }, [])
 
   useEffect(() => {
-    void loadMore()
-  }, [])
+    if (!seed) {
+      const nextSeed = nextTimestampSeed()
+      setSearchParams((prev) => {
+        const next = new URLSearchParams(prev)
+        next.set('seed', nextSeed)
+        return next
+      }, { replace: true })
+      return
+    }
+    void loadFeed(seed)
+  }, [loadFeed, seed, setSearchParams])
 
   useEffect(() => {
     const target = sentinelRef.current
@@ -59,15 +79,22 @@ export function WallPage() {
 
     const observer = new IntersectionObserver((entries) => {
       for (const entry of entries) {
-        if (entry.isIntersecting) {
-          void loadMore()
-        }
+        if (entry.target === target) setIsAtBottom(entry.isIntersecting)
       }
-    }, { rootMargin: '1200px' })
+    })
 
     observer.observe(target)
     return () => observer.disconnect()
-  }, [loadMore])
+  }, [])
+
+  const onRefresh = () => {
+    const nextSeed = nextTimestampSeed(seed)
+    setSearchParams((prev) => {
+      const next = new URLSearchParams(prev)
+      next.set('seed', nextSeed)
+      return next
+    })
+  }
 
   const onPickFile = async (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0]
@@ -84,10 +111,16 @@ export function WallPage() {
       }
       await finalizeAlbum(created.albumId)
 
-      const data = await fetchFeed()
-      setItems(data.items)
-      setCursor(data.nextCursor)
-      setHasMore(Boolean(data.nextCursor))
+      if (seed) {
+        await loadFeed(seed)
+      } else {
+        const nextSeed = nextTimestampSeed()
+        setSearchParams((prev) => {
+          const next = new URLSearchParams(prev)
+          next.set('seed', nextSeed)
+          return next
+        }, { replace: true })
+      }
     } catch (err) {
       setError((err as Error).message)
     } finally {
@@ -105,7 +138,7 @@ export function WallPage() {
               <button
                 className="tile"
                 key={`${item.albumId}-${item.i}-${idx}`}
-                onClick={() => navigate(`/album/${item.albumId}?i=${item.i}`)}
+                onClick={() => navigate(`/album/${item.albumId}`)}
                 data-testid="wall-tile"
               >
                 <img
@@ -138,6 +171,16 @@ export function WallPage() {
             </button>
           ))}
         </div>
+        {isAtBottom && (
+          <button
+            className="upload wall-refresh"
+            onClick={onRefresh}
+            disabled={loading || uploading}
+            data-testid="wall-refresh"
+          >
+            Refresh
+          </button>
+        )}
         <button className="upload" onClick={() => fileInputRef.current?.click()} disabled={uploading} data-testid="upload-button">
           {uploading ? 'Uploading...' : '+'}
         </button>

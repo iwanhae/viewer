@@ -108,6 +108,12 @@ body,
   line-height: 1;
 }
 
+.wall-refresh {
+  padding: 0 14px;
+  min-width: 84px;
+  font-size: 14px;
+}
+
 .status {
   position: fixed;
   top: 16px;
