@@ -2,13 +2,19 @@ SHELL := /bin/bash
 .SHELLFLAGS := -eu -o pipefail -c
 
 BIN := bin/viewer
+RECO_WORKER_BIN := bin/reco-worker
 
-.PHONY: build run test clean deps e2e-install
+.PHONY: build run test clean deps e2e-install worker-build
 
-build: deps
+build: deps worker-build
 	npm --prefix frontend ci
 	npm --prefix frontend run build
 	go build -o $(BIN) ./cmd/viewer
+
+worker-build:
+	cargo build --manifest-path workers/reco-worker/Cargo.toml
+	mkdir -p bin
+	cp workers/reco-worker/target/debug/reco-worker $(RECO_WORKER_BIN)
 
 run: build
 	@if [ -f .env ]; then \
@@ -66,4 +72,4 @@ test: build e2e-install
 	E2E_BASE_URL="$${E2E_BASE_URL}" SCREENSHOT_DIR="$${SCREENSHOT_DIR}" npm --prefix e2e test
 
 clean:
-	rm -rf bin .cache frontend/node_modules e2e/node_modules
+	rm -rf bin .cache frontend/node_modules e2e/node_modules workers/reco-worker/target

@@ -44,6 +44,19 @@ func TestLoadRejectsNonPositiveRangeChunkSize(t *testing.T) {
 	}
 }
 
+func TestLoadDefaultRecoWorkerCommand(t *testing.T) {
+	setRequiredEnv(t)
+	t.Setenv("RECO_WORKER_CMD", "")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got, want := cfg.RecoWorkerCmd, "RECO_WORKER_MODE=worker ./bin/reco-worker"; got != want {
+		t.Fatalf("RecoWorkerCmd=%q want=%q", got, want)
+	}
+}
+
 func setRequiredEnv(t *testing.T) {
 	t.Helper()
 	t.Setenv("S3_ENDPOINT", "https://example.invalid")

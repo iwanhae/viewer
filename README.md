@@ -23,24 +23,23 @@ Optional tuning:
 - `RECO_TOPK_DEFAULT` default recommendation count (default `12`).
 - `RECO_TOPK_MAX` max recommendation count (default `48`).
 - `RECO_WORKER_CONCURRENCY` number of background embedding workers (default `2`).
-- `RECO_WORKER_CMD` command used to run embedding worker (default `RECO_WORKER_MODE=worker python3 scripts/reco_worker.py`).
+- `RECO_WORKER_CMD` command used to run embedding worker (default `RECO_WORKER_MODE=worker ./bin/reco-worker`).
 - `RECO_WORKER_REQUEST_TIMEOUT_SECONDS` timeout per embed request (default `120`).
 - `RECO_WORKER_RESTART_LIMIT` max worker restarts per hour (default `10`).
 - `SIGLIP2_MODEL_ID` model identifier for worker backends (default `google/siglip2-base-patch16-224`).
-- `SIGLIP2_DEVICE` embedding device hint such as `cpu` or `cuda:0` (default `cpu`).
-- Python worker runtime currently pins `transformers==5.1.0` for SigLIP2 compatibility.
+- `SIGLIP2_DEVICE` embedding device hint (default `cpu`, CPU-only worker build).
+- Rust worker downloads SigLIP2 model files from Hugging Face on demand and caches them locally.
 
 Recommendation vectors are persisted in each album's `albums/<album-id>/index.json` under an `embeddings` section.
 
-Python worker supports two modes:
-- Worker mode (Go uses this): `RECO_WORKER_MODE=worker python3 scripts/reco_worker.py`
-- One-shot debug mode (default): `cat test.jpg | python3 scripts/reco_worker.py`
+Rust worker supports two modes:
+- Worker mode (Go uses this): `RECO_WORKER_MODE=worker ./bin/reco-worker`
+- One-shot debug mode (default): `cat test.jpg | ./bin/reco-worker`
 
 ## Commands
-- `make build` builds frontend and backend into `bin/viewer`.
+- `make build` builds `bin/viewer` and `bin/reco-worker`.
 - `make test` runs Playwright e2e and saves screenshots to `samples/`.
 - `make test` binds the app to `TEST_PORT` (default `18080`) and sets `E2E_BASE_URL` automatically.
-- `scripts/chunk_bench.sh` runs a chunk-size benchmark and writes CSV outputs to `.cache/bench/...`.
 
 ## Observability
 - The server logs to stdout/stderr via Go's standard logger.

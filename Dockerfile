@@ -21,20 +21,25 @@ COPY --from=frontend-build /src/internal/web/static ./internal/web/static
 
 RUN CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /out/viewer ./cmd/viewer
 
-FROM python:3.13-slim-bookworm AS runtime
+FROM rust:1.90-bookworm AS reco-worker-build
+WORKDIR /src
+
+COPY workers/reco-worker/Cargo.toml workers/reco-worker/Cargo.lock ./workers/reco-worker/
+COPY workers/reco-worker/src ./workers/reco-worker/src
+
+RUN cargo build --manifest-path workers/reco-worker/Cargo.toml --release && \
+    mkdir -p /out && \
+    cp workers/reco-worker/target/release/reco-worker /out/reco-worker
+
+FROM debian:bookworm-slim AS runtime
 WORKDIR /app
 
-COPY pyproject.toml uv.lock ./
-RUN python3 -m pip install --no-cache-dir --upgrade pip && \
-    python3 -m pip install --no-cache-dir \
-      numpy \
-      onnxruntime \
-      pillow \
-      torch \
-      transformers==5.1.0
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
 
 COPY --from=backend-build /out/viewer /app/viewer
-COPY scripts/reco_worker.py /app/scripts/reco_worker.py
+COPY --from=reco-worker-build /out/reco-worker /app/reco-worker
 
 RUN mkdir -p /tmp/viewer-cache/images /tmp/viewer-cache/zips && \
     chown -R 65532:65532 /app /tmp/viewer-cache
@@ -44,7 +49,7 @@ USER 65532:65532
 ENV PORT=8080 \
     CACHE_DIR=/tmp/viewer-cache/images \
     ZIP_CACHE_DIR=/tmp/viewer-cache/zips \
-    RECO_WORKER_CMD="RECO_WORKER_MODE=worker python3 scripts/reco_worker.py"
+    RECO_WORKER_CMD="RECO_WORKER_MODE=worker /app/reco-worker"
 
 EXPOSE 8080
 ENTRYPOINT ["/app/viewer"]

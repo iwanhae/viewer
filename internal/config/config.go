@@ -39,7 +39,7 @@ func Load() (Config, error) {
 	cacheDir := getenv("CACHE_DIR", ".cache/images")
 	zipCacheDir := getenv("ZIP_CACHE_DIR", ".cache/zips")
 	rangeChunkSize := getenvInt64("RANGE_CHUNK_SIZE_BYTES", 1<<17)
-	recoWorkerCmd := getenv("RECO_WORKER_CMD", "RECO_WORKER_MODE=worker python3 scripts/reco_worker.py")
+	recoWorkerCmd := getenv("RECO_WORKER_CMD", "RECO_WORKER_MODE=worker ./bin/reco-worker")
 
 	cfg := Config{
 		Port:                   port,
