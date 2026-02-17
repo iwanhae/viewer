@@ -22,7 +22,7 @@ Current baseline was `1 MiB` (`1048576` bytes).
 - Backend: local `bin/viewer`, real S3 backend from `.env.test`
 - Fixture ZIP: generated random PNG set, `120` images at `256x256`, ZIP size `23,658,022` bytes
 - For each chunk size:
-  1. Start server with `SKIP_WARMUP=true` and selected `RANGE_CHUNK_SIZE_BYTES`
+  1. Start server with selected `RANGE_CHUNK_SIZE_BYTES`
   2. Upload + finalize fixture album
   3. Call `/api/feed?limit=80&seed=chunk-bench-fixed-seed`
   4. Fetch 80 returned `/api/image` URLs (parallelism `8`)

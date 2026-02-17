@@ -45,7 +45,7 @@ test: build e2e-install
 	: "$${SCREENSHOT_DIR:=./samples}"; \
 	if [[ "$${SCREENSHOT_DIR}" != /* ]]; then SCREENSHOT_DIR="$$(pwd)/$${SCREENSHOT_DIR}"; fi; \
 	mkdir -p "$${SCREENSHOT_DIR}"; \
-	SKIP_WARMUP=true ./$(BIN) > .cache/e2e-server.log 2>&1 & \
+	./$(BIN) > .cache/e2e-server.log 2>&1 & \
 	SERVER_PID=$$!; \
 	trap 'kill $$SERVER_PID >/dev/null 2>&1 || true' EXIT; \
 	for i in $$(seq 1 60); do \

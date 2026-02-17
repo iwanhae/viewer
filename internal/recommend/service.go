@@ -6,10 +6,7 @@ import (
 	"fmt"
 	"log"
 	"math/rand"
-	"path/filepath"
-	"runtime"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -44,11 +41,6 @@ type Service struct {
 	albumLocks  map[string]*sync.Mutex
 }
 
-type fetchedAlbumIndex struct {
-	key string
-	idx models.AlbumIndex
-}
-
 func NewService(cfg cfgpkg.Config, albumsService *albums.Service, imagesService *images.Service, s3Store *storage.S3Store) (*Service, error) {
 	embedder := NewPythonEmbedder(
 		cfg.RecoWorkerCmd,
@@ -81,10 +73,6 @@ func NewService(cfg cfgpkg.Config, albumsService *albums.Service, imagesService 
 
 func (s *Service) Start(ctx context.Context) error {
 	s.startOnce.Do(func() {
-		s.startErr = s.warmup(ctx)
-		if s.startErr != nil {
-			return
-		}
 		go func() {
 			<-ctx.Done()
 			_ = s.embedder.Close()
@@ -97,132 +85,16 @@ func (s *Service) Start(ctx context.Context) error {
 		for i := 0; i < concurrency; i++ {
 			go s.workerLoop(ctx)
 		}
+		s.startErr = nil
 	})
 	return s.startErr
 }
 
-func (s *Service) warmup(ctx context.Context) error {
-	workers := warmupWorkerCount(s.cfg.WarmupFetchConcurrency)
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	keyCh := make(chan string, workers*2)
-	idxCh := make(chan fetchedAlbumIndex, workers)
-	errCh := make(chan error, 1)
-
-	setErr := func(err error) {
-		if err == nil {
-			return
-		}
-		select {
-		case errCh <- err:
-		default:
-		}
-		cancel()
+func (s *Service) IngestAlbumIndex(idx models.AlbumIndex) {
+	if idx.AlbumID == "" {
+		return
 	}
-
-	var listWG sync.WaitGroup
-	listWG.Add(1)
-	go func() {
-		defer listWG.Done()
-		defer close(keyCh)
-		err := s.s3.ForEachAlbumIndexKey(ctx, func(key string) error {
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case keyCh <- key:
-				return nil
-			}
-		})
-		if err != nil && ctx.Err() == nil {
-			setErr(fmt.Errorf("list album keys: %w", err))
-		}
-	}()
-
-	var fetchWG sync.WaitGroup
-	for i := 0; i < workers; i++ {
-		fetchWG.Add(1)
-		go func() {
-			defer fetchWG.Done()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case key, ok := <-keyCh:
-					if !ok {
-						return
-					}
-					var idx models.AlbumIndex
-					if err := s.s3.ReadJSON(ctx, key, &idx); err != nil {
-						setErr(fmt.Errorf("warmup read %s: %w", key, err))
-						return
-					}
-					if idx.AlbumID == "" {
-						idx.AlbumID = albumIDFromIndexKey(key)
-					}
-					if idx.AlbumID == "" {
-						setErr(fmt.Errorf("warmup missing album id for key=%s", key))
-						return
-					}
-					select {
-					case <-ctx.Done():
-						return
-					case idxCh <- fetchedAlbumIndex{key: key, idx: idx}:
-					}
-				}
-			}
-		}()
-	}
-
-	go func() {
-		fetchWG.Wait()
-		close(idxCh)
-	}()
-
-	loaded := 0
-	for fetched := range idxCh {
-		s.applyAlbumIndex(fetched.idx)
-		loaded++
-		if loaded%100 == 0 {
-			log.Printf("recommend: warmup loaded albums=%d", loaded)
-		}
-	}
-	listWG.Wait()
-
-	select {
-	case err := <-errCh:
-		return err
-	default:
-	}
-
-	log.Printf("recommend: warmup complete albums=%d", loaded)
-	return nil
-}
-
-func warmupWorkerCount(configured int) int {
-	if configured > 0 {
-		return configured
-	}
-	workers := runtime.GOMAXPROCS(0) * 2
-	if workers < 2 {
-		return 2
-	}
-	if workers > 32 {
-		return 32
-	}
-	return workers
-}
-
-func albumIDFromIndexKey(key string) string {
-	if !strings.HasPrefix(key, "albums/") || !strings.HasSuffix(key, "/index.json") {
-		return ""
-	}
-	dir := filepath.Dir(key)
-	parts := strings.Split(dir, "/")
-	if len(parts) < 2 {
-		return ""
-	}
-	return parts[len(parts)-1]
+	s.applyAlbumIndex(idx)
 }
 
 func albumIndexKey(albumID string) string {

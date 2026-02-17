@@ -17,6 +17,7 @@ import (
 	"viewer/internal/albums"
 	"viewer/internal/feed"
 	"viewer/internal/images"
+	"viewer/internal/models"
 	"viewer/internal/recommend"
 	"viewer/internal/web"
 )
@@ -142,9 +143,7 @@ func (s *Server) finalizeAlbum(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, status, code, err.Error())
 		return
 	}
-	if s.recommend != nil {
-		s.recommend.NotifyAlbumFinalized(r.Context(), albumID)
-	}
+	s.recommend.NotifyAlbumFinalized(r.Context(), albumID)
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status":     "READY",
@@ -253,13 +252,6 @@ func (s *Server) getRecommendations(w http.ResponseWriter, r *http.Request) {
 		}
 		limit = n
 	}
-	if s.recommend == nil {
-		writeJSON(w, http.StatusOK, map[string]any{
-			"items":  []any{},
-			"status": "pending",
-		})
-		return
-	}
 	result, err := s.recommend.Recommend(r.Context(), albumID, idx, limit)
 	if err != nil {
 		if strings.Contains(err.Error(), "not found") {
@@ -310,43 +302,49 @@ func jsonBody(r *http.Request, out any) error {
 	return nil
 }
 
-func Warmup(ctx context.Context, albumsService *albums.Service) {
+func Warmup(ctx context.Context, albumsService *albums.Service, recommendService *recommend.Service) {
 	startedAt := time.Now()
 	log.Printf("album cache warmup started")
 
 	loadedCount := 0
 	failedCount := 0
-	if err := albumsService.RefreshFromStorageWithProgress(ctx, func(progress albums.RefreshProgress) {
-		stage := "listing"
-		if progress.ListingDone {
-			stage = "draining"
-		}
-		if progress.Err != nil {
-			failedCount++
+	if err := albumsService.RefreshFromStorageWithProgressAndAlbum(
+		ctx,
+		func(progress albums.RefreshProgress) {
+			stage := "listing"
+			if progress.ListingDone {
+				stage = "draining"
+			}
+			if progress.Err != nil {
+				failedCount++
+				log.Printf(
+					"album cache warmup stage=%s discovered=%d processed=%d succeeded=%d failed=%d status=failed key=%s err=%v",
+					stage,
+					progress.Discovered,
+					progress.Processed,
+					progress.Succeeded,
+					progress.Failed,
+					progress.Key,
+					progress.Err,
+				)
+				return
+			}
+
+			loadedCount++
 			log.Printf(
-				"album cache warmup stage=%s discovered=%d processed=%d succeeded=%d failed=%d status=failed key=%s err=%v",
+				"album cache warmup stage=%s discovered=%d processed=%d succeeded=%d failed=%d status=ok album_id=%s",
 				stage,
 				progress.Discovered,
 				progress.Processed,
 				progress.Succeeded,
 				progress.Failed,
-				progress.Key,
-				progress.Err,
+				progress.AlbumID,
 			)
-			return
-		}
-
-		loadedCount++
-		log.Printf(
-			"album cache warmup stage=%s discovered=%d processed=%d succeeded=%d failed=%d status=ok album_id=%s",
-			stage,
-			progress.Discovered,
-			progress.Processed,
-			progress.Succeeded,
-			progress.Failed,
-			progress.AlbumID,
-		)
-	}); err != nil {
+		},
+		func(idx models.AlbumIndex) {
+			recommendService.IngestAlbumIndex(idx)
+		},
+	); err != nil {
 		log.Printf("album cache warmup skipped: %v", err)
 		return
 	}

@@ -183,14 +183,18 @@ func (s *Service) Finalize(ctx context.Context, albumID string) (*models.AlbumIn
 }
 
 func (s *Service) RefreshFromStorage(ctx context.Context) error {
-	return s.refreshFromStorage(ctx, nil)
+	return s.refreshFromStorage(ctx, nil, nil)
 }
 
 func (s *Service) RefreshFromStorageWithProgress(ctx context.Context, onProgress func(RefreshProgress)) error {
-	return s.refreshFromStorage(ctx, onProgress)
+	return s.refreshFromStorage(ctx, onProgress, nil)
 }
 
-func (s *Service) refreshFromStorage(ctx context.Context, onProgress func(RefreshProgress)) error {
+func (s *Service) RefreshFromStorageWithProgressAndAlbum(ctx context.Context, onProgress func(RefreshProgress), onAlbum func(models.AlbumIndex)) error {
+	return s.refreshFromStorage(ctx, onProgress, onAlbum)
+}
+
+func (s *Service) refreshFromStorage(ctx context.Context, onProgress func(RefreshProgress), onAlbum func(models.AlbumIndex)) error {
 	workerCount := warmupWorkerCount(s.cfg.WarmupFetchConcurrency)
 	keyCh := make(chan string, workerCount*2)
 	resultCh := make(chan RefreshProgress, workerCount*2)
@@ -248,6 +252,9 @@ func (s *Service) refreshFromStorage(ctx context.Context, onProgress func(Refres
 				s.mu.Lock()
 				s.albumCache[idx.AlbumID] = cached
 				s.mu.Unlock()
+				if onAlbum != nil {
+					onAlbum(idx)
+				}
 
 				progress.AlbumID = idx.AlbumID
 				resultCh <- progress

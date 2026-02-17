@@ -4,6 +4,7 @@ import io
 import json
 import os
 import sys
+import traceback
 from typing import List, Tuple
 
 MEAN = [0.48145466, 0.4578275, 0.40821073]
@@ -21,10 +22,8 @@ class ONNXBackend(Backend):
     def __init__(self):
         import numpy as np
         import onnxruntime as ort
-        from PIL import Image
 
         self.np = np
-        self.Image = Image
 
         model_path = os.environ.get("SIGLIP2_ONNX_PATH", "")
         if not model_path:
@@ -36,7 +35,7 @@ class ONNXBackend(Backend):
         self.name = f"siglip2-onnx:{os.path.basename(model_path)}"
 
     def preprocess(self, image_bytes: bytes):
-        img = self.Image.open(io.BytesIO(image_bytes)).convert("RGB").resize((224, 224))
+        img = decode_image_rgb(image_bytes).resize((224, 224))
         arr = self.np.asarray(img).astype("float32") / 255.0
         arr = (arr - self.np.array(MEAN, dtype="float32")) / self.np.array(STD, dtype="float32")
         arr = self.np.transpose(arr, (2, 0, 1))
@@ -52,11 +51,9 @@ class ONNXBackend(Backend):
 
 class TransformersBackend(Backend):
     def __init__(self):
-        from PIL import Image
         import torch
         from transformers import AutoModel, AutoProcessor
 
-        self.Image = Image
         self.torch = torch
         self.AutoModel = AutoModel
         self.AutoProcessor = AutoProcessor
@@ -86,7 +83,7 @@ class TransformersBackend(Backend):
 
     def embed(self, image_bytes: bytes, model_id: str, device: str) -> Tuple[List[float], str]:
         model, processor, use_device = self._load(model_id, device)
-        image = self.Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        image = decode_image_rgb(image_bytes)
         inputs = processor(images=image, return_tensors="pt")
         if use_device != "cpu":
             inputs = {k: v.to(use_device) for k, v in inputs.items()}
@@ -111,6 +108,22 @@ def pick_backend() -> Backend:
     except Exception as exc:
         errors.append(f"transformers:{exc}")
     raise RuntimeError("no SigLIP2 backend available (" + "; ".join(errors) + ")")
+
+
+def decode_image_rgb(image_bytes: bytes):
+    # Normalize potentially malformed/truncated images into a consistent RGB PIL image.
+    from PIL import Image, ImageFile, ImageOps
+
+    if not image_bytes:
+        raise ValueError("empty image bytes")
+
+    ImageFile.LOAD_TRUNCATED_IMAGES = True
+    with Image.open(io.BytesIO(image_bytes)) as opened:
+        opened.load()
+        image = ImageOps.exif_transpose(opened)
+        if image.mode != "RGB":
+            image = image.convert("RGB")
+    return image
 
 
 def run_worker_mode() -> int:
@@ -156,10 +169,12 @@ def run_worker_mode() -> int:
                     "embedding": vector,
                 }
         except Exception as exc:
+            sys.stderr.write(traceback.format_exc() + "\n")
+            sys.stderr.flush()
             resp = {
                 "request_id": req.get("request_id", "") if "req" in locals() else "",
                 "ok": False,
-                "error": str(exc),
+                "error": f"{type(exc).__name__}: {exc}",
             }
         sys.stdout.write(json.dumps(resp, separators=(",", ":")) + "\n")
         sys.stdout.flush()

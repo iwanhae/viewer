@@ -19,7 +19,7 @@ At minimum configure S3 values:
 Optional tuning:
 - `RANGE_CHUNK_SIZE_BYTES` controls S3 byte-range cache chunk size for ZIP reads (default `131072`).
 - Recommendation feature:
-- `RECO_ENABLED` enables recommendation warmup + background embedding (default `true`).
+- Recommendation warmup + background embedding are always enabled.
 - `RECO_TOPK_DEFAULT` default recommendation count (default `12`).
 - `RECO_TOPK_MAX` max recommendation count (default `48`).
 - `RECO_WORKER_CONCURRENCY` number of background embedding workers (default `2`).
@@ -43,6 +43,7 @@ Python worker supports two modes:
 
 ## Observability
 - The server logs to stdout/stderr via Go's standard logger.
+- Startup warmup now runs in background and streams each loaded album index once into both album cache and recommendation state.
 - Request-scoped 500 errors now include request context including:
   - request method/path
   - request ID (Chi request ID middleware)

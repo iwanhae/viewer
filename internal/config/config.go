@@ -15,7 +15,6 @@ type Config struct {
 	S3AccessKey            string
 	S3SecretKey            string
 	S3UsePathStyle         bool
-	SkipWarmup             bool
 	PresignTTL             time.Duration
 	MaxUploadBytes         int64
 	CacheDir               string
@@ -23,7 +22,6 @@ type Config struct {
 	RangeChunkSize         int64
 	WarmupFetchConcurrency int
 	FeedDefaultSize        int
-	RecoEnabled            bool
 	RecoTopKDefault        int
 	RecoTopKMax            int
 	RecoWorkerConcurrency  int
@@ -51,7 +49,6 @@ func Load() (Config, error) {
 		S3AccessKey:            os.Getenv("S3_ACCESS_KEY"),
 		S3SecretKey:            os.Getenv("S3_SECRET_KEY"),
 		S3UsePathStyle:         getenvBool("S3_USE_PATH_STYLE", true),
-		SkipWarmup:             getenvBool("SKIP_WARMUP", false),
 		PresignTTL:             time.Duration(presignTTLSeconds) * time.Second,
 		MaxUploadBytes:         maxUploadBytes,
 		CacheDir:               cacheDir,
@@ -59,7 +56,6 @@ func Load() (Config, error) {
 		RangeChunkSize:         rangeChunkSize,
 		WarmupFetchConcurrency: getenvInt("WARMUP_FETCH_CONCURRENCY", 0),
 		FeedDefaultSize:        getenvInt("FEED_DEFAULT_LIMIT", 80),
-		RecoEnabled:            getenvBool("RECO_ENABLED", true),
 		RecoTopKDefault:        getenvInt("RECO_TOPK_DEFAULT", 12),
 		RecoTopKMax:            getenvInt("RECO_TOPK_MAX", 48),
 		RecoWorkerConcurrency:  getenvInt("RECO_WORKER_CONCURRENCY", 2),

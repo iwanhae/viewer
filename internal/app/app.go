@@ -35,20 +35,14 @@ func Run(ctx context.Context) error {
 		return err
 	}
 
-	var recommendService *recommend.Service
-	if cfg.RecoEnabled {
-		rec, recErr := recommend.NewService(cfg, albumService, imageService, store)
-		if recErr != nil {
-			return fmt.Errorf("recommendation service init failed: %w", recErr)
-		}
-		recommendService = rec
-		if err := recommendService.Start(ctx); err != nil {
-			return fmt.Errorf("recommendation warmup failed: %w", err)
-		}
-		log.Printf("viewer: recommendation service enabled")
-	} else {
-		log.Printf("viewer: recommendation service disabled by config")
+	recommendService, err := recommend.NewService(cfg, albumService, imageService, store)
+	if err != nil {
+		return fmt.Errorf("recommendation service init failed: %w", err)
 	}
+	if err := recommendService.Start(ctx); err != nil {
+		return fmt.Errorf("recommendation startup failed: %w", err)
+	}
+	log.Printf("viewer: recommendation service enabled")
 
 	h := httpapi.New(albumService, feedService, imageService, recommendService, cfg.MaxUploadBytes).Router()
 	srv := &http.Server{
@@ -57,12 +51,8 @@ func Run(ctx context.Context) error {
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	log.Printf("viewer: starting HTTP server on %s", srv.Addr)
-	if cfg.SkipWarmup {
-		log.Printf("viewer: startup warmup skipped")
-	} else {
-		log.Printf("viewer: startup warmup running in background")
-		go httpapi.Warmup(ctx, albumService)
-	}
+	log.Printf("viewer: startup warmup running in background")
+	go httpapi.Warmup(ctx, albumService, recommendService)
 
 	return srv.ListenAndServe()
 }

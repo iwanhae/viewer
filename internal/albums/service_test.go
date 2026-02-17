@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"reflect"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -272,6 +273,50 @@ func TestRefreshFromStorageTracksFailuresAndFallbackAlbumID(t *testing.T) {
 	}
 	if last.Discovered != 3 || last.Processed != 3 || last.Succeeded != 1 || last.Failed != 2 {
 		t.Fatalf("unexpected final counters: %+v", last)
+	}
+}
+
+func TestRefreshFromStorageWithProgressAndAlbumEmitsLoadedAlbums(t *testing.T) {
+	s := &Service{
+		store: &fakeAlbumStore{
+			forEachAlbumIndexKeyFn: func(ctx context.Context, fn func(key string) error) error {
+				for _, key := range []string{
+					"albums/album-a/index.json",
+					"albums/album-b/index.json",
+				} {
+					if err := fn(key); err != nil {
+						return err
+					}
+				}
+				return nil
+			},
+			readJSONFn: func(ctx context.Context, key string, out any) error {
+				idx := out.(*models.AlbumIndex)
+				if strings.Contains(key, "album-a") {
+					idx.AlbumID = "album-a"
+					return nil
+				}
+				idx.AlbumID = "album-b"
+				return nil
+			},
+		},
+		albumCache: make(map[string]*models.AlbumIndex),
+	}
+
+	var loaded []string
+	if err := s.RefreshFromStorageWithProgressAndAlbum(
+		context.Background(),
+		nil,
+		func(idx models.AlbumIndex) {
+			loaded = append(loaded, idx.AlbumID)
+		},
+	); err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	sort.Strings(loaded)
+	if !reflect.DeepEqual(loaded, []string{"album-a", "album-b"}) {
+		t.Fatalf("unexpected loaded albums: %v", loaded)
 	}
 }
 
