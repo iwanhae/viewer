@@ -44,16 +44,29 @@ func TestLoadRejectsNonPositiveRangeChunkSize(t *testing.T) {
 	}
 }
 
-func TestLoadDefaultRecoWorkerCommand(t *testing.T) {
+func TestLoadRequiresRecommenderEndpoint(t *testing.T) {
 	setRequiredEnv(t)
-	t.Setenv("RECO_WORKER_CMD", "")
+	t.Setenv("RECOMMENDER_ENDPOINT", "")
+
+	_, err := Load()
+	if err == nil {
+		t.Fatalf("Load expected error for missing RECOMMENDER_ENDPOINT")
+	}
+	if got := err.Error(); !strings.Contains(got, "RECOMMENDER_ENDPOINT is required") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestLoadRecommenderEndpoint(t *testing.T) {
+	setRequiredEnv(t)
+	t.Setenv("RECOMMENDER_ENDPOINT", "http://127.0.0.1:8081")
 
 	cfg, err := Load()
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if got, want := cfg.RecoWorkerCmd, "RECO_WORKER_MODE=worker ./bin/reco-worker"; got != want {
-		t.Fatalf("RecoWorkerCmd=%q want=%q", got, want)
+	if got, want := cfg.RecommenderEndpoint, "http://127.0.0.1:8081"; got != want {
+		t.Fatalf("RecommenderEndpoint=%q want=%q", got, want)
 	}
 }
 

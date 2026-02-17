@@ -21,15 +21,15 @@ COPY --from=frontend-build /src/internal/web/static ./internal/web/static
 
 RUN CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /out/viewer ./cmd/viewer
 
-FROM rust:1.90-bookworm AS reco-worker-build
+FROM rust:1.90-bookworm AS recommender-build
 WORKDIR /src
 
-COPY workers/reco-worker/Cargo.toml workers/reco-worker/Cargo.lock ./workers/reco-worker/
-COPY workers/reco-worker/src ./workers/reco-worker/src
+COPY workers/recommender/Cargo.toml workers/recommender/Cargo.lock ./workers/recommender/
+COPY workers/recommender/src ./workers/recommender/src
 
-RUN cargo build --manifest-path workers/reco-worker/Cargo.toml --release && \
+RUN cargo build --manifest-path workers/recommender/Cargo.toml --release && \
     mkdir -p /out && \
-    cp workers/reco-worker/target/release/reco-worker /out/reco-worker
+    cp workers/recommender/target/release/recommender /out/recommender
 
 FROM debian:bookworm-slim AS runtime
 WORKDIR /app
@@ -39,7 +39,7 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 COPY --from=backend-build /out/viewer /app/viewer
-COPY --from=reco-worker-build /out/reco-worker /app/reco-worker
+COPY --from=recommender-build /out/recommender /app/recommender
 
 RUN mkdir -p /tmp/viewer-cache/images /tmp/viewer-cache/zips && \
     chown -R 65532:65532 /app /tmp/viewer-cache
@@ -49,7 +49,7 @@ USER 65532:65532
 ENV PORT=8080 \
     CACHE_DIR=/tmp/viewer-cache/images \
     ZIP_CACHE_DIR=/tmp/viewer-cache/zips \
-    RECO_WORKER_CMD="RECO_WORKER_MODE=worker /app/reco-worker"
+    RECOMMENDER_ENDPOINT="http://127.0.0.1:18081"
 
 EXPOSE 8080
 ENTRYPOINT ["/app/viewer"]

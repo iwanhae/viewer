@@ -43,11 +43,10 @@ type Service struct {
 
 func NewService(cfg cfgpkg.Config, albumsService *albums.Service, imagesService *images.Service, s3Store *storage.S3Store) (*Service, error) {
 	embedder := NewPythonEmbedder(
-		cfg.RecoWorkerCmd,
+		cfg.RecommenderEndpoint,
 		cfg.Siglip2ModelID,
 		cfg.Siglip2Device,
-		time.Duration(cfg.RecoWorkerTimeoutSec)*time.Second,
-		cfg.RecoWorkerRestartLimit,
+		time.Duration(cfg.RecommenderTimeoutSec)*time.Second,
 	)
 	healthCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -78,7 +77,7 @@ func (s *Service) Start(ctx context.Context) error {
 			_ = s.embedder.Close()
 		}()
 
-		concurrency := s.cfg.RecoWorkerConcurrency
+		concurrency := s.cfg.RecommenderConcurrency
 		if concurrency <= 0 {
 			concurrency = 1
 		}

@@ -24,10 +24,9 @@ type Config struct {
 	FeedDefaultSize        int
 	RecoTopKDefault        int
 	RecoTopKMax            int
-	RecoWorkerConcurrency  int
-	RecoWorkerCmd          string
-	RecoWorkerTimeoutSec   int
-	RecoWorkerRestartLimit int
+	RecommenderEndpoint    string
+	RecommenderConcurrency int
+	RecommenderTimeoutSec  int
 	Siglip2ModelID         string
 	Siglip2Device          string
 }
@@ -39,7 +38,7 @@ func Load() (Config, error) {
 	cacheDir := getenv("CACHE_DIR", ".cache/images")
 	zipCacheDir := getenv("ZIP_CACHE_DIR", ".cache/zips")
 	rangeChunkSize := getenvInt64("RANGE_CHUNK_SIZE_BYTES", 1<<17)
-	recoWorkerCmd := getenv("RECO_WORKER_CMD", "RECO_WORKER_MODE=worker ./bin/reco-worker")
+	recommenderEndpoint := os.Getenv("RECOMMENDER_ENDPOINT")
 
 	cfg := Config{
 		Port:                   port,
@@ -58,10 +57,9 @@ func Load() (Config, error) {
 		FeedDefaultSize:        getenvInt("FEED_DEFAULT_LIMIT", 80),
 		RecoTopKDefault:        getenvInt("RECO_TOPK_DEFAULT", 12),
 		RecoTopKMax:            getenvInt("RECO_TOPK_MAX", 48),
-		RecoWorkerConcurrency:  getenvInt("RECO_WORKER_CONCURRENCY", 2),
-		RecoWorkerCmd:          recoWorkerCmd,
-		RecoWorkerTimeoutSec:   getenvInt("RECO_WORKER_REQUEST_TIMEOUT_SECONDS", 120),
-		RecoWorkerRestartLimit: getenvInt("RECO_WORKER_RESTART_LIMIT", 10),
+		RecommenderEndpoint:    recommenderEndpoint,
+		RecommenderConcurrency: getenvInt("RECOMMENDER_CONCURRENCY", 2),
+		RecommenderTimeoutSec:  getenvInt("RECOMMENDER_REQUEST_TIMEOUT_SECONDS", 120),
 		Siglip2ModelID:         getenv("SIGLIP2_MODEL_ID", "google/siglip2-base-patch16-224"),
 		Siglip2Device:          getenv("SIGLIP2_DEVICE", "cpu"),
 	}
@@ -90,17 +88,14 @@ func Load() (Config, error) {
 	if cfg.RecoTopKMax <= 0 {
 		cfg.RecoTopKMax = 48
 	}
-	if cfg.RecoWorkerConcurrency <= 0 {
-		cfg.RecoWorkerConcurrency = 1
+	if cfg.RecommenderConcurrency <= 0 {
+		cfg.RecommenderConcurrency = 1
 	}
-	if cfg.RecoWorkerTimeoutSec <= 0 {
-		cfg.RecoWorkerTimeoutSec = 120
+	if cfg.RecommenderTimeoutSec <= 0 {
+		cfg.RecommenderTimeoutSec = 120
 	}
-	if cfg.RecoWorkerRestartLimit <= 0 {
-		cfg.RecoWorkerRestartLimit = 10
-	}
-	if cfg.RecoWorkerCmd == "" {
-		return Config{}, fmt.Errorf("RECO_WORKER_CMD is required")
+	if cfg.RecommenderEndpoint == "" {
+		return Config{}, fmt.Errorf("RECOMMENDER_ENDPOINT is required")
 	}
 
 	return cfg, nil
