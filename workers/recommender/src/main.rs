@@ -109,7 +109,6 @@ impl Worker {
 struct HttpRequest {
     method: String,
     path: String,
-    headers: HashMap<String, String>,
     body: Vec<u8>,
 }
 
@@ -261,7 +260,6 @@ fn parse_request(stream: &mut TcpStream) -> Result<HttpRequest> {
     let path = target.split('?').next().unwrap_or("/").trim().to_string();
     let _version = parts.next();
 
-    let mut headers = HashMap::new();
     let mut content_length = 0usize;
     loop {
         let mut line = String::new();
@@ -276,7 +274,6 @@ fn parse_request(stream: &mut TcpStream) -> Result<HttpRequest> {
             if key.eq_ignore_ascii_case("content-length") {
                 content_length = value.parse().unwrap_or(0);
             }
-            headers.insert(key, value);
         }
     }
 
@@ -288,7 +285,6 @@ fn parse_request(stream: &mut TcpStream) -> Result<HttpRequest> {
     Ok(HttpRequest {
         method,
         path,
-        headers,
         body,
     })
 }
@@ -415,7 +411,7 @@ fn handle_embed(worker: &Arc<Mutex<Worker>>, body: &[u8]) -> Result<HttpResponse
     }
 }
 
-fn handle_healthz(worker: &Arc<Mutex<Worker>>) -> Result<HttpResponse> {
+fn handle_healthz() -> Result<HttpResponse> {
     let model_id = default_model_id();
     let device = default_device();
     let req = EmbedRequest {
@@ -425,20 +421,6 @@ fn handle_healthz(worker: &Arc<Mutex<Worker>>) -> Result<HttpResponse> {
         device: device.clone(),
         image_b64: String::new(),
     };
-    let mut guard = worker.lock().map_err(|_| anyhow::anyhow!("worker lock poisoned"))?;
-    if let Err(err) = guard.ensure_model(&model_id) {
-        return Ok(write_json_response(
-            req.request_id.clone(),
-            error_response(
-                req.request_id,
-                err,
-                "init",
-                model_id.clone(),
-                device.clone(),
-                0,
-            ),
-        )?);
-    }
     Ok(write_json_response(
         "healthz".to_string(),
         ping_response(&req),
@@ -449,7 +431,7 @@ fn handle_client(mut stream: TcpStream, worker: Arc<Mutex<Worker>>) {
     let response = match parse_request(&mut stream) {
         Ok(req) => match (req.method.as_str(), req.path.as_str()) {
             ("GET", "/ping") | ("GET", "/healthz") => {
-                handle_healthz(&worker).unwrap_or_else(|err| {
+                handle_healthz().unwrap_or_else(|err| {
                     let resp = error_response(
                         "system".to_string(),
                         err,
@@ -512,14 +494,9 @@ fn handle_client(mut stream: TcpStream, worker: Arc<Mutex<Worker>>) {
 
 fn main() {
     let listen_addr = env::var("RECOMMENDER_LISTEN_ADDR").unwrap_or_else(|_| DEFAULT_LISTEN_ADDR.to_string());
-    let startup_model_id = env::var("SIGLIP2_MODEL_ID").unwrap_or_else(|_| DEFAULT_MODEL_ID.to_string());
     let startup_device = env::var("SIGLIP2_DEVICE").unwrap_or_else(|_| DEFAULT_DEVICE.to_string());
 
     let mut worker = Worker::default();
-    if let Err(err) = worker.ensure_model(&startup_model_id) {
-        eprintln!("failed to initialize startup model '{startup_model_id}': {err}");
-        std::process::exit(1);
-    }
     if let Err(err) = ensure_supported_device(&startup_device) {
         eprintln!("unsupported startup device '{startup_device}': {err}");
         std::process::exit(1);
