@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
-import { AlbumIndex, fetchAlbum } from '../api/client'
+import { AlbumIndex, RecommendationItem, fetchAlbum, fetchRecommendations } from '../api/client'
 
 export function PhotoPage() {
   const { albumId = '', photoIndex: rawPhotoIndex = '' } = useParams<{ albumId: string; photoIndex: string }>()
@@ -15,6 +15,9 @@ export function PhotoPage() {
 
   const [album, setAlbum] = useState<AlbumIndex | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [recommendations, setRecommendations] = useState<RecommendationItem[]>([])
+  const [recommendationStatus, setRecommendationStatus] = useState<'idle' | 'loading' | 'ready' | 'partial' | 'pending'>('idle')
+  const [recommendationError, setRecommendationError] = useState<string | null>(null)
 
   useEffect(() => {
     setAlbum(null)
@@ -57,6 +60,34 @@ export function PhotoPage() {
     if (Number.isNaN(parsed.getTime())) return album.createdAt
     return parsed.toLocaleString()
   }, [album])
+
+  useEffect(() => {
+    if (!album || !photo) {
+      setRecommendations([])
+      setRecommendationStatus('idle')
+      setRecommendationError(null)
+      return
+    }
+    let cancelled = false
+    setRecommendationStatus('loading')
+    setRecommendationError(null)
+    void (async () => {
+      try {
+        const result = await fetchRecommendations(album.albumId, photo.i, 12)
+        if (cancelled) return
+        setRecommendations(result.items)
+        setRecommendationStatus(result.status)
+      } catch (err) {
+        if (cancelled) return
+        setRecommendations([])
+        setRecommendationStatus('idle')
+        setRecommendationError((err as Error).message)
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [album, photo])
 
   if (error) {
     return <div className="photo-error">{error}</div>
@@ -109,6 +140,37 @@ export function PhotoPage() {
               <dd>{photo.i}</dd>
             </div>
           </dl>
+          <section className="photo-recommendations" data-testid="photo-recommendations">
+            <h2 className="photo-recommendations-title">Similar images</h2>
+            {recommendationStatus === 'loading' && <p className="photo-recommendations-note">Finding similar images...</p>}
+            {recommendationStatus === 'pending' && (
+              <p className="photo-recommendations-note">Recommendations are being prepared in background.</p>
+            )}
+            {recommendationError && <p className="photo-recommendations-note">Recommendations unavailable right now.</p>}
+            {(recommendationStatus === 'ready' || recommendationStatus === 'partial') && recommendations.length === 0 && (
+              <p className="photo-recommendations-note">No similar images found yet.</p>
+            )}
+            {recommendations.length > 0 && (
+              <div className="photo-recommendation-grid">
+                {recommendations.map((item) => (
+                  <button
+                    key={`${item.albumId}-${item.i}`}
+                    className="photo-recommendation-tile"
+                    onClick={() => navigate(`/photo/${item.albumId}/${item.i}`)}
+                    aria-label={`Open similar image ${item.i + 1}`}
+                    data-testid="photo-recommendation-tile"
+                  >
+                    <img
+                      src={item.src}
+                      alt=""
+                      loading="lazy"
+                      style={{ aspectRatio: `${item.w} / ${item.h}` }}
+                    />
+                  </button>
+                ))}
+              </div>
+            )}
+          </section>
         </aside>
       </div>
       <div className="photo-bottom-actions">

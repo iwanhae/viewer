@@ -17,6 +17,7 @@ import (
 	"viewer/internal/albums"
 	"viewer/internal/feed"
 	"viewer/internal/images"
+	"viewer/internal/recommend"
 	"viewer/internal/web"
 )
 
@@ -24,14 +25,16 @@ type Server struct {
 	albums         *albums.Service
 	feed           *feed.Service
 	images         *images.Service
+	recommend      *recommend.Service
 	maxUploadBytes int64
 }
 
-func New(albumsService *albums.Service, feedService *feed.Service, imageService *images.Service, maxUploadBytes int64) *Server {
+func New(albumsService *albums.Service, feedService *feed.Service, imageService *images.Service, recommendService *recommend.Service, maxUploadBytes int64) *Server {
 	return &Server{
 		albums:         albumsService,
 		feed:           feedService,
 		images:         imageService,
+		recommend:      recommendService,
 		maxUploadBytes: maxUploadBytes,
 	}
 }
@@ -56,6 +59,7 @@ func (s *Server) Router() http.Handler {
 		r.Get("/albums/{albumId}", s.getAlbum)
 		r.Get("/feed", s.getFeed)
 		r.Get("/image/{albumId}/{index}", s.getImage)
+		r.Get("/recommendations/{albumId}/{index}", s.getRecommendations)
 		r.Get("/debug/range-cache-stats", s.getRangeCacheStats)
 	})
 
@@ -137,6 +141,9 @@ func (s *Server) finalizeAlbum(w http.ResponseWriter, r *http.Request) {
 		}
 		writeError(w, r, status, code, err.Error())
 		return
+	}
+	if s.recommend != nil {
+		s.recommend.NotifyAlbumFinalized(r.Context(), albumID)
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -227,6 +234,42 @@ func (s *Server) getImage(w http.ResponseWriter, r *http.Request) {
 	if _, err := w.Write(result.Bytes); err != nil {
 		log.Printf("write image response failed: %v", err)
 	}
+}
+
+func (s *Server) getRecommendations(w http.ResponseWriter, r *http.Request) {
+	albumID := chi.URLParam(r, "albumId")
+	idxRaw := chi.URLParam(r, "index")
+	idx, err := strconv.Atoi(idxRaw)
+	if err != nil || idx < 0 {
+		writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", "invalid image index")
+		return
+	}
+	limit := 12
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		n, parseErr := strconv.Atoi(raw)
+		if parseErr != nil {
+			writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", "invalid limit")
+			return
+		}
+		limit = n
+	}
+	if s.recommend == nil {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"items":  []any{},
+			"status": "pending",
+		})
+		return
+	}
+	result, err := s.recommend.Recommend(r.Context(), albumID, idx, limit)
+	if err != nil {
+		if strings.Contains(err.Error(), "not found") {
+			writeError(w, r, http.StatusNotFound, "NOT_FOUND", "photo not found")
+			return
+		}
+		writeError(w, r, http.StatusInternalServerError, "INTERNAL", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
 }
 
 func (s *Server) getRangeCacheStats(w http.ResponseWriter, r *http.Request) {

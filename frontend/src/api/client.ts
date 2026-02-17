@@ -28,6 +28,20 @@ export type AlbumIndex = {
   photos: PhotoMeta[]
 }
 
+export type RecommendationItem = {
+  albumId: string
+  i: number
+  w: number
+  h: number
+  score: number
+  src: string
+}
+
+export type RecommendationResponse = {
+  items: RecommendationItem[]
+  status: 'ready' | 'partial' | 'pending'
+}
+
 export async function fetchFeed(params?: { cursor?: string; seed?: string }): Promise<FeedResponse> {
   const query = new URLSearchParams({ limit: '80' })
   if (params?.cursor) query.set('cursor', params.cursor)
@@ -76,4 +90,16 @@ export async function fetchAlbum(albumId: string): Promise<AlbumIndex> {
   const res = await fetch(`/api/albums/${albumId}`)
   if (!res.ok) throw new Error(`fetch album failed: ${res.status}`)
   return (await res.json()) as AlbumIndex
+}
+
+export async function fetchRecommendations(
+  albumId: string,
+  index: number,
+  limit = 12,
+): Promise<RecommendationResponse> {
+  const query = new URLSearchParams()
+  query.set('limit', String(limit))
+  const res = await fetch(`/api/recommendations/${albumId}/${index}?${query.toString()}`)
+  if (!res.ok) throw new Error(`fetch recommendations failed: ${res.status}`)
+  return (await res.json()) as RecommendationResponse
 }

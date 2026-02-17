@@ -12,6 +12,7 @@ import (
 	"viewer/internal/feed"
 	"viewer/internal/httpapi"
 	"viewer/internal/images"
+	"viewer/internal/recommend"
 	"viewer/internal/storage"
 )
 
@@ -34,8 +35,21 @@ func Run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	var recommendService *recommend.Service
+	if cfg.RecoEnabled {
+		rec, recErr := recommend.NewService(cfg, albumService, imageService, store)
+		if recErr != nil {
+			log.Printf("viewer: recommendation service disabled due to startup error: %v", recErr)
+		} else {
+			recommendService = rec
+			recommendService.Start(ctx)
+			log.Printf("viewer: recommendation service enabled")
+		}
+	} else {
+		log.Printf("viewer: recommendation service disabled by config")
+	}
 
-	h := httpapi.New(albumService, feedService, imageService, cfg.MaxUploadBytes).Router()
+	h := httpapi.New(albumService, feedService, imageService, recommendService, cfg.MaxUploadBytes).Router()
 	srv := &http.Server{
 		Addr:              fmt.Sprintf(":%d", cfg.Port),
 		Handler:           h,

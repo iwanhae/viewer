@@ -18,6 +18,18 @@ At minimum configure S3 values:
 
 Optional tuning:
 - `RANGE_CHUNK_SIZE_BYTES` controls S3 byte-range cache chunk size for ZIP reads (default `131072`).
+- Recommendation feature:
+- `RECO_ENABLED` enables the background recommendation system (default `true`).
+- `RECO_DB_PATH` local metadata/vector state path (default `.cache/reco/reco.db`).
+- `RECO_SYNC_INTERVAL_SECONDS` periodic S3 metadata sync interval (default `600`).
+- `RECO_TOPK_DEFAULT` default recommendation count (default `12`).
+- `RECO_TOPK_MAX` max recommendation count (default `48`).
+- `RECO_WORKER_CONCURRENCY` number of background embedding workers (default `2`).
+- `RECO_MAX_RETRIES` max retry attempts per embedding job (default `5`).
+- `RECO_WORKER_CMD` command used to run embedding worker (default `python3 scripts/reco_worker.py`).
+- `SIGLIP2_MODEL_ID` model identifier for worker backends (default `google/siglip2-base-patch16-224`).
+- `SIGLIP2_DEVICE` embedding device hint such as `cpu` or `cuda:0` (default `cpu`).
+- `VECTOR_BACKEND` vector backend selector (default `embedded`).
 
 ## Commands
 - `make build` builds frontend and backend into `bin/viewer`.
