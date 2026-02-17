@@ -28,6 +28,7 @@ Optional tuning:
 - `RECO_WORKER_RESTART_LIMIT` max worker restarts per hour (default `10`).
 - `SIGLIP2_MODEL_ID` model identifier for worker backends (default `google/siglip2-base-patch16-224`).
 - `SIGLIP2_DEVICE` embedding device hint such as `cpu` or `cuda:0` (default `cpu`).
+- Python worker runtime currently pins `transformers==5.1.0` for SigLIP2 compatibility.
 
 Recommendation vectors are persisted in each album's `albums/<album-id>/index.json` under an `embeddings` section.
 

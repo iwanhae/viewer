@@ -31,7 +31,7 @@ RUN python3 -m pip install --no-cache-dir --upgrade pip && \
       onnxruntime \
       pillow \
       torch \
-      transformers
+      transformers==5.1.0
 
 COPY --from=backend-build /out/viewer /app/viewer
 COPY scripts/reco_worker.py /app/scripts/reco_worker.py
