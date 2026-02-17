@@ -21,6 +21,7 @@ type Config struct {
 	CacheDir                string
 	ZipCacheDir             string
 	RangeChunkSize          int64
+	WarmupFetchConcurrency  int
 	FeedDefaultSize         int
 	RecoEnabled             bool
 	RecoDBPath              string
@@ -63,6 +64,7 @@ func Load() (Config, error) {
 		CacheDir:                cacheDir,
 		ZipCacheDir:             zipCacheDir,
 		RangeChunkSize:          rangeChunkSize,
+		WarmupFetchConcurrency:  getenvInt("WARMUP_FETCH_CONCURRENCY", 0),
 		FeedDefaultSize:         getenvInt("FEED_DEFAULT_LIMIT", 80),
 		RecoEnabled:             getenvBool("RECO_ENABLED", true),
 		RecoDBPath:              recoDBPath,
@@ -95,6 +97,9 @@ func Load() (Config, error) {
 	}
 	if cfg.RangeChunkSize <= 0 {
 		return Config{}, fmt.Errorf("RANGE_CHUNK_SIZE_BYTES must be > 0")
+	}
+	if cfg.WarmupFetchConcurrency < 0 {
+		cfg.WarmupFetchConcurrency = 0
 	}
 	if cfg.RecoTopKDefault <= 0 {
 		cfg.RecoTopKDefault = 12

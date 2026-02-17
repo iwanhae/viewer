@@ -7,9 +7,12 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/google/uuid"
 	cfgpkg "viewer/internal/config"
@@ -19,7 +22,7 @@ import (
 
 type Service struct {
 	cfg     cfgpkg.Config
-	store   *storage.S3Store
+	store   albumStore
 	indexer *Indexer
 
 	mu          sync.RWMutex
@@ -28,11 +31,26 @@ type Service struct {
 }
 
 type RefreshProgress struct {
-	Done    int
-	Total   int
-	AlbumID string
-	Key     string
-	Err     error
+	Done        int
+	Total       int
+	Discovered  int
+	Processed   int
+	Succeeded   int
+	Failed      int
+	ListingDone bool
+	AlbumID     string
+	Key         string
+	Err         error
+}
+
+type albumStore interface {
+	PresignPut(ctx context.Context, key string, ttl time.Duration) (string, map[string]string, error)
+	PutObject(ctx context.Context, key string, body io.Reader, contentType string) error
+	HeadObject(ctx context.Context, key string) (bool, int64, error)
+	GetObject(ctx context.Context, key string) (io.ReadCloser, string, error)
+	PutJSON(ctx context.Context, key string, v any) error
+	ReadJSON(ctx context.Context, key string, out any) error
+	ForEachAlbumIndexKey(ctx context.Context, fn func(key string) error) error
 }
 
 func NewService(cfg cfgpkg.Config, store *storage.S3Store, indexer *Indexer) *Service {
@@ -173,59 +191,112 @@ func (s *Service) RefreshFromStorageWithProgress(ctx context.Context, onProgress
 }
 
 func (s *Service) refreshFromStorage(ctx context.Context, onProgress func(RefreshProgress)) error {
-	keys, err := s.store.ListAlbumIndexKeys(ctx)
-	if err != nil {
+	workerCount := warmupWorkerCount(s.cfg.WarmupFetchConcurrency)
+	keyCh := make(chan string, workerCount*2)
+	resultCh := make(chan RefreshProgress, workerCount*2)
+
+	var discovered atomic.Int64
+	var processed atomic.Int64
+	var succeeded atomic.Int64
+	var failed atomic.Int64
+	var listingDone atomic.Bool
+
+	producerDone := make(chan error, 1)
+	go func() {
+		defer close(keyCh)
+		err := s.store.ForEachAlbumIndexKey(ctx, func(key string) error {
+			select {
+			case keyCh <- key:
+				discovered.Add(1)
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		})
+		listingDone.Store(true)
+		producerDone <- err
+	}()
+
+	var workers sync.WaitGroup
+	for i := 0; i < workerCount; i++ {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			for key := range keyCh {
+				progress := RefreshProgress{Key: key}
+				var idx models.AlbumIndex
+				if err := s.store.ReadJSON(ctx, key, &idx); err != nil {
+					progress.Err = err
+					resultCh <- progress
+					continue
+				}
+
+				if idx.AlbumID == "" {
+					parts := strings.Split(filepath.Dir(key), "/")
+					if len(parts) > 0 {
+						idx.AlbumID = parts[len(parts)-1]
+					}
+				}
+				if idx.AlbumID == "" {
+					progress.Err = fmt.Errorf("missing album id")
+					resultCh <- progress
+					continue
+				}
+
+				cached := new(models.AlbumIndex)
+				*cached = idx
+				s.mu.Lock()
+				s.albumCache[idx.AlbumID] = cached
+				s.mu.Unlock()
+
+				progress.AlbumID = idx.AlbumID
+				resultCh <- progress
+			}
+		}()
+	}
+
+	go func() {
+		workers.Wait()
+		close(resultCh)
+	}()
+
+	for progress := range resultCh {
+		done := processed.Add(1)
+		if progress.Err != nil {
+			failed.Add(1)
+		} else {
+			succeeded.Add(1)
+		}
+		progress.Done = int(done)
+		progress.Total = int(discovered.Load())
+		progress.Discovered = int(discovered.Load())
+		progress.Processed = int(done)
+		progress.Succeeded = int(succeeded.Load())
+		progress.Failed = int(failed.Load())
+		progress.ListingDone = listingDone.Load()
+		if onProgress != nil {
+			onProgress(progress)
+		}
+	}
+
+	if err := <-producerDone; err != nil {
 		return err
 	}
-
-	for i, key := range keys {
-		var idx models.AlbumIndex
-		if err := s.store.ReadJSON(ctx, key, &idx); err != nil {
-			if onProgress != nil {
-				onProgress(RefreshProgress{
-					Done:  i + 1,
-					Total: len(keys),
-					Key:   key,
-					Err:   err,
-				})
-			}
-			continue
-		}
-		if idx.AlbumID == "" {
-			parts := strings.Split(filepath.Dir(key), "/")
-			if len(parts) > 0 {
-				idx.AlbumID = parts[len(parts)-1]
-			}
-		}
-		if idx.AlbumID == "" {
-			if onProgress != nil {
-				onProgress(RefreshProgress{
-					Done:  i + 1,
-					Total: len(keys),
-					Key:   key,
-					Err:   fmt.Errorf("missing album id"),
-				})
-			}
-			continue
-		}
-		cached := new(models.AlbumIndex)
-		*cached = idx
-
-		s.mu.Lock()
-		s.albumCache[idx.AlbumID] = cached
-		s.mu.Unlock()
-
-		if onProgress != nil {
-			onProgress(RefreshProgress{
-				Done:    i + 1,
-				Total:   len(keys),
-				AlbumID: idx.AlbumID,
-				Key:     key,
-			})
-		}
-	}
-
 	return nil
+}
+
+func warmupWorkerCount(configured int) int {
+	if configured > 0 {
+		return configured
+	}
+	workers := runtime.GOMAXPROCS(0) * 2
+	if workers < 2 {
+		return 2
+	}
+	if workers > 32 {
+		return 32
+	}
+	return workers
 }
 
 func mergeAlbumCaches(existing map[string]*models.AlbumIndex, scanned map[string]*models.AlbumIndex) map[string]*models.AlbumIndex {

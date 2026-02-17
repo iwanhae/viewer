@@ -317,12 +317,19 @@ func Warmup(ctx context.Context, albumsService *albums.Service) {
 	loadedCount := 0
 	failedCount := 0
 	if err := albumsService.RefreshFromStorageWithProgress(ctx, func(progress albums.RefreshProgress) {
+		stage := "listing"
+		if progress.ListingDone {
+			stage = "draining"
+		}
 		if progress.Err != nil {
 			failedCount++
 			log.Printf(
-				"album cache warmup progress=%d/%d status=failed key=%s err=%v",
-				progress.Done,
-				progress.Total,
+				"album cache warmup stage=%s discovered=%d processed=%d succeeded=%d failed=%d status=failed key=%s err=%v",
+				stage,
+				progress.Discovered,
+				progress.Processed,
+				progress.Succeeded,
+				progress.Failed,
 				progress.Key,
 				progress.Err,
 			)
@@ -331,9 +338,12 @@ func Warmup(ctx context.Context, albumsService *albums.Service) {
 
 		loadedCount++
 		log.Printf(
-			"album cache warmup progress=%d/%d status=ok album_id=%s",
-			progress.Done,
-			progress.Total,
+			"album cache warmup stage=%s discovered=%d processed=%d succeeded=%d failed=%d status=ok album_id=%s",
+			stage,
+			progress.Discovered,
+			progress.Processed,
+			progress.Succeeded,
+			progress.Failed,
 			progress.AlbumID,
 		)
 	}); err != nil {
