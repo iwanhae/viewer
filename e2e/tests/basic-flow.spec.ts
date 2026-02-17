@@ -1,4 +1,4 @@
-import { expect, test } from '@playwright/test'
+import { expect, test, type Page } from '@playwright/test'
 import fs from 'node:fs/promises'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -13,11 +13,69 @@ const zip1Base64 =
   'UEsDBBQAAAAIAA+ETVzTNyprPwAAAEQAAAAHABwAMDAxLnBuZ1VUCQADHVKPaR1Sj2l1eAsAAQToAwAABOgDAADrDPBz5+WS4mJgYOD19HAJAtKMIMzBAiS3yvAwASluTxfHkIpbyX/+yzMwMzMxvLtafhIozODp6ueyzimhCQBQSwMEFAAAAAgAD4RNXKnVyORAAAAARAAAAAcAHAAwMDIucG5nVVQJAAMdUo9pHVKPaXV4CwABBOgDAAAE6AMAAOsM8HPn5ZLiYmBg4PX0cAkC0kxAzMjBAiT/1EzJAVLcni6OIRW3kv+cP8DAyszYsPJ9ciFQmMHT1c9lnVNCEwBQSwECHgMUAAAACAAPhE1c0zcqaz8AAABEAAAABwAYAAAAAAAAAAAApIEAAAAAMDAxLnBuZ1VUBQADHVKPaXV4CwABBOgDAAAE6AMAAFBLAQIeAxQAAAAIAA+ETVyp1cjkQAAAAEQAAAAHABgAAAAAAAAAAACkgYAAAAAwMDIucG5nVVQFAAMdUo9pdXgLAAEE6AMAAAToAwAAUEsFBgAAAAACAAIAmgAAAAEBAAAAAA=='
 const zip2Base64 =
   'UEsDBBQAAAAIAA+ETVxw8BtLQAAAAEQAAAAHABwAMDAxLnBuZ1VUCQADHVKPaR1Sj2l1eAsAAQToAwAABOgDAADrDPBz5+WS4mJgYOD19HAJAtKMQMzEwQIkXTP+igEpbk8Xx5CKW8l//s9nYGZmYnjP5jgFKMzg6ernss4poQkAUEsDBBQAAAAIAA+ETVynezQxPgAAAEQAAAAHABwAMDAyLnBuZ1VUCQADHVKPaR1Sj2l1eAsAAQToAwAABOgDAADrDPBz5+WS4mJgYOD19HAJAtJMIMzBAiT/1EzJAVLcni6OIRW3kv+cB0owMzL+V43OAgozeLr6uaxzSmgCAFBLAQIeAxQAAAAIAA+ETVxw8BtLQAAAAEQAAAAHABgAAAAAAAAAAACkgQAAAAAwMDEucG5nVVQFAAMdUo9pdXgLAAEE6AMAAAToAwAAUEsBAh4DFAAAAAgAD4RNXKd7NDE+AAAARAAAAAcAGAAAAAAAAAAAAKSBgQAAADAwMi5wbmdVVAUAAx1Sj2l1eAsAAQToAwAABOgDAABQSwUGAAAAAAIAAgCaAAAAAAEAAAAA'
+const wallColumns = 3
+
+type FeedItem = {
+  src: string
+  w: number
+  h: number
+}
+
+type FeedResponse = {
+  items: FeedItem[]
+}
 
 async function ensureFixtureZips() {
   await fs.mkdir(fixturesDir, { recursive: true })
   await fs.writeFile(zip1, Buffer.from(zip1Base64, 'base64'))
   await fs.writeFile(zip2, Buffer.from(zip2Base64, 'base64'))
+}
+
+function distributeMasonry<T>(items: T[], columnCount: number, weight: (item: T) => number): T[][] {
+  const normalizedColumnCount = Number.isFinite(columnCount) && columnCount > 0 ? Math.floor(columnCount) : 1
+  const columns = Array.from({ length: normalizedColumnCount }, () => [] as T[])
+  const heights = Array.from({ length: normalizedColumnCount }, () => 0)
+
+  for (const item of items) {
+    let targetColumn = 0
+    let shortestHeight = heights[0]
+    for (let index = 1; index < normalizedColumnCount; index++) {
+      if (heights[index] < shortestHeight) {
+        shortestHeight = heights[index]
+        targetColumn = index
+      }
+    }
+
+    columns[targetColumn].push(item)
+    const value = weight(item)
+    heights[targetColumn] += Number.isFinite(value) && value > 0 ? value : 1
+  }
+
+  return columns
+}
+
+function wallOrderSrcs(items: FeedItem[], columns: number): string[] {
+  return distributeMasonry(items, columns, (item) => item.h / Math.max(item.w, 1))
+    .flatMap((column) => column.map((item) => item.src))
+}
+
+async function fetchFeedForSeed(page: Page, seed: string): Promise<FeedResponse> {
+  const response = await page.request.get(`/api/feed?limit=80&seed=${encodeURIComponent(seed)}`)
+  expect(response.ok()).toBeTruthy()
+  const payload = (await response.json()) as FeedResponse
+  expect(Array.isArray(payload.items)).toBeTruthy()
+  return payload
+}
+
+async function collectWallSrcs(page: Page, count: number): Promise<string[]> {
+  const images = page.getByTestId('wall-tile').locator('img')
+  const srcs: string[] = []
+  for (let i = 0; i < count; i++) {
+    const src = await images.nth(i).getAttribute('src')
+    expect(src).toBeTruthy()
+    srcs.push(src!)
+  }
+  return srcs
 }
 
 test('basic upload -> wall -> album flow', async ({ page }) => {
@@ -45,26 +103,33 @@ test('basic upload -> wall -> album flow', async ({ page }) => {
 
   const initialSeed = new URL(page.url()).searchParams.get('seed')
   expect(initialSeed).toBeTruthy()
+  const pinnedFeedSnapshot = await fetchFeedForSeed(page, initialSeed!)
+  const pinnedFeedPattern = `**/api/feed?*seed=${encodeURIComponent(initialSeed!)}*`
+  await page.route(pinnedFeedPattern, async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify(pinnedFeedSnapshot),
+    })
+  })
+  const expectedWallSrcs = wallOrderSrcs(pinnedFeedSnapshot.items, wallColumns)
+  const sampleCount = Math.min(10, expectedWallSrcs.length)
+  expect(sampleCount).toBeGreaterThan(0)
+  const expectedTopSrcs = expectedWallSrcs.slice(0, sampleCount)
 
-  const seededWallImages = page.getByTestId('wall-tile').locator('img')
-  const sampleCount = Math.min(10, await seededWallImages.count())
-  const seededWallSrcs: string[] = []
-  for (let i = 0; i < sampleCount; i++) {
-    const src = await seededWallImages.nth(i).getAttribute('src')
-    expect(src).toBeTruthy()
-    seededWallSrcs.push(src!)
-  }
+  try {
+    await page.goto(`/?seed=${initialSeed!}`)
+    await expect(page.getByTestId('wall-tile').first()).toBeVisible({ timeout: 60_000 })
+    const replayWallSrcs = await collectWallSrcs(page, sampleCount)
+    expect(replayWallSrcs).toEqual(expectedTopSrcs)
 
-  await page.goto(`/?seed=${initialSeed}`)
-  await expect(page.getByTestId('wall-tile').first()).toBeVisible({ timeout: 60_000 })
-  const replayWallImages = page.getByTestId('wall-tile').locator('img')
-  const replayWallSrcs: string[] = []
-  for (let i = 0; i < sampleCount; i++) {
-    const src = await replayWallImages.nth(i).getAttribute('src')
-    expect(src).toBeTruthy()
-    replayWallSrcs.push(src!)
+    await page.goto(`/?seed=${initialSeed!}`)
+    await expect(page.getByTestId('wall-tile').first()).toBeVisible({ timeout: 60_000 })
+    const replayAgainWallSrcs = await collectWallSrcs(page, sampleCount)
+    expect(replayAgainWallSrcs).toEqual(expectedTopSrcs)
+  } finally {
+    await page.unroute(pinnedFeedPattern)
   }
-  expect(replayWallSrcs).toEqual(seededWallSrcs)
 
   await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight))
   const refreshButton = page.getByTestId('wall-refresh')
