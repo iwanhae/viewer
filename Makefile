@@ -55,9 +55,8 @@ test: build e2e-install
 	mkdir -p "$${SCREENSHOT_DIR}"; \
 	RECOMMENDER_LISTEN_ADDR="$${RECOMMENDER_LISTEN_ADDR}" ./$(RECOMMENDER_BIN) > .cache/recommender-server.log 2>&1 & \
 	RECOMMENDER_PID=$$!; \
-	./$(BIN) > .cache/e2e-server.log 2>&1 & \
-	SERVER_PID=$$!; \
-	trap 'kill $$SERVER_PID $$RECOMMENDER_PID >/dev/null 2>&1 || true' EXIT; \
+	SERVER_PID=""; \
+	trap 'kill "$${SERVER_PID:-}" "$${RECOMMENDER_PID:-}" >/dev/null 2>&1 || true' EXIT; \
 	for i in $$(seq 1 60); do \
 		if ! kill -0 $$RECOMMENDER_PID >/dev/null 2>&1; then \
 			echo "recommender worker exited before healthcheck"; \
@@ -67,6 +66,13 @@ test: build e2e-install
 		if curl -fsS "$${RECOMMENDER_ENDPOINT}/healthz" >/dev/null; then break; fi; \
 		sleep 1; \
 	done; \
+	if ! curl -fsS "$${RECOMMENDER_ENDPOINT}/healthz" >/dev/null; then \
+		echo "recommender worker failed healthcheck"; \
+		sed -n '1,200p' .cache/recommender-server.log; \
+		exit 1; \
+	fi; \
+	./$(BIN) > .cache/e2e-server.log 2>&1 & \
+	SERVER_PID=$$!; \
 	for i in $$(seq 1 60); do \
 		if ! kill -0 $$SERVER_PID >/dev/null 2>&1; then \
 			echo "viewer server exited before healthcheck"; \

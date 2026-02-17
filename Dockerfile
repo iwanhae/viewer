@@ -40,8 +40,10 @@ RUN apt-get update && \
 
 COPY --from=backend-build /out/viewer /app/viewer
 COPY --from=recommender-build /out/recommender /app/recommender
+COPY docker/entrypoint.sh /app/entrypoint.sh
 
 RUN mkdir -p /tmp/viewer-cache/images /tmp/viewer-cache/zips && \
+    chmod +x /app/entrypoint.sh && \
     chown -R 65532:65532 /app /tmp/viewer-cache
 
 USER 65532:65532
@@ -49,7 +51,8 @@ USER 65532:65532
 ENV PORT=8080 \
     CACHE_DIR=/tmp/viewer-cache/images \
     ZIP_CACHE_DIR=/tmp/viewer-cache/zips \
+    RECOMMENDER_LISTEN_ADDR="0.0.0.0:18081" \
     RECOMMENDER_ENDPOINT="http://127.0.0.1:18081"
 
 EXPOSE 8080
-ENTRYPOINT ["/app/viewer"]
+ENTRYPOINT ["/app/entrypoint.sh"]

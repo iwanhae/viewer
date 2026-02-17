@@ -17,15 +17,32 @@ const DEFAULT_MODEL_ID: &str = "google/siglip2-base-patch16-224";
 const DEFAULT_DEVICE: &str = "cpu";
 const BACKEND_NAME: &str = "siglip2-candle";
 
+#[derive(Debug, Clone)]
+struct RuntimeConfig {
+    listen_addr: String,
+    model_id: String,
+    device: String,
+}
+
+impl RuntimeConfig {
+    fn from_env() -> Self {
+        Self {
+            listen_addr: env_or_default("RECOMMENDER_LISTEN_ADDR", DEFAULT_LISTEN_ADDR),
+            model_id: env_or_default("SIGLIP2_MODEL_ID", DEFAULT_MODEL_ID),
+            device: env_or_default("SIGLIP2_DEVICE", DEFAULT_DEVICE),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct EmbedRequest {
     #[serde(default)]
     request_id: String,
     #[serde(default = "default_op")]
     op: String,
-    #[serde(default = "default_model_id")]
+    #[serde(default)]
     model_id: String,
-    #[serde(default = "default_device")]
+    #[serde(default)]
     device: String,
     #[serde(default)]
     image_b64: String,
@@ -123,12 +140,18 @@ fn default_op() -> String {
     "embed".to_string()
 }
 
-fn default_model_id() -> String {
-    DEFAULT_MODEL_ID.to_string()
-}
-
-fn default_device() -> String {
-    DEFAULT_DEVICE.to_string()
+fn env_or_default(key: &str, fallback: &str) -> String {
+    match env::var(key) {
+        Ok(value) => {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                fallback.to_string()
+            } else {
+                trimmed.to_string()
+            }
+        }
+        Err(_) => fallback.to_string(),
+    }
 }
 
 fn ensure_supported_device(device: &str) -> Result<()> {
@@ -272,7 +295,9 @@ fn parse_request(stream: &mut TcpStream) -> Result<HttpRequest> {
             let key = name.trim().to_lowercase();
             let value = value.trim().to_string();
             if key.eq_ignore_ascii_case("content-length") {
-                content_length = value.parse().unwrap_or(0);
+                content_length = value
+                    .parse::<usize>()
+                    .with_context(|| format!("invalid content-length header '{value}'"))?;
             }
         }
     }
@@ -314,6 +339,33 @@ fn parse_embed_request(body: &[u8]) -> Result<EmbedRequest> {
     serde_json::from_slice::<EmbedRequest>(body).context("parse /embed request body")
 }
 
+fn apply_request_defaults(req: &mut EmbedRequest, config: &RuntimeConfig) {
+    req.model_id = req.model_id.trim().to_string();
+    if req.model_id.is_empty() {
+        req.model_id = config.model_id.clone();
+    }
+
+    req.device = req.device.trim().to_string();
+    if req.device.is_empty() {
+        req.device = config.device.clone();
+    }
+}
+
+fn decode_image_b64(raw: &str) -> Result<Vec<u8>> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow::anyhow!("image_b64 is required for op=embed"));
+    }
+
+    let encoded = match trimmed.split_once(',') {
+        Some((prefix, data)) if prefix.to_ascii_lowercase().contains(";base64") => data.trim(),
+        _ => trimmed,
+    };
+    STANDARD
+        .decode(encoded.as_bytes())
+        .context("decode image_b64 payload")
+}
+
 fn write_json_response(req_id: String, response: EmbedResponse) -> Result<HttpResponse> {
     let mut response = response;
     response.request_id = req_id;
@@ -325,19 +377,25 @@ fn write_json_response(req_id: String, response: EmbedResponse) -> Result<HttpRe
     })
 }
 
-fn handle_embed(worker: &Arc<Mutex<Worker>>, body: &[u8]) -> Result<HttpResponse> {
+fn handle_embed(worker: &Arc<Mutex<Worker>>, config: &RuntimeConfig, body: &[u8]) -> Result<HttpResponse> {
     let mut req = parse_embed_request(body)?;
-    req.model_id = req.model_id.trim().to_string();
-    if req.model_id.is_empty() {
-        req.model_id = default_model_id();
-    }
-    req.device = req.device.trim().to_string();
-    if req.device.is_empty() {
-        req.device = default_device();
-    }
+    apply_request_defaults(&mut req, config);
     let op = req.op.to_ascii_lowercase();
 
     if op == "ping" {
+        if let Err(err) = ensure_supported_device(&req.device) {
+            return Ok(write_json_response(
+                req.request_id.clone(),
+                error_response(
+                    req.request_id,
+                    err,
+                    "request",
+                    req.model_id.clone(),
+                    req.device.clone(),
+                    0,
+                ),
+            )?);
+        }
         let mut guard = worker.lock().map_err(|_| anyhow::anyhow!("worker lock poisoned"))?;
         if let Err(err) = guard.ensure_model(&req.model_id) {
             return Ok(write_json_response(
@@ -371,9 +429,22 @@ fn handle_embed(worker: &Arc<Mutex<Worker>>, body: &[u8]) -> Result<HttpResponse
         )?);
     }
 
-    let decoded = STANDARD.decode(req.image_b64.as_bytes()).map_err(|err| {
-        anyhow::anyhow!("decode image_b64 for request {}: {err}", req.request_id)
-    })?;
+    let decoded = match decode_image_b64(&req.image_b64) {
+        Ok(decoded) => decoded,
+        Err(err) => {
+            return Ok(write_json_response(
+                req.request_id.clone(),
+                error_response(
+                    req.request_id,
+                    err,
+                    "decode",
+                    req.model_id.clone(),
+                    req.device.clone(),
+                    0,
+                ),
+            )?);
+        }
+    };
     let image_size_bytes = decoded.len();
 
     let mut guard = worker.lock().map_err(|_| anyhow::anyhow!("worker lock poisoned"))?;
@@ -411,36 +482,63 @@ fn handle_embed(worker: &Arc<Mutex<Worker>>, body: &[u8]) -> Result<HttpResponse
     }
 }
 
-fn handle_healthz() -> Result<HttpResponse> {
-    let model_id = default_model_id();
-    let device = default_device();
+fn handle_ping_or_healthz(
+    worker: &Arc<Mutex<Worker>>,
+    config: &RuntimeConfig,
+    request_id: &str,
+) -> Result<HttpResponse> {
+    ensure_supported_device(&config.device).context("validate startup device")?;
+
     let req = EmbedRequest {
-        request_id: "healthz".to_string(),
+        request_id: request_id.to_string(),
         op: "ping".to_string(),
-        model_id: model_id.clone(),
-        device: device.clone(),
+        model_id: config.model_id.clone(),
+        device: config.device.clone(),
         image_b64: String::new(),
     };
+    let mut guard = worker.lock().map_err(|_| anyhow::anyhow!("worker lock poisoned"))?;
+    guard
+        .ensure_model(&config.model_id)
+        .with_context(|| format!("initialize model '{}'", config.model_id))?;
     Ok(write_json_response(
-        "healthz".to_string(),
+        request_id.to_string(),
         ping_response(&req),
     )?)
 }
 
-fn handle_client(mut stream: TcpStream, worker: Arc<Mutex<Worker>>) {
+fn handle_client(mut stream: TcpStream, worker: Arc<Mutex<Worker>>, config: Arc<RuntimeConfig>) {
     let response = match parse_request(&mut stream) {
         Ok(req) => match (req.method.as_str(), req.path.as_str()) {
-            ("GET", "/ping") | ("GET", "/healthz") => {
-                handle_healthz().unwrap_or_else(|err| {
+            ("GET", "/ping") => {
+                handle_ping_or_healthz(&worker, &config, "ping").unwrap_or_else(|err| {
                     let resp = error_response(
-                        "system".to_string(),
+                        "ping".to_string(),
                         err,
-                        "healthz",
-                        default_model_id(),
-                        default_device(),
+                        "ping",
+                        config.model_id.clone(),
+                        config.device.clone(),
                         0,
                     );
-                    write_json_response("system".to_string(), resp).unwrap_or_else(|write_err| {
+                    write_json_response("ping".to_string(), resp).unwrap_or_else(|write_err| {
+                        HttpResponse {
+                            status: 500,
+                            reason: "Internal Server Error",
+                            body: write_err.to_string().into_bytes(),
+                        }
+                    })
+                })
+            }
+            ("GET", "/healthz") => {
+                handle_ping_or_healthz(&worker, &config, "healthz").unwrap_or_else(|err| {
+                    let resp = error_response(
+                        "healthz".to_string(),
+                        err,
+                        "healthz",
+                        config.model_id.clone(),
+                        config.device.clone(),
+                        0,
+                    );
+                    write_json_response("healthz".to_string(), resp).unwrap_or_else(|write_err| {
                         HttpResponse {
                             status: 500,
                             reason: "Internal Server Error",
@@ -450,15 +548,15 @@ fn handle_client(mut stream: TcpStream, worker: Arc<Mutex<Worker>>) {
                 })
             }
             ("POST", "/embed") => {
-                match handle_embed(&worker, &req.body) {
+                match handle_embed(&worker, &config, &req.body) {
                     Ok(response) => response,
                     Err(err) => {
                         let resp = error_response(
                             "request".to_string(),
                             err,
                             "request",
-                            default_model_id(),
-                            default_device(),
+                            config.model_id.clone(),
+                            config.device.clone(),
                             req.body.len(),
                         );
                         write_json_response("request".to_string(), resp).unwrap_or_else(|write_err| {
@@ -493,28 +591,42 @@ fn handle_client(mut stream: TcpStream, worker: Arc<Mutex<Worker>>) {
 }
 
 fn main() {
-    let listen_addr = env::var("RECOMMENDER_LISTEN_ADDR").unwrap_or_else(|_| DEFAULT_LISTEN_ADDR.to_string());
-    let startup_device = env::var("SIGLIP2_DEVICE").unwrap_or_else(|_| DEFAULT_DEVICE.to_string());
+    let config = RuntimeConfig::from_env();
 
-    let mut worker = Worker::default();
-    if let Err(err) = ensure_supported_device(&startup_device) {
-        eprintln!("unsupported startup device '{startup_device}': {err}");
+    if let Err(err) = ensure_supported_device(&config.device) {
+        eprintln!("unsupported startup device '{}': {err}", config.device);
         std::process::exit(1);
     }
 
-    let listener = match TcpListener::bind(&listen_addr) {
+    let mut worker = Worker::default();
+    if let Err(err) = worker.ensure_model(&config.model_id) {
+        eprintln!(
+            "failed to initialize model '{}' during startup: {err}",
+            config.model_id
+        );
+        std::process::exit(1);
+    }
+
+    let listener = match TcpListener::bind(&config.listen_addr) {
         Ok(listener) => listener,
         Err(err) => {
-            eprintln!("failed to bind {listen_addr}: {err}");
+            eprintln!("failed to bind {}: {err}", config.listen_addr);
             std::process::exit(1);
         }
     };
+    eprintln!(
+        "recommender listening on {} with model '{}' (device '{}')",
+        config.listen_addr, config.model_id, config.device
+    );
+
     let worker = Arc::new(Mutex::new(worker));
+    let config = Arc::new(config);
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
                 let worker = Arc::clone(&worker);
-                thread::spawn(move || handle_client(stream, worker));
+                let config = Arc::clone(&config);
+                thread::spawn(move || handle_client(stream, worker, config));
             }
             Err(err) => {
                 eprintln!("failed to accept connection: {err}");

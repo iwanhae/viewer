@@ -37,7 +37,7 @@ Rust worker downloads SigLIP2 model files from Hugging Face on demand and caches
 
 Recommendation vectors are persisted in each album's `albums/<album-id>/index.json` under an `embeddings` section.
 
-Rust recommender service should be started separately from the Go server.
+In the Docker image, the container entrypoint starts both the Rust recommender service and the Go server.
 
 ## Commands
 - `make build` builds `bin/viewer` and `bin/recommender`.
