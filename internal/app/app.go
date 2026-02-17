@@ -29,22 +29,23 @@ func Run(ctx context.Context) error {
 	}
 
 	albumService := albums.NewService(cfg, store, albums.NewIndexer())
-
 	feedService := feed.NewService(albumService)
 	imageService, err := images.NewService(albumService, store, cfg.CacheDir, cfg.ZipCacheDir, cfg.RangeChunkSize)
 	if err != nil {
 		return err
 	}
+
 	var recommendService *recommend.Service
 	if cfg.RecoEnabled {
 		rec, recErr := recommend.NewService(cfg, albumService, imageService, store)
 		if recErr != nil {
-			log.Printf("viewer: recommendation service disabled due to startup error: %v", recErr)
-		} else {
-			recommendService = rec
-			recommendService.Start(ctx)
-			log.Printf("viewer: recommendation service enabled")
+			return fmt.Errorf("recommendation service init failed: %w", recErr)
 		}
+		recommendService = rec
+		if err := recommendService.Start(ctx); err != nil {
+			return fmt.Errorf("recommendation warmup failed: %w", err)
+		}
+		log.Printf("viewer: recommendation service enabled")
 	} else {
 		log.Printf("viewer: recommendation service disabled by config")
 	}

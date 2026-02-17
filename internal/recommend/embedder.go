@@ -16,6 +16,8 @@ import (
 
 type EmbeddingProvider interface {
 	Embed(ctx context.Context, imageBytes []byte) ([]float32, string, error)
+	Healthcheck(ctx context.Context) error
+	Close() error
 }
 
 type PythonEmbedder struct {
@@ -36,7 +38,8 @@ type PythonEmbedder struct {
 
 type embedRequest struct {
 	RequestID string `json:"request_id"`
-	ImageB64  string `json:"image_b64"`
+	Op        string `json:"op,omitempty"`
+	ImageB64  string `json:"image_b64,omitempty"`
 	ModelID   string `json:"model_id"`
 	Device    string `json:"device"`
 }
@@ -63,12 +66,6 @@ func (p *workerProcess) setWaitErr(err error) {
 	p.waitMu.Lock()
 	defer p.waitMu.Unlock()
 	p.waitErr = err
-}
-
-func (p *workerProcess) WaitErr() error {
-	p.waitMu.Lock()
-	defer p.waitMu.Unlock()
-	return p.waitErr
 }
 
 func (p *workerProcess) IsDone() bool {
@@ -117,11 +114,6 @@ func (l *limitedBuffer) String() string {
 	return string(l.buf)
 }
 
-type embedResult struct {
-	out embedResponse
-	err error
-}
-
 func NewPythonEmbedder(command string, modelID string, device string, requestTimeout time.Duration, restartLimit int) *PythonEmbedder {
 	if requestTimeout <= 0 {
 		requestTimeout = 120 * time.Second
@@ -138,11 +130,32 @@ func NewPythonEmbedder(command string, modelID string, device string, requestTim
 	}
 }
 
+func (e *PythonEmbedder) Healthcheck(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	out, _, err := e.sendRequest(ctx, embedRequest{
+		RequestID: e.nextRequestID(),
+		Op:        "ping",
+		ModelID:   e.modelID,
+		Device:    e.device,
+	})
+	if err != nil {
+		return fmt.Errorf("worker healthcheck failed: %w", err)
+	}
+	if !out.OK {
+		if out.Error == "" {
+			out.Error = "worker healthcheck failed"
+		}
+		return errors.New(out.Error)
+	}
+	return nil
+}
+
 func (e *PythonEmbedder) Embed(ctx context.Context, imageBytes []byte) ([]float32, string, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-
 	requestCtx := ctx
 	cancel := func() {}
 	if e.requestTimeout > 0 {
@@ -150,16 +163,41 @@ func (e *PythonEmbedder) Embed(ctx context.Context, imageBytes []byte) ([]float3
 	}
 	defer cancel()
 
+	payload := embedRequest{
+		RequestID: e.nextRequestID(),
+		Op:        "embed",
+		ImageB64:  base64.StdEncoding.EncodeToString(imageBytes),
+		ModelID:   e.modelID,
+		Device:    e.device,
+	}
+
 	var lastErr error
 	for attempt := 0; attempt < 2; attempt++ {
-		vector, modelID, err := e.embedOnce(requestCtx, imageBytes)
+		out, stderr, err := e.sendRequest(requestCtx, payload)
 		if err == nil {
-			return vector, modelID, nil
+			if !out.OK {
+				if out.Error == "" {
+					out.Error = "embedding failed"
+				}
+				return nil, out.Model, errors.New(out.Error)
+			}
+			if len(out.Embedding) == 0 {
+				return nil, out.Model, fmt.Errorf("worker returned empty embedding")
+			}
+			modelID := out.Model
+			if modelID == "" {
+				modelID = e.modelID
+			}
+			return out.Embedding, modelID, nil
 		}
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return nil, "", err
 		}
-		lastErr = err
+		if stderr != "" {
+			lastErr = fmt.Errorf("%w (stderr=%s)", err, stderr)
+		} else {
+			lastErr = err
+		}
 		e.stopProcess()
 	}
 	if lastErr == nil {
@@ -168,76 +206,53 @@ func (e *PythonEmbedder) Embed(ctx context.Context, imageBytes []byte) ([]float3
 	return nil, "", lastErr
 }
 
-func (e *PythonEmbedder) embedOnce(ctx context.Context, imageBytes []byte) ([]float32, string, error) {
+func (e *PythonEmbedder) sendRequest(ctx context.Context, payload embedRequest) (embedResponse, string, error) {
 	e.reqMu.Lock()
 	defer e.reqMu.Unlock()
 
-	requestID := e.nextRequestID()
-	payload := embedRequest{
-		RequestID: requestID,
-		ImageB64:  base64.StdEncoding.EncodeToString(imageBytes),
-		ModelID:   e.modelID,
-		Device:    e.device,
-	}
-	input, err := json.Marshal(payload)
-	if err != nil {
-		return nil, "", fmt.Errorf("encode worker request: %w", err)
-	}
-
 	proc, err := e.ensureProcess()
 	if err != nil {
-		return nil, "", err
+		return embedResponse{}, "", err
 	}
 
+	input, err := json.Marshal(payload)
+	if err != nil {
+		return embedResponse{}, proc.stderr.String(), fmt.Errorf("encode worker request: %w", err)
+	}
 	if _, err := proc.stdin.Write(append(input, '\n')); err != nil {
-		stderr := proc.stderr.String()
-		if stderr != "" {
-			return nil, "", fmt.Errorf("write worker request: %w (stderr=%s)", err, stderr)
-		}
-		return nil, "", fmt.Errorf("write worker request: %w", err)
+		return embedResponse{}, proc.stderr.String(), fmt.Errorf("write worker request: %w", err)
 	}
 
-	respCh := make(chan embedResult, 1)
+	respCh := make(chan struct {
+		out embedResponse
+		err error
+	}, 1)
 	go func() {
 		out, readErr := readEmbedResponse(proc.scanner)
-		respCh <- embedResult{out: out, err: readErr}
+		respCh <- struct {
+			out embedResponse
+			err error
+		}{out: out, err: readErr}
 	}()
 
 	select {
 	case <-ctx.Done():
 		e.stopProcess()
-		return nil, "", ctx.Err()
+		return embedResponse{}, proc.stderr.String(), ctx.Err()
 	case result := <-respCh:
 		if result.err != nil {
-			stderr := proc.stderr.String()
-			if stderr != "" {
-				return nil, "", fmt.Errorf("read worker output: %w (stderr=%s)", result.err, stderr)
-			}
-			return nil, "", fmt.Errorf("read worker output: %w", result.err)
+			return embedResponse{}, proc.stderr.String(), fmt.Errorf("read worker output: %w", result.err)
 		}
-		out := result.out
-		if out.RequestID != requestID {
-			return nil, "", fmt.Errorf("worker request id mismatch: got=%s want=%s", out.RequestID, requestID)
+		if result.out.RequestID != payload.RequestID {
+			return embedResponse{}, proc.stderr.String(), fmt.Errorf("worker request id mismatch: got=%s want=%s", result.out.RequestID, payload.RequestID)
 		}
-		if !out.OK {
-			if out.Error == "" {
-				out.Error = "embedding failed"
-			}
-			return nil, out.Model, fmt.Errorf(out.Error)
-		}
-		if len(out.Embedding) == 0 {
-			return nil, out.Model, fmt.Errorf("worker returned empty embedding")
-		}
-		modelID := out.Model
-		if modelID == "" {
-			modelID = e.modelID
-		}
-		return out.Embedding, modelID, nil
+		return result.out, proc.stderr.String(), nil
 	}
-
 }
 
 func (e *PythonEmbedder) nextRequestID() string {
+	e.stateMu.Lock()
+	defer e.stateMu.Unlock()
 	e.sequence++
 	return fmt.Sprintf("%d", e.sequence)
 }
@@ -249,11 +264,9 @@ func (e *PythonEmbedder) ensureProcess() (*workerProcess, error) {
 	if e.isClosing {
 		return nil, fmt.Errorf("embedder is closed")
 	}
-
 	if e.proc != nil && e.proc.IsDone() {
 		e.proc = nil
 	}
-
 	if e.proc != nil {
 		return e.proc, nil
 	}

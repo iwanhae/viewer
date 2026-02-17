@@ -2,7 +2,6 @@ package recommend
 
 import (
 	"cmp"
-	"context"
 	"math"
 	"slices"
 )
@@ -12,43 +11,18 @@ type Neighbor struct {
 	Score   float64
 }
 
-type SearchOptions struct {
-	Limit      int
-	ExcludeIDs map[string]struct{}
-}
-
-type VectorIndex interface {
-	Search(ctx context.Context, query []float32, options SearchOptions) ([]Neighbor, error)
-	Upsert(ctx context.Context, imageIDValue string, vector []float32, modelID string) error
-}
-
-type EmbeddedVectorIndex struct {
-	store *LocalStore
-}
-
-func NewEmbeddedVectorIndex(store *LocalStore) *EmbeddedVectorIndex {
-	return &EmbeddedVectorIndex{store: store}
-}
-
-func (i *EmbeddedVectorIndex) Upsert(ctx context.Context, imageIDValue string, vector []float32, modelID string) error {
-	_ = ctx
-	return i.store.MarkDone(imageIDValue, vector, modelID)
-}
-
-func (i *EmbeddedVectorIndex) Search(ctx context.Context, query []float32, options SearchOptions) ([]Neighbor, error) {
-	_ = ctx
-	if options.Limit <= 0 {
-		return nil, nil
+func findNeighbors(embeddings map[string]EmbeddingRecord, query []float32, limit int, excludeIDs map[string]struct{}) []Neighbor {
+	if limit <= 0 {
+		return nil
 	}
 	queryNormed, _ := normalizeVector(query)
 	if len(queryNormed) == 0 {
-		return nil, nil
+		return nil
 	}
-	embeddings := i.store.EmbeddingsSnapshot()
 	neighbors := make([]Neighbor, 0, len(embeddings))
 	for id, emb := range embeddings {
-		if options.ExcludeIDs != nil {
-			if _, excluded := options.ExcludeIDs[id]; excluded {
+		if excludeIDs != nil {
+			if _, excluded := excludeIDs[id]; excluded {
 				continue
 			}
 		}
@@ -61,10 +35,10 @@ func (i *EmbeddedVectorIndex) Search(ctx context.Context, query []float32, optio
 		}
 		return cmp.Compare(a.ImageID, b.ImageID)
 	})
-	if len(neighbors) > options.Limit {
-		neighbors = neighbors[:options.Limit]
+	if len(neighbors) > limit {
+		neighbors = neighbors[:limit]
 	}
-	return neighbors, nil
+	return neighbors
 }
 
 func normalizeVector(in []float32) ([]float32, float64) {

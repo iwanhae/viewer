@@ -19,17 +19,21 @@ At minimum configure S3 values:
 Optional tuning:
 - `RANGE_CHUNK_SIZE_BYTES` controls S3 byte-range cache chunk size for ZIP reads (default `131072`).
 - Recommendation feature:
-- `RECO_ENABLED` enables the background recommendation system (default `true`).
-- `RECO_DB_PATH` local metadata/vector state path (default `.cache/reco/reco.db`).
-- `RECO_SYNC_INTERVAL_SECONDS` periodic S3 metadata sync interval (default `600`).
+- `RECO_ENABLED` enables recommendation warmup + background embedding (default `true`).
 - `RECO_TOPK_DEFAULT` default recommendation count (default `12`).
 - `RECO_TOPK_MAX` max recommendation count (default `48`).
 - `RECO_WORKER_CONCURRENCY` number of background embedding workers (default `2`).
-- `RECO_MAX_RETRIES` max retry attempts per embedding job (default `5`).
-- `RECO_WORKER_CMD` command used to run embedding worker (default `python3 scripts/reco_worker.py`).
+- `RECO_WORKER_CMD` command used to run embedding worker (default `RECO_WORKER_MODE=worker python3 scripts/reco_worker.py`).
+- `RECO_WORKER_REQUEST_TIMEOUT_SECONDS` timeout per embed request (default `120`).
+- `RECO_WORKER_RESTART_LIMIT` max worker restarts per hour (default `10`).
 - `SIGLIP2_MODEL_ID` model identifier for worker backends (default `google/siglip2-base-patch16-224`).
 - `SIGLIP2_DEVICE` embedding device hint such as `cpu` or `cuda:0` (default `cpu`).
-- `VECTOR_BACKEND` vector backend selector (default `embedded`).
+
+Recommendation vectors are persisted in each album's `albums/<album-id>/index.json` under an `embeddings` section.
+
+Python worker supports two modes:
+- Worker mode (Go uses this): `RECO_WORKER_MODE=worker python3 scripts/reco_worker.py`
+- One-shot debug mode (default): `cat test.jpg | python3 scripts/reco_worker.py`
 
 ## Commands
 - `make build` builds frontend and backend into `bin/viewer`.

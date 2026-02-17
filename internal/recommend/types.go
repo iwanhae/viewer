@@ -4,51 +4,32 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
-	"time"
+)
+
+const (
+	embeddingStatusMissing = "missing"
+	embeddingStatusReady   = "ready"
+	embeddingStatusFailed  = "failed"
 )
 
 type PhotoRecord struct {
-	ImageID         string  `json:"imageId"`
-	AlbumID         string  `json:"albumId"`
-	PhotoIndex      int     `json:"photoIndex"`
-	EntryName       string  `json:"entryName"`
-	Width           int     `json:"width"`
-	Height          int     `json:"height"`
-	Ratio           float64 `json:"ratio"`
-	CreatedAt       string  `json:"createdAt"`
-	EmbeddingStatus string  `json:"embeddingStatus"`
-	EmbeddingModel  string  `json:"embeddingModel,omitempty"`
-	UpdatedAt       string  `json:"updatedAt"`
+	ImageID    string
+	AlbumID    string
+	PhotoIndex int
+	EntryName  string
+	Width      int
+	Height     int
+	Ratio      float64
+	CreatedAt  string
 }
 
 type EmbeddingRecord struct {
-	ImageID    string    `json:"imageId"`
-	Vector     []float32 `json:"vector"`
-	Norm       float64   `json:"norm"`
-	ModelID    string    `json:"modelId"`
-	UpdatedAt  string    `json:"updatedAt"`
-	CreatedAt  string    `json:"createdAt"`
-	Dimensions int       `json:"dimensions"`
-}
-
-type JobRecord struct {
-	ImageID   string `json:"imageId"`
-	Status    string `json:"status"`
-	Attempts  int    `json:"attempts"`
-	LastError string `json:"lastError,omitempty"`
-	NotBefore string `json:"notBefore"`
-	UpdatedAt string `json:"updatedAt"`
-	CreatedAt string `json:"createdAt"`
-	RunningBy string `json:"runningBy,omitempty"`
-	StartedAt string `json:"startedAt,omitempty"`
-}
-
-type AlbumSyncRecord struct {
-	AlbumID          string `json:"albumId"`
-	OriginalFilename string `json:"originalFilename"`
-	CreatedAt        string `json:"createdAt"`
-	PhotoCount       int    `json:"photoCount"`
-	UpdatedAt        string `json:"updatedAt"`
+	ImageID    string
+	Vector     []float32
+	Norm       float64
+	ModelID    string
+	UpdatedAt  string
+	Dimensions int
 }
 
 type RecommendationItem struct {
@@ -63,63 +44,6 @@ type RecommendationItem struct {
 type RecommendationResponse struct {
 	Items  []RecommendationItem `json:"items"`
 	Status string               `json:"status"`
-}
-
-type BackfillOrder string
-
-const (
-	BackfillOrderOldestFirst BackfillOrder = "oldest-first"
-	BackfillOrderNewestFirst BackfillOrder = "newest-first"
-)
-
-type BackfillSeedResult struct {
-	StartedAt        string `json:"startedAt"`
-	FinishedAt       string `json:"finishedAt"`
-	AlbumsDiscovered int    `json:"albumsDiscovered"`
-	AlbumsSynced     int    `json:"albumsSynced"`
-	AlbumsFailed     int    `json:"albumsFailed"`
-	PhotosEnqueued   int    `json:"photosEnqueued"`
-}
-
-type JobQueueCounts struct {
-	Pending int `json:"pending"`
-	Running int `json:"running"`
-	Failed  int `json:"failed"`
-	Total   int `json:"total"`
-}
-
-type BackfillProgress struct {
-	PhotosTotal     int            `json:"photosTotal"`
-	EmbeddingsTotal int            `json:"embeddingsTotal"`
-	Queue           JobQueueCounts `json:"queue"`
-}
-
-type BackfillDrainOptions struct {
-	WorkerCount int           `json:"workerCount"`
-	PollInterval time.Duration `json:"pollInterval"`
-	StableRounds int           `json:"stableRounds"`
-	LogEvery     time.Duration `json:"logEvery"`
-}
-
-type BackfillDrainResult struct {
-	StartedAt      string         `json:"startedAt"`
-	FinishedAt     string         `json:"finishedAt"`
-	Processed      int            `json:"processed"`
-	WorkerFailures int            `json:"workerFailures"`
-	PhotosTotal    int            `json:"photosTotal"`
-	EmbeddingsTotal int           `json:"embeddingsTotal"`
-	Queue          JobQueueCounts `json:"queue"`
-}
-
-func ParseBackfillOrder(raw string) BackfillOrder {
-	switch strings.ToLower(strings.TrimSpace(raw)) {
-	case string(BackfillOrderNewestFirst):
-		return BackfillOrderNewestFirst
-	case string(BackfillOrderOldestFirst):
-		return BackfillOrderOldestFirst
-	default:
-		return BackfillOrderOldestFirst
-	}
 }
 
 func imageID(albumID string, photoIndex int) string {

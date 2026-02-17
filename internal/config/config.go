@@ -8,36 +8,30 @@ import (
 )
 
 type Config struct {
-	Port                    int
-	S3Endpoint              string
-	S3Region                string
-	S3Bucket                string
-	S3AccessKey             string
-	S3SecretKey             string
-	S3UsePathStyle          bool
-	SkipWarmup              bool
-	PresignTTL              time.Duration
-	MaxUploadBytes          int64
-	CacheDir                string
-	ZipCacheDir             string
-	RangeChunkSize          int64
-	WarmupFetchConcurrency  int
-	FeedDefaultSize         int
-	RecoEnabled             bool
-	RecoDBPath              string
-	RecoSyncIntervalSeconds int
-	RecoTopKDefault         int
-	RecoTopKMax             int
-	RecoWorkerConcurrency   int
-	RecoMaxRetries          int
-	RecoPipelinePrefetch    int
-	RecoPipelineMaxBytesMB  int
-	RecoWorkerCmd           string
-	RecoWorkerTimeoutSec    int
-	RecoWorkerRestartLimit  int
-	Siglip2ModelID          string
-	Siglip2Device           string
-	VectorBackend           string
+	Port                   int
+	S3Endpoint             string
+	S3Region               string
+	S3Bucket               string
+	S3AccessKey            string
+	S3SecretKey            string
+	S3UsePathStyle         bool
+	SkipWarmup             bool
+	PresignTTL             time.Duration
+	MaxUploadBytes         int64
+	CacheDir               string
+	ZipCacheDir            string
+	RangeChunkSize         int64
+	WarmupFetchConcurrency int
+	FeedDefaultSize        int
+	RecoEnabled            bool
+	RecoTopKDefault        int
+	RecoTopKMax            int
+	RecoWorkerConcurrency  int
+	RecoWorkerCmd          string
+	RecoWorkerTimeoutSec   int
+	RecoWorkerRestartLimit int
+	Siglip2ModelID         string
+	Siglip2Device          string
 }
 
 func Load() (Config, error) {
@@ -47,40 +41,33 @@ func Load() (Config, error) {
 	cacheDir := getenv("CACHE_DIR", ".cache/images")
 	zipCacheDir := getenv("ZIP_CACHE_DIR", ".cache/zips")
 	rangeChunkSize := getenvInt64("RANGE_CHUNK_SIZE_BYTES", 1<<17)
-	recoDBPath := getenv("RECO_DB_PATH", ".cache/reco/reco.db")
-	recoWorkerCmd := getenv("RECO_WORKER_CMD", "python3 scripts/reco_worker.py")
+	recoWorkerCmd := getenv("RECO_WORKER_CMD", "RECO_WORKER_MODE=worker python3 scripts/reco_worker.py")
 
 	cfg := Config{
-		Port:                    port,
-		S3Endpoint:              os.Getenv("S3_ENDPOINT"),
-		S3Region:                getenv("S3_REGION", "us-east-1"),
-		S3Bucket:                os.Getenv("S3_BUCKET"),
-		S3AccessKey:             os.Getenv("S3_ACCESS_KEY"),
-		S3SecretKey:             os.Getenv("S3_SECRET_KEY"),
-		S3UsePathStyle:          getenvBool("S3_USE_PATH_STYLE", true),
-		SkipWarmup:              getenvBool("SKIP_WARMUP", false),
-		PresignTTL:              time.Duration(presignTTLSeconds) * time.Second,
-		MaxUploadBytes:          maxUploadBytes,
-		CacheDir:                cacheDir,
-		ZipCacheDir:             zipCacheDir,
-		RangeChunkSize:          rangeChunkSize,
-		WarmupFetchConcurrency:  getenvInt("WARMUP_FETCH_CONCURRENCY", 0),
-		FeedDefaultSize:         getenvInt("FEED_DEFAULT_LIMIT", 80),
-		RecoEnabled:             getenvBool("RECO_ENABLED", true),
-		RecoDBPath:              recoDBPath,
-		RecoSyncIntervalSeconds: getenvInt("RECO_SYNC_INTERVAL_SECONDS", 600),
-		RecoTopKDefault:         getenvInt("RECO_TOPK_DEFAULT", 12),
-		RecoTopKMax:             getenvInt("RECO_TOPK_MAX", 48),
-		RecoWorkerConcurrency:   getenvInt("RECO_WORKER_CONCURRENCY", 2),
-		RecoMaxRetries:          getenvInt("RECO_MAX_RETRIES", 5),
-		RecoPipelinePrefetch:    getenvInt("RECO_PIPELINE_PREFETCH", 48),
-		RecoPipelineMaxBytesMB:  getenvInt("RECO_PIPELINE_MAX_BYTES_MB", 512),
-		RecoWorkerCmd:           recoWorkerCmd,
-		RecoWorkerTimeoutSec:    getenvInt("RECO_WORKER_REQUEST_TIMEOUT_SECONDS", 120),
-		RecoWorkerRestartLimit:  getenvInt("RECO_WORKER_RESTART_LIMIT", 10),
-		Siglip2ModelID:          getenv("SIGLIP2_MODEL_ID", "google/siglip2-base-patch16-224"),
-		Siglip2Device:           getenv("SIGLIP2_DEVICE", "cpu"),
-		VectorBackend:           getenv("VECTOR_BACKEND", "embedded"),
+		Port:                   port,
+		S3Endpoint:             os.Getenv("S3_ENDPOINT"),
+		S3Region:               getenv("S3_REGION", "us-east-1"),
+		S3Bucket:               os.Getenv("S3_BUCKET"),
+		S3AccessKey:            os.Getenv("S3_ACCESS_KEY"),
+		S3SecretKey:            os.Getenv("S3_SECRET_KEY"),
+		S3UsePathStyle:         getenvBool("S3_USE_PATH_STYLE", true),
+		SkipWarmup:             getenvBool("SKIP_WARMUP", false),
+		PresignTTL:             time.Duration(presignTTLSeconds) * time.Second,
+		MaxUploadBytes:         maxUploadBytes,
+		CacheDir:               cacheDir,
+		ZipCacheDir:            zipCacheDir,
+		RangeChunkSize:         rangeChunkSize,
+		WarmupFetchConcurrency: getenvInt("WARMUP_FETCH_CONCURRENCY", 0),
+		FeedDefaultSize:        getenvInt("FEED_DEFAULT_LIMIT", 80),
+		RecoEnabled:            getenvBool("RECO_ENABLED", true),
+		RecoTopKDefault:        getenvInt("RECO_TOPK_DEFAULT", 12),
+		RecoTopKMax:            getenvInt("RECO_TOPK_MAX", 48),
+		RecoWorkerConcurrency:  getenvInt("RECO_WORKER_CONCURRENCY", 2),
+		RecoWorkerCmd:          recoWorkerCmd,
+		RecoWorkerTimeoutSec:   getenvInt("RECO_WORKER_REQUEST_TIMEOUT_SECONDS", 120),
+		RecoWorkerRestartLimit: getenvInt("RECO_WORKER_RESTART_LIMIT", 10),
+		Siglip2ModelID:         getenv("SIGLIP2_MODEL_ID", "google/siglip2-base-patch16-224"),
+		Siglip2Device:          getenv("SIGLIP2_DEVICE", "cpu"),
 	}
 
 	if cfg.S3Bucket == "" {
@@ -110,26 +97,11 @@ func Load() (Config, error) {
 	if cfg.RecoWorkerConcurrency <= 0 {
 		cfg.RecoWorkerConcurrency = 1
 	}
-	if cfg.RecoMaxRetries <= 0 {
-		cfg.RecoMaxRetries = 5
-	}
-	if cfg.RecoPipelinePrefetch <= 0 {
-		cfg.RecoPipelinePrefetch = 48
-	}
-	if cfg.RecoPipelineMaxBytesMB <= 0 {
-		cfg.RecoPipelineMaxBytesMB = 512
-	}
 	if cfg.RecoWorkerTimeoutSec <= 0 {
 		cfg.RecoWorkerTimeoutSec = 120
 	}
 	if cfg.RecoWorkerRestartLimit <= 0 {
 		cfg.RecoWorkerRestartLimit = 10
-	}
-	if cfg.RecoSyncIntervalSeconds <= 0 {
-		cfg.RecoSyncIntervalSeconds = 600
-	}
-	if cfg.RecoDBPath == "" {
-		return Config{}, fmt.Errorf("RECO_DB_PATH is required")
 	}
 	if cfg.RecoWorkerCmd == "" {
 		return Config{}, fmt.Errorf("RECO_WORKER_CMD is required")

@@ -37,14 +37,16 @@ export type RecommendationItem = {
   src: string
 }
 
+export type RecommendationStatus = 'ready' | 'partial' | 'pending' | 'failed'
+
 export type RecommendationResponse = {
   items: RecommendationItem[]
-  status: 'ready' | 'partial' | 'pending'
+  status: RecommendationStatus
 }
 
 type RawRecommendationResponse = {
   items: RecommendationItem[] | null
-  status: 'ready' | 'partial' | 'pending'
+  status: RecommendationStatus
 }
 
 export async function fetchFeed(params?: { cursor?: string; seed?: string }): Promise<FeedResponse> {

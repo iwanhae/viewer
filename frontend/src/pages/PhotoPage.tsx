@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
-import { AlbumIndex, RecommendationItem, fetchAlbum, fetchRecommendations } from '../api/client'
+import { AlbumIndex, RecommendationItem, RecommendationStatus, fetchAlbum, fetchRecommendations } from '../api/client'
 
 export function PhotoPage() {
   const { albumId = '', photoIndex: rawPhotoIndex = '' } = useParams<{ albumId: string; photoIndex: string }>()
@@ -16,7 +16,7 @@ export function PhotoPage() {
   const [album, setAlbum] = useState<AlbumIndex | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [recommendations, setRecommendations] = useState<RecommendationItem[]>([])
-  const [recommendationStatus, setRecommendationStatus] = useState<'idle' | 'loading' | 'ready' | 'partial' | 'pending'>('idle')
+  const [recommendationStatus, setRecommendationStatus] = useState<RecommendationStatus | 'idle' | 'loading'>('idle')
   const [recommendationError, setRecommendationError] = useState<string | null>(null)
 
   useEffect(() => {
@@ -145,6 +145,9 @@ export function PhotoPage() {
             {recommendationStatus === 'loading' && <p className="photo-recommendations-note">Finding similar images...</p>}
             {recommendationStatus === 'pending' && (
               <p className="photo-recommendations-note">Recommendations are being prepared in background.</p>
+            )}
+            {recommendationStatus === 'failed' && (
+              <p className="photo-recommendations-note">Embedding failed for this photo. Skipping recommendations.</p>
             )}
             {recommendationError && <p className="photo-recommendations-note">Recommendations unavailable right now.</p>}
             {(recommendationStatus === 'ready' || recommendationStatus === 'partial') && recommendations.length === 0 && (

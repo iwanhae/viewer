@@ -113,7 +113,7 @@ def pick_backend() -> Backend:
     raise RuntimeError("no SigLIP2 backend available (" + "; ".join(errors) + ")")
 
 
-def main() -> int:
+def run_worker_mode() -> int:
     backend = None
     backend_error = ""
     try:
@@ -128,27 +128,36 @@ def main() -> int:
         try:
             req = json.loads(line)
             req_id = str(req.get("request_id", ""))
-            image_b64 = req.get("image_b64", "")
+            op = str(req.get("op", "embed"))
             model_id = str(req.get("model_id", "google/siglip2-base-patch16-224"))
             device = str(req.get("device", "cpu"))
-            if not image_b64:
-                raise ValueError("missing image_b64")
+
             if backend_error:
                 raise RuntimeError(backend_error)
             if backend is None:
                 raise RuntimeError("backend not initialized")
 
-            image_bytes = base64.b64decode(image_b64)
-            vector, used_model = backend.embed(image_bytes, model_id, device)
-            resp = {
-                "request_id": req_id,
-                "ok": True,
-                "model": used_model,
-                "embedding": vector,
-            }
+            if op == "ping":
+                resp = {
+                    "request_id": req_id,
+                    "ok": True,
+                    "model": backend.name,
+                }
+            else:
+                image_b64 = req.get("image_b64", "")
+                if not image_b64:
+                    raise ValueError("missing image_b64")
+                image_bytes = base64.b64decode(image_b64)
+                vector, used_model = backend.embed(image_bytes, model_id, device)
+                resp = {
+                    "request_id": req_id,
+                    "ok": True,
+                    "model": used_model,
+                    "embedding": vector,
+                }
         except Exception as exc:
             resp = {
-                "request_id": req.get("request_id", "") if 'req' in locals() else "",
+                "request_id": req.get("request_id", "") if "req" in locals() else "",
                 "ok": False,
                 "error": str(exc),
             }
@@ -156,6 +165,31 @@ def main() -> int:
         sys.stdout.flush()
 
     return 0
+
+
+def run_debug_mode() -> int:
+    image_bytes = sys.stdin.buffer.read()
+    if not image_bytes:
+        sys.stdout.write(json.dumps({"ok": False, "error": "missing stdin image bytes"}) + "\n")
+        return 1
+
+    try:
+        backend = pick_backend()
+        model_id = os.environ.get("SIGLIP2_MODEL_ID", "google/siglip2-base-patch16-224")
+        device = os.environ.get("SIGLIP2_DEVICE", "cpu")
+        vector, used_model = backend.embed(image_bytes, model_id, device)
+        sys.stdout.write(json.dumps({"ok": True, "model": used_model, "embedding": vector}, separators=(",", ":")) + "\n")
+        return 0
+    except Exception as exc:
+        sys.stdout.write(json.dumps({"ok": False, "error": str(exc)}) + "\n")
+        return 1
+
+
+def main() -> int:
+    mode = os.environ.get("RECO_WORKER_MODE", "").strip().lower()
+    if mode == "worker":
+        return run_worker_mode()
+    return run_debug_mode()
 
 
 if __name__ == "__main__":
