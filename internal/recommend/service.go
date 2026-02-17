@@ -300,6 +300,15 @@ func (s *Service) embedAndPersist(ctx context.Context, photo PhotoRecord) error 
 		s.markFailedLocal(photo.ImageID, fmt.Sprintf("persist embedding: %v", err))
 		return fmt.Errorf("persist embedding: %w", err)
 	}
+	log.Printf("recommend: embed success image=%s album=%s model=%s", photo.ImageID, photo.AlbumID, modelID)
+	total, ready, failed, missing := s.albumEmbeddingStats(photo.AlbumID)
+	if missing == 0 {
+		if failed == 0 {
+			log.Printf("recommend: album embedded successfully album=%s total=%d ready=%d", photo.AlbumID, total, ready)
+		} else {
+			log.Printf("recommend: album embedding complete album=%s total=%d ready=%d failed=%d", photo.AlbumID, total, ready, failed)
+		}
+	}
 	return nil
 }
 
@@ -355,6 +364,27 @@ func (s *Service) albumLock(albumID string) *sync.Mutex {
 		s.albumLocks[albumID] = lock
 	}
 	return lock
+}
+
+func (s *Service) albumEmbeddingStats(albumID string) (total int, ready int, failed int, missing int) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, photo := range s.photosByID {
+		if photo.AlbumID != albumID {
+			continue
+		}
+		total++
+		if _, ok := s.embeddingsByID[photo.ImageID]; ok {
+			ready++
+		}
+		if _, ok := s.failedByID[photo.ImageID]; ok {
+			failed++
+		}
+	}
+	if m, ok := s.missingByAlbum[albumID]; ok {
+		missing = len(m)
+	}
+	return total, ready, failed, missing
 }
 
 func (s *Service) Recommend(ctx context.Context, albumID string, photoIndex int, limit int) (RecommendationResponse, error) {

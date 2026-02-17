@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"os/exec"
+	"strings"
 	"sync"
 	"time"
 )
@@ -45,11 +46,17 @@ type embedRequest struct {
 }
 
 type embedResponse struct {
-	RequestID string    `json:"request_id"`
-	OK        bool      `json:"ok"`
-	Error     string    `json:"error,omitempty"`
-	Model     string    `json:"model,omitempty"`
-	Embedding []float32 `json:"embedding,omitempty"`
+	RequestID      string    `json:"request_id"`
+	OK             bool      `json:"ok"`
+	Error          string    `json:"error,omitempty"`
+	ErrorStage     string    `json:"error_stage,omitempty"`
+	Traceback      string    `json:"traceback,omitempty"`
+	Backend        string    `json:"backend,omitempty"`
+	Model          string    `json:"model,omitempty"`
+	ModelID        string    `json:"model_id,omitempty"`
+	Device         string    `json:"device,omitempty"`
+	ImageSizeBytes int       `json:"image_size_bytes,omitempty"`
+	Embedding      []float32 `json:"embedding,omitempty"`
 }
 
 type workerProcess struct {
@@ -147,7 +154,7 @@ func (e *PythonEmbedder) Healthcheck(ctx context.Context) error {
 		if out.Error == "" {
 			out.Error = "worker healthcheck failed"
 		}
-		return errors.New(out.Error)
+		return errors.New(formatWorkerError(out, ""))
 	}
 	return nil
 }
@@ -179,7 +186,7 @@ func (e *PythonEmbedder) Embed(ctx context.Context, imageBytes []byte) ([]float3
 				if out.Error == "" {
 					out.Error = "embedding failed"
 				}
-				return nil, out.Model, errors.New(out.Error)
+				return nil, out.Model, errors.New(formatWorkerError(out, stderr))
 			}
 			if len(out.Embedding) == 0 {
 				return nil, out.Model, fmt.Errorf("worker returned empty embedding")
@@ -385,4 +392,40 @@ func readEmbedResponse(scanner *bufio.Scanner) (embedResponse, error) {
 		return embedResponse{}, err
 	}
 	return embedResponse{}, io.EOF
+}
+
+func formatWorkerError(out embedResponse, stderr string) string {
+	parts := []string{out.Error}
+	if out.ErrorStage != "" {
+		parts = append(parts, "stage="+out.ErrorStage)
+	}
+	if out.Backend != "" {
+		parts = append(parts, "backend="+out.Backend)
+	}
+	if out.Model != "" {
+		parts = append(parts, "model="+out.Model)
+	}
+	if out.ModelID != "" {
+		parts = append(parts, "model_id="+out.ModelID)
+	}
+	if out.Device != "" {
+		parts = append(parts, "device="+out.Device)
+	}
+	if out.ImageSizeBytes > 0 {
+		parts = append(parts, fmt.Sprintf("image_bytes=%d", out.ImageSizeBytes))
+	}
+	if trimmed := strings.TrimSpace(out.Traceback); trimmed != "" {
+		parts = append(parts, "traceback="+truncateText(trimmed, 8<<10))
+	}
+	if trimmed := strings.TrimSpace(stderr); trimmed != "" {
+		parts = append(parts, "stderr="+truncateText(trimmed, 8<<10))
+	}
+	return strings.Join(parts, " ")
+}
+
+func truncateText(value string, max int) string {
+	if max <= 0 || len(value) <= max {
+		return value
+	}
+	return value[:max] + "...(truncated)"
 }
