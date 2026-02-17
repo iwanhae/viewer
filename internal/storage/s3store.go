@@ -186,6 +186,19 @@ func (s *S3Store) HeadObject(ctx context.Context, key string) (bool, int64, erro
 
 func (s *S3Store) ListAlbumIndexKeys(ctx context.Context) ([]string, error) {
 	keys := make([]string, 0, 128)
+	if err := s.ForEachAlbumIndexKey(ctx, func(key string) error {
+		keys = append(keys, key)
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	return keys, nil
+}
+
+func (s *S3Store) ForEachAlbumIndexKey(ctx context.Context, fn func(key string) error) error {
+	if fn == nil {
+		return nil
+	}
 	var token *string
 	for {
 		out, err := s.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
@@ -194,15 +207,18 @@ func (s *S3Store) ListAlbumIndexKeys(ctx context.Context) ([]string, error) {
 			ContinuationToken: token,
 		})
 		if err != nil {
-			return nil, fmt.Errorf("list objects: %w", err)
+			return fmt.Errorf("list objects: %w", err)
 		}
 
 		for _, obj := range out.Contents {
 			if obj.Key == nil {
 				continue
 			}
-			if strings.HasSuffix(*obj.Key, "/index.json") {
-				keys = append(keys, *obj.Key)
+			if !strings.HasSuffix(*obj.Key, "/index.json") {
+				continue
+			}
+			if err := fn(*obj.Key); err != nil {
+				return err
 			}
 		}
 		if out.IsTruncated == nil || !*out.IsTruncated {
@@ -210,5 +226,5 @@ func (s *S3Store) ListAlbumIndexKeys(ctx context.Context) ([]string, error) {
 		}
 		token = out.NextContinuationToken
 	}
-	return keys, nil
+	return nil
 }

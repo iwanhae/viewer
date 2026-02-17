@@ -1,23 +1,20 @@
 #!/usr/bin/env python3
 import base64
-import hashlib
 import io
 import json
-import math
 import os
 import sys
 from typing import List, Tuple
 
-DIM_DEFAULT = 768
 MEAN = [0.48145466, 0.4578275, 0.40821073]
 STD = [0.26862954, 0.26130258, 0.27577711]
 
 
 class Backend:
-    name = "hash-fallback"
+    name = "unknown"
 
     def embed(self, image_bytes: bytes, model_id: str, device: str) -> Tuple[List[float], str]:
-        return deterministic_embedding(image_bytes, DIM_DEFAULT), self.name
+        raise RuntimeError("backend is not initialized")
 
 
 class ONNXBackend(Backend):
@@ -103,42 +100,26 @@ class TransformersBackend(Backend):
         return vec, f"{self.name}:{model_id}"
 
 
-def deterministic_embedding(image_bytes: bytes, dims: int) -> List[float]:
-    if dims <= 0:
-        dims = DIM_DEFAULT
-    values = []
-    seed = hashlib.sha256(image_bytes).digest()
-    current = seed
-    while len(values) < dims:
-        current = hashlib.sha256(current).digest()
-        for i in range(0, len(current), 4):
-            chunk = current[i : i + 4]
-            if len(chunk) < 4:
-                continue
-            raw = int.from_bytes(chunk, "little", signed=False)
-            values.append(((raw % 2000000) / 1000000.0) - 1.0)
-            if len(values) >= dims:
-                break
-    norm = math.sqrt(sum(v * v for v in values))
-    if norm == 0:
-        norm = 1.0
-    return [v / norm for v in values]
-
-
 def pick_backend() -> Backend:
+    errors = []
     try:
         return ONNXBackend()
-    except Exception:
-        pass
+    except Exception as exc:
+        errors.append(f"onnx:{exc}")
     try:
         return TransformersBackend()
-    except Exception:
-        pass
-    return Backend()
+    except Exception as exc:
+        errors.append(f"transformers:{exc}")
+    raise RuntimeError("no SigLIP2 backend available (" + "; ".join(errors) + ")")
 
 
 def main() -> int:
-    backend = pick_backend()
+    backend = None
+    backend_error = ""
+    try:
+        backend = pick_backend()
+    except Exception as exc:
+        backend_error = str(exc)
 
     for raw in sys.stdin:
         line = raw.strip()
@@ -152,6 +133,10 @@ def main() -> int:
             device = str(req.get("device", "cpu"))
             if not image_b64:
                 raise ValueError("missing image_b64")
+            if backend_error:
+                raise RuntimeError(backend_error)
+            if backend is None:
+                raise RuntimeError("backend not initialized")
 
             image_bytes = base64.b64decode(image_b64)
             vector, used_model = backend.embed(image_bytes, model_id, device)

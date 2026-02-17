@@ -324,9 +324,47 @@ func (s *LocalStore) EnqueueIfNeeded(albumID string, photoIndex int) error {
 }
 
 func (s *LocalStore) PendingJobsCount() int {
-	var count int
-	err := s.db.QueryRow(`SELECT COUNT(1) FROM ingest_jobs WHERE status='pending'`).Scan(&count)
+	return s.JobCounts().Pending
+}
+
+func (s *LocalStore) JobCounts() JobQueueCounts {
+	rows, err := s.db.Query(`SELECT status, COUNT(1) FROM ingest_jobs GROUP BY status`)
 	if err != nil {
+		return JobQueueCounts{}
+	}
+	defer rows.Close()
+
+	counts := JobQueueCounts{}
+	for rows.Next() {
+		var status string
+		var count int
+		if err := rows.Scan(&status, &count); err != nil {
+			continue
+		}
+		counts.Total += count
+		switch status {
+		case "pending":
+			counts.Pending = count
+		case "running":
+			counts.Running = count
+		case "failed":
+			counts.Failed = count
+		}
+	}
+	return counts
+}
+
+func (s *LocalStore) BackfillProgress() BackfillProgress {
+	return BackfillProgress{
+		PhotosTotal:     s.countRows(`SELECT COUNT(1) FROM photos_local`),
+		EmbeddingsTotal: s.countRows(`SELECT COUNT(1) FROM embeddings_local`),
+		Queue:           s.JobCounts(),
+	}
+}
+
+func (s *LocalStore) countRows(query string) int {
+	var count int
+	if err := s.db.QueryRow(query).Scan(&count); err != nil {
 		return 0
 	}
 	return count

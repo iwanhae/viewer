@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 )
 
 type PhotoRecord struct {
@@ -62,6 +63,63 @@ type RecommendationItem struct {
 type RecommendationResponse struct {
 	Items  []RecommendationItem `json:"items"`
 	Status string               `json:"status"`
+}
+
+type BackfillOrder string
+
+const (
+	BackfillOrderOldestFirst BackfillOrder = "oldest-first"
+	BackfillOrderNewestFirst BackfillOrder = "newest-first"
+)
+
+type BackfillSeedResult struct {
+	StartedAt        string `json:"startedAt"`
+	FinishedAt       string `json:"finishedAt"`
+	AlbumsDiscovered int    `json:"albumsDiscovered"`
+	AlbumsSynced     int    `json:"albumsSynced"`
+	AlbumsFailed     int    `json:"albumsFailed"`
+	PhotosEnqueued   int    `json:"photosEnqueued"`
+}
+
+type JobQueueCounts struct {
+	Pending int `json:"pending"`
+	Running int `json:"running"`
+	Failed  int `json:"failed"`
+	Total   int `json:"total"`
+}
+
+type BackfillProgress struct {
+	PhotosTotal     int            `json:"photosTotal"`
+	EmbeddingsTotal int            `json:"embeddingsTotal"`
+	Queue           JobQueueCounts `json:"queue"`
+}
+
+type BackfillDrainOptions struct {
+	WorkerCount int           `json:"workerCount"`
+	PollInterval time.Duration `json:"pollInterval"`
+	StableRounds int           `json:"stableRounds"`
+	LogEvery     time.Duration `json:"logEvery"`
+}
+
+type BackfillDrainResult struct {
+	StartedAt      string         `json:"startedAt"`
+	FinishedAt     string         `json:"finishedAt"`
+	Processed      int            `json:"processed"`
+	WorkerFailures int            `json:"workerFailures"`
+	PhotosTotal    int            `json:"photosTotal"`
+	EmbeddingsTotal int           `json:"embeddingsTotal"`
+	Queue          JobQueueCounts `json:"queue"`
+}
+
+func ParseBackfillOrder(raw string) BackfillOrder {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case string(BackfillOrderNewestFirst):
+		return BackfillOrderNewestFirst
+	case string(BackfillOrderOldestFirst):
+		return BackfillOrderOldestFirst
+	default:
+		return BackfillOrderOldestFirst
+	}
 }
 
 func imageID(albumID string, photoIndex int) string {

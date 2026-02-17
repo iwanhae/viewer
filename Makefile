@@ -2,8 +2,9 @@ SHELL := /bin/bash
 .SHELLFLAGS := -eu -o pipefail -c
 
 BIN := bin/viewer
+BIN_BACKFILL := bin/viewer-backfill
 
-.PHONY: build run test clean deps e2e-install
+.PHONY: build run test clean deps e2e-install reco-backfill
 
 build: deps
 	npm --prefix frontend ci
@@ -17,6 +18,15 @@ run: build
 		set +a; \
 	fi; \
 	./$(BIN)
+
+reco-backfill: deps
+	go build -o $(BIN_BACKFILL) ./cmd/viewer-backfill
+	@if [ -f .env ]; then \
+		set -a; \
+		. ./.env; \
+		set +a; \
+	fi; \
+	./$(BIN_BACKFILL)
 
 deps:
 	go mod tidy

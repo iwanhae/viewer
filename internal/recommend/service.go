@@ -104,25 +104,24 @@ func (s *Service) syncOnce(ctx context.Context) {
 		if albumID == "" {
 			continue
 		}
-		if err := s.syncAlbum(ctx, albumID); err != nil {
+		if _, err := s.syncAlbum(ctx, albumID); err != nil {
 			log.Printf("recommend: sync album=%s failed: %v", albumID, err)
 		}
 	}
 	_ = s.store.SetMeta("lastSyncAt", time.Now().UTC().Format(time.RFC3339))
 }
 
-func (s *Service) syncAlbum(ctx context.Context, albumID string) error {
+func (s *Service) syncAlbum(ctx context.Context, albumID string) (int, error) {
 	idx, err := s.albums.GetAlbum(ctx, albumID)
 	if err != nil {
-		return err
+		return 0, err
 	}
-	_, err = s.store.UpsertAlbum(idx)
-	return err
+	return s.store.UpsertAlbum(idx)
 }
 
 func (s *Service) NotifyAlbumFinalized(ctx context.Context, albumID string) {
 	go func() {
-		if err := s.syncAlbum(ctx, albumID); err != nil {
+		if _, err := s.syncAlbum(ctx, albumID); err != nil {
 			log.Printf("recommend: finalize sync failed album=%s err=%v", albumID, err)
 		}
 	}()
@@ -188,7 +187,7 @@ func (s *Service) Recommend(ctx context.Context, albumID string, photoIndex int,
 	}
 
 	if _, ok := s.store.GetPhoto(albumID, photoIndex); !ok {
-		if err := s.syncAlbum(ctx, albumID); err != nil {
+		if _, err := s.syncAlbum(ctx, albumID); err != nil {
 			return RecommendationResponse{}, err
 		}
 	}
