@@ -16,8 +16,7 @@ body,
   min-height: 100%;
   background:
     radial-gradient(circle at 16% 18%, #e8f4ff, transparent 42%),
-    radial-gradient(circle at 82% 10%, #f6efe3, transparent 38%),
-    #f8fbfd;
+    radial-gradient(circle at 82% 10%, #f6efe3, transparent 38%), #f8fbfd;
 }
 
 .wall-page {
@@ -225,7 +224,8 @@ body,
 
 .photo-page {
   min-height: 100vh;
-  padding: max(12px, env(safe-area-inset-top)) 16px max(90px, env(safe-area-inset-bottom));
+  padding: max(12px, env(safe-area-inset-top)) 16px
+    max(90px, env(safe-area-inset-bottom));
 }
 
 .photo-nav-button,
@@ -285,7 +285,7 @@ body,
   width: 100%;
   max-width: 100%;
   max-height: none;
-  border-radius: 0;
+  border-radius: 20px;
   display: block;
   object-fit: cover;
   animation: photo-enter 240ms ease;

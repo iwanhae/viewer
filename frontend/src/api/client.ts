@@ -42,6 +42,11 @@ export type RecommendationResponse = {
   status: 'ready' | 'partial' | 'pending'
 }
 
+type RawRecommendationResponse = {
+  items: RecommendationItem[] | null
+  status: 'ready' | 'partial' | 'pending'
+}
+
 export async function fetchFeed(params?: { cursor?: string; seed?: string }): Promise<FeedResponse> {
   const query = new URLSearchParams({ limit: '80' })
   if (params?.cursor) query.set('cursor', params.cursor)
@@ -101,5 +106,9 @@ export async function fetchRecommendations(
   query.set('limit', String(limit))
   const res = await fetch(`/api/recommendations/${albumId}/${index}?${query.toString()}`)
   if (!res.ok) throw new Error(`fetch recommendations failed: ${res.status}`)
-  return (await res.json()) as RecommendationResponse
+  const data = (await res.json()) as RawRecommendationResponse
+  return {
+    status: data.status,
+    items: Array.isArray(data.items) ? data.items : [],
+  }
 }

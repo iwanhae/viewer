@@ -75,7 +75,7 @@ export function PhotoPage() {
       try {
         const result = await fetchRecommendations(album.albumId, photo.i, 12)
         if (cancelled) return
-        setRecommendations(result.items)
+        setRecommendations(Array.isArray(result.items) ? result.items : [])
         setRecommendationStatus(result.status)
       } catch (err) {
         if (cancelled) return
