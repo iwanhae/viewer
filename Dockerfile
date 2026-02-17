@@ -51,6 +51,7 @@ USER 65532:65532
 ENV PORT=8080 \
     CACHE_DIR=/tmp/viewer-cache/images \
     ZIP_CACHE_DIR=/tmp/viewer-cache/zips \
+    RECOMMENDER_REQUIRED=false \
     RECOMMENDER_LISTEN_ADDR="0.0.0.0:18081" \
     RECOMMENDER_ENDPOINT="http://127.0.0.1:18081"
 

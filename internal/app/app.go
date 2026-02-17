@@ -39,6 +39,20 @@ func Run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("recommendation service init failed: %w", err)
 	}
+	if cfg.RecommenderRequired {
+		healthcheckCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		if err := recommendService.Healthcheck(healthcheckCtx); err != nil {
+			cancel()
+			return fmt.Errorf("recommendation service init failed: %w", err)
+		}
+		cancel()
+	} else {
+		healthcheckCtx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+		if err := recommendService.Healthcheck(healthcheckCtx); err != nil {
+			log.Printf("viewer: recommender unavailable at startup, continuing in degraded mode: %v", err)
+		}
+		cancel()
+	}
 	if err := recommendService.Start(ctx); err != nil {
 		return fmt.Errorf("recommendation startup failed: %w", err)
 	}

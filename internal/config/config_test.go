@@ -57,6 +57,32 @@ func TestLoadRequiresRecommenderEndpoint(t *testing.T) {
 	}
 }
 
+func TestLoadDefaultRecommenderRequired(t *testing.T) {
+	setRequiredEnv(t)
+	t.Setenv("RECOMMENDER_REQUIRED", "")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got, want := cfg.RecommenderRequired, true; got != want {
+		t.Fatalf("RecommenderRequired=%v want=%v", got, want)
+	}
+}
+
+func TestLoadRecommenderRequiredFalse(t *testing.T) {
+	setRequiredEnv(t)
+	t.Setenv("RECOMMENDER_REQUIRED", "false")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got, want := cfg.RecommenderRequired, false; got != want {
+		t.Fatalf("RecommenderRequired=%v want=%v", got, want)
+	}
+}
+
 func TestLoadRecommenderEndpoint(t *testing.T) {
 	setRequiredEnv(t)
 	t.Setenv("RECOMMENDER_ENDPOINT", "http://127.0.0.1:8081")

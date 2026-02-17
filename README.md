@@ -23,6 +23,7 @@ Optional tuning:
   - `RECO_TOPK_MAX` max recommendation count (default `48`).
 - Recommender service:
   - `RECOMMENDER_ENDPOINT` endpoint for the Rust recommender service (example `http://127.0.0.1:18081`).
+  - `RECOMMENDER_REQUIRED` whether startup must fail when recommender is unavailable (`true` in development and compose; `false` in Docker image for first-run model downloads).
   - `RECOMMENDER_CONCURRENCY` number of background embedding workers (default `2`).
   - `RECOMMENDER_REQUEST_TIMEOUT_SECONDS` timeout per embed request (default `120`).
 - `SIGLIP2_MODEL_ID` model identifier for worker backends (default `google/siglip2-base-patch16-224`).

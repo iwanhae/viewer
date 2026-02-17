@@ -42,25 +42,12 @@ type Service struct {
 }
 
 func NewService(cfg cfgpkg.Config, albumsService *albums.Service, imagesService *images.Service, s3Store *storage.S3Store) (*Service, error) {
-	embedder := NewPythonEmbedder(
-		cfg.RecommenderEndpoint,
-		cfg.Siglip2ModelID,
-		cfg.Siglip2Device,
-		time.Duration(cfg.RecommenderTimeoutSec)*time.Second,
-	)
-	healthCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	if err := embedder.Healthcheck(healthCtx); err != nil {
-		_ = embedder.Close()
-		return nil, err
-	}
-
 	return &Service{
 		cfg:            cfg,
 		albums:         albumsService,
 		images:         imagesService,
 		s3:             s3Store,
-		embedder:       embedder,
+		embedder:       NewPythonEmbedder(cfg.RecommenderEndpoint, cfg.Siglip2ModelID, cfg.Siglip2Device, time.Duration(cfg.RecommenderTimeoutSec)*time.Second),
 		photosByID:     make(map[string]PhotoRecord),
 		embeddingsByID: make(map[string]EmbeddingRecord),
 		failedByID:     make(map[string]string),
@@ -68,6 +55,16 @@ func NewService(cfg cfgpkg.Config, albumsService *albums.Service, imagesService 
 		rng:            rand.New(rand.NewSource(time.Now().UnixNano())),
 		albumLocks:     make(map[string]*sync.Mutex),
 	}, nil
+}
+
+func (s *Service) Healthcheck(ctx context.Context) error {
+	if s == nil {
+		return fmt.Errorf("recommendation service is nil")
+	}
+	if s.embedder == nil {
+		return fmt.Errorf("recommendation embedder is not initialized")
+	}
+	return s.embedder.Healthcheck(ctx)
 }
 
 func (s *Service) Start(ctx context.Context) error {
@@ -209,6 +206,13 @@ func (s *Service) workerLoop(ctx context.Context) {
 
 		if err := s.embedAndPersist(ctx, photo); err != nil {
 			log.Printf("recommend: embed failed image=%s err=%v", photo.ImageID, err)
+			if isTransientEmbedError(err) {
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(2 * time.Second):
+				}
+			}
 		}
 	}
 }
@@ -277,6 +281,10 @@ func (s *Service) embedAndPersist(ctx context.Context, photo PhotoRecord) error 
 
 	vector, modelID, err := s.embedder.Embed(ctx, result.Bytes)
 	if err != nil {
+		if isTransientEmbedError(err) {
+			s.requeueMissingPhoto(photo)
+			return fmt.Errorf("embed image: %w", err)
+		}
 		failErr := fmt.Sprintf("embed image: %v", err)
 		if persistErr := s.persistEmbeddingStatus(ctx, photo.AlbumID, photo.PhotoIndex, models.PhotoEmbedding{
 			Status:    embeddingStatusFailed,
@@ -309,6 +317,22 @@ func (s *Service) embedAndPersist(ctx context.Context, photo PhotoRecord) error 
 		}
 	}
 	return nil
+}
+
+func (s *Service) requeueMissingPhoto(photo PhotoRecord) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.photosByID[photo.ImageID]; !ok {
+		return
+	}
+	delete(s.failedByID, photo.ImageID)
+	missing, ok := s.missingByAlbum[photo.AlbumID]
+	if !ok {
+		missing = make(map[int]struct{})
+		s.missingByAlbum[photo.AlbumID] = missing
+	}
+	missing[photo.PhotoIndex] = struct{}{}
 }
 
 func (s *Service) markFailedLocal(imageIDValue string, errText string) {

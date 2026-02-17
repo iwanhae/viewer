@@ -8,7 +8,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -89,6 +91,9 @@ func (e *PythonEmbedder) Healthcheck(ctx context.Context) error {
 		return fmt.Errorf("read ping response: %w", err)
 	}
 	if res.StatusCode != http.StatusOK {
+		if res.StatusCode >= 500 {
+			return workerStatusError{status: res.StatusCode, body: strings.TrimSpace(string(body)), op: "ping"}
+		}
 		return fmt.Errorf("worker ping failed: status=%d body=%s", res.StatusCode, strings.TrimSpace(string(body)))
 	}
 	if len(body) == 0 {
@@ -162,6 +167,10 @@ func (e *PythonEmbedder) sendRequest(ctx context.Context, path string, payload e
 		return embedResponse{}, "", fmt.Errorf("read worker response: %w", err)
 	}
 	if res.StatusCode != http.StatusOK {
+		bodyText := strings.TrimSpace(string(responseBody))
+		if res.StatusCode >= 500 {
+			return embedResponse{}, bodyText, workerStatusError{status: res.StatusCode, body: bodyText, op: strings.TrimPrefix(path, "/")}
+		}
 		return embedResponse{}, string(responseBody), fmt.Errorf("worker request failed: status=%d body=%s", res.StatusCode, strings.TrimSpace(string(responseBody)))
 	}
 	var out embedResponse
@@ -172,6 +181,57 @@ func (e *PythonEmbedder) sendRequest(ctx context.Context, path string, payload e
 		return embedResponse{}, string(responseBody), fmt.Errorf("worker request id mismatch: got=%s want=%s", out.RequestID, payload.RequestID)
 	}
 	return out, string(responseBody), nil
+}
+
+type workerStatusError struct {
+	status int
+	body   string
+	op     string
+}
+
+func (e workerStatusError) Error() string {
+	return fmt.Sprintf("worker %s failed: status=%d body=%s", e.op, e.status, e.body)
+}
+
+func (e workerStatusError) Status() int {
+	return e.status
+}
+
+func isTransientEmbedError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return true
+	}
+
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		return true
+	}
+
+	var statusErr workerStatusError
+	if errors.As(err, &statusErr) && statusErr.Status() >= 500 {
+		return true
+	}
+
+	msg := strings.ToLower(err.Error())
+	if strings.Contains(msg, "connection refused") ||
+		strings.Contains(msg, "connection reset by peer") ||
+		strings.Contains(msg, "no such host") ||
+		strings.Contains(msg, "i/o timeout") ||
+		strings.Contains(msg, "timed out") ||
+		strings.Contains(msg, "broken pipe") ||
+		strings.Contains(msg, "eof") {
+		return true
+	}
+	return false
 }
 
 func (e *PythonEmbedder) nextRequestID() string {

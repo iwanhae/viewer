@@ -25,6 +25,7 @@ type Config struct {
 	RecoTopKDefault        int
 	RecoTopKMax            int
 	RecommenderEndpoint    string
+	RecommenderRequired    bool
 	RecommenderConcurrency int
 	RecommenderTimeoutSec  int
 	Siglip2ModelID         string
@@ -58,6 +59,7 @@ func Load() (Config, error) {
 		RecoTopKDefault:        getenvInt("RECO_TOPK_DEFAULT", 12),
 		RecoTopKMax:            getenvInt("RECO_TOPK_MAX", 48),
 		RecommenderEndpoint:    recommenderEndpoint,
+		RecommenderRequired:    getenvBool("RECOMMENDER_REQUIRED", true),
 		RecommenderConcurrency: getenvInt("RECOMMENDER_CONCURRENCY", 2),
 		RecommenderTimeoutSec:  getenvInt("RECOMMENDER_REQUEST_TIMEOUT_SECONDS", 120),
 		Siglip2ModelID:         getenv("SIGLIP2_MODEL_ID", "google/siglip2-base-patch16-224"),
