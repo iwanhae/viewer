@@ -3,12 +3,20 @@ SHELL := /bin/bash
 
 BIN := bin/viewer
 
-.PHONY: build test clean deps e2e-install
+.PHONY: build run test clean deps e2e-install
 
 build: deps
 	npm --prefix frontend ci
 	npm --prefix frontend run build
 	go build -o $(BIN) ./cmd/viewer
+
+run: build
+	@if [ -f .env ]; then \
+		set -a; \
+		. ./.env; \
+		set +a; \
+	fi; \
+	./$(BIN)
 
 deps:
 	go mod tidy

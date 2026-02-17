@@ -20,7 +20,7 @@ export function ViewerPage() {
   )
   const [error, setError] = useState<string | null>(null)
 
-  const anchorRef = useRef<HTMLDivElement | null>(null)
+  const anchorRef = useRef<HTMLButtonElement | null>(null)
   const anchoredRef = useRef(false)
   const navigate = useNavigate()
 
@@ -88,28 +88,21 @@ export function ViewerPage() {
         {masonryColumns.map((columnPhotos, columnIndex) => (
           <div className="masonry-column" data-testid="masonry-column" key={columnIndex}>
             {columnPhotos.map((photo) => (
-              <div
+              <button
                 key={photo.i}
-                className="tile album-tile"
+                className="tile album-photo-tile"
                 data-testid="album-tile"
                 ref={photo.i === anchorIndex ? anchorRef : null}
+                onClick={() => navigate(`/photo/${album.albumId}/${photo.i}`)}
+                aria-label={`Open details for image ${photo.i + 1}`}
               >
-                <a
-                  className="album-original-link"
-                  href={`/api/image/${album.albumId}/${photo.i}`}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  aria-label={`Open original image ${photo.i + 1}`}
-                  data-testid="album-original-link"
-                >
-                  <img
-                    src={`/api/image/${album.albumId}/${photo.i}?mode=wall&w=${imageWidth}`}
-                    alt=""
-                    loading="lazy"
-                    style={{ aspectRatio: `${photo.w} / ${photo.h}` }}
-                  />
-                </a>
-              </div>
+                <img
+                  src={`/api/image/${album.albumId}/${photo.i}?mode=wall&w=${imageWidth}`}
+                  alt=""
+                  loading="lazy"
+                  style={{ aspectRatio: `${photo.w} / ${photo.h}` }}
+                />
+              </button>
             ))}
           </div>
         ))}
