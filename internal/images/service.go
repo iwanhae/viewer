@@ -98,6 +98,20 @@ func (s *Service) GetImage(ctx context.Context, albumID string, idx int, mode st
 	return ImageResult{Bytes: data, ContentType: contentType}, nil
 }
 
+func (s *Service) GetImageByEntry(ctx context.Context, albumID string, entryName string) (ImageResult, error) {
+	if strings.TrimSpace(albumID) == "" {
+		return ImageResult{}, fmt.Errorf("album id is required")
+	}
+	if strings.TrimSpace(entryName) == "" {
+		return ImageResult{}, fmt.Errorf("entry name is required")
+	}
+	data, contentType, err := s.readEntryBytes(ctx, albumID, entryName)
+	if err != nil {
+		return ImageResult{}, err
+	}
+	return ImageResult{Bytes: data, ContentType: contentType}, nil
+}
+
 func (s *Service) readEntryBytes(ctx context.Context, albumID string, entryName string) ([]byte, string, error) {
 	key := sourceKey(albumID)
 	exists, size, err := s.store.HeadObject(ctx, key)

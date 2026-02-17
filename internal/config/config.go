@@ -29,7 +29,11 @@ type Config struct {
 	RecoTopKMax             int
 	RecoWorkerConcurrency   int
 	RecoMaxRetries          int
+	RecoPipelinePrefetch    int
+	RecoPipelineMaxBytesMB  int
 	RecoWorkerCmd           string
+	RecoWorkerTimeoutSec    int
+	RecoWorkerRestartLimit  int
 	Siglip2ModelID          string
 	Siglip2Device           string
 	VectorBackend           string
@@ -67,7 +71,11 @@ func Load() (Config, error) {
 		RecoTopKMax:             getenvInt("RECO_TOPK_MAX", 48),
 		RecoWorkerConcurrency:   getenvInt("RECO_WORKER_CONCURRENCY", 2),
 		RecoMaxRetries:          getenvInt("RECO_MAX_RETRIES", 5),
+		RecoPipelinePrefetch:    getenvInt("RECO_PIPELINE_PREFETCH", 48),
+		RecoPipelineMaxBytesMB:  getenvInt("RECO_PIPELINE_MAX_BYTES_MB", 512),
 		RecoWorkerCmd:           recoWorkerCmd,
+		RecoWorkerTimeoutSec:    getenvInt("RECO_WORKER_REQUEST_TIMEOUT_SECONDS", 120),
+		RecoWorkerRestartLimit:  getenvInt("RECO_WORKER_RESTART_LIMIT", 10),
 		Siglip2ModelID:          getenv("SIGLIP2_MODEL_ID", "google/siglip2-base-patch16-224"),
 		Siglip2Device:           getenv("SIGLIP2_DEVICE", "cpu"),
 		VectorBackend:           getenv("VECTOR_BACKEND", "embedded"),
@@ -99,6 +107,18 @@ func Load() (Config, error) {
 	}
 	if cfg.RecoMaxRetries <= 0 {
 		cfg.RecoMaxRetries = 5
+	}
+	if cfg.RecoPipelinePrefetch <= 0 {
+		cfg.RecoPipelinePrefetch = 48
+	}
+	if cfg.RecoPipelineMaxBytesMB <= 0 {
+		cfg.RecoPipelineMaxBytesMB = 512
+	}
+	if cfg.RecoWorkerTimeoutSec <= 0 {
+		cfg.RecoWorkerTimeoutSec = 120
+	}
+	if cfg.RecoWorkerRestartLimit <= 0 {
+		cfg.RecoWorkerRestartLimit = 10
 	}
 	if cfg.RecoSyncIntervalSeconds <= 0 {
 		cfg.RecoSyncIntervalSeconds = 600

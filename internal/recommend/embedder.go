@@ -6,8 +6,11 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os/exec"
+	"sync"
 	"time"
 )
 
@@ -16,9 +19,19 @@ type EmbeddingProvider interface {
 }
 
 type PythonEmbedder struct {
-	command string
-	modelID string
-	device  string
+	command        string
+	modelID        string
+	device         string
+	requestTimeout time.Duration
+	restartLimit   int
+
+	reqMu     sync.Mutex
+	stateMu   sync.Mutex
+	proc      *workerProcess
+	started   bool
+	restarts  []time.Time
+	sequence  uint64
+	isClosing bool
 }
 
 type embedRequest struct {
@@ -36,12 +49,130 @@ type embedResponse struct {
 	Embedding []float32 `json:"embedding,omitempty"`
 }
 
-func NewPythonEmbedder(command string, modelID string, device string) *PythonEmbedder {
-	return &PythonEmbedder{command: command, modelID: modelID, device: device}
+type workerProcess struct {
+	cmd     *exec.Cmd
+	stdin   io.WriteCloser
+	scanner *bufio.Scanner
+	stderr  *limitedBuffer
+	done    chan struct{}
+	waitMu  sync.Mutex
+	waitErr error
+}
+
+func (p *workerProcess) setWaitErr(err error) {
+	p.waitMu.Lock()
+	defer p.waitMu.Unlock()
+	p.waitErr = err
+}
+
+func (p *workerProcess) WaitErr() error {
+	p.waitMu.Lock()
+	defer p.waitMu.Unlock()
+	return p.waitErr
+}
+
+func (p *workerProcess) IsDone() bool {
+	select {
+	case <-p.done:
+		return true
+	default:
+		return false
+	}
+}
+
+type limitedBuffer struct {
+	mu  sync.Mutex
+	max int
+	buf []byte
+}
+
+func newLimitedBuffer(max int) *limitedBuffer {
+	if max <= 0 {
+		max = 16 << 10
+	}
+	return &limitedBuffer{max: max}
+}
+
+func (l *limitedBuffer) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if len(p) == 0 {
+		return 0, nil
+	}
+	keep := p
+	if len(keep) > l.max {
+		keep = keep[len(keep)-l.max:]
+	}
+	combined := append(l.buf, keep...)
+	if len(combined) > l.max {
+		combined = combined[len(combined)-l.max:]
+	}
+	l.buf = combined
+	return len(p), nil
+}
+
+func (l *limitedBuffer) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return string(l.buf)
+}
+
+type embedResult struct {
+	out embedResponse
+	err error
+}
+
+func NewPythonEmbedder(command string, modelID string, device string, requestTimeout time.Duration, restartLimit int) *PythonEmbedder {
+	if requestTimeout <= 0 {
+		requestTimeout = 120 * time.Second
+	}
+	if restartLimit <= 0 {
+		restartLimit = 10
+	}
+	return &PythonEmbedder{
+		command:        command,
+		modelID:        modelID,
+		device:         device,
+		requestTimeout: requestTimeout,
+		restartLimit:   restartLimit,
+	}
 }
 
 func (e *PythonEmbedder) Embed(ctx context.Context, imageBytes []byte) ([]float32, string, error) {
-	requestID := fmt.Sprintf("%d", time.Now().UnixNano())
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	requestCtx := ctx
+	cancel := func() {}
+	if e.requestTimeout > 0 {
+		requestCtx, cancel = context.WithTimeout(ctx, e.requestTimeout)
+	}
+	defer cancel()
+
+	var lastErr error
+	for attempt := 0; attempt < 2; attempt++ {
+		vector, modelID, err := e.embedOnce(requestCtx, imageBytes)
+		if err == nil {
+			return vector, modelID, nil
+		}
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, "", err
+		}
+		lastErr = err
+		e.stopProcess()
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("embedding failed")
+	}
+	return nil, "", lastErr
+}
+
+func (e *PythonEmbedder) embedOnce(ctx context.Context, imageBytes []byte) ([]float32, string, error) {
+	e.reqMu.Lock()
+	defer e.reqMu.Unlock()
+
+	requestID := e.nextRequestID()
 	payload := embedRequest{
 		RequestID: requestID,
 		ImageB64:  base64.StdEncoding.EncodeToString(imageBytes),
@@ -53,28 +184,40 @@ func (e *PythonEmbedder) Embed(ctx context.Context, imageBytes []byte) ([]float3
 		return nil, "", fmt.Errorf("encode worker request: %w", err)
 	}
 
-	cmd := exec.CommandContext(ctx, "bash", "-lc", e.command)
-	cmd.Stdin = bytes.NewReader(append(input, '\n'))
-	stdout := new(bytes.Buffer)
-	stderr := new(bytes.Buffer)
-	cmd.Stdout = stdout
-	cmd.Stderr = stderr
-	if err := cmd.Run(); err != nil {
-		return nil, "", fmt.Errorf("worker command failed: %w (stderr=%s)", err, stderr.String())
+	proc, err := e.ensureProcess()
+	if err != nil {
+		return nil, "", err
 	}
 
-	scanner := bufio.NewScanner(bytes.NewReader(stdout.Bytes()))
-	for scanner.Scan() {
-		line := scanner.Bytes()
-		if len(bytes.TrimSpace(line)) == 0 {
-			continue
+	if _, err := proc.stdin.Write(append(input, '\n')); err != nil {
+		stderr := proc.stderr.String()
+		if stderr != "" {
+			return nil, "", fmt.Errorf("write worker request: %w (stderr=%s)", err, stderr)
 		}
-		var out embedResponse
-		if err := json.Unmarshal(line, &out); err != nil {
-			continue
+		return nil, "", fmt.Errorf("write worker request: %w", err)
+	}
+
+	respCh := make(chan embedResult, 1)
+	go func() {
+		out, readErr := readEmbedResponse(proc.scanner)
+		respCh <- embedResult{out: out, err: readErr}
+	}()
+
+	select {
+	case <-ctx.Done():
+		e.stopProcess()
+		return nil, "", ctx.Err()
+	case result := <-respCh:
+		if result.err != nil {
+			stderr := proc.stderr.String()
+			if stderr != "" {
+				return nil, "", fmt.Errorf("read worker output: %w (stderr=%s)", result.err, stderr)
+			}
+			return nil, "", fmt.Errorf("read worker output: %w", result.err)
 		}
+		out := result.out
 		if out.RequestID != requestID {
-			continue
+			return nil, "", fmt.Errorf("worker request id mismatch: got=%s want=%s", out.RequestID, requestID)
 		}
 		if !out.OK {
 			if out.Error == "" {
@@ -91,8 +234,142 @@ func (e *PythonEmbedder) Embed(ctx context.Context, imageBytes []byte) ([]float3
 		}
 		return out.Embedding, modelID, nil
 	}
-	if err := scanner.Err(); err != nil {
-		return nil, "", fmt.Errorf("read worker output: %w", err)
+
+}
+
+func (e *PythonEmbedder) nextRequestID() string {
+	e.sequence++
+	return fmt.Sprintf("%d", e.sequence)
+}
+
+func (e *PythonEmbedder) ensureProcess() (*workerProcess, error) {
+	e.stateMu.Lock()
+	defer e.stateMu.Unlock()
+
+	if e.isClosing {
+		return nil, fmt.Errorf("embedder is closed")
 	}
-	return nil, "", fmt.Errorf("worker produced no parseable response")
+
+	if e.proc != nil && e.proc.IsDone() {
+		e.proc = nil
+	}
+
+	if e.proc != nil {
+		return e.proc, nil
+	}
+
+	if e.started && e.restartLimit > 0 {
+		now := time.Now()
+		cutoff := now.Add(-1 * time.Hour)
+		kept := e.restarts[:0]
+		for _, t := range e.restarts {
+			if t.After(cutoff) {
+				kept = append(kept, t)
+			}
+		}
+		e.restarts = kept
+		if len(e.restarts) >= e.restartLimit {
+			return nil, fmt.Errorf("worker restart limit reached (%d in last hour)", e.restartLimit)
+		}
+		e.restarts = append(e.restarts, now)
+	}
+
+	proc, err := startWorkerProcess(e.command)
+	if err != nil {
+		return nil, err
+	}
+	e.proc = proc
+	e.started = true
+	return e.proc, nil
+}
+
+func (e *PythonEmbedder) stopProcess() {
+	e.stateMu.Lock()
+	proc := e.proc
+	e.proc = nil
+	e.stateMu.Unlock()
+
+	if proc == nil {
+		return
+	}
+	_ = proc.stdin.Close()
+	if proc.cmd.Process != nil {
+		_ = proc.cmd.Process.Kill()
+	}
+	select {
+	case <-proc.done:
+	case <-time.After(2 * time.Second):
+	}
+}
+
+func (e *PythonEmbedder) Close() error {
+	e.stateMu.Lock()
+	e.isClosing = true
+	proc := e.proc
+	e.proc = nil
+	e.stateMu.Unlock()
+	if proc == nil {
+		return nil
+	}
+	_ = proc.stdin.Close()
+	if proc.cmd.Process != nil {
+		_ = proc.cmd.Process.Kill()
+	}
+	select {
+	case <-proc.done:
+	case <-time.After(2 * time.Second):
+	}
+	return nil
+}
+
+func startWorkerProcess(command string) (*workerProcess, error) {
+	cmd := exec.Command("bash", "-lc", command)
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return nil, fmt.Errorf("open worker stdin: %w", err)
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, fmt.Errorf("open worker stdout: %w", err)
+	}
+	stderr := newLimitedBuffer(16 << 10)
+	cmd.Stderr = stderr
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("start worker command: %w", err)
+	}
+
+	scanner := bufio.NewScanner(stdout)
+	scanner.Buffer(make([]byte, 64*1024), 16*1024*1024)
+
+	proc := &workerProcess{
+		cmd:     cmd,
+		stdin:   stdin,
+		scanner: scanner,
+		stderr:  stderr,
+		done:    make(chan struct{}),
+	}
+	go func() {
+		waitErr := cmd.Wait()
+		proc.setWaitErr(waitErr)
+		close(proc.done)
+	}()
+	return proc, nil
+}
+
+func readEmbedResponse(scanner *bufio.Scanner) (embedResponse, error) {
+	for scanner.Scan() {
+		line := bytes.TrimSpace(scanner.Bytes())
+		if len(line) == 0 {
+			continue
+		}
+		var out embedResponse
+		if err := json.Unmarshal(line, &out); err != nil {
+			continue
+		}
+		return out, nil
+	}
+	if err := scanner.Err(); err != nil {
+		return embedResponse{}, err
+	}
+	return embedResponse{}, io.EOF
 }
