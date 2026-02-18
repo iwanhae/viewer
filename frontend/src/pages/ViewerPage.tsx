@@ -3,6 +3,7 @@ import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { useAlbum } from '../hooks/useAlbum'
 import { readColumnPreference, writeColumnPreference } from '../utils/columnPreference'
 import { distributeMasonry } from '../utils/masonry'
+import { readLastWallSeed } from '../utils/wallSeed'
 
 const COLUMN_OPTIONS = [1, 2, 3, 4, 5, 6]
 const VIEWER_COLUMNS_KEY = 'viewer_columns'
@@ -58,6 +59,18 @@ export function ViewerPage() {
     [album?.photos, columnCount],
   )
 
+  const onBackToWall = () => {
+    const seed = readLastWallSeed()
+    if (!seed) {
+      navigate('/')
+      return
+    }
+
+    const query = new URLSearchParams()
+    query.set('seed', seed)
+    navigate(`/?${query.toString()}`)
+  }
+
   if (error) {
     return <div className="viewer-error">{error}</div>
   }
@@ -79,7 +92,7 @@ export function ViewerPage() {
                 className="tile album-photo-tile"
                 data-testid="album-tile"
                 ref={photo.i === anchorIndex ? anchorRef : null}
-                onClick={() => navigate(`/photo/${album.albumId}/${photo.i}`, { state: { album } })}
+                onClick={() => navigate(`/album/${album.albumId}/${photo.i}`, { state: { album } })}
                 aria-label={`Open details for image ${photo.i + 1}`}
               >
                 <img
@@ -110,7 +123,7 @@ export function ViewerPage() {
             </button>
           ))}
         </div>
-        <button className="upload album-back" onClick={() => navigate(-1)} data-testid="album-back">
+        <button className="upload album-back" onClick={onBackToWall} data-testid="album-back">
           Back
         </button>
       </div>

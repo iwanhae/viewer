@@ -137,7 +137,7 @@ export function PhotoPage() {
                   <button
                     key={`${item.albumId}-${item.i}`}
                     className="photo-recommendation-tile"
-                    onClick={() => navigate(`/photo/${item.albumId}/${item.i}`)}
+                    onClick={() => navigate(`/album/${item.albumId}/${item.i}`)}
                     aria-label={`Open similar image ${item.i + 1}`}
                     data-testid="photo-recommendation-tile"
                   >
@@ -155,7 +155,11 @@ export function PhotoPage() {
         </aside>
       </div>
       <div className="photo-bottom-actions">
-        <button className="photo-nav-button" onClick={() => navigate(-1)} data-testid="photo-back">
+        <button
+          className="photo-nav-button"
+          onClick={() => navigate(`/album/${album.albumId}`)}
+          data-testid="photo-back"
+        >
           Back to album
         </button>
         <a

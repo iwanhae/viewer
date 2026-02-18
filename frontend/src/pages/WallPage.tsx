@@ -9,6 +9,7 @@ import {
 import { useFeed } from '../hooks/useFeed'
 import { readColumnPreference, writeColumnPreference } from '../utils/columnPreference'
 import { distributeMasonry } from '../utils/masonry'
+import { writeLastWallSeed } from '../utils/wallSeed'
 
 const columnOptions = [1, 2, 3, 4, 5, 6]
 const WALL_COLUMNS_KEY = 'wall_columns'
@@ -60,6 +61,11 @@ export function WallPage() {
       { replace: true },
     )
   }, [seed, setSearchParams])
+
+  useEffect(() => {
+    if (!seed) return
+    writeLastWallSeed(seed)
+  }, [seed])
 
   const onRefresh = () => {
     if (typeof window !== 'undefined') {

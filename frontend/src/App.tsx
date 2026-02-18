@@ -9,7 +9,7 @@ export default function App() {
       <Routes>
         <Route path="/" element={<WallPage />} />
         <Route path="/album/:albumId" element={<ViewerPage />} />
-        <Route path="/photo/:albumId/:photoIndex" element={<PhotoPage />} />
+        <Route path="/album/:albumId/:photoIndex" element={<PhotoPage />} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>
     </BrowserRouter>
