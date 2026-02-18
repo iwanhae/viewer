@@ -4,6 +4,20 @@ set -eu
 RECOMMENDER_LISTEN_ADDR="${RECOMMENDER_LISTEN_ADDR:-0.0.0.0:18081}"
 export RECOMMENDER_LISTEN_ADDR
 
+if [ -z "${RAYON_NUM_THREADS:-}" ]; then
+    CPU_COUNT="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)"
+    case "$CPU_COUNT" in
+        ''|*[!0-9]*)
+            CPU_COUNT=1
+            ;;
+    esac
+    if [ "$CPU_COUNT" -lt 1 ]; then
+        CPU_COUNT=1
+    fi
+    RAYON_NUM_THREADS="$CPU_COUNT"
+fi
+export RAYON_NUM_THREADS
+
 echo "entrypoint: starting recommender on ${RECOMMENDER_LISTEN_ADDR}" >&2
 /app/recommender &
 RECOMMENDER_PID=$!

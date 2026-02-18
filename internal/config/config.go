@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"runtime"
 	"strconv"
 	"time"
 )
@@ -60,7 +61,7 @@ func Load() (Config, error) {
 		RecoTopKMax:            getenvInt("RECO_TOPK_MAX", 48),
 		RecommenderEndpoint:    recommenderEndpoint,
 		RecommenderRequired:    getenvBool("RECOMMENDER_REQUIRED", true),
-		RecommenderConcurrency: getenvInt("RECOMMENDER_CONCURRENCY", 2),
+		RecommenderConcurrency: getenvInt("RECOMMENDER_CONCURRENCY", defaultRecommenderConcurrency()),
 		RecommenderTimeoutSec:  getenvInt("RECOMMENDER_REQUEST_TIMEOUT_SECONDS", 120),
 		Siglip2ModelID:         getenv("SIGLIP2_MODEL_ID", "google/siglip2-base-patch16-224"),
 		Siglip2Device:          getenv("SIGLIP2_DEVICE", "cpu"),
@@ -91,7 +92,7 @@ func Load() (Config, error) {
 		cfg.RecoTopKMax = 48
 	}
 	if cfg.RecommenderConcurrency <= 0 {
-		cfg.RecommenderConcurrency = 1
+		cfg.RecommenderConcurrency = defaultRecommenderConcurrency()
 	}
 	if cfg.RecommenderTimeoutSec <= 0 {
 		cfg.RecommenderTimeoutSec = 120
@@ -145,4 +146,15 @@ func getenvBool(key string, fallback bool) bool {
 		return fallback
 	}
 	return b
+}
+
+func defaultRecommenderConcurrency() int {
+	workers := runtime.GOMAXPROCS(0) * 3
+	if workers < 8 {
+		return 8
+	}
+	if workers > 64 {
+		return 64
+	}
+	return workers
 }

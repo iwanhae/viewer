@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::env;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 use std::thread;
 
 const DEFAULT_LISTEN_ADDR: &str = "0.0.0.0:18081";
@@ -80,24 +80,29 @@ struct LoadedModel {
 
 #[derive(Debug, Default)]
 struct Worker {
-    models: HashMap<String, LoadedModel>,
+    models: RwLock<HashMap<String, Arc<LoadedModel>>>,
 }
 
 impl Worker {
-    fn ensure_model(&mut self, model_id: &str) -> Result<&LoadedModel> {
-        if !self.models.contains_key(model_id) {
-            let loaded = load_model(model_id)?;
-            self.models.insert(model_id.to_string(), loaded);
+    fn ensure_model(&self, model_id: &str) -> Result<Arc<LoadedModel>> {
+        if let Some(model) = self
+            .models
+            .read()
+            .map_err(|_| anyhow::anyhow!("worker model cache lock poisoned"))?
+            .get(model_id)
+            .cloned()
+        {
+            return Ok(model);
         }
-        self.models
-            .get(model_id)
-            .context("model cache lookup failed after load")
-    }
-
-    fn model(&self, model_id: &str) -> Result<&LoadedModel> {
-        self.models
-            .get(model_id)
-            .with_context(|| format!("model '{model_id}' is not initialized"))
+        let loaded = Arc::new(load_model(model_id)?);
+        let mut guard = self
+            .models
+            .write()
+            .map_err(|_| anyhow::anyhow!("worker model cache lock poisoned"))?;
+        let entry = guard
+            .entry(model_id.to_string())
+            .or_insert_with(|| Arc::clone(&loaded));
+        Ok(Arc::clone(entry))
     }
 
     fn embed(
@@ -107,7 +112,7 @@ impl Worker {
         device: &str,
     ) -> Result<(Vec<f32>, String)> {
         ensure_supported_device(device)?;
-        let loaded = self.model(model_id)?;
+        let loaded = self.ensure_model(model_id)?;
         let pixel_values = preprocess_image(image_bytes, loaded.config.vision_config.image_size)?;
         let features = loaded
             .model
@@ -317,11 +322,7 @@ fn parse_request(stream: &mut TcpStream) -> Result<HttpRequest> {
         reader.read_exact(&mut body)?;
     }
 
-    Ok(HttpRequest {
-        method,
-        path,
-        body,
-    })
+    Ok(HttpRequest { method, path, body })
 }
 
 fn response_to_string(response: &HttpResponse) -> String {
@@ -382,12 +383,16 @@ fn write_json_response(req_id: String, response: EmbedResponse) -> Result<HttpRe
     let body = serde_json::to_vec(&response).context("serialize JSON response")?;
     Ok(HttpResponse {
         status: if response.ok { 200 } else { 500 },
-        reason: if response.ok { "OK" } else { "Internal Server Error" },
+        reason: if response.ok {
+            "OK"
+        } else {
+            "Internal Server Error"
+        },
         body,
     })
 }
 
-fn handle_embed(worker: &Arc<Mutex<Worker>>, config: &RuntimeConfig, body: &[u8]) -> Result<HttpResponse> {
+fn handle_embed(worker: &Arc<Worker>, config: &RuntimeConfig, body: &[u8]) -> Result<HttpResponse> {
     let mut req = parse_embed_request(body)?;
     apply_request_defaults(&mut req, config);
     let op = req.op.to_ascii_lowercase();
@@ -406,8 +411,7 @@ fn handle_embed(worker: &Arc<Mutex<Worker>>, config: &RuntimeConfig, body: &[u8]
                 ),
             )?);
         }
-        let mut guard = worker.lock().map_err(|_| anyhow::anyhow!("worker lock poisoned"))?;
-        if let Err(err) = guard.ensure_model(&req.model_id) {
+        if let Err(err) = worker.ensure_model(&req.model_id) {
             return Ok(write_json_response(
                 req.request_id.clone(),
                 error_response(
@@ -457,8 +461,7 @@ fn handle_embed(worker: &Arc<Mutex<Worker>>, config: &RuntimeConfig, body: &[u8]
     };
     let image_size_bytes = decoded.len();
 
-    let mut guard = worker.lock().map_err(|_| anyhow::anyhow!("worker lock poisoned"))?;
-    if let Err(err) = guard.ensure_model(&req.model_id) {
+    if let Err(err) = worker.ensure_model(&req.model_id) {
         return Ok(write_json_response(
             req.request_id.clone(),
             error_response(
@@ -472,7 +475,7 @@ fn handle_embed(worker: &Arc<Mutex<Worker>>, config: &RuntimeConfig, body: &[u8]
         )?);
     }
     let request_id = req.request_id.clone();
-    let result = guard.embed(&decoded, &req.model_id, &req.device);
+    let result = worker.embed(&decoded, &req.model_id, &req.device);
     match result {
         Ok((embedding, model_id)) => Ok(write_json_response(
             request_id,
@@ -493,7 +496,7 @@ fn handle_embed(worker: &Arc<Mutex<Worker>>, config: &RuntimeConfig, body: &[u8]
 }
 
 fn handle_ping_or_healthz(
-    worker: &Arc<Mutex<Worker>>,
+    worker: &Arc<Worker>,
     config: &RuntimeConfig,
     request_id: &str,
 ) -> Result<HttpResponse> {
@@ -506,8 +509,7 @@ fn handle_ping_or_healthz(
         device: config.device.clone(),
         image_b64: String::new(),
     };
-    let mut guard = worker.lock().map_err(|_| anyhow::anyhow!("worker lock poisoned"))?;
-    guard
+    worker
         .ensure_model(&config.model_id)
         .with_context(|| format!("initialize model '{}'", config.model_id))?;
     Ok(write_json_response(
@@ -516,7 +518,7 @@ fn handle_ping_or_healthz(
     )?)
 }
 
-fn handle_client(mut stream: TcpStream, worker: Arc<Mutex<Worker>>, config: Arc<RuntimeConfig>) {
+fn handle_client(mut stream: TcpStream, worker: Arc<Worker>, config: Arc<RuntimeConfig>) {
     let response = match parse_request(&mut stream) {
         Ok(req) => match (req.method.as_str(), req.path.as_str()) {
             ("GET", "/ping") => {
@@ -538,8 +540,8 @@ fn handle_client(mut stream: TcpStream, worker: Arc<Mutex<Worker>>, config: Arc<
                     })
                 })
             }
-            ("GET", "/healthz") => {
-                handle_ping_or_healthz(&worker, &config, "healthz").unwrap_or_else(|err| {
+            ("GET", "/healthz") => handle_ping_or_healthz(&worker, &config, "healthz")
+                .unwrap_or_else(|err| {
                     let resp = error_response(
                         "healthz".to_string(),
                         err,
@@ -555,30 +557,27 @@ fn handle_client(mut stream: TcpStream, worker: Arc<Mutex<Worker>>, config: Arc<
                             body: write_err.to_string().into_bytes(),
                         }
                     })
-                })
-            }
-            ("POST", "/embed") => {
-                match handle_embed(&worker, &config, &req.body) {
-                    Ok(response) => response,
-                    Err(err) => {
-                        let resp = error_response(
-                            "request".to_string(),
-                            err,
-                            "request",
-                            config.model_id.clone(),
-                            config.device.clone(),
-                            req.body.len(),
-                        );
-                        write_json_response("request".to_string(), resp).unwrap_or_else(|write_err| {
-                            HttpResponse {
-                                status: 500,
-                                reason: "Internal Server Error",
-                                body: write_err.to_string().into_bytes(),
-                            }
-                        })
-                    }
+                }),
+            ("POST", "/embed") => match handle_embed(&worker, &config, &req.body) {
+                Ok(response) => response,
+                Err(err) => {
+                    let resp = error_response(
+                        "request".to_string(),
+                        err,
+                        "request",
+                        config.model_id.clone(),
+                        config.device.clone(),
+                        req.body.len(),
+                    );
+                    write_json_response("request".to_string(), resp).unwrap_or_else(|write_err| {
+                        HttpResponse {
+                            status: 500,
+                            reason: "Internal Server Error",
+                            body: write_err.to_string().into_bytes(),
+                        }
+                    })
                 }
-            }
+            },
             _ => HttpResponse {
                 status: 404,
                 reason: "Not Found",
@@ -608,7 +607,7 @@ fn main() {
         std::process::exit(1);
     }
 
-    let mut worker = Worker::default();
+    let worker = Worker::default();
     if let Err(err) = worker.ensure_model(&config.model_id) {
         let hf_home = env::var("HF_HOME").unwrap_or_else(|_| "<default>".to_string());
         log_error_chain(
@@ -633,7 +632,7 @@ fn main() {
         config.listen_addr, config.model_id, config.device
     );
 
-    let worker = Arc::new(Mutex::new(worker));
+    let worker = Arc::new(worker);
     let config = Arc::new(config);
     for stream in listener.incoming() {
         match stream {
