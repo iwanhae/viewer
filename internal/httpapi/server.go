@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"runtime/debug"
@@ -196,7 +197,7 @@ func (s *Server) getFeed(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) getImage(w http.ResponseWriter, r *http.Request) {
 	albumID := chi.URLParam(r, "albumId")
-	idx, err := parsePathIntParam(r, "index")
+	idx, err := parseNonNegativePathIntParam(r, "index")
 	if err != nil {
 		writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", "invalid image index")
 		return
@@ -226,8 +227,8 @@ func (s *Server) getImage(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) getRecommendations(w http.ResponseWriter, r *http.Request) {
 	albumID := chi.URLParam(r, "albumId")
-	idx, err := parsePathIntParam(r, "index")
-	if err != nil || idx < 0 {
+	idx, err := parseNonNegativePathIntParam(r, "index")
+	if err != nil {
 		writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", "invalid image index")
 		return
 	}
@@ -283,6 +284,9 @@ func jsonBody(r *http.Request, out any) error {
 	if err := dec.Decode(out); err != nil {
 		return fmt.Errorf("invalid body: %w", err)
 	}
+	if err := dec.Decode(&struct{}{}); err != io.EOF {
+		return fmt.Errorf("invalid body: unexpected trailing content")
+	}
 	return nil
 }
 
@@ -291,6 +295,17 @@ func parsePathIntParam(r *http.Request, key string) (int, error) {
 	value, err := strconv.Atoi(raw)
 	if err != nil {
 		return 0, err
+	}
+	return value, nil
+}
+
+func parseNonNegativePathIntParam(r *http.Request, key string) (int, error) {
+	value, err := parsePathIntParam(r, key)
+	if err != nil {
+		return 0, err
+	}
+	if value < 0 {
+		return 0, fmt.Errorf("invalid %s: negative", key)
 	}
 	return value, nil
 }
