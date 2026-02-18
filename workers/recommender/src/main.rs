@@ -172,7 +172,10 @@ fn log_error_chain(prefix: &str, err: &anyhow::Error) {
 }
 
 fn load_model(model_id: &str) -> Result<LoadedModel> {
-    let api = hf_hub::api::sync::Api::new().context("create Hugging Face API client")?;
+    let api = hf_hub::api::sync::ApiBuilder::from_env()
+        .with_progress(false)
+        .build()
+        .context("create Hugging Face API client")?;
     let repo = api.model(model_id.to_string());
     let model_file = repo
         .get("model.safetensors")
