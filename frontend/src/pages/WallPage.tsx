@@ -1,6 +1,12 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
-import { createAlbum, fetchFeed, FeedItem, finalizeAlbum, uploadZip, uploadZipFallback } from '../api/client'
+import {
+  createAlbum,
+  finalizeAlbum,
+  uploadZip,
+  uploadZipFallback,
+} from '../api/client'
+import { useFeed } from '../hooks/useFeed'
 import { readColumnPreference, writeColumnPreference } from '../utils/columnPreference'
 import { distributeMasonry } from '../utils/masonry'
 
@@ -18,19 +24,19 @@ function nextTimestampSeed(currentSeed?: string): string {
 }
 
 export function WallPage() {
-  const [items, setItems] = useState<FeedItem[]>([])
-  const [loading, setLoading] = useState(false)
   const [columns, setColumns] = useState(() =>
     readColumnPreference(WALL_COLUMNS_KEY, columnOptions, DEFAULT_COLUMNS),
   )
-  const [error, setError] = useState<string | null>(null)
+  const [uploadError, setUploadError] = useState<string | null>(null)
   const [uploading, setUploading] = useState(false)
 
   const fileInputRef = useRef<HTMLInputElement | null>(null)
-  const loadingRef = useRef(false)
   const navigate = useNavigate()
   const [searchParams, setSearchParams] = useSearchParams()
   const seed = searchParams.get('seed') ?? ''
+
+  const { items, loading, error: feedError, refetch } = useFeed(seed)
+  const error = uploadError ?? feedError
 
   const masonryColumns = useMemo(
     () =>
@@ -42,34 +48,18 @@ export function WallPage() {
     [columns, items],
   )
 
-  const loadFeed = useCallback(async (seedValue: string) => {
-    if (loadingRef.current) return
-    loadingRef.current = true
-    setLoading(true)
-    setError(null)
-    try {
-      const data = await fetchFeed({ seed: seedValue })
-      setItems(data.items)
-    } catch (err) {
-      setError((err as Error).message)
-    } finally {
-      loadingRef.current = false
-      setLoading(false)
-    }
-  }, [])
-
   useEffect(() => {
-    if (!seed) {
-      const nextSeed = nextTimestampSeed()
-      setSearchParams((prev) => {
+    if (seed) return
+    const nextSeed = nextTimestampSeed()
+    setSearchParams(
+      (prev) => {
         const next = new URLSearchParams(prev)
         next.set('seed', nextSeed)
         return next
-      }, { replace: true })
-      return
-    }
-    void loadFeed(seed)
-  }, [loadFeed, seed, setSearchParams])
+      },
+      { replace: true },
+    )
+  }, [seed, setSearchParams])
 
   const onRefresh = () => {
     if (typeof window !== 'undefined') {
@@ -88,7 +78,7 @@ export function WallPage() {
     if (!file) return
 
     setUploading(true)
-    setError(null)
+    setUploadError(null)
     try {
       const created = await createAlbum(file)
       try {
@@ -99,17 +89,20 @@ export function WallPage() {
       await finalizeAlbum(created.albumId)
 
       if (seed) {
-        await loadFeed(seed)
+        await refetch()
       } else {
         const nextSeed = nextTimestampSeed()
-        setSearchParams((prev) => {
-          const next = new URLSearchParams(prev)
-          next.set('seed', nextSeed)
-          return next
-        }, { replace: true })
+        setSearchParams(
+          (prev) => {
+            const next = new URLSearchParams(prev)
+            next.set('seed', nextSeed)
+            return next
+          },
+          { replace: true },
+        )
       }
     } catch (err) {
-      setError((err as Error).message)
+      setUploadError((err as Error).message)
     } finally {
       setUploading(false)
       if (event.target) event.target.value = ''
@@ -125,13 +118,7 @@ export function WallPage() {
               <button
                 className="tile"
                 key={`${item.albumId}-${item.i}-${idx}`}
-                onClick={() => {
-                  if (typeof window !== 'undefined') {
-                    window.location.assign(`/album/${item.albumId}`)
-                    return
-                  }
-                  navigate(`/album/${item.albumId}`)
-                }}
+                onClick={() => navigate(`/album/${item.albumId}`)}
                 data-testid="wall-tile"
               >
                 <img
@@ -170,7 +157,12 @@ export function WallPage() {
         >
           Refresh
         </button>
-        <button className="upload" onClick={() => fileInputRef.current?.click()} disabled={uploading} data-testid="upload-button">
+        <button
+          className="upload"
+          onClick={() => fileInputRef.current?.click()}
+          disabled={uploading}
+          data-testid="upload-button"
+        >
           {uploading ? 'Uploading...' : '+'}
         </button>
         <input

@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
-import { AlbumIndex, fetchAlbum, getCachedAlbum } from '../api/client'
+import { useAlbum } from '../hooks/useAlbum'
 import { readColumnPreference, writeColumnPreference } from '../utils/columnPreference'
 import { distributeMasonry } from '../utils/masonry'
 
@@ -14,41 +14,18 @@ export function ViewerPage() {
   const initialIndexValue = Number(params.get('i') ?? '0')
   const initialIndex = Number.isFinite(initialIndexValue) ? initialIndexValue : 0
 
-  const cachedAlbum = useMemo(() => getCachedAlbum(albumId), [albumId])
-  const [album, setAlbum] = useState<AlbumIndex | null>(cachedAlbum)
+  const { album, loading, error } = useAlbum(albumId)
   const [columnCount, setColumnCount] = useState(() =>
     readColumnPreference(VIEWER_COLUMNS_KEY, COLUMN_OPTIONS, DEFAULT_COLUMNS),
   )
-  const [error, setError] = useState<string | null>(null)
 
   const anchorRef = useRef<HTMLButtonElement | null>(null)
   const anchoredRef = useRef(false)
   const navigate = useNavigate()
 
   useEffect(() => {
-    setAlbum(cachedAlbum)
-    setError(null)
     anchoredRef.current = false
-
-    if (cachedAlbum) {
-      return
-    }
-
-    let cancelled = false
-    void (async () => {
-      try {
-        const fetched = await fetchAlbum(albumId)
-        if (!cancelled) {
-          setAlbum(fetched)
-        }
-      } catch (err) {
-        if (!cancelled) setError((err as Error).message)
-      }
-    })()
-    return () => {
-      cancelled = true
-    }
-  }, [albumId, cachedAlbum])
+  }, [albumId])
 
   const anchorIndex = useMemo(() => {
     if (!album) return null
@@ -75,6 +52,7 @@ export function ViewerPage() {
     if (estimated > 2048) return 2048
     return estimated
   }, [columnCount])
+
   const masonryColumns = useMemo(
     () => distributeMasonry(album?.photos ?? [], columnCount, (photo) => photo.h / Math.max(photo.w, 1)),
     [album?.photos, columnCount],
@@ -82,6 +60,9 @@ export function ViewerPage() {
 
   if (error) {
     return <div className="viewer-error">{error}</div>
+  }
+  if (loading && !album) {
+    return <div className="viewer-loading">Loading album...</div>
   }
   if (!album) {
     return <div className="viewer-loading">Loading album...</div>

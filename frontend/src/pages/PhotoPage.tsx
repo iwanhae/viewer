@@ -1,9 +1,14 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useMemo } from 'react'
 import { useLocation, useNavigate, useParams } from 'react-router-dom'
-import { AlbumIndex, RecommendationItem, RecommendationStatus, fetchAlbum, fetchRecommendations, getCachedAlbum, seedCachedAlbum } from '../api/client'
+import { seedCachedAlbum, type AlbumIndex } from '../api/client'
+import { useAlbum } from '../hooks/useAlbum'
+import { useRecommendations } from '../hooks/useRecommendations'
 
 export function PhotoPage() {
-  const { albumId = '', photoIndex: rawPhotoIndex = '' } = useParams<{ albumId: string; photoIndex: string }>()
+  const { albumId = '', photoIndex: rawPhotoIndex = '' } = useParams<{
+    albumId: string
+    photoIndex: string
+  }>()
   const navigate = useNavigate()
   const location = useLocation()
 
@@ -14,12 +19,6 @@ export function PhotoPage() {
     return parsed
   }, [rawPhotoIndex])
 
-  const [album, setAlbum] = useState<AlbumIndex | null>(null)
-  const [error, setError] = useState<string | null>(null)
-  const [recommendations, setRecommendations] = useState<RecommendationItem[]>([])
-  const [recommendationStatus, setRecommendationStatus] = useState<RecommendationStatus | 'idle' | 'loading'>('idle')
-  const [recommendationError, setRecommendationError] = useState<string | null>(null)
-  const cachedAlbum = useMemo(() => getCachedAlbum(albumId), [albumId])
   const locationAlbum = useMemo(() => {
     const state = location.state as { album?: AlbumIndex } | null
     const candidate = state?.album
@@ -30,46 +29,13 @@ export function PhotoPage() {
     return candidate
   }, [location.state, albumId])
 
-  useEffect(() => {
-    const seeded = locationAlbum ?? cachedAlbum
-    setAlbum(seeded)
-    setError(null)
-
-    if (!albumId) {
-      setError('Missing album ID')
-      return
-    }
-    if (photoIndex === null) {
-      setError('Invalid photo index')
-      return
-    }
-
-    if (seeded) {
-      return
-    }
-
-    let cancelled = false
-    void (async () => {
-      try {
-        const fetched = await fetchAlbum(albumId)
-        if (!cancelled) {
-          setAlbum(fetched)
-        }
-      } catch (err) {
-        if (!cancelled) {
-          setError((err as Error).message)
-        }
-      }
-    })()
-    return () => {
-      cancelled = true
-    }
-  }, [albumId, photoIndex, locationAlbum, cachedAlbum])
+  const { album, loading, error } = useAlbum(albumId, locationAlbum)
 
   const photo = useMemo(() => {
     if (!album || photoIndex === null) return null
     return album.photos.find((item) => item.i === photoIndex) ?? null
   }, [album, photoIndex])
+
   const createdAtLabel = useMemo(() => {
     if (!album) return ''
     const parsed = new Date(album.createdAt)
@@ -77,36 +43,23 @@ export function PhotoPage() {
     return parsed.toLocaleString()
   }, [album])
 
-  useEffect(() => {
-    if (!album || !photo) {
-      setRecommendations([])
-      setRecommendationStatus('idle')
-      setRecommendationError(null)
-      return
-    }
-    let cancelled = false
-    setRecommendationStatus('loading')
-    setRecommendationError(null)
-    void (async () => {
-      try {
-        const result = await fetchRecommendations(album.albumId, photo.i, 12)
-        if (cancelled) return
-        setRecommendations(Array.isArray(result.items) ? result.items : [])
-        setRecommendationStatus(result.status)
-      } catch (err) {
-        if (cancelled) return
-        setRecommendations([])
-        setRecommendationStatus('idle')
-        setRecommendationError((err as Error).message)
-      }
-    })()
-    return () => {
-      cancelled = true
-    }
-  }, [album, photo])
+  const {
+    items: recommendations,
+    status: recommendationStatus,
+    error: recommendationError,
+  } = useRecommendations(album?.albumId ?? '', photo?.i ?? null, 12)
 
+  if (!albumId) {
+    return <div className="photo-error">Missing album ID</div>
+  }
+  if (photoIndex === null) {
+    return <div className="photo-error">Invalid photo index</div>
+  }
   if (error) {
     return <div className="photo-error">{error}</div>
+  }
+  if (loading && !album) {
+    return <div className="photo-loading">Loading photo...</div>
   }
   if (!album) {
     return <div className="photo-loading">Loading photo...</div>
@@ -158,17 +111,26 @@ export function PhotoPage() {
           </dl>
           <section className="photo-recommendations" data-testid="photo-recommendations">
             <h2 className="photo-recommendations-title">Similar images</h2>
-            {recommendationStatus === 'loading' && <p className="photo-recommendations-note">Finding similar images...</p>}
+            {recommendationStatus === 'loading' && (
+              <p className="photo-recommendations-note">Finding similar images...</p>
+            )}
             {recommendationStatus === 'pending' && (
-              <p className="photo-recommendations-note">Recommendations are being prepared in background.</p>
+              <p className="photo-recommendations-note">
+                Recommendations are being prepared in background.
+              </p>
             )}
             {recommendationStatus === 'failed' && (
-              <p className="photo-recommendations-note">Embedding failed for this photo. Skipping recommendations.</p>
+              <p className="photo-recommendations-note">
+                Embedding failed for this photo. Skipping recommendations.
+              </p>
             )}
-            {recommendationError && <p className="photo-recommendations-note">Recommendations unavailable right now.</p>}
-            {(recommendationStatus === 'ready' || recommendationStatus === 'partial') && recommendations.length === 0 && (
-              <p className="photo-recommendations-note">No similar images found yet.</p>
+            {recommendationError && (
+              <p className="photo-recommendations-note">Recommendations unavailable right now.</p>
             )}
+            {(recommendationStatus === 'ready' || recommendationStatus === 'partial') &&
+              recommendations.length === 0 && (
+                <p className="photo-recommendations-note">No similar images found yet.</p>
+              )}
             {recommendations.length > 0 && (
               <div className="photo-recommendation-grid">
                 {recommendations.map((item) => (
