@@ -73,9 +73,8 @@ func Run(ctx context.Context) error {
 		case <-ctx.Done():
 			return
 		case <-warmupDone:
-		case <-time.After(30 * time.Second):
-			log.Printf("viewer: warmup still running after 30s, starting recommendation workers")
 		}
+		log.Printf("viewer: warmup completed, starting recommendation workers")
 		if err := recommendService.Start(ctx); err != nil {
 			log.Printf("viewer: recommendation startup failed: %v", err)
 			return
