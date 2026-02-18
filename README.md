@@ -41,12 +41,16 @@ Recommendation vectors are persisted in each album's `albums/<album-id>/index.js
 
 In the Docker image, the container entrypoint starts both the Rust recommender service and the Go server.
 The image prefetches `config.json` and `model.safetensors` for `SIGLIP2_MODEL_ID` at build time, so pod startup does not require Hugging Face egress.
-To use a different model in Docker, build with `--build-arg SIGLIP2_MODEL_ID=<repo-id>`.
+CI publishes a reusable model base image (`model-siglip2-base-patch16-224`) and app images can reuse it with `--build-arg MODEL_BASE_IMAGE=<registry/repo:tag>`.
+Local `docker build` keeps working without overrides by defaulting `MODEL_BASE_IMAGE` to the in-file `model-base` stage.
+To use a different model in Docker, build with `--build-arg SIGLIP2_MODEL_ID=<repo-id>` and publish a corresponding model base image tag.
 
 ## Commands
-- `make build` builds `bin/viewer` and `bin/recommender`.
-- `make test` runs Playwright e2e and saves screenshots to `samples/`.
+- `make build` runs `go mod tidy`, builds `bin/recommender` in release mode, builds frontend assets, and compiles `bin/viewer`.
+- `make test` runs `make build`, then `go test ./...`, then Playwright e2e and saves screenshots to `samples/` by default.
 - `make test` binds the app to `TEST_PORT` (default `18080`) and sets `E2E_BASE_URL` automatically.
+- `make run` starts `bin/viewer` (loads `.env` if present, does not rebuild binaries).
+- `make clean` removes build outputs and dependency caches.
 
 ## Observability
 - The server logs to stdout/stderr via Go's standard logger.

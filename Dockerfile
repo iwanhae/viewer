@@ -1,5 +1,6 @@
 # syntax=docker/dockerfile:1.7
 ARG SIGLIP2_MODEL_ID=google/siglip2-base-patch16-224
+ARG MODEL_BASE_IMAGE=model-base
 
 FROM node:22-bookworm-slim AS frontend-build
 WORKDIR /src
@@ -47,7 +48,7 @@ for filename in ("config.json", "model.safetensors"):
     hf_hub_download(repo_id=model_id, filename=filename)
 PY
 
-FROM debian:bookworm-slim AS runtime
+FROM debian:bookworm-slim AS model-base
 ARG SIGLIP2_MODEL_ID
 WORKDIR /app
 
@@ -55,14 +56,19 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
-COPY --from=backend-build /out/viewer /app/viewer
-COPY --from=recommender-build /out/recommender /app/recommender
 COPY --from=model-prefetch --chown=65532:65532 /opt/hf-home /tmp/hf-home
-COPY docker/entrypoint.sh /app/entrypoint.sh
 
 RUN mkdir -p /tmp/viewer-cache/images /tmp/viewer-cache/zips && \
-    chmod +x /app/entrypoint.sh && \
-    chown -R 65532:65532 /app /tmp/viewer-cache
+    chown -R 65532:65532 /app /tmp/viewer-cache /tmp/hf-home
+
+FROM ${MODEL_BASE_IMAGE} AS runtime
+ARG SIGLIP2_MODEL_ID
+
+COPY --from=backend-build --chown=65532:65532 /out/viewer /app/viewer
+COPY --from=recommender-build --chown=65532:65532 /out/recommender /app/recommender
+COPY --chown=65532:65532 docker/entrypoint.sh /app/entrypoint.sh
+
+RUN chmod +x /app/entrypoint.sh
 
 USER 65532:65532
 
