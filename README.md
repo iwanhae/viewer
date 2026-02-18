@@ -39,6 +39,8 @@ Rust worker resolves model files through the Hugging Face cache (`HF_HOME`), dow
 
 Recommendation vectors are persisted in each album's `albums/<album-id>/index.json` under an `embeddings` section.
 Background embedding now runs album-by-album: workers pick a random album with missing vectors, embed all pending photos in that album, then persist metadata in one write.
+Recommendation responses are cross-album only: photos from the same album as the query are excluded from results.
+If no cross-album neighbors exist for an embedded query photo, the recommendation status returns `ready` with an empty `items` list.
 
 In the Docker image, the container entrypoint starts both the Rust recommender service and the Go server.
 The image prefetches `config.json` and `model.safetensors` for `SIGLIP2_MODEL_ID` at build time, so pod startup does not require Hugging Face egress.

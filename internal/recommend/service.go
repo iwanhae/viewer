@@ -531,7 +531,14 @@ func (s *Service) Recommend(ctx context.Context, albumID string, photoIndex int,
 		return RecommendationResponse{Items: nil, Status: "pending"}, nil
 	}
 
+	// Recommendations are cross-album only: exclude the query photo and all
+	// photos from the same album.
 	exclude := map[string]struct{}{queryID: {}}
+	for id, photo := range s.photosByID {
+		if photo.AlbumID == albumID {
+			exclude[id] = struct{}{}
+		}
+	}
 	neighbors := findNeighbors(s.embeddingsByID, queryEmbedding.Vector, limit+1, exclude)
 	items := make([]RecommendationItem, 0, limit)
 	for _, n := range neighbors {
@@ -554,9 +561,7 @@ func (s *Service) Recommend(ctx context.Context, albumID string, photoIndex int,
 	s.mu.RUnlock()
 
 	status := "ready"
-	if len(items) == 0 {
-		status = "pending"
-	} else if len(items) < limit {
+	if len(items) > 0 && len(items) < limit {
 		status = "partial"
 	}
 	return RecommendationResponse{Items: items, Status: status}, nil

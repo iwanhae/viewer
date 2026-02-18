@@ -1,6 +1,7 @@
 package recommend
 
 import (
+	"context"
 	"math/rand"
 	"testing"
 )
@@ -108,5 +109,108 @@ func TestRequeueMissingPhotosRestoresPendingSet(t *testing.T) {
 	}
 	if _, ok := s.failedByID[imageID("album-a", 1)]; ok {
 		t.Fatalf("expected stale failure marker for photo 1 to be removed")
+	}
+}
+
+func TestRecommendExcludesSameAlbumAndReturnsPartial(t *testing.T) {
+	s := &Service{
+		photosByID: map[string]PhotoRecord{
+			imageID("album-a", 0): {ImageID: imageID("album-a", 0), AlbumID: "album-a", PhotoIndex: 0},
+			imageID("album-a", 1): {ImageID: imageID("album-a", 1), AlbumID: "album-a", PhotoIndex: 1},
+			imageID("album-b", 0): {ImageID: imageID("album-b", 0), AlbumID: "album-b", PhotoIndex: 0},
+			imageID("album-c", 0): {ImageID: imageID("album-c", 0), AlbumID: "album-c", PhotoIndex: 0},
+		},
+		embeddingsByID: map[string]EmbeddingRecord{
+			imageID("album-a", 0): {ImageID: imageID("album-a", 0), Vector: []float32{1, 0}},
+			imageID("album-a", 1): {ImageID: imageID("album-a", 1), Vector: []float32{1, 0}},
+			imageID("album-b", 0): {ImageID: imageID("album-b", 0), Vector: []float32{0.95, 0.05}},
+			imageID("album-c", 0): {ImageID: imageID("album-c", 0), Vector: []float32{0.7, 0.3}},
+		},
+		failedByID: make(map[string]string),
+	}
+
+	resp, err := s.Recommend(context.Background(), "album-a", 0, 3)
+	if err != nil {
+		t.Fatalf("recommend failed: %v", err)
+	}
+	if resp.Status != "partial" {
+		t.Fatalf("expected partial status, got %q", resp.Status)
+	}
+	if len(resp.Items) != 2 {
+		t.Fatalf("expected 2 cross-album items, got %d", len(resp.Items))
+	}
+	for _, item := range resp.Items {
+		if item.AlbumID == "album-a" {
+			t.Fatalf("same-album recommendation leaked: %+v", item)
+		}
+	}
+	if resp.Items[0].AlbumID != "album-b" || resp.Items[1].AlbumID != "album-c" {
+		t.Fatalf("unexpected recommendation order: %+v", resp.Items)
+	}
+}
+
+func TestRecommendReturnsReadyWhenOnlySameAlbumCandidates(t *testing.T) {
+	s := &Service{
+		photosByID: map[string]PhotoRecord{
+			imageID("album-a", 0): {ImageID: imageID("album-a", 0), AlbumID: "album-a", PhotoIndex: 0},
+			imageID("album-a", 1): {ImageID: imageID("album-a", 1), AlbumID: "album-a", PhotoIndex: 1},
+		},
+		embeddingsByID: map[string]EmbeddingRecord{
+			imageID("album-a", 0): {ImageID: imageID("album-a", 0), Vector: []float32{1, 0}},
+			imageID("album-a", 1): {ImageID: imageID("album-a", 1), Vector: []float32{0.9, 0.1}},
+		},
+		failedByID: make(map[string]string),
+	}
+
+	resp, err := s.Recommend(context.Background(), "album-a", 0, 12)
+	if err != nil {
+		t.Fatalf("recommend failed: %v", err)
+	}
+	if resp.Status != "ready" {
+		t.Fatalf("expected ready status for filtered-empty result, got %q", resp.Status)
+	}
+	if len(resp.Items) != 0 {
+		t.Fatalf("expected no recommendations, got %d", len(resp.Items))
+	}
+}
+
+func TestRecommendPendingWhenQueryEmbeddingMissing(t *testing.T) {
+	s := &Service{
+		photosByID: map[string]PhotoRecord{
+			imageID("album-a", 0): {ImageID: imageID("album-a", 0), AlbumID: "album-a", PhotoIndex: 0},
+			imageID("album-b", 0): {ImageID: imageID("album-b", 0), AlbumID: "album-b", PhotoIndex: 0},
+		},
+		embeddingsByID: map[string]EmbeddingRecord{
+			imageID("album-b", 0): {ImageID: imageID("album-b", 0), Vector: []float32{1, 0}},
+		},
+		failedByID: make(map[string]string),
+	}
+
+	resp, err := s.Recommend(context.Background(), "album-a", 0, 12)
+	if err != nil {
+		t.Fatalf("recommend failed: %v", err)
+	}
+	if resp.Status != "pending" {
+		t.Fatalf("expected pending status, got %q", resp.Status)
+	}
+}
+
+func TestRecommendFailedWhenQueryEmbeddingFailed(t *testing.T) {
+	s := &Service{
+		photosByID: map[string]PhotoRecord{
+			imageID("album-a", 0): {ImageID: imageID("album-a", 0), AlbumID: "album-a", PhotoIndex: 0},
+		},
+		embeddingsByID: make(map[string]EmbeddingRecord),
+		failedByID: map[string]string{
+			imageID("album-a", 0): "embed failed",
+		},
+	}
+
+	resp, err := s.Recommend(context.Background(), "album-a", 0, 12)
+	if err != nil {
+		t.Fatalf("recommend failed: %v", err)
+	}
+	if resp.Status != "failed" {
+		t.Fatalf("expected failed status, got %q", resp.Status)
 	}
 }
