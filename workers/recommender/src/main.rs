@@ -5,12 +5,15 @@ use candle::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::siglip;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{hash_map::Entry, HashMap};
 use std::env;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, RwLock};
 use std::thread;
+use std::time::Instant;
+use tracing::{debug, error, info, warn};
+use tracing_subscriber::EnvFilter;
 
 #[cfg(feature = "mkl")]
 #[allow(clippy::too_many_arguments)]
@@ -133,6 +136,7 @@ pub unsafe extern "C" fn hgemm_(
 const DEFAULT_LISTEN_ADDR: &str = "0.0.0.0:18081";
 const DEFAULT_MODEL_ID: &str = "google/siglip2-base-patch16-224";
 const DEFAULT_DEVICE: &str = "cpu";
+const DEFAULT_LOG_FILTER: &str = "info,recommender=info";
 const BACKEND_NAME: &str = "siglip2-candle";
 
 #[derive(Debug, Clone)]
@@ -210,17 +214,28 @@ impl Worker {
             .get(model_id)
             .cloned()
         {
+            debug!(model_id = %model_id, "model cache hit");
             return Ok(model);
         }
+        info!(model_id = %model_id, "model cache miss; loading model");
         let loaded = Arc::new(load_model(model_id)?);
         let mut guard = self
             .models
             .write()
             .map_err(|_| anyhow::anyhow!("worker model cache lock poisoned"))?;
-        let entry = guard
-            .entry(model_id.to_string())
-            .or_insert_with(|| Arc::clone(&loaded));
-        Ok(Arc::clone(entry))
+        match guard.entry(model_id.to_string()) {
+            Entry::Occupied(entry) => {
+                debug!(
+                    model_id = %model_id,
+                    "model cache filled by another thread while loading"
+                );
+                Ok(Arc::clone(entry.get()))
+            }
+            Entry::Vacant(entry) => {
+                info!(model_id = %model_id, "model loaded");
+                Ok(Arc::clone(entry.insert(loaded)))
+            }
+        }
     }
 
     fn embed(
@@ -277,6 +292,18 @@ fn env_or_default(key: &str, fallback: &str) -> String {
     }
 }
 
+fn init_logging() -> Result<()> {
+    let env_filter = EnvFilter::try_from_default_env()
+        .or_else(|_| EnvFilter::try_new(DEFAULT_LOG_FILTER))
+        .context("build logging filter")?;
+    tracing_subscriber::fmt()
+        .with_env_filter(env_filter)
+        .compact()
+        .try_init()
+        .map_err(|err| anyhow::anyhow!("initialize tracing subscriber: {err}"))?;
+    Ok(())
+}
+
 fn ensure_supported_device(device: &str) -> Result<()> {
     let normalized = device.trim();
     if normalized.is_empty() || normalized.eq_ignore_ascii_case("cpu") {
@@ -288,13 +315,14 @@ fn ensure_supported_device(device: &str) -> Result<()> {
 }
 
 fn log_error_chain(prefix: &str, err: &anyhow::Error) {
-    eprintln!("{prefix}: {err}");
+    error!(error = %err, "{prefix}");
     for (idx, cause) in err.chain().skip(1).enumerate() {
-        eprintln!("  caused_by[{}]: {}", idx + 1, cause);
+        error!(cause_index = idx + 1, cause = %cause, "error cause");
     }
 }
 
 fn load_model(model_id: &str) -> Result<LoadedModel> {
+    info!(model_id = %model_id, "resolving model artifacts");
     let api = hf_hub::api::sync::ApiBuilder::from_env()
         .with_progress(false)
         .build()
@@ -319,6 +347,7 @@ fn load_model(model_id: &str) -> Result<LoadedModel> {
     .with_context(|| format!("load model weights from {}", model_file.display()))?;
     let model = siglip::Model::new(&config, vb).context("initialize SigLIP model")?;
 
+    info!(model_id = %model_id, "model artifacts loaded");
     Ok(LoadedModel { model, config })
 }
 
@@ -511,12 +540,28 @@ fn write_json_response(req_id: String, response: EmbedResponse) -> Result<HttpRe
 }
 
 fn handle_embed(worker: &Arc<Worker>, config: &RuntimeConfig, body: &[u8]) -> Result<HttpResponse> {
+    let request_started = Instant::now();
     let mut req = parse_embed_request(body)?;
     apply_request_defaults(&mut req, config);
     let op = req.op.to_ascii_lowercase();
+    info!(
+        request_id = %req.request_id,
+        op = %op,
+        model_id = %req.model_id,
+        device = %req.device,
+        "handling embed request"
+    );
 
     if op == "ping" {
         if let Err(err) = ensure_supported_device(&req.device) {
+            warn!(
+                request_id = %req.request_id,
+                model_id = %req.model_id,
+                device = %req.device,
+                stage = "request",
+                error = %err,
+                "ping request failed validation"
+            );
             return Ok(write_json_response(
                 req.request_id.clone(),
                 error_response(
@@ -530,6 +575,14 @@ fn handle_embed(worker: &Arc<Worker>, config: &RuntimeConfig, body: &[u8]) -> Re
             )?);
         }
         if let Err(err) = worker.ensure_model(&req.model_id) {
+            error!(
+                request_id = %req.request_id,
+                model_id = %req.model_id,
+                device = %req.device,
+                stage = "init",
+                error = %err,
+                "ping request failed model initialization"
+            );
             return Ok(write_json_response(
                 req.request_id.clone(),
                 error_response(
@@ -542,12 +595,27 @@ fn handle_embed(worker: &Arc<Worker>, config: &RuntimeConfig, body: &[u8]) -> Re
                 ),
             )?);
         }
+        info!(
+            request_id = %req.request_id,
+            model_id = %req.model_id,
+            device = %req.device,
+            elapsed_ms = request_started.elapsed().as_millis() as u64,
+            "ping operation succeeded"
+        );
         return Ok(write_json_response(
             req.request_id.clone(),
             ping_response(&req),
         )?);
     }
     if op != "embed" {
+        warn!(
+            request_id = %req.request_id,
+            op = %op,
+            model_id = %req.model_id,
+            device = %req.device,
+            stage = "request",
+            "unsupported embed operation"
+        );
         return Ok(write_json_response(
             req.request_id.clone(),
             error_response(
@@ -564,6 +632,14 @@ fn handle_embed(worker: &Arc<Worker>, config: &RuntimeConfig, body: &[u8]) -> Re
     let decoded = match decode_image_b64(&req.image_b64) {
         Ok(decoded) => decoded,
         Err(err) => {
+            warn!(
+                request_id = %req.request_id,
+                model_id = %req.model_id,
+                device = %req.device,
+                stage = "decode",
+                error = %err,
+                "failed to decode image payload"
+            );
             return Ok(write_json_response(
                 req.request_id.clone(),
                 error_response(
@@ -578,8 +654,24 @@ fn handle_embed(worker: &Arc<Worker>, config: &RuntimeConfig, body: &[u8]) -> Re
         }
     };
     let image_size_bytes = decoded.len();
+    debug!(
+        request_id = %req.request_id,
+        model_id = %req.model_id,
+        device = %req.device,
+        image_size_bytes,
+        "decoded image payload"
+    );
 
     if let Err(err) = worker.ensure_model(&req.model_id) {
+        error!(
+            request_id = %req.request_id,
+            model_id = %req.model_id,
+            device = %req.device,
+            image_size_bytes,
+            stage = "init",
+            error = %err,
+            "failed to initialize model for embed request"
+        );
         return Ok(write_json_response(
             req.request_id.clone(),
             error_response(
@@ -593,23 +685,49 @@ fn handle_embed(worker: &Arc<Worker>, config: &RuntimeConfig, body: &[u8]) -> Re
         )?);
     }
     let request_id = req.request_id.clone();
+    let inference_started = Instant::now();
     let result = worker.embed(&decoded, &req.model_id, &req.device);
     match result {
-        Ok((embedding, model_id)) => Ok(write_json_response(
-            request_id,
-            success_response(&req, model_id, embedding),
-        )?),
-        Err(err) => Ok(write_json_response(
-            request_id.clone(),
-            error_response(
-                request_id,
-                err,
-                "inference",
-                req.model_id.clone(),
-                req.device.clone(),
+        Ok((embedding, model_id)) => {
+            info!(
+                request_id = %request_id,
+                model_id = %req.model_id,
+                device = %req.device,
                 image_size_bytes,
-            ),
-        )?),
+                embedding_len = embedding.len(),
+                inference_elapsed_ms = inference_started.elapsed().as_millis() as u64,
+                elapsed_ms = request_started.elapsed().as_millis() as u64,
+                "embed inference succeeded"
+            );
+            Ok(write_json_response(
+                request_id,
+                success_response(&req, model_id, embedding),
+            )?)
+        }
+        Err(err) => {
+            error!(
+                request_id = %request_id,
+                model_id = %req.model_id,
+                device = %req.device,
+                image_size_bytes,
+                stage = "inference",
+                error = %err,
+                inference_elapsed_ms = inference_started.elapsed().as_millis() as u64,
+                elapsed_ms = request_started.elapsed().as_millis() as u64,
+                "embed inference failed"
+            );
+            Ok(write_json_response(
+                request_id.clone(),
+                error_response(
+                    request_id,
+                    err,
+                    "inference",
+                    req.model_id.clone(),
+                    req.device.clone(),
+                    image_size_bytes,
+                ),
+            )?)
+        }
     }
 }
 
@@ -618,6 +736,13 @@ fn handle_ping_or_healthz(
     config: &RuntimeConfig,
     request_id: &str,
 ) -> Result<HttpResponse> {
+    let started = Instant::now();
+    debug!(
+        request_id = %request_id,
+        model_id = %config.model_id,
+        device = %config.device,
+        "handling health check request"
+    );
     ensure_supported_device(&config.device).context("validate startup device")?;
 
     let req = EmbedRequest {
@@ -630,79 +755,147 @@ fn handle_ping_or_healthz(
     worker
         .ensure_model(&config.model_id)
         .with_context(|| format!("initialize model '{}'", config.model_id))?;
-    Ok(write_json_response(
-        request_id.to_string(),
-        ping_response(&req),
-    )?)
+    info!(
+        request_id = %request_id,
+        model_id = %config.model_id,
+        device = %config.device,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "health check request succeeded"
+    );
+    Ok(write_json_response(request_id.to_string(), ping_response(&req))?)
 }
 
 fn handle_client(mut stream: TcpStream, worker: Arc<Worker>, config: Arc<RuntimeConfig>) {
+    let request_started = Instant::now();
+    let mut method = "UNKNOWN".to_string();
+    let mut path = "UNKNOWN".to_string();
     let response = match parse_request(&mut stream) {
-        Ok(req) => match (req.method.as_str(), req.path.as_str()) {
-            ("GET", "/ping") => {
-                handle_ping_or_healthz(&worker, &config, "ping").unwrap_or_else(|err| {
-                    let resp = error_response(
-                        "ping".to_string(),
-                        err,
-                        "ping",
-                        config.model_id.clone(),
-                        config.device.clone(),
-                        0,
-                    );
-                    write_json_response("ping".to_string(), resp).unwrap_or_else(|write_err| {
-                        HttpResponse {
-                            status: 500,
-                            reason: "Internal Server Error",
-                            body: write_err.to_string().into_bytes(),
-                        }
-                    })
-                })
-            }
-            ("GET", "/healthz") => handle_ping_or_healthz(&worker, &config, "healthz")
-                .unwrap_or_else(|err| {
-                    let resp = error_response(
-                        "healthz".to_string(),
-                        err,
-                        "healthz",
-                        config.model_id.clone(),
-                        config.device.clone(),
-                        0,
-                    );
-                    write_json_response("healthz".to_string(), resp).unwrap_or_else(|write_err| {
-                        HttpResponse {
-                            status: 500,
-                            reason: "Internal Server Error",
-                            body: write_err.to_string().into_bytes(),
-                        }
-                    })
-                }),
-            ("POST", "/embed") => match handle_embed(&worker, &config, &req.body) {
-                Ok(response) => response,
-                Err(err) => {
-                    let resp = error_response(
-                        "request".to_string(),
-                        err,
-                        "request",
-                        config.model_id.clone(),
-                        config.device.clone(),
-                        req.body.len(),
-                    );
-                    write_json_response("request".to_string(), resp).unwrap_or_else(|write_err| {
-                        HttpResponse {
-                            status: 500,
-                            reason: "Internal Server Error",
-                            body: write_err.to_string().into_bytes(),
-                        }
+        Ok(req) => {
+            method = req.method.clone();
+            path = req.path.clone();
+            info!(
+                method = %method,
+                path = %path,
+                body_len = req.body.len(),
+                "received HTTP request"
+            );
+            match (req.method.as_str(), req.path.as_str()) {
+                ("GET", "/ping") => {
+                    handle_ping_or_healthz(&worker, &config, "ping").unwrap_or_else(|err| {
+                        error!(
+                            method = "GET",
+                            path = "/ping",
+                            stage = "ping",
+                            error = %err,
+                            "failed to serve /ping"
+                        );
+                        let resp = error_response(
+                            "ping".to_string(),
+                            err,
+                            "ping",
+                            config.model_id.clone(),
+                            config.device.clone(),
+                            0,
+                        );
+                        write_json_response("ping".to_string(), resp).unwrap_or_else(|write_err| {
+                            error!(
+                                method = "GET",
+                                path = "/ping",
+                                stage = "serialize_response",
+                                error = %write_err,
+                                "failed to serialize /ping error response"
+                            );
+                            HttpResponse {
+                                status: 500,
+                                reason: "Internal Server Error",
+                                body: write_err.to_string().into_bytes(),
+                            }
+                        })
                     })
                 }
-            },
-            _ => HttpResponse {
-                status: 404,
-                reason: "Not Found",
-                body: b"{\"ok\":false,\"error\":\"not found\"}".to_vec(),
-            },
-        },
+                ("GET", "/healthz") => handle_ping_or_healthz(&worker, &config, "healthz")
+                    .unwrap_or_else(|err| {
+                        error!(
+                            method = "GET",
+                            path = "/healthz",
+                            stage = "healthz",
+                            error = %err,
+                            "failed to serve /healthz"
+                        );
+                        let resp = error_response(
+                            "healthz".to_string(),
+                            err,
+                            "healthz",
+                            config.model_id.clone(),
+                            config.device.clone(),
+                            0,
+                        );
+                        write_json_response("healthz".to_string(), resp).unwrap_or_else(
+                            |write_err| {
+                                error!(
+                                    method = "GET",
+                                    path = "/healthz",
+                                    stage = "serialize_response",
+                                    error = %write_err,
+                                    "failed to serialize /healthz error response"
+                                );
+                                HttpResponse {
+                                    status: 500,
+                                    reason: "Internal Server Error",
+                                    body: write_err.to_string().into_bytes(),
+                                }
+                            },
+                        )
+                    }),
+                ("POST", "/embed") => match handle_embed(&worker, &config, &req.body) {
+                    Ok(response) => response,
+                    Err(err) => {
+                        error!(
+                            method = "POST",
+                            path = "/embed",
+                            stage = "request",
+                            body_len = req.body.len(),
+                            error = %err,
+                            "failed to process /embed request"
+                        );
+                        let resp = error_response(
+                            "request".to_string(),
+                            err,
+                            "request",
+                            config.model_id.clone(),
+                            config.device.clone(),
+                            req.body.len(),
+                        );
+                        write_json_response("request".to_string(), resp).unwrap_or_else(
+                            |write_err| {
+                                error!(
+                                    method = "POST",
+                                    path = "/embed",
+                                    stage = "serialize_response",
+                                    error = %write_err,
+                                    "failed to serialize /embed error response"
+                                );
+                                HttpResponse {
+                                    status: 500,
+                                    reason: "Internal Server Error",
+                                    body: write_err.to_string().into_bytes(),
+                                }
+                            },
+                        )
+                    }
+                },
+                _ => {
+                    warn!(method = %req.method, path = %req.path, status = 404, "route not found");
+                    HttpResponse {
+                        status: 404,
+                        reason: "Not Found",
+                        body: b"{\"ok\":false,\"error\":\"not found\"}".to_vec(),
+                    }
+                }
+            }
+        }
         Err(err) => {
+            warn!(status = 400, error = %err, "failed to parse HTTP request");
             let body = format!("{{\"ok\":false,\"error\":\"{err}\"}}");
             HttpResponse {
                 status: 400,
@@ -712,16 +905,35 @@ fn handle_client(mut stream: TcpStream, worker: Arc<Worker>, config: Arc<Runtime
         }
     };
 
+    let status = response.status;
+    let elapsed_ms = request_started.elapsed().as_millis() as u64;
     if let Err(err) = send_response(&mut stream, response) {
-        eprintln!("failed to write response: {err}");
+        warn!(
+            method = %method,
+            path = %path,
+            status,
+            elapsed_ms,
+            error = %err,
+            "failed to write HTTP response"
+        );
+        return;
     }
+    info!(method = %method, path = %path, status, elapsed_ms, "request completed");
 }
 
 fn main() {
+    if let Err(err) = init_logging() {
+        panic!("failed to initialize logging: {err}");
+    }
+
     let config = RuntimeConfig::from_env();
 
     if let Err(err) = ensure_supported_device(&config.device) {
-        eprintln!("unsupported startup device '{}': {err}", config.device);
+        error!(
+            device = %config.device,
+            error = %err,
+            "unsupported startup device"
+        );
         std::process::exit(1);
     }
 
@@ -741,13 +953,19 @@ fn main() {
     let listener = match TcpListener::bind(&config.listen_addr) {
         Ok(listener) => listener,
         Err(err) => {
-            eprintln!("failed to bind {}: {err}", config.listen_addr);
+            error!(
+                listen_addr = %config.listen_addr,
+                error = %err,
+                "failed to bind listener"
+            );
             std::process::exit(1);
         }
     };
-    eprintln!(
-        "recommender listening on {} with model '{}' (device '{}')",
-        config.listen_addr, config.model_id, config.device
+    info!(
+        listen_addr = %config.listen_addr,
+        model_id = %config.model_id,
+        device = %config.device,
+        "recommender listening"
     );
 
     let worker = Arc::new(worker);
@@ -760,7 +978,7 @@ fn main() {
                 thread::spawn(move || handle_client(stream, worker, config));
             }
             Err(err) => {
-                eprintln!("failed to accept connection: {err}");
+                warn!(error = %err, "failed to accept connection");
             }
         }
     }
