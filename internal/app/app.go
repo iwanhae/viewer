@@ -53,9 +53,6 @@ func Run(ctx context.Context) error {
 		}
 		cancel()
 	}
-	if err := recommendService.Start(ctx); err != nil {
-		return fmt.Errorf("recommendation startup failed: %w", err)
-	}
 	log.Printf("viewer: recommendation service enabled")
 
 	h := httpapi.New(albumService, feedService, imageService, recommendService, cfg.MaxUploadBytes).Router()
@@ -66,7 +63,25 @@ func Run(ctx context.Context) error {
 	}
 	log.Printf("viewer: starting HTTP server on %s", srv.Addr)
 	log.Printf("viewer: startup warmup running in background")
-	go httpapi.Warmup(ctx, albumService, recommendService)
+	warmupDone := make(chan struct{})
+	go func() {
+		httpapi.Warmup(ctx, albumService, recommendService)
+		close(warmupDone)
+	}()
+	go func() {
+		select {
+		case <-ctx.Done():
+			return
+		case <-warmupDone:
+		case <-time.After(30 * time.Second):
+			log.Printf("viewer: warmup still running after 30s, starting recommendation workers")
+		}
+		if err := recommendService.Start(ctx); err != nil {
+			log.Printf("viewer: recommendation startup failed: %v", err)
+			return
+		}
+		log.Printf("viewer: recommendation background workers started")
+	}()
 
 	return srv.ListenAndServe()
 }

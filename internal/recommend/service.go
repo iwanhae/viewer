@@ -2,10 +2,10 @@ package recommend
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log"
 	"math/rand"
+	"sort"
 	"strconv"
 	"sync"
 	"time"
@@ -39,6 +39,8 @@ type Service struct {
 
 	albumLockMu sync.Mutex
 	albumLocks  map[string]*sync.Mutex
+
+	imageLoadSem chan struct{}
 }
 
 func NewService(cfg cfgpkg.Config, albumsService *albums.Service, imagesService *images.Service, s3Store *storage.S3Store) (*Service, error) {
@@ -54,6 +56,7 @@ func NewService(cfg cfgpkg.Config, albumsService *albums.Service, imagesService 
 		missingByAlbum: make(map[string]map[int]struct{}),
 		rng:            rand.New(rand.NewSource(time.Now().UnixNano())),
 		albumLocks:     make(map[string]*sync.Mutex),
+		imageLoadSem:   make(chan struct{}, 1),
 	}, nil
 }
 
@@ -194,7 +197,7 @@ func (s *Service) workerLoop(ctx context.Context) {
 		default:
 		}
 
-		photo, ok := s.claimRandomMissingPhoto()
+		albumID, photos, ok := s.claimRandomMissingAlbum()
 		if !ok {
 			select {
 			case <-ctx.Done():
@@ -204,8 +207,8 @@ func (s *Service) workerLoop(ctx context.Context) {
 			continue
 		}
 
-		if err := s.embedAndPersist(ctx, photo); err != nil {
-			log.Printf("recommend: embed failed image=%s err=%v", photo.ImageID, err)
+		if err := s.embedAlbumAndPersist(ctx, albumID, photos); err != nil {
+			log.Printf("recommend: album embed failed album=%s claimed=%d err=%v", albumID, len(photos), err)
 			if isTransientEmbedError(err) {
 				select {
 				case <-ctx.Done():
@@ -217,9 +220,10 @@ func (s *Service) workerLoop(ctx context.Context) {
 	}
 }
 
-func (s *Service) claimRandomMissingPhoto() (PhotoRecord, bool) {
+func (s *Service) claimRandomMissingAlbum() (string, []PhotoRecord, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
 	albumsWithMissing := make([]string, 0, len(s.missingByAlbum))
 	for albumID, missing := range s.missingByAlbum {
 		if len(missing) > 0 {
@@ -227,112 +231,191 @@ func (s *Service) claimRandomMissingPhoto() (PhotoRecord, bool) {
 		}
 	}
 	if len(albumsWithMissing) == 0 {
-		return PhotoRecord{}, false
+		return "", nil, false
 	}
 
 	s.rngMu.Lock()
 	albumID := albumsWithMissing[s.rng.Intn(len(albumsWithMissing))]
+	s.rngMu.Unlock()
+
 	missing := s.missingByAlbum[albumID]
 	indexes := make([]int, 0, len(missing))
 	for idx := range missing {
 		indexes = append(indexes, idx)
 	}
-	photoIndex := indexes[s.rng.Intn(len(indexes))]
-	s.rngMu.Unlock()
+	sort.Ints(indexes)
 
-	delete(missing, photoIndex)
-	photo, ok := s.photosByID[imageID(albumID, photoIndex)]
-	if !ok {
-		return PhotoRecord{}, false
+	photos := make([]PhotoRecord, 0, len(indexes))
+	for _, photoIndex := range indexes {
+		delete(missing, photoIndex)
+		photo, ok := s.photosByID[imageID(albumID, photoIndex)]
+		if !ok {
+			continue
+		}
+		photos = append(photos, photo)
 	}
-	return photo, true
+	if len(photos) == 0 {
+		return "", nil, false
+	}
+	return albumID, photos, true
 }
 
-func (s *Service) embedAndPersist(ctx context.Context, photo PhotoRecord) error {
-	idx, err := s.readAlbumIndex(ctx, photo.AlbumID)
-	if err != nil {
-		s.markFailedLocal(photo.ImageID, err.Error())
-		return err
-	}
-
-	current := idx.Embeddings[embeddingIndexKey(photo.PhotoIndex)]
-	if current.Status == embeddingStatusReady && len(current.Vector) > 0 {
-		s.applyAlbumIndex(*idx)
-		return nil
-	}
-	if current.Status == embeddingStatusFailed {
-		s.applyAlbumIndex(*idx)
+func (s *Service) embedAlbumAndPersist(ctx context.Context, albumID string, photos []PhotoRecord) error {
+	if albumID == "" || len(photos) == 0 {
 		return nil
 	}
 
-	result, err := s.images.GetImageByEntry(ctx, photo.AlbumID, photo.EntryName)
+	startedAt := time.Now()
+
+	idx, err := s.readAlbumIndex(ctx, albumID)
 	if err != nil {
-		failErr := fmt.Sprintf("load image bytes: %v", err)
-		if persistErr := s.persistEmbeddingStatus(ctx, photo.AlbumID, photo.PhotoIndex, models.PhotoEmbedding{
-			Status:    embeddingStatusFailed,
-			Error:     failErr,
-			UpdatedAt: time.Now().UTC().Format(time.RFC3339),
-		}); persistErr != nil {
-			s.markFailedLocal(photo.ImageID, failErr)
-			return fmt.Errorf("%s; persist failed: %w", failErr, persistErr)
-		}
-		return errors.New(failErr)
+		s.requeueMissingPhotos(albumID, photoIndexesFromRecords(photos))
+		return fmt.Errorf("read album index: %w", err)
 	}
 
-	vector, modelID, err := s.embedder.Embed(ctx, result.Bytes)
-	if err != nil {
-		if isTransientEmbedError(err) {
-			s.requeueMissingPhoto(photo)
-			return fmt.Errorf("embed image: %w", err)
+	targets := make([]PhotoRecord, 0, len(photos))
+	for _, photo := range photos {
+		current := idx.Embeddings[embeddingIndexKey(photo.PhotoIndex)]
+		if current.Status == embeddingStatusReady && len(current.Vector) > 0 {
+			continue
 		}
-		failErr := fmt.Sprintf("embed image: %v", err)
-		if persistErr := s.persistEmbeddingStatus(ctx, photo.AlbumID, photo.PhotoIndex, models.PhotoEmbedding{
-			Status:    embeddingStatusFailed,
-			Error:     failErr,
-			UpdatedAt: time.Now().UTC().Format(time.RFC3339),
-		}); persistErr != nil {
-			s.markFailedLocal(photo.ImageID, failErr)
-			return fmt.Errorf("%s; persist failed: %w", failErr, persistErr)
+		if current.Status == embeddingStatusFailed {
+			continue
 		}
-		return errors.New(failErr)
+		targets = append(targets, photo)
+	}
+	if len(targets) == 0 {
+		s.applyAlbumIndex(*idx)
+		return nil
 	}
 
-	entry := models.PhotoEmbedding{
-		Status:    embeddingStatusReady,
-		Vector:    vector,
-		Model:     modelID,
-		UpdatedAt: time.Now().UTC().Format(time.RFC3339),
+	updates := make(map[int]models.PhotoEmbedding, len(targets))
+	transientIndexes := make([]int, 0, len(targets))
+	readyCount := 0
+	failedCount := 0
+
+	for _, photo := range targets {
+		if err := s.acquireImageLoadSlot(ctx); err != nil {
+			s.requeueMissingPhotos(albumID, photoIndexesFromRecords(targets))
+			return fmt.Errorf("wait for image download slot: %w", err)
+		}
+		result, err := s.images.GetImageByEntry(ctx, albumID, photo.EntryName)
+		s.releaseImageLoadSlot()
+		if err != nil {
+			failedCount++
+			updates[photo.PhotoIndex] = models.PhotoEmbedding{
+				Status:    embeddingStatusFailed,
+				Error:     fmt.Sprintf("load image bytes: %v", err),
+				UpdatedAt: time.Now().UTC().Format(time.RFC3339),
+			}
+			continue
+		}
+
+		vector, modelID, err := s.embedder.Embed(ctx, result.Bytes)
+		if err != nil {
+			if isTransientEmbedError(err) {
+				transientIndexes = append(transientIndexes, photo.PhotoIndex)
+				continue
+			}
+			failedCount++
+			updates[photo.PhotoIndex] = models.PhotoEmbedding{
+				Status:    embeddingStatusFailed,
+				Error:     fmt.Sprintf("embed image: %v", err),
+				UpdatedAt: time.Now().UTC().Format(time.RFC3339),
+			}
+			continue
+		}
+
+		readyCount++
+		updates[photo.PhotoIndex] = models.PhotoEmbedding{
+			Status:    embeddingStatusReady,
+			Vector:    vector,
+			Model:     modelID,
+			UpdatedAt: time.Now().UTC().Format(time.RFC3339),
+		}
 	}
-	if err := s.persistEmbeddingStatus(ctx, photo.AlbumID, photo.PhotoIndex, entry); err != nil {
-		s.markFailedLocal(photo.ImageID, fmt.Sprintf("persist embedding: %v", err))
-		return fmt.Errorf("persist embedding: %w", err)
+
+	if err := s.persistEmbeddingStatuses(ctx, albumID, updates); err != nil {
+		s.requeueMissingPhotos(albumID, photoIndexesFromRecords(targets))
+		return fmt.Errorf("persist album embeddings: %w", err)
 	}
-	log.Printf("recommend: embed success image=%s album=%s model=%s", photo.ImageID, photo.AlbumID, modelID)
-	total, ready, failed, missing := s.albumEmbeddingStats(photo.AlbumID)
+
+	s.requeueMissingPhotos(albumID, transientIndexes)
+
+	log.Printf(
+		"recommend: album embed batch album=%s claimed=%d processed=%d ready=%d failed=%d retry=%d duration=%s",
+		albumID,
+		len(photos),
+		len(targets),
+		readyCount,
+		failedCount,
+		len(transientIndexes),
+		time.Since(startedAt).Round(time.Millisecond),
+	)
+
+	total, ready, failed, missing := s.albumEmbeddingStats(albumID)
 	if missing == 0 {
 		if failed == 0 {
-			log.Printf("recommend: album embedded successfully album=%s total=%d ready=%d", photo.AlbumID, total, ready)
+			log.Printf("recommend: album embedded successfully album=%s total=%d ready=%d", albumID, total, ready)
 		} else {
-			log.Printf("recommend: album embedding complete album=%s total=%d ready=%d failed=%d", photo.AlbumID, total, ready, failed)
+			log.Printf("recommend: album embedding complete album=%s total=%d ready=%d failed=%d", albumID, total, ready, failed)
 		}
 	}
 	return nil
 }
 
-func (s *Service) requeueMissingPhoto(photo PhotoRecord) {
+func (s *Service) acquireImageLoadSlot(ctx context.Context) error {
+	if s.imageLoadSem == nil {
+		return nil
+	}
+	select {
+	case s.imageLoadSem <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (s *Service) releaseImageLoadSlot() {
+	if s.imageLoadSem == nil {
+		return
+	}
+	select {
+	case <-s.imageLoadSem:
+	default:
+	}
+}
+
+func photoIndexesFromRecords(photos []PhotoRecord) []int {
+	indexes := make([]int, 0, len(photos))
+	for _, photo := range photos {
+		indexes = append(indexes, photo.PhotoIndex)
+	}
+	return indexes
+}
+
+func (s *Service) requeueMissingPhotos(albumID string, photoIndexes []int) {
+	if albumID == "" || len(photoIndexes) == 0 {
+		return
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if _, ok := s.photosByID[photo.ImageID]; !ok {
-		return
-	}
-	delete(s.failedByID, photo.ImageID)
-	missing, ok := s.missingByAlbum[photo.AlbumID]
+	missing, ok := s.missingByAlbum[albumID]
 	if !ok {
 		missing = make(map[int]struct{})
-		s.missingByAlbum[photo.AlbumID] = missing
+		s.missingByAlbum[albumID] = missing
 	}
-	missing[photo.PhotoIndex] = struct{}{}
+
+	for _, photoIndex := range photoIndexes {
+		imageIDValue := imageID(albumID, photoIndex)
+		if _, ok := s.photosByID[imageIDValue]; !ok {
+			continue
+		}
+		delete(s.failedByID, imageIDValue)
+		missing[photoIndex] = struct{}{}
+	}
 }
 
 func (s *Service) markFailedLocal(imageIDValue string, errText string) {
@@ -361,7 +444,11 @@ func (s *Service) readAlbumIndex(ctx context.Context, albumID string) (*models.A
 	return &idx, nil
 }
 
-func (s *Service) persistEmbeddingStatus(ctx context.Context, albumID string, photoIndex int, embedding models.PhotoEmbedding) error {
+func (s *Service) persistEmbeddingStatuses(ctx context.Context, albumID string, embeddings map[int]models.PhotoEmbedding) error {
+	if len(embeddings) == 0 {
+		return nil
+	}
+
 	lock := s.albumLock(albumID)
 	lock.Lock()
 	defer lock.Unlock()
@@ -370,7 +457,9 @@ func (s *Service) persistEmbeddingStatus(ctx context.Context, albumID string, ph
 	if err != nil {
 		return err
 	}
-	idx.Embeddings[embeddingIndexKey(photoIndex)] = embedding
+	for photoIndex, embedding := range embeddings {
+		idx.Embeddings[embeddingIndexKey(photoIndex)] = embedding
+	}
 	if err := s.s3.PutJSON(ctx, albumIndexKey(albumID), idx); err != nil {
 		return err
 	}

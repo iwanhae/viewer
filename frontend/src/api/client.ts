@@ -28,6 +28,33 @@ export type AlbumIndex = {
   photos: PhotoMeta[]
 }
 
+const albumCache = new Map<string, AlbumIndex>()
+const albumCacheOrder: string[] = []
+const maxCachedAlbums = 64
+
+function cacheAlbum(album: AlbumIndex): void {
+  if (!album?.albumId) return
+  if (!albumCache.has(album.albumId)) {
+    albumCacheOrder.push(album.albumId)
+    if (albumCacheOrder.length > maxCachedAlbums) {
+      const oldest = albumCacheOrder.shift()
+      if (oldest) {
+        albumCache.delete(oldest)
+      }
+    }
+  }
+  albumCache.set(album.albumId, album)
+}
+
+export function getCachedAlbum(albumId: string): AlbumIndex | null {
+  if (!albumId) return null
+  return albumCache.get(albumId) ?? null
+}
+
+export function seedCachedAlbum(album: AlbumIndex): void {
+  cacheAlbum(album)
+}
+
 export type RecommendationItem = {
   albumId: string
   i: number
@@ -96,7 +123,9 @@ export async function finalizeAlbum(albumId: string): Promise<{ status: string; 
 export async function fetchAlbum(albumId: string): Promise<AlbumIndex> {
   const res = await fetch(`/api/albums/${albumId}`)
   if (!res.ok) throw new Error(`fetch album failed: ${res.status}`)
-  return (await res.json()) as AlbumIndex
+  const album = (await res.json()) as AlbumIndex
+  cacheAlbum(album)
+  return album
 }
 
 export async function fetchRecommendations(

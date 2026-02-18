@@ -90,12 +90,7 @@ func (s *Service) GetImage(ctx context.Context, albumID string, idx int, mode st
 	}
 
 	photo := album.Photos[idx]
-	data, contentType, err := s.readEntryBytes(ctx, albumID, photo.Name)
-	if err != nil {
-		return ImageResult{}, err
-	}
-
-	return ImageResult{Bytes: data, ContentType: contentType}, nil
+	return s.GetImageByEntry(ctx, albumID, photo.Name)
 }
 
 func (s *Service) GetImageByEntry(ctx context.Context, albumID string, entryName string) (ImageResult, error) {
@@ -105,53 +100,85 @@ func (s *Service) GetImageByEntry(ctx context.Context, albumID string, entryName
 	if strings.TrimSpace(entryName) == "" {
 		return ImageResult{}, fmt.Errorf("entry name is required")
 	}
-	data, contentType, err := s.readEntryBytes(ctx, albumID, entryName)
+
+	entries, err := s.GetImagesByEntries(ctx, albumID, []string{entryName})
 	if err != nil {
 		return ImageResult{}, err
 	}
-	return ImageResult{Bytes: data, ContentType: contentType}, nil
+	result, ok := entries[entryName]
+	if !ok {
+		return ImageResult{}, fmt.Errorf("image entry not found")
+	}
+	return result, nil
 }
 
-func (s *Service) readEntryBytes(ctx context.Context, albumID string, entryName string) ([]byte, string, error) {
+func (s *Service) GetImagesByEntries(ctx context.Context, albumID string, entryNames []string) (map[string]ImageResult, error) {
+	if strings.TrimSpace(albumID) == "" {
+		return nil, fmt.Errorf("album id is required")
+	}
+	if len(entryNames) == 0 {
+		return map[string]ImageResult{}, nil
+	}
+
+	wanted := make(map[string]struct{}, len(entryNames))
+	for _, entryName := range entryNames {
+		clean := strings.TrimSpace(entryName)
+		if clean == "" {
+			return nil, fmt.Errorf("entry name is required")
+		}
+		wanted[clean] = struct{}{}
+	}
+
 	key := sourceKey(albumID)
 	exists, size, err := s.store.HeadObject(ctx, key)
 	if err != nil {
-		return nil, "", err
+		return nil, err
 	}
 	if !exists || size <= 0 {
-		return nil, "", fmt.Errorf("source zip not found")
+		return nil, fmt.Errorf("source zip not found")
 	}
 
 	handle, err := s.rangeCache.Open(ctx, key, size)
 	if err != nil {
-		return nil, "", fmt.Errorf("open range cache: %w", err)
+		return nil, fmt.Errorf("open range cache: %w", err)
 	}
 	defer handle.Close()
 
 	r, err := zip.NewReader(handle, size)
 	if err != nil {
-		return nil, "", fmt.Errorf("open zip: %w", err)
+		return nil, fmt.Errorf("open zip: %w", err)
 	}
 
+	results := make(map[string]ImageResult, len(wanted))
 	for _, f := range r.File {
-		if f.Name != entryName {
+		if _, ok := wanted[f.Name]; !ok {
 			continue
 		}
 		rc, err := f.Open()
 		if err != nil {
-			return nil, "", fmt.Errorf("open zip entry: %w", err)
+			return nil, fmt.Errorf("open zip entry: %w", err)
 		}
 		data, err := io.ReadAll(rc)
 		rc.Close()
 		if err != nil {
-			return nil, "", fmt.Errorf("read zip entry: %w", err)
+			return nil, fmt.Errorf("read zip entry: %w", err)
 		}
-		ct := mime.TypeByExtension(strings.ToLower(filepath.Ext(f.Name)))
-		if ct == "" {
-			ct = "application/octet-stream"
+		results[f.Name] = ImageResult{
+			Bytes:       data,
+			ContentType: contentTypeForEntry(f.Name),
 		}
-		return data, ct, nil
+		if len(results) >= len(wanted) {
+			break
+		}
 	}
 
-	return nil, "", fmt.Errorf("image entry not found")
+	return results, nil
+}
+
+func contentTypeForEntry(entryName string) string {
+	ct := mime.TypeByExtension(strings.ToLower(filepath.Ext(entryName)))
+	if ct == "" {
+		return "application/octet-stream"
+	}
+	return ct
 }

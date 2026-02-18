@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
-import { AlbumIndex, fetchAlbum } from '../api/client'
+import { AlbumIndex, fetchAlbum, getCachedAlbum } from '../api/client'
 import { readColumnPreference, writeColumnPreference } from '../utils/columnPreference'
 import { distributeMasonry } from '../utils/masonry'
 
@@ -14,7 +14,8 @@ export function ViewerPage() {
   const initialIndexValue = Number(params.get('i') ?? '0')
   const initialIndex = Number.isFinite(initialIndexValue) ? initialIndexValue : 0
 
-  const [album, setAlbum] = useState<AlbumIndex | null>(null)
+  const cachedAlbum = useMemo(() => getCachedAlbum(albumId), [albumId])
+  const [album, setAlbum] = useState<AlbumIndex | null>(cachedAlbum)
   const [columnCount, setColumnCount] = useState(() =>
     readColumnPreference(VIEWER_COLUMNS_KEY, COLUMN_OPTIONS, DEFAULT_COLUMNS),
   )
@@ -25,9 +26,13 @@ export function ViewerPage() {
   const navigate = useNavigate()
 
   useEffect(() => {
-    setAlbum(null)
+    setAlbum(cachedAlbum)
     setError(null)
     anchoredRef.current = false
+
+    if (cachedAlbum) {
+      return
+    }
 
     let cancelled = false
     void (async () => {
@@ -43,7 +48,7 @@ export function ViewerPage() {
     return () => {
       cancelled = true
     }
-  }, [albumId])
+  }, [albumId, cachedAlbum])
 
   const anchorIndex = useMemo(() => {
     if (!album) return null
@@ -93,7 +98,7 @@ export function ViewerPage() {
                 className="tile album-photo-tile"
                 data-testid="album-tile"
                 ref={photo.i === anchorIndex ? anchorRef : null}
-                onClick={() => navigate(`/photo/${album.albumId}/${photo.i}`)}
+                onClick={() => navigate(`/photo/${album.albumId}/${photo.i}`, { state: { album } })}
                 aria-label={`Open details for image ${photo.i + 1}`}
               >
                 <img

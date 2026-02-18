@@ -125,7 +125,13 @@ export function WallPage() {
               <button
                 className="tile"
                 key={`${item.albumId}-${item.i}-${idx}`}
-                onClick={() => navigate(`/album/${item.albumId}`)}
+                onClick={() => {
+                  if (typeof window !== 'undefined') {
+                    window.location.assign(`/album/${item.albumId}`)
+                    return
+                  }
+                  navigate(`/album/${item.albumId}`)
+                }}
                 data-testid="wall-tile"
               >
                 <img

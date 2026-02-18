@@ -1,10 +1,11 @@
 import { useEffect, useMemo, useState } from 'react'
-import { useNavigate, useParams } from 'react-router-dom'
-import { AlbumIndex, RecommendationItem, RecommendationStatus, fetchAlbum, fetchRecommendations } from '../api/client'
+import { useLocation, useNavigate, useParams } from 'react-router-dom'
+import { AlbumIndex, RecommendationItem, RecommendationStatus, fetchAlbum, fetchRecommendations, getCachedAlbum, seedCachedAlbum } from '../api/client'
 
 export function PhotoPage() {
   const { albumId = '', photoIndex: rawPhotoIndex = '' } = useParams<{ albumId: string; photoIndex: string }>()
   const navigate = useNavigate()
+  const location = useLocation()
 
   const photoIndex = useMemo(() => {
     if (!rawPhotoIndex) return null
@@ -18,9 +19,20 @@ export function PhotoPage() {
   const [recommendations, setRecommendations] = useState<RecommendationItem[]>([])
   const [recommendationStatus, setRecommendationStatus] = useState<RecommendationStatus | 'idle' | 'loading'>('idle')
   const [recommendationError, setRecommendationError] = useState<string | null>(null)
+  const cachedAlbum = useMemo(() => getCachedAlbum(albumId), [albumId])
+  const locationAlbum = useMemo(() => {
+    const state = location.state as { album?: AlbumIndex } | null
+    const candidate = state?.album
+    if (!candidate || candidate.albumId !== albumId) {
+      return null
+    }
+    seedCachedAlbum(candidate)
+    return candidate
+  }, [location.state, albumId])
 
   useEffect(() => {
-    setAlbum(null)
+    const seeded = locationAlbum ?? cachedAlbum
+    setAlbum(seeded)
     setError(null)
 
     if (!albumId) {
@@ -29,6 +41,10 @@ export function PhotoPage() {
     }
     if (photoIndex === null) {
       setError('Invalid photo index')
+      return
+    }
+
+    if (seeded) {
       return
     }
 
@@ -48,7 +64,7 @@ export function PhotoPage() {
     return () => {
       cancelled = true
     }
-  }, [albumId, photoIndex])
+  }, [albumId, photoIndex, locationAlbum, cachedAlbum])
 
   const photo = useMemo(() => {
     if (!album || photoIndex === null) return null
