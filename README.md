@@ -47,6 +47,8 @@ The image prefetches `config.json` and `model.safetensors` for `SIGLIP2_MODEL_ID
 CI publishes a reusable model base image (`model-siglip2-base-patch16-224`) and app images can reuse it with `--build-arg MODEL_BASE_IMAGE=<registry/repo:tag>`.
 Local `docker build` keeps working without overrides by defaulting `MODEL_BASE_IMAGE` to the in-file `model-base` stage.
 To use a different model in Docker, build with `--build-arg SIGLIP2_MODEL_ID=<repo-id>` and publish a corresponding model base image tag.
+To build an MKL-accelerated recommender for x86_64 images, pass `--build-arg RECOMMENDER_ACCEL=mkl --platform linux/amd64`.
+`RECOMMENDER_ACCEL` defaults to `none`; if `mkl` is requested on non-`amd64` targets, the Dockerfile falls back to a non-MKL recommender build.
 
 ## Commands
 - `make build` runs `go mod tidy`, builds `bin/recommender` in release mode, builds frontend assets, and compiles `bin/viewer`.

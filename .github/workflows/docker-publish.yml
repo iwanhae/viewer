@@ -20,6 +20,7 @@ env:
   IMAGE_NAME: ${{ github.repository }}
   SIGLIP2_MODEL_ID: google/siglip2-base-patch16-224
   MODEL_BASE_TAG: model-siglip2-base-patch16-224
+  RECOMMENDER_ACCEL: mkl
   APP_CACHE_IMAGE: ghcr.io/${{ github.repository }}:buildcache-app
   MODEL_BASE_CACHE_IMAGE: ghcr.io/${{ github.repository }}:buildcache-model-base
 
@@ -102,6 +103,7 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             SIGLIP2_MODEL_ID=${{ env.SIGLIP2_MODEL_ID }}
+            RECOMMENDER_ACCEL=${{ env.RECOMMENDER_ACCEL }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -119,6 +121,7 @@ jobs:
           build-args: |
             SIGLIP2_MODEL_ID=${{ env.SIGLIP2_MODEL_ID }}
             MODEL_BASE_IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.MODEL_BASE_TAG }}
+            RECOMMENDER_ACCEL=${{ env.RECOMMENDER_ACCEL }}
           cache-from: |
             type=gha
             type=registry,ref=${{ env.APP_CACHE_IMAGE }}

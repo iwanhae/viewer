@@ -12,6 +12,124 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, RwLock};
 use std::thread;
 
+#[cfg(feature = "mkl")]
+#[allow(clippy::too_many_arguments)]
+#[no_mangle]
+// Candle's MKL backend references `hgemm_`; provide a local fallback for MKL toolchains
+// that do not export this symbol.
+pub unsafe extern "C" fn hgemm_(
+    transa: *const std::ffi::c_char,
+    transb: *const std::ffi::c_char,
+    m: *const std::ffi::c_int,
+    n: *const std::ffi::c_int,
+    k: *const std::ffi::c_int,
+    alpha: *const half::f16,
+    a: *const half::f16,
+    lda: *const std::ffi::c_int,
+    b: *const half::f16,
+    ldb: *const std::ffi::c_int,
+    beta: *const half::f16,
+    c: *mut half::f16,
+    ldc: *const std::ffi::c_int,
+) {
+    if transa.is_null()
+        || transb.is_null()
+        || m.is_null()
+        || n.is_null()
+        || k.is_null()
+        || alpha.is_null()
+        || a.is_null()
+        || lda.is_null()
+        || b.is_null()
+        || ldb.is_null()
+        || beta.is_null()
+        || c.is_null()
+        || ldc.is_null()
+    {
+        return;
+    }
+
+    let transa = ((*transa as u8) as char).to_ascii_uppercase();
+    let transb = ((*transb as u8) as char).to_ascii_uppercase();
+    let transa_n = match transa {
+        'N' => true,
+        'T' | 'C' => false,
+        _ => return,
+    };
+    let transb_n = match transb {
+        'N' => true,
+        'T' | 'C' => false,
+        _ => return,
+    };
+
+    let (m, n, k) = (*m, *n, *k);
+    let (lda, ldb, ldc) = (*lda, *ldb, *ldc);
+    if m < 0 || n < 0 || k < 0 || lda <= 0 || ldb <= 0 || ldc <= 0 {
+        return;
+    }
+    let (m, n, k, lda, ldb, ldc) = (
+        m as usize,
+        n as usize,
+        k as usize,
+        lda as usize,
+        ldb as usize,
+        ldc as usize,
+    );
+    if m == 0 || n == 0 {
+        return;
+    }
+    if (transa_n && lda < m) || (!transa_n && lda < k) {
+        return;
+    }
+    if (transb_n && ldb < k) || (!transb_n && ldb < n) {
+        return;
+    }
+    if ldc < m {
+        return;
+    }
+
+    let a_cols = if transa_n { k } else { m };
+    let b_cols = if transb_n { n } else { k };
+    let Some(a_len) = lda.checked_mul(a_cols) else {
+        return;
+    };
+    let Some(b_len) = ldb.checked_mul(b_cols) else {
+        return;
+    };
+    let Some(c_len) = ldc.checked_mul(n) else {
+        return;
+    };
+
+    let a = std::slice::from_raw_parts(a, a_len);
+    let b = std::slice::from_raw_parts(b, b_len);
+    let c = std::slice::from_raw_parts_mut(c, c_len);
+    let alpha = (*alpha).to_f32();
+    let beta = (*beta).to_f32();
+
+    for col in 0..n {
+        for row in 0..m {
+            let mut acc = 0f32;
+            for depth in 0..k {
+                let a_idx = if transa_n {
+                    row + depth * lda
+                } else {
+                    depth + row * lda
+                };
+                let b_idx = if transb_n {
+                    depth + col * ldb
+                } else {
+                    col + depth * ldb
+                };
+                acc += a[a_idx].to_f32() * b[b_idx].to_f32();
+            }
+
+            let c_idx = row + col * ldc;
+            let cur = c[c_idx].to_f32();
+            c[c_idx] = half::f16::from_f32(alpha * acc + beta * cur);
+        }
+    }
+}
+
 const DEFAULT_LISTEN_ADDR: &str = "0.0.0.0:18081";
 const DEFAULT_MODEL_ID: &str = "google/siglip2-base-patch16-224";
 const DEFAULT_DEVICE: &str = "cpu";

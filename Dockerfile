@@ -1,6 +1,7 @@
 # syntax=docker/dockerfile:1.7
 ARG SIGLIP2_MODEL_ID=google/siglip2-base-patch16-224
 ARG MODEL_BASE_IMAGE=model-base
+ARG RECOMMENDER_ACCEL=none
 
 FROM node:22-bookworm-slim AS frontend-build
 WORKDIR /src
@@ -25,12 +26,25 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /out/viewer ./cmd/viewe
 
 FROM rust:1.90-bookworm AS recommender-build
 WORKDIR /src
+ARG RECOMMENDER_ACCEL
+ARG TARGETARCH
 
 COPY workers/recommender/Cargo.toml workers/recommender/Cargo.lock ./workers/recommender/
 COPY workers/recommender/src ./workers/recommender/src
 
-RUN cargo build --manifest-path workers/recommender/Cargo.toml --release && \
-    mkdir -p /out && \
+RUN set -eux; \
+    if [ "${RECOMMENDER_ACCEL}" = "mkl" ] && [ "${TARGETARCH:-}" = "amd64" ]; then \
+        echo "building recommender with MKL acceleration for TARGETARCH=${TARGETARCH}"; \
+        cargo build --manifest-path workers/recommender/Cargo.toml --release --features mkl; \
+    else \
+        if [ "${RECOMMENDER_ACCEL}" = "mkl" ]; then \
+            echo "RECOMMENDER_ACCEL=mkl requested for TARGETARCH=${TARGETARCH:-unknown}; building without MKL"; \
+        else \
+            echo "building recommender without MKL acceleration"; \
+        fi; \
+        cargo build --manifest-path workers/recommender/Cargo.toml --release; \
+    fi; \
+    mkdir -p /out; \
     cp workers/recommender/target/release/recommender /out/recommender
 
 FROM python:3.12-bookworm AS model-prefetch
