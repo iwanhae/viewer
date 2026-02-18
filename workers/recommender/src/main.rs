@@ -164,6 +164,13 @@ fn ensure_supported_device(device: &str) -> Result<()> {
     ))
 }
 
+fn log_error_chain(prefix: &str, err: &anyhow::Error) {
+    eprintln!("{prefix}: {err}");
+    for (idx, cause) in err.chain().skip(1).enumerate() {
+        eprintln!("  caused_by[{}]: {}", idx + 1, cause);
+    }
+}
+
 fn load_model(model_id: &str) -> Result<LoadedModel> {
     let api = hf_hub::api::sync::Api::new().context("create Hugging Face API client")?;
     let repo = api.model(model_id.to_string());
@@ -600,9 +607,13 @@ fn main() {
 
     let mut worker = Worker::default();
     if let Err(err) = worker.ensure_model(&config.model_id) {
-        eprintln!(
-            "failed to initialize model '{}' during startup: {err}",
-            config.model_id
+        let hf_home = env::var("HF_HOME").unwrap_or_else(|_| "<default>".to_string());
+        log_error_chain(
+            &format!(
+                "failed to initialize model '{}' during startup (HF_HOME={hf_home})",
+                config.model_id
+            ),
+            &err,
         );
         std::process::exit(1);
     }

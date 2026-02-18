@@ -28,17 +28,20 @@ Optional tuning:
   - `RECOMMENDER_REQUEST_TIMEOUT_SECONDS` timeout per embed request (default `120`).
 - `SIGLIP2_MODEL_ID` model identifier for worker backends (default `google/siglip2-base-patch16-224`).
 - `SIGLIP2_DEVICE` embedding device hint (default `cpu`, CPU-only worker build).
+- `HF_HOME` Hugging Face cache root used by the Rust worker. In Docker runtime this is pre-populated at `/tmp/hf-home`.
 
 Rust recommender service endpoints:
 - `GET /ping`
 - `GET /healthz`
 - `POST /embed` with JSON `{"request_id","image_b64","model_id","device"}`
 
-Rust worker downloads SigLIP2 model files from Hugging Face on demand and caches them locally.
+Rust worker resolves model files through the Hugging Face cache (`HF_HOME`), downloading only if a required file is missing.
 
 Recommendation vectors are persisted in each album's `albums/<album-id>/index.json` under an `embeddings` section.
 
 In the Docker image, the container entrypoint starts both the Rust recommender service and the Go server.
+The image prefetches `config.json` and `model.safetensors` for `SIGLIP2_MODEL_ID` at build time, so pod startup does not require Hugging Face egress.
+To use a different model in Docker, build with `--build-arg SIGLIP2_MODEL_ID=<repo-id>`.
 
 ## Commands
 - `make build` builds `bin/viewer` and `bin/recommender`.

@@ -1,4 +1,5 @@
 # syntax=docker/dockerfile:1.7
+ARG SIGLIP2_MODEL_ID=google/siglip2-base-patch16-224
 
 FROM node:22-bookworm-slim AS frontend-build
 WORKDIR /src
@@ -31,7 +32,23 @@ RUN cargo build --manifest-path workers/recommender/Cargo.toml --release && \
     mkdir -p /out && \
     cp workers/recommender/target/release/recommender /out/recommender
 
+FROM python:3.12-bookworm AS model-prefetch
+ARG SIGLIP2_MODEL_ID
+ENV HF_HOME=/opt/hf-home \
+    SIGLIP2_MODEL_ID=${SIGLIP2_MODEL_ID}
+
+RUN pip install --no-cache-dir huggingface_hub==0.29.2
+RUN python - <<'PY'
+import os
+from huggingface_hub import hf_hub_download
+
+model_id = os.environ["SIGLIP2_MODEL_ID"]
+for filename in ("config.json", "model.safetensors"):
+    hf_hub_download(repo_id=model_id, filename=filename)
+PY
+
 FROM debian:bookworm-slim AS runtime
+ARG SIGLIP2_MODEL_ID
 WORKDIR /app
 
 RUN apt-get update && \
@@ -40,6 +57,7 @@ RUN apt-get update && \
 
 COPY --from=backend-build /out/viewer /app/viewer
 COPY --from=recommender-build /out/recommender /app/recommender
+COPY --from=model-prefetch --chown=65532:65532 /opt/hf-home /tmp/hf-home
 COPY docker/entrypoint.sh /app/entrypoint.sh
 
 RUN mkdir -p /tmp/viewer-cache/images /tmp/viewer-cache/zips && \
@@ -52,6 +70,8 @@ ENV PORT=8080 \
     CACHE_DIR=/tmp/viewer-cache/images \
     ZIP_CACHE_DIR=/tmp/viewer-cache/zips \
     RECOMMENDER_REQUIRED=false \
+    HF_HOME=/tmp/hf-home \
+    SIGLIP2_MODEL_ID="${SIGLIP2_MODEL_ID}" \
     RECOMMENDER_LISTEN_ADDR="0.0.0.0:18081" \
     RECOMMENDER_ENDPOINT="http://127.0.0.1:18081"
 
