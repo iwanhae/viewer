@@ -83,6 +83,35 @@ func TestListAlbumsDoesNotBlockOnEmptyCache(t *testing.T) {
 	}
 }
 
+func TestListAlbumsSnapshotInvalidatesOnCacheMutation(t *testing.T) {
+	s := &Service{
+		albumCache: map[string]*models.AlbumIndex{
+			"album-a": {AlbumID: "album-a", CreatedAt: "2026-02-15T00:00:01Z"},
+		},
+	}
+
+	first, err := s.ListAlbums(context.Background())
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if len(first) != 1 {
+		t.Fatalf("expected one album in first snapshot, got %d", len(first))
+	}
+
+	s.mu.Lock()
+	s.albumCache["album-b"] = &models.AlbumIndex{AlbumID: "album-b", CreatedAt: "2026-02-15T00:00:02Z"}
+	s.invalidateSnapshotsLocked()
+	s.mu.Unlock()
+
+	second, err := s.ListAlbums(context.Background())
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if len(second) != 2 {
+		t.Fatalf("expected two albums after invalidation, got %d", len(second))
+	}
+}
+
 func TestMergeAlbumCachesPreservesExistingAndOverwritesScanned(t *testing.T) {
 	existing := map[string]*models.AlbumIndex{
 		"from-memory": {AlbumID: "from-memory", CreatedAt: "2026-02-15T00:00:01Z"},
@@ -105,6 +134,35 @@ func TestMergeAlbumCachesPreservesExistingAndOverwritesScanned(t *testing.T) {
 	}
 	if merged["shared"].CreatedAt != "new" {
 		t.Fatalf("expected scanned album to overwrite shared key, got %q", merged["shared"].CreatedAt)
+	}
+}
+
+func TestAllAlbumsSnapshotReturnsDefensiveCopies(t *testing.T) {
+	s := &Service{
+		albumCache: map[string]*models.AlbumIndex{
+			"album-a": {
+				AlbumID:   "album-a",
+				CreatedAt: "2026-02-15T00:00:01Z",
+				Photos: []models.PhotoMeta{
+					{I: 0, Name: "001.png", W: 100, H: 100},
+				},
+			},
+		},
+	}
+
+	first := s.AllAlbums()
+	if len(first) != 1 {
+		t.Fatalf("expected one album, got %d", len(first))
+	}
+	first[0].AlbumID = "changed"
+	first[0].Photos[0].Name = "changed.png"
+
+	second := s.AllAlbums()
+	if second[0].AlbumID != "album-a" {
+		t.Fatalf("expected cached snapshot clone to keep original album id, got %q", second[0].AlbumID)
+	}
+	if second[0].Photos[0].Name != "001.png" {
+		t.Fatalf("expected cached snapshot clone to keep original photo name, got %q", second[0].Photos[0].Name)
 	}
 }
 

@@ -4,7 +4,72 @@ import (
 	"context"
 	"math/rand"
 	"testing"
+
+	"viewer/internal/models"
 )
+
+func TestApplyAlbumIndexReplacesOnlyTargetAlbumRecords(t *testing.T) {
+	s := &Service{
+		photosByID: map[string]PhotoRecord{
+			imageID("album-a", 0): {ImageID: imageID("album-a", 0), AlbumID: "album-a", PhotoIndex: 0},
+			imageID("album-a", 1): {ImageID: imageID("album-a", 1), AlbumID: "album-a", PhotoIndex: 1},
+			imageID("album-b", 0): {ImageID: imageID("album-b", 0), AlbumID: "album-b", PhotoIndex: 0},
+		},
+		photoIDsByAlbum: map[string]map[string]struct{}{
+			"album-a": {
+				imageID("album-a", 0): {},
+				imageID("album-a", 1): {},
+			},
+			"album-b": {
+				imageID("album-b", 0): {},
+			},
+		},
+		embeddingsByID: map[string]EmbeddingRecord{
+			imageID("album-a", 0): {ImageID: imageID("album-a", 0), Vector: []float32{1, 0}},
+			imageID("album-b", 0): {ImageID: imageID("album-b", 0), Vector: []float32{0, 1}},
+		},
+		failedByID: map[string]string{
+			imageID("album-a", 1): "old failure",
+		},
+		missingByAlbum: make(map[string]map[int]struct{}),
+	}
+
+	s.applyAlbumIndex(models.AlbumIndex{
+		AlbumID: "album-a",
+		Photos: []models.PhotoMeta{
+			{I: 2, Name: "new.jpg", W: 100, H: 100, Ratio: 1},
+		},
+		Embeddings: map[string]models.PhotoEmbedding{
+			"2": {
+				Status: embeddingStatusReady,
+				Vector: []float32{1, 1},
+				Model:  "m",
+			},
+		},
+	})
+
+	if _, ok := s.photosByID[imageID("album-a", 0)]; ok {
+		t.Fatalf("expected old album-a photo 0 to be removed")
+	}
+	if _, ok := s.photosByID[imageID("album-a", 1)]; ok {
+		t.Fatalf("expected old album-a photo 1 to be removed")
+	}
+	if _, ok := s.failedByID[imageID("album-a", 1)]; ok {
+		t.Fatalf("expected stale failed marker to be removed")
+	}
+	if _, ok := s.photosByID[imageID("album-a", 2)]; !ok {
+		t.Fatalf("expected new album-a photo to be present")
+	}
+	if _, ok := s.photosByID[imageID("album-b", 0)]; !ok {
+		t.Fatalf("expected album-b records to remain")
+	}
+	if _, ok := s.photoIDsByAlbum["album-a"][imageID("album-a", 2)]; !ok {
+		t.Fatalf("expected reverse index to include new album-a photo")
+	}
+	if _, ok := s.photoIDsByAlbum["album-a"][imageID("album-a", 0)]; ok {
+		t.Fatalf("expected reverse index to drop old album-a photo")
+	}
+}
 
 func TestClaimRandomMissingAlbumClaimsWholeAlbum(t *testing.T) {
 	s := &Service{
@@ -47,6 +112,9 @@ func TestClaimRandomMissingAlbumClaimsWholeAlbum(t *testing.T) {
 	}
 	if len(s.missingByAlbum[albumID]) != 0 {
 		t.Fatalf("expected claimed album missing set to be empty")
+	}
+	if _, ok := s.albumMissingPos[albumID]; ok {
+		t.Fatalf("expected claimed album to be removed from active missing index")
 	}
 
 	otherAlbum := "album-a"
@@ -109,6 +177,9 @@ func TestRequeueMissingPhotosRestoresPendingSet(t *testing.T) {
 	}
 	if _, ok := s.failedByID[imageID("album-a", 1)]; ok {
 		t.Fatalf("expected stale failure marker for photo 1 to be removed")
+	}
+	if _, ok := s.albumMissingPos["album-a"]; !ok {
+		t.Fatalf("expected album to be present in active missing index")
 	}
 }
 

@@ -6,21 +6,39 @@ import (
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
-	"math/rand"
 	"strconv"
+	"sync"
 	"time"
 
 	"viewer/internal/albums"
 	"viewer/internal/models"
 )
 
+const photoRefsSnapshotTTL = 3 * time.Second
+
+type albumSource interface {
+	AllAlbums() []*models.AlbumIndex
+}
+
 type Service struct {
-	albums *albums.Service
+	albums albumSource
+
+	mu             sync.RWMutex
+	refsSnapshot   []photoRef
+	refsSnapshotAt time.Time
+	snapshotTTL    time.Duration
+	now            func() time.Time
 }
 
 type cursorState struct {
+	Seed int64 `json:"seed"`
+	Page int   `json:"page"`
+}
+
+type rawCursorState struct {
 	Seed   int64 `json:"seed"`
-	Offset int   `json:"offset"`
+	Page   *int  `json:"page,omitempty"`
+	Offset *int  `json:"offset,omitempty"`
 }
 
 type photoRef struct {
@@ -29,7 +47,11 @@ type photoRef struct {
 }
 
 func NewService(albumsService *albums.Service) *Service {
-	return &Service{albums: albumsService}
+	return &Service{
+		albums:      albumsService,
+		snapshotTTL: photoRefsSnapshotTTL,
+		now:         time.Now,
+	}
 }
 
 func (s *Service) Build(ctx context.Context, limit int, cursor string, seedParam string) (models.FeedResponse, error) {
@@ -41,34 +63,24 @@ func (s *Service) Build(ctx context.Context, limit int, cursor string, seedParam
 		limit = 200
 	}
 
-	albumsList := s.albums.AllAlbums()
-	refs := make([]photoRef, 0)
-	for _, a := range albumsList {
-		for _, p := range a.Photos {
-			refs = append(refs, photoRef{albumID: a.AlbumID, photo: p})
-		}
-	}
+	refs := s.snapshotPhotoRefs()
 	if len(refs) == 0 {
 		return models.FeedResponse{Items: []models.FeedItem{}}, nil
 	}
 
-	state, err := parseCursor(cursor)
+	state, err := parseCursor(cursor, limit)
 	if err != nil {
 		return models.FeedResponse{}, err
 	}
 	if state == nil {
 		seed := parseSeed(seedParam)
-		state = &cursorState{Seed: seed, Offset: 0}
-	}
-
-	r := rand.New(rand.NewSource(state.Seed))
-	for i := 0; i < state.Offset; i++ {
-		_ = r.Intn(len(refs))
+		state = &cursorState{Seed: seed, Page: 0}
 	}
 
 	items := make([]models.FeedItem, 0, limit)
 	for i := 0; i < limit; i++ {
-		idx := r.Intn(len(refs))
+		position := int64(state.Page)*int64(limit) + int64(i)
+		idx := deterministicIndex(state.Seed, position, len(refs))
 		ref := refs[idx]
 		items = append(items, models.FeedItem{
 			AlbumID: ref.albumID,
@@ -80,13 +92,50 @@ func (s *Service) Build(ctx context.Context, limit int, cursor string, seedParam
 		})
 	}
 
-	next := &cursorState{Seed: state.Seed, Offset: state.Offset + len(items)}
+	next := &cursorState{Seed: state.Seed, Page: state.Page + 1}
 	nextCursor, err := encodeCursor(next)
 	if err != nil {
 		return models.FeedResponse{}, err
 	}
 
 	return models.FeedResponse{Items: items, NextCursor: nextCursor}, nil
+}
+
+func (s *Service) snapshotPhotoRefs() []photoRef {
+	nowFn := s.now
+	if nowFn == nil {
+		nowFn = time.Now
+	}
+	ttl := s.snapshotTTL
+	if ttl <= 0 {
+		ttl = photoRefsSnapshotTTL
+	}
+	now := nowFn()
+
+	s.mu.RLock()
+	if s.refsSnapshot != nil && now.Sub(s.refsSnapshotAt) < ttl {
+		refs := s.refsSnapshot
+		s.mu.RUnlock()
+		return refs
+	}
+	s.mu.RUnlock()
+
+	if s.albums == nil {
+		return nil
+	}
+	albumsList := s.albums.AllAlbums()
+	refs := make([]photoRef, 0)
+	for _, album := range albumsList {
+		for _, photo := range album.Photos {
+			refs = append(refs, photoRef{albumID: album.AlbumID, photo: photo})
+		}
+	}
+
+	s.mu.Lock()
+	s.refsSnapshot = refs
+	s.refsSnapshotAt = now
+	s.mu.Unlock()
+	return refs
 }
 
 func parseSeed(seed string) int64 {
@@ -102,7 +151,7 @@ func parseSeed(seed string) int64 {
 	return int64(h.Sum64())
 }
 
-func parseCursor(raw string) (*cursorState, error) {
+func parseCursor(raw string, limit int) (*cursorState, error) {
 	if raw == "" {
 		return nil, nil
 	}
@@ -110,14 +159,31 @@ func parseCursor(raw string) (*cursorState, error) {
 	if err != nil {
 		return nil, fmt.Errorf("invalid cursor")
 	}
-	var st cursorState
+	var st rawCursorState
 	if err := json.Unmarshal(decoded, &st); err != nil {
 		return nil, fmt.Errorf("invalid cursor")
 	}
-	if st.Offset < 0 {
-		st.Offset = 0
+	if st.Page != nil {
+		page := *st.Page
+		if page < 0 {
+			page = 0
+		}
+		return &cursorState{Seed: st.Seed, Page: page}, nil
 	}
-	return &st, nil
+	if st.Offset == nil {
+		return nil, fmt.Errorf("invalid cursor")
+	}
+	offset := *st.Offset
+	if offset < 0 {
+		offset = 0
+	}
+	if limit <= 0 {
+		limit = 80
+	}
+	return &cursorState{
+		Seed: st.Seed,
+		Page: offset / limit,
+	}, nil
 }
 
 func encodeCursor(st *cursorState) (string, error) {
@@ -126,4 +192,17 @@ func encodeCursor(st *cursorState) (string, error) {
 		return "", err
 	}
 	return base64.RawURLEncoding.EncodeToString(b), nil
+}
+
+func deterministicIndex(seed int64, position int64, size int) int {
+	if size <= 0 {
+		return 0
+	}
+	x := uint64(seed) + 0x9e3779b97f4a7c15*uint64(position+1)
+	x ^= x >> 30
+	x *= 0xbf58476d1ce4e5b9
+	x ^= x >> 27
+	x *= 0x94d049bb133111eb
+	x ^= x >> 31
+	return int(x % uint64(size))
 }

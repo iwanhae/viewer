@@ -29,11 +29,14 @@ type Service struct {
 	startOnce sync.Once
 	startErr  error
 
-	mu             sync.RWMutex
-	photosByID     map[string]PhotoRecord
-	embeddingsByID map[string]EmbeddingRecord
-	failedByID     map[string]string
-	missingByAlbum map[string]map[int]struct{}
+	mu                sync.RWMutex
+	photosByID        map[string]PhotoRecord
+	photoIDsByAlbum   map[string]map[string]struct{}
+	embeddingsByID    map[string]EmbeddingRecord
+	failedByID        map[string]string
+	missingByAlbum    map[string]map[int]struct{}
+	albumsWithMissing []string
+	albumMissingPos   map[string]int
 
 	rngMu sync.Mutex
 	rng   *rand.Rand
@@ -46,18 +49,21 @@ type Service struct {
 
 func NewService(cfg cfgpkg.Config, albumsService *albums.Service, imagesService *images.Service, s3Store *storage.S3Store) (*Service, error) {
 	return &Service{
-		cfg:            cfg,
-		albums:         albumsService,
-		images:         imagesService,
-		s3:             s3Store,
-		embedder:       NewHTTPEmbedder(cfg.RecommenderEndpoint, cfg.Siglip2ModelID, cfg.Siglip2Device, time.Duration(cfg.RecommenderTimeoutSec)*time.Second),
-		photosByID:     make(map[string]PhotoRecord),
-		embeddingsByID: make(map[string]EmbeddingRecord),
-		failedByID:     make(map[string]string),
-		missingByAlbum: make(map[string]map[int]struct{}),
-		rng:            rand.New(rand.NewSource(time.Now().UnixNano())),
-		albumLocks:     make(map[string]*sync.Mutex),
-		imageLoadSem:   make(chan struct{}, 1),
+		cfg:               cfg,
+		albums:            albumsService,
+		images:            imagesService,
+		s3:                s3Store,
+		embedder:          NewHTTPEmbedder(cfg.RecommenderEndpoint, cfg.Siglip2ModelID, cfg.Siglip2Device, time.Duration(cfg.RecommenderTimeoutSec)*time.Second),
+		photosByID:        make(map[string]PhotoRecord),
+		photoIDsByAlbum:   make(map[string]map[string]struct{}),
+		embeddingsByID:    make(map[string]EmbeddingRecord),
+		failedByID:        make(map[string]string),
+		missingByAlbum:    make(map[string]map[int]struct{}),
+		albumsWithMissing: make([]string, 0),
+		albumMissingPos:   make(map[string]int),
+		rng:               rand.New(rand.NewSource(time.Now().UnixNano())),
+		albumLocks:        make(map[string]*sync.Mutex),
+		imageLoadSem:      make(chan struct{}, 1),
 	}, nil
 }
 
@@ -112,21 +118,26 @@ func (s *Service) applyAlbumIndex(idx models.AlbumIndex) {
 }
 
 func (s *Service) applyAlbumIndexLocked(idx models.AlbumIndex) {
+	s.ensureIndexesLocked()
+
 	albumID := idx.AlbumID
 	if albumID == "" {
 		return
 	}
-	for id, photo := range s.photosByID {
-		if photo.AlbumID == albumID {
+	if previous, ok := s.photoIDsByAlbum[albumID]; ok {
+		for id := range previous {
 			delete(s.photosByID, id)
 			delete(s.embeddingsByID, id)
 			delete(s.failedByID, id)
 		}
 	}
+	delete(s.photoIDsByAlbum, albumID)
 
 	missing := make(map[int]struct{})
+	albumPhotoIDs := make(map[string]struct{}, len(idx.Photos))
 	for _, photo := range idx.Photos {
 		id := imageID(albumID, photo.I)
+		albumPhotoIDs[id] = struct{}{}
 		rec := PhotoRecord{
 			ImageID:    id,
 			AlbumID:    albumID,
@@ -165,7 +176,8 @@ func (s *Service) applyAlbumIndexLocked(idx models.AlbumIndex) {
 			missing[photo.I] = struct{}{}
 		}
 	}
-	s.missingByAlbum[albumID] = missing
+	s.photoIDsByAlbum[albumID] = albumPhotoIDs
+	s.setMissingForAlbumLocked(albumID, missing)
 }
 
 func (s *Service) NotifyAlbumFinalized(ctx context.Context, albumID string) {
@@ -224,41 +236,43 @@ func (s *Service) workerLoop(ctx context.Context) {
 func (s *Service) claimRandomMissingAlbum() (string, []PhotoRecord, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.ensureIndexesLocked()
 
-	albumsWithMissing := make([]string, 0, len(s.missingByAlbum))
-	for albumID, missing := range s.missingByAlbum {
-		if len(missing) > 0 {
-			albumsWithMissing = append(albumsWithMissing, albumID)
-		}
-	}
-	if len(albumsWithMissing) == 0 {
-		return "", nil, false
-	}
+	for len(s.albumsWithMissing) > 0 {
+		s.rngMu.Lock()
+		albumID := s.albumsWithMissing[s.rng.Intn(len(s.albumsWithMissing))]
+		s.rngMu.Unlock()
 
-	s.rngMu.Lock()
-	albumID := albumsWithMissing[s.rng.Intn(len(albumsWithMissing))]
-	s.rngMu.Unlock()
-
-	missing := s.missingByAlbum[albumID]
-	indexes := make([]int, 0, len(missing))
-	for idx := range missing {
-		indexes = append(indexes, idx)
-	}
-	sort.Ints(indexes)
-
-	photos := make([]PhotoRecord, 0, len(indexes))
-	for _, photoIndex := range indexes {
-		delete(missing, photoIndex)
-		photo, ok := s.photosByID[imageID(albumID, photoIndex)]
-		if !ok {
+		missing := s.missingByAlbum[albumID]
+		if len(missing) == 0 {
+			s.removeAlbumWithMissingLocked(albumID)
 			continue
 		}
-		photos = append(photos, photo)
+
+		indexes := make([]int, 0, len(missing))
+		for idx := range missing {
+			indexes = append(indexes, idx)
+		}
+		sort.Ints(indexes)
+
+		photos := make([]PhotoRecord, 0, len(indexes))
+		for _, photoIndex := range indexes {
+			delete(missing, photoIndex)
+			photo, ok := s.photosByID[imageID(albumID, photoIndex)]
+			if !ok {
+				continue
+			}
+			photos = append(photos, photo)
+		}
+		if len(missing) == 0 {
+			s.removeAlbumWithMissingLocked(albumID)
+		}
+		if len(photos) == 0 {
+			continue
+		}
+		return albumID, photos, true
 	}
-	if len(photos) == 0 {
-		return "", nil, false
-	}
-	return albumID, photos, true
+	return "", nil, false
 }
 
 func (s *Service) embedAlbumAndPersist(ctx context.Context, albumID string, photos []PhotoRecord) error {
@@ -402,6 +416,7 @@ func (s *Service) requeueMissingPhotos(albumID string, photoIndexes []int) {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.ensureIndexesLocked()
 
 	missing, ok := s.missingByAlbum[albumID]
 	if !ok {
@@ -417,16 +432,25 @@ func (s *Service) requeueMissingPhotos(albumID string, photoIndexes []int) {
 		delete(s.failedByID, imageIDValue)
 		missing[photoIndex] = struct{}{}
 	}
+	if len(missing) > 0 {
+		s.addAlbumWithMissingLocked(albumID)
+	} else {
+		s.removeAlbumWithMissingLocked(albumID)
+	}
 }
 
 func (s *Service) markFailedLocal(imageIDValue string, errText string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.ensureIndexesLocked()
 	s.failedByID[imageIDValue] = errText
 	albumID, photoIndex, err := parseImageID(imageIDValue)
 	if err == nil {
 		if missing, ok := s.missingByAlbum[albumID]; ok {
 			delete(missing, photoIndex)
+			if len(missing) == 0 {
+				s.removeAlbumWithMissingLocked(albumID)
+			}
 		}
 	}
 }
@@ -541,19 +565,16 @@ func (s *Service) Recommend(ctx context.Context, albumID string, photoIndex int,
 		return RecommendationResponse{Items: nil, Status: "pending"}, nil
 	}
 
-	// Recommendations are cross-album only: exclude the query photo and all
-	// photos from the same album.
+	// Recommendations are cross-album only.
 	exclude := map[string]struct{}{queryID: {}}
-	for id, photo := range s.photosByID {
-		if photo.AlbumID == albumID {
-			exclude[id] = struct{}{}
-		}
-	}
-	neighbors := findNeighbors(s.embeddingsByID, queryEmbedding.Vector, limit+1, exclude)
+	neighbors := findNeighbors(s.embeddingsByID, queryEmbedding.Vector, len(s.embeddingsByID), exclude)
 	items := make([]RecommendationItem, 0, limit)
 	for _, n := range neighbors {
 		photo, ok := s.photosByID[n.ImageID]
 		if !ok {
+			continue
+		}
+		if photo.AlbumID == albumID {
 			continue
 		}
 		items = append(items, RecommendationItem{
@@ -575,4 +596,81 @@ func (s *Service) Recommend(ctx context.Context, albumID string, photoIndex int,
 		status = "partial"
 	}
 	return RecommendationResponse{Items: items, Status: status}, nil
+}
+
+func (s *Service) ensureIndexesLocked() {
+	if s.photosByID == nil {
+		s.photosByID = make(map[string]PhotoRecord)
+	}
+	if s.photoIDsByAlbum == nil {
+		s.photoIDsByAlbum = make(map[string]map[string]struct{})
+	}
+	if s.embeddingsByID == nil {
+		s.embeddingsByID = make(map[string]EmbeddingRecord)
+	}
+	if s.failedByID == nil {
+		s.failedByID = make(map[string]string)
+	}
+	if s.missingByAlbum == nil {
+		s.missingByAlbum = make(map[string]map[int]struct{})
+	}
+	if s.albumsWithMissing == nil {
+		s.albumsWithMissing = make([]string, 0)
+	}
+	if s.albumMissingPos == nil {
+		s.albumMissingPos = make(map[string]int)
+		if len(s.albumsWithMissing) > 0 {
+			for idx, albumID := range s.albumsWithMissing {
+				s.albumMissingPos[albumID] = idx
+			}
+		}
+	}
+	if len(s.albumMissingPos) == 0 {
+		if len(s.albumsWithMissing) > 0 {
+			for idx, albumID := range s.albumsWithMissing {
+				s.albumMissingPos[albumID] = idx
+			}
+		} else {
+			for albumID, missing := range s.missingByAlbum {
+				if len(missing) == 0 {
+					continue
+				}
+				s.albumMissingPos[albumID] = len(s.albumsWithMissing)
+				s.albumsWithMissing = append(s.albumsWithMissing, albumID)
+			}
+		}
+	}
+}
+
+func (s *Service) setMissingForAlbumLocked(albumID string, missing map[int]struct{}) {
+	if missing == nil {
+		missing = make(map[int]struct{})
+	}
+	s.missingByAlbum[albumID] = missing
+	if len(missing) > 0 {
+		s.addAlbumWithMissingLocked(albumID)
+	} else {
+		s.removeAlbumWithMissingLocked(albumID)
+	}
+}
+
+func (s *Service) addAlbumWithMissingLocked(albumID string) {
+	if _, ok := s.albumMissingPos[albumID]; ok {
+		return
+	}
+	s.albumMissingPos[albumID] = len(s.albumsWithMissing)
+	s.albumsWithMissing = append(s.albumsWithMissing, albumID)
+}
+
+func (s *Service) removeAlbumWithMissingLocked(albumID string) {
+	pos, ok := s.albumMissingPos[albumID]
+	if !ok {
+		return
+	}
+	lastIdx := len(s.albumsWithMissing) - 1
+	lastAlbumID := s.albumsWithMissing[lastIdx]
+	s.albumsWithMissing[pos] = lastAlbumID
+	s.albumMissingPos[lastAlbumID] = pos
+	s.albumsWithMissing = s.albumsWithMissing[:lastIdx]
+	delete(s.albumMissingPos, albumID)
 }

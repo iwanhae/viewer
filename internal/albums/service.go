@@ -25,9 +25,11 @@ type Service struct {
 	store   albumStore
 	indexer *Indexer
 
-	mu          sync.RWMutex
-	albumCache  map[string]*models.AlbumIndex
-	uploadHints map[string]string
+	mu                     sync.RWMutex
+	albumCache             map[string]*models.AlbumIndex
+	uploadHints            map[string]string
+	albumSummariesSnapshot []models.AlbumSummary
+	allAlbumsSnapshot      []*models.AlbumIndex
 }
 
 type RefreshProgress struct {
@@ -176,6 +178,7 @@ func (s *Service) Finalize(ctx context.Context, albumID string) (*models.AlbumIn
 
 	s.mu.Lock()
 	s.albumCache[albumID] = idx
+	s.invalidateSnapshotsLocked()
 	delete(s.uploadHints, albumID)
 	s.mu.Unlock()
 
@@ -251,6 +254,7 @@ func (s *Service) refreshFromStorage(ctx context.Context, onProgress func(Refres
 				*cached = idx
 				s.mu.Lock()
 				s.albumCache[idx.AlbumID] = cached
+				s.invalidateSnapshotsLocked()
 				s.mu.Unlock()
 				if onAlbum != nil {
 					onAlbum(idx)
@@ -339,6 +343,7 @@ func (s *Service) GetAlbum(ctx context.Context, albumID string) (*models.AlbumIn
 
 	s.mu.Lock()
 	s.albumCache[albumID] = &idx
+	s.invalidateSnapshotsLocked()
 	s.mu.Unlock()
 
 	return &idx, nil
@@ -347,42 +352,37 @@ func (s *Service) GetAlbum(ctx context.Context, albumID string) (*models.AlbumIn
 func (s *Service) ListAlbums(ctx context.Context) ([]models.AlbumSummary, error) {
 	_ = ctx
 	s.mu.RLock()
-	out := make([]models.AlbumSummary, 0, len(s.albumCache))
-	for _, idx := range s.albumCache {
-		out = append(out, models.AlbumSummary{
-			AlbumID:          idx.AlbumID,
-			OriginalFilename: idx.OriginalFilename,
-			PhotoCount:       idx.PhotoCount,
-			CreatedAt:        idx.CreatedAt,
-		})
+	if s.albumSummariesSnapshot != nil {
+		out := cloneAlbumSummarySlice(s.albumSummariesSnapshot)
+		s.mu.RUnlock()
+		return out, nil
 	}
 	s.mu.RUnlock()
 
-	sort.Slice(out, func(i, j int) bool {
-		return out[i].CreatedAt > out[j].CreatedAt
-	})
+	s.mu.Lock()
+	if s.albumSummariesSnapshot == nil || s.allAlbumsSnapshot == nil {
+		s.rebuildSnapshotsLocked()
+	}
+	out := cloneAlbumSummarySlice(s.albumSummariesSnapshot)
+	s.mu.Unlock()
 	return out, nil
 }
 
 func (s *Service) AllAlbums() []*models.AlbumIndex {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	out := make([]*models.AlbumIndex, 0, len(s.albumCache))
-	for _, idx := range s.albumCache {
-		dup := *idx
-		dup.Photos = append([]models.PhotoMeta(nil), idx.Photos...)
-		out = append(out, &dup)
+	if s.allAlbumsSnapshot != nil {
+		out := cloneAlbumIndexSlice(s.allAlbumsSnapshot)
+		s.mu.RUnlock()
+		return out
 	}
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].AlbumID != out[j].AlbumID {
-			return out[i].AlbumID < out[j].AlbumID
-		}
-		if out[i].CreatedAt != out[j].CreatedAt {
-			return out[i].CreatedAt < out[j].CreatedAt
-		}
-		return out[i].OriginalFilename < out[j].OriginalFilename
-	})
+	s.mu.RUnlock()
+
+	s.mu.Lock()
+	if s.albumSummariesSnapshot == nil || s.allAlbumsSnapshot == nil {
+		s.rebuildSnapshotsLocked()
+	}
+	out := cloneAlbumIndexSlice(s.allAlbumsSnapshot)
+	s.mu.Unlock()
 	return out
 }
 
@@ -394,4 +394,60 @@ func (s *Service) DumpAlbumJSON(albumID string) ([]byte, error) {
 		return nil, fmt.Errorf("%w: %s", ErrAlbumNotFound, albumID)
 	}
 	return json.Marshal(idx)
+}
+
+func (s *Service) invalidateSnapshotsLocked() {
+	s.albumSummariesSnapshot = nil
+	s.allAlbumsSnapshot = nil
+}
+
+func (s *Service) rebuildSnapshotsLocked() {
+	summaries := make([]models.AlbumSummary, 0, len(s.albumCache))
+	albumsList := make([]*models.AlbumIndex, 0, len(s.albumCache))
+	for _, idx := range s.albumCache {
+		summaries = append(summaries, models.AlbumSummary{
+			AlbumID:          idx.AlbumID,
+			OriginalFilename: idx.OriginalFilename,
+			PhotoCount:       idx.PhotoCount,
+			CreatedAt:        idx.CreatedAt,
+		})
+		albumsList = append(albumsList, cloneAlbumIndex(idx))
+	}
+
+	sort.Slice(summaries, func(i, j int) bool {
+		return summaries[i].CreatedAt > summaries[j].CreatedAt
+	})
+	sort.Slice(albumsList, func(i, j int) bool {
+		if albumsList[i].AlbumID != albumsList[j].AlbumID {
+			return albumsList[i].AlbumID < albumsList[j].AlbumID
+		}
+		if albumsList[i].CreatedAt != albumsList[j].CreatedAt {
+			return albumsList[i].CreatedAt < albumsList[j].CreatedAt
+		}
+		return albumsList[i].OriginalFilename < albumsList[j].OriginalFilename
+	})
+
+	s.albumSummariesSnapshot = summaries
+	s.allAlbumsSnapshot = albumsList
+}
+
+func cloneAlbumSummarySlice(in []models.AlbumSummary) []models.AlbumSummary {
+	return append([]models.AlbumSummary(nil), in...)
+}
+
+func cloneAlbumIndexSlice(in []*models.AlbumIndex) []*models.AlbumIndex {
+	out := make([]*models.AlbumIndex, 0, len(in))
+	for _, idx := range in {
+		out = append(out, cloneAlbumIndex(idx))
+	}
+	return out
+}
+
+func cloneAlbumIndex(idx *models.AlbumIndex) *models.AlbumIndex {
+	if idx == nil {
+		return nil
+	}
+	dup := *idx
+	dup.Photos = append([]models.PhotoMeta(nil), idx.Photos...)
+	return &dup
 }
