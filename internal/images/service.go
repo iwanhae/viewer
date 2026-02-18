@@ -80,13 +80,13 @@ func sourceKey(albumID string) string {
 	return fmt.Sprintf("albums/%s/source.zip", albumID)
 }
 
-func (s *Service) GetImage(ctx context.Context, albumID string, idx int, mode string, wallWidth int) (ImageResult, error) {
+func (s *Service) GetImage(ctx context.Context, albumID string, idx int) (ImageResult, error) {
 	album, err := s.albums.GetAlbum(ctx, albumID)
 	if err != nil {
 		return ImageResult{}, err
 	}
 	if idx < 0 || idx >= len(album.Photos) {
-		return ImageResult{}, fmt.Errorf("photo index out of range")
+		return ImageResult{}, fmt.Errorf("%w: %d", ErrPhotoIndexOutOfRange, idx)
 	}
 
 	photo := album.Photos[idx]
@@ -107,7 +107,7 @@ func (s *Service) GetImageByEntry(ctx context.Context, albumID string, entryName
 	}
 	result, ok := entries[entryName]
 	if !ok {
-		return ImageResult{}, fmt.Errorf("image entry not found")
+		return ImageResult{}, fmt.Errorf("%w: %s", ErrImageEntryNotFound, entryName)
 	}
 	return result, nil
 }
@@ -135,7 +135,7 @@ func (s *Service) GetImagesByEntries(ctx context.Context, albumID string, entryN
 		return nil, err
 	}
 	if !exists || size <= 0 {
-		return nil, fmt.Errorf("source zip not found")
+		return nil, fmt.Errorf("%w: %s", albums.ErrAlbumSourceNotFound, albumID)
 	}
 
 	handle, err := s.rangeCache.Open(ctx, key, size)

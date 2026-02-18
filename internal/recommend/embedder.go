@@ -22,7 +22,7 @@ type EmbeddingProvider interface {
 	Close() error
 }
 
-type PythonEmbedder struct {
+type HTTPEmbedder struct {
 	endpoint       string
 	modelID        string
 	device         string
@@ -55,11 +55,11 @@ type embedResponse struct {
 	Embedding      []float32 `json:"embedding,omitempty"`
 }
 
-func NewPythonEmbedder(endpoint string, modelID string, device string, requestTimeout time.Duration) *PythonEmbedder {
+func NewHTTPEmbedder(endpoint string, modelID string, device string, requestTimeout time.Duration) *HTTPEmbedder {
 	if requestTimeout <= 0 {
 		requestTimeout = 120 * time.Second
 	}
-	return &PythonEmbedder{
+	return &HTTPEmbedder{
 		endpoint:       normalizeEndpoint(endpoint),
 		modelID:        modelID,
 		device:         device,
@@ -69,7 +69,7 @@ func NewPythonEmbedder(endpoint string, modelID string, device string, requestTi
 	}
 }
 
-func (e *PythonEmbedder) Healthcheck(ctx context.Context) error {
+func (e *HTTPEmbedder) Healthcheck(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -109,7 +109,7 @@ func (e *PythonEmbedder) Healthcheck(ctx context.Context) error {
 	return nil
 }
 
-func (e *PythonEmbedder) Embed(ctx context.Context, imageBytes []byte) ([]float32, string, error) {
+func (e *HTTPEmbedder) Embed(ctx context.Context, imageBytes []byte) ([]float32, string, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -144,7 +144,7 @@ func (e *PythonEmbedder) Embed(ctx context.Context, imageBytes []byte) ([]float3
 	return out.Embedding, modelID, nil
 }
 
-func (e *PythonEmbedder) sendRequest(ctx context.Context, path string, payload embedRequest) (embedResponse, string, error) {
+func (e *HTTPEmbedder) sendRequest(ctx context.Context, path string, payload embedRequest) (embedResponse, string, error) {
 	bodyBytes, err := json.Marshal(payload)
 	if err != nil {
 		return embedResponse{}, "", fmt.Errorf("encode worker request: %w", err)
@@ -234,12 +234,12 @@ func isTransientEmbedError(err error) bool {
 	return false
 }
 
-func (e *PythonEmbedder) nextRequestID() string {
+func (e *HTTPEmbedder) nextRequestID() string {
 	next := atomic.AddUint64(&e.sequence, 1)
 	return e.requestPrefix + "-" + fmt.Sprintf("%d", next)
 }
 
-func (e *PythonEmbedder) Close() error {
+func (e *HTTPEmbedder) Close() error {
 	return nil
 }
 

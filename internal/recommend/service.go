@@ -2,6 +2,7 @@ package recommend
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"math/rand"
@@ -49,7 +50,7 @@ func NewService(cfg cfgpkg.Config, albumsService *albums.Service, imagesService 
 		albums:         albumsService,
 		images:         imagesService,
 		s3:             s3Store,
-		embedder:       NewPythonEmbedder(cfg.RecommenderEndpoint, cfg.Siglip2ModelID, cfg.Siglip2Device, time.Duration(cfg.RecommenderTimeoutSec)*time.Second),
+		embedder:       NewHTTPEmbedder(cfg.RecommenderEndpoint, cfg.Siglip2ModelID, cfg.Siglip2Device, time.Duration(cfg.RecommenderTimeoutSec)*time.Second),
 		photosByID:     make(map[string]PhotoRecord),
 		embeddingsByID: make(map[string]EmbeddingRecord),
 		failedByID:     make(map[string]string),
@@ -516,7 +517,16 @@ func (s *Service) Recommend(ctx context.Context, albumID string, photoIndex int,
 	s.mu.RUnlock()
 	if !hasPhoto {
 		if err := s.syncAlbum(ctx, albumID); err != nil {
+			if storage.IsNotFound(err) || errors.Is(err, albums.ErrAlbumNotFound) {
+				return RecommendationResponse{}, fmt.Errorf("%w: %s:%d", ErrPhotoNotFound, albumID, photoIndex)
+			}
 			return RecommendationResponse{}, err
+		}
+		s.mu.RLock()
+		_, hasPhoto = s.photosByID[queryID]
+		s.mu.RUnlock()
+		if !hasPhoto {
+			return RecommendationResponse{}, fmt.Errorf("%w: %s:%d", ErrPhotoNotFound, albumID, photoIndex)
 		}
 	}
 

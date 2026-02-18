@@ -12,6 +12,7 @@ type errorBody struct {
 	Error struct {
 		Code    string `json:"code"`
 		Message string `json:"message"`
+		Details any    `json:"details,omitempty"`
 	} `json:"error"`
 }
 
@@ -24,6 +25,10 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 }
 
 func writeError(w http.ResponseWriter, r *http.Request, status int, code string, message string) {
+	writeErrorDetailed(w, r, status, code, message, nil)
+}
+
+func writeErrorDetailed(w http.ResponseWriter, r *http.Request, status int, code string, message string, details any) {
 	if status >= http.StatusInternalServerError {
 		reqID := "n/a"
 		if r != nil {
@@ -47,5 +52,6 @@ func writeError(w http.ResponseWriter, r *http.Request, status int, code string,
 	var b errorBody
 	b.Error.Code = code
 	b.Error.Message = message
+	b.Error.Details = details
 	writeJSON(w, status, b)
 }

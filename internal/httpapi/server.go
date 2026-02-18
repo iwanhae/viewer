@@ -133,7 +133,7 @@ func (s *Server) finalizeAlbum(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		status := http.StatusInternalServerError
 		code := "INDEXING_FAILED"
-		if strings.Contains(err.Error(), "not found") {
+		if errors.Is(err, albums.ErrAlbumNotFound) || errors.Is(err, albums.ErrAlbumSourceNotFound) {
 			status = http.StatusNotFound
 			code = "NOT_FOUND"
 		}
@@ -155,7 +155,11 @@ func (s *Server) getAlbum(w http.ResponseWriter, r *http.Request) {
 	albumID := chi.URLParam(r, "albumId")
 	idx, err := s.albums.GetAlbum(r.Context(), albumID)
 	if err != nil {
-		writeError(w, r, http.StatusNotFound, "NOT_FOUND", "album not found")
+		if errors.Is(err, albums.ErrAlbumNotFound) {
+			writeError(w, r, http.StatusNotFound, "NOT_FOUND", "album not found")
+			return
+		}
+		writeError(w, r, http.StatusInternalServerError, "INTERNAL", err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, idx)
@@ -171,14 +175,10 @@ func (s *Server) listAlbums(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) getFeed(w http.ResponseWriter, r *http.Request) {
-	limit := 80
-	if raw := r.URL.Query().Get("limit"); raw != "" {
-		n, err := strconv.Atoi(raw)
-		if err != nil {
-			writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", "invalid limit")
-			return
-		}
-		limit = n
+	limit, err := parseOptionalIntQuery(r, "limit", 80, 1, 200)
+	if err != nil {
+		writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", "invalid limit")
+		return
 	}
 
 	resp, err := s.feed.Build(
@@ -196,30 +196,19 @@ func (s *Server) getFeed(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) getImage(w http.ResponseWriter, r *http.Request) {
 	albumID := chi.URLParam(r, "albumId")
-	idxRaw := chi.URLParam(r, "index")
-	idx, err := strconv.Atoi(idxRaw)
+	idx, err := parsePathIntParam(r, "index")
 	if err != nil {
 		writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", "invalid image index")
 		return
 	}
-	mode := r.URL.Query().Get("mode")
-	if mode == "" {
-		mode = "viewer"
-	}
-
-	wallWidth := 480
-	if raw := r.URL.Query().Get("w"); raw != "" {
-		n, err := strconv.Atoi(raw)
-		if err == nil {
-			wallWidth = n
-		}
-	}
-
-	result, err := s.images.GetImage(r.Context(), albumID, idx, mode, wallWidth)
+	result, err := s.images.GetImage(r.Context(), albumID, idx)
 	if err != nil {
 		status := http.StatusInternalServerError
 		code := "INTERNAL"
-		if strings.Contains(err.Error(), "out of range") || strings.Contains(err.Error(), "not found") {
+		if errors.Is(err, albums.ErrAlbumNotFound) ||
+			errors.Is(err, albums.ErrAlbumSourceNotFound) ||
+			errors.Is(err, images.ErrPhotoIndexOutOfRange) ||
+			errors.Is(err, images.ErrImageEntryNotFound) {
 			status = http.StatusNotFound
 			code = "NOT_FOUND"
 		}
@@ -237,24 +226,19 @@ func (s *Server) getImage(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) getRecommendations(w http.ResponseWriter, r *http.Request) {
 	albumID := chi.URLParam(r, "albumId")
-	idxRaw := chi.URLParam(r, "index")
-	idx, err := strconv.Atoi(idxRaw)
+	idx, err := parsePathIntParam(r, "index")
 	if err != nil || idx < 0 {
 		writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", "invalid image index")
 		return
 	}
-	limit := 12
-	if raw := r.URL.Query().Get("limit"); raw != "" {
-		n, parseErr := strconv.Atoi(raw)
-		if parseErr != nil {
-			writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", "invalid limit")
-			return
-		}
-		limit = n
+	limit, err := parseOptionalIntQuery(r, "limit", 12, 1, 200)
+	if err != nil {
+		writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", "invalid limit")
+		return
 	}
 	result, err := s.recommend.Recommend(r.Context(), albumID, idx, limit)
 	if err != nil {
-		if strings.Contains(err.Error(), "not found") {
+		if errors.Is(err, recommend.ErrPhotoNotFound) {
 			writeError(w, r, http.StatusNotFound, "NOT_FOUND", "photo not found")
 			return
 		}
@@ -300,6 +284,33 @@ func jsonBody(r *http.Request, out any) error {
 		return fmt.Errorf("invalid body: %w", err)
 	}
 	return nil
+}
+
+func parsePathIntParam(r *http.Request, key string) (int, error) {
+	raw := chi.URLParam(r, key)
+	value, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, err
+	}
+	return value, nil
+}
+
+func parseOptionalIntQuery(r *http.Request, key string, defaultValue int, min int, max int) (int, error) {
+	raw := strings.TrimSpace(r.URL.Query().Get(key))
+	if raw == "" {
+		return defaultValue, nil
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, err
+	}
+	if value < min {
+		return 0, fmt.Errorf("invalid %s: too small", key)
+	}
+	if max > 0 && value > max {
+		return 0, fmt.Errorf("invalid %s: too large", key)
+	}
+	return value, nil
 }
 
 func Warmup(ctx context.Context, albumsService *albums.Service, recommendService *recommend.Service) {

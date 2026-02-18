@@ -134,7 +134,7 @@ func (s *Service) Finalize(ctx context.Context, albumID string) (*models.AlbumIn
 		return nil, err
 	}
 	if !exists {
-		return nil, fmt.Errorf("source zip not found")
+		return nil, fmt.Errorf("%w: %s", ErrAlbumSourceNotFound, albumID)
 	}
 
 	body, _, err := s.store.GetObject(ctx, sourceKey(albumID))
@@ -328,6 +328,9 @@ func (s *Service) GetAlbum(ctx context.Context, albumID string) (*models.AlbumIn
 
 	var idx models.AlbumIndex
 	if err := s.store.ReadJSON(ctx, indexKey(albumID), &idx); err != nil {
+		if storage.IsNotFound(err) {
+			return nil, fmt.Errorf("%w: %s", ErrAlbumNotFound, albumID)
+		}
 		return nil, err
 	}
 	if idx.AlbumID == "" {
@@ -388,7 +391,7 @@ func (s *Service) DumpAlbumJSON(albumID string) ([]byte, error) {
 	idx, ok := s.albumCache[albumID]
 	s.mu.RUnlock()
 	if !ok {
-		return nil, fmt.Errorf("album not cached")
+		return nil, fmt.Errorf("%w: %s", ErrAlbumNotFound, albumID)
 	}
 	return json.Marshal(idx)
 }
