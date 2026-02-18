@@ -3,6 +3,7 @@ import { useLocation, useNavigate, useParams } from 'react-router-dom'
 import { seedCachedAlbum, type AlbumIndex } from '../api/client'
 import { useAlbum } from '../hooks/useAlbum'
 import { useRecommendations } from '../hooks/useRecommendations'
+import { MasonryWall } from '../components/MasonryWall'
 
 export function PhotoPage() {
   const { albumId = '', photoIndex: rawPhotoIndex = '' } = useParams<{
@@ -30,6 +31,7 @@ export function PhotoPage() {
   }, [location.state, albumId])
 
   const { album, loading, error } = useAlbum(albumId, locationAlbum)
+  const recommendationColumnCount = 3
 
   const photo = useMemo(() => {
     if (!album || photoIndex === null) return null
@@ -132,10 +134,12 @@ export function PhotoPage() {
                 <p className="photo-recommendations-note">No similar images found yet.</p>
               )}
             {recommendations.length > 0 && (
-              <div className="photo-recommendation-grid">
-                {recommendations.map((item) => (
+              <MasonryWall
+                items={recommendations}
+                columnCount={recommendationColumnCount}
+                getItemWeight={(item) => item.h / Math.max(item.w, 1)}
+                renderItem={(item) => (
                   <button
-                    key={`${item.albumId}-${item.i}`}
                     className="photo-recommendation-tile"
                     onClick={() => navigate(`/album/${item.albumId}/${item.i}`)}
                     aria-label={`Open similar image ${item.i + 1}`}
@@ -148,8 +152,12 @@ export function PhotoPage() {
                       style={{ aspectRatio: `${item.w} / ${item.h}` }}
                     />
                   </button>
-                ))}
-              </div>
+                )}
+                getItemKey={(item) => `${item.albumId}-${item.i}`}
+                containerClassName="photo-recommendation-grid"
+                containerTestId="photo-recommendation-grid"
+                columnTestId="photo-recommendation-column"
+              />
             )}
           </section>
         </aside>

@@ -2,8 +2,8 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { useAlbum } from '../hooks/useAlbum'
 import { readColumnPreference, writeColumnPreference } from '../utils/columnPreference'
-import { distributeMasonry } from '../utils/masonry'
 import { readLastWallSeed } from '../utils/wallSeed'
+import { MasonryWall } from '../components/MasonryWall'
 
 const COLUMN_OPTIONS = [1, 2, 3, 4, 5, 6]
 const VIEWER_COLUMNS_KEY = 'viewer_columns'
@@ -54,10 +54,7 @@ export function ViewerPage() {
     return estimated
   }, [columnCount])
 
-  const masonryColumns = useMemo(
-    () => distributeMasonry(album?.photos ?? [], columnCount, (photo) => photo.h / Math.max(photo.w, 1)),
-    [album?.photos, columnCount],
-  )
+  const albumPhotos = useMemo(() => album?.photos ?? [], [album?.photos])
 
   const onBackToWall = () => {
     const seed = readLastWallSeed()
@@ -83,29 +80,32 @@ export function ViewerPage() {
 
   return (
     <div className="album-page">
-      <div className="album-grid wall-grid" data-testid="album-grid">
-        {masonryColumns.map((columnPhotos, columnIndex) => (
-          <div className="masonry-column" data-testid="masonry-column" key={columnIndex}>
-            {columnPhotos.map((photo) => (
-              <button
-                key={photo.i}
-                className="tile album-photo-tile"
-                data-testid="album-tile"
-                ref={photo.i === anchorIndex ? anchorRef : null}
-                onClick={() => navigate(`/album/${album.albumId}/${photo.i}`, { state: { album } })}
-                aria-label={`Open details for image ${photo.i + 1}`}
-              >
-                <img
-                  src={`/api/image/${album.albumId}/${photo.i}?mode=wall&w=${imageWidth}`}
-                  alt=""
-                  loading="lazy"
-                  style={{ aspectRatio: `${photo.w} / ${photo.h}` }}
-                />
-              </button>
-            ))}
-          </div>
-        ))}
-      </div>
+      <MasonryWall
+        items={albumPhotos}
+        columnCount={columnCount}
+        getItemWeight={(photo) => photo.h / Math.max(photo.w, 1)}
+        renderItem={(photo) => (
+          <button
+            className="tile album-photo-tile"
+            data-testid="album-tile"
+            ref={photo.i === anchorIndex ? anchorRef : null}
+            onClick={() => navigate(`/album/${album.albumId}/${photo.i}`, { state: { album } })}
+            aria-label={`Open details for image ${photo.i + 1}`}
+          >
+            <img
+              src={`/api/image/${album.albumId}/${photo.i}?mode=wall&w=${imageWidth}`}
+              alt=""
+              loading="lazy"
+              style={{ aspectRatio: `${photo.w} / ${photo.h}` }}
+            />
+          </button>
+        )}
+        getItemKey={(photo, idx) => `${album.albumId}-${photo.i}-${idx}`}
+        containerClassName="album-grid"
+        columnClassName=""
+        containerTestId="album-grid"
+        columnTestId="masonry-column"
+      />
 
       <div className="bottom-bar">
         <div className="columns">

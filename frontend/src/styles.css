@@ -362,9 +362,6 @@ body,
 
 .photo-recommendation-grid {
   margin-top: 10px;
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 8px;
 }
 
 .photo-recommendation-tile {
@@ -419,9 +416,6 @@ body,
     justify-content: space-between;
   }
 
-  .photo-recommendation-grid {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
 }
 
 @media (max-width: 640px) {

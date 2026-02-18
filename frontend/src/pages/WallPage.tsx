@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import {
   createAlbum,
@@ -8,8 +8,8 @@ import {
 } from '../api/client'
 import { useFeed } from '../hooks/useFeed'
 import { readColumnPreference, writeColumnPreference } from '../utils/columnPreference'
-import { distributeMasonry } from '../utils/masonry'
 import { writeLastWallSeed } from '../utils/wallSeed'
+import { MasonryWall } from '../components/MasonryWall'
 
 const columnOptions = [1, 2, 3, 4, 5, 6]
 const WALL_COLUMNS_KEY = 'wall_columns'
@@ -38,16 +38,6 @@ export function WallPage() {
 
   const { items, loading, error: feedError, refetch } = useFeed(seed)
   const error = uploadError ?? feedError
-
-  const masonryColumns = useMemo(
-    () =>
-      distributeMasonry(
-        items.map((item, idx) => ({ item, idx })),
-        columns,
-        ({ item }) => item.h / Math.max(item.w, 1),
-      ),
-    [columns, items],
-  )
 
   useEffect(() => {
     if (seed) return
@@ -117,27 +107,30 @@ export function WallPage() {
 
   return (
     <div className="wall-page">
-      <div className="wall-grid" data-testid="wall-grid">
-        {masonryColumns.map((columnItems, columnIndex) => (
-          <div className="masonry-column" data-testid="masonry-column" key={columnIndex}>
-            {columnItems.map(({ item, idx }) => (
-              <button
-                className="tile"
-                key={`${item.albumId}-${item.i}-${idx}`}
-                onClick={() => navigate(`/album/${item.albumId}`)}
-                data-testid="wall-tile"
-              >
-                <img
-                  src={item.src}
-                  alt=""
-                  loading="lazy"
-                  style={{ aspectRatio: `${item.w} / ${item.h}` }}
-                />
-              </button>
-            ))}
-          </div>
-        ))}
-      </div>
+      <MasonryWall
+        items={items}
+        columnCount={columns}
+        getItemWeight={(item) => item.h / Math.max(item.w, 1)}
+        renderItem={(item) => (
+          <button
+            className="tile"
+            onClick={() => navigate(`/album/${item.albumId}`)}
+            data-testid="wall-tile"
+          >
+            <img
+              src={item.src}
+              alt=""
+              loading="lazy"
+              style={{ aspectRatio: `${item.w} / ${item.h}` }}
+            />
+          </button>
+        )}
+        getItemKey={(item, idx) => `${item.albumId}-${item.i}-${idx}`}
+        containerClassName=""
+        columnClassName=""
+        containerTestId="wall-grid"
+        columnTestId="masonry-column"
+      />
 
       <div className="bottom-bar">
         <div className="columns">
