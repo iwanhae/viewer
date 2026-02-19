@@ -69,9 +69,25 @@ async function createAndFinalizeAlbum(
   expect(completeRes.ok()).toBeTruthy()
 
   const finalizeRes = await request.post(`/api/albums/${created.albumId}/finalize`)
-  expect(finalizeRes.ok()).toBeTruthy()
+  expect(finalizeRes.status()).toBe(202)
 
-  return created.albumId
+  for (let i = 0; i < 120; i++) {
+    const statusRes = await request.get(`/api/albums/${created.albumId}/status`)
+    expect(statusRes.ok()).toBeTruthy()
+    const status = (await statusRes.json()) as {
+      status: string
+      lastError?: string
+    }
+    if (status.status === 'ready') {
+      return created.albumId
+    }
+    if (status.status === 'failed') {
+      throw new Error(`finalize failed for album ${created.albumId}: ${status.lastError ?? 'unknown error'}`)
+    }
+    await new Promise((resolve) => setTimeout(resolve, 1000))
+  }
+
+  throw new Error(`timed out waiting for album ${created.albumId} to reach ready status`)
 }
 
 test('api validation returns INVALID_REQUEST for negative indexes and trailing json body', async ({ page }) => {

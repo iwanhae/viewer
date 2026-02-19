@@ -2,6 +2,8 @@ import { cacheAlbum, getCachedAlbum as getCachedAlbumValue } from './albumCache'
 import { ensureOK, requestJSON } from './http'
 import type {
   AlbumIndex,
+  AlbumStatus,
+  AlbumStatusState,
   AlbumSearchResponse,
   FeedResponse,
   RecommendationItem,
@@ -11,6 +13,8 @@ import type {
 
 export type {
   AlbumIndex,
+  AlbumStatus,
+  AlbumStatusState,
   AlbumIndexStatus,
   AlbumSearchItem,
   AlbumSearchResponse,
@@ -128,8 +132,12 @@ export async function abortMultipartUpload(
   })
 }
 
-export async function finalizeAlbum(albumId: string): Promise<{ status: string; photoCount: number }> {
+export async function finalizeAlbum(albumId: string): Promise<AlbumStatus> {
   return await requestJSON(`/api/albums/${albumId}/finalize`, { method: 'POST' })
+}
+
+export async function fetchAlbumStatus(albumId: string): Promise<AlbumStatus> {
+  return await requestJSON(`/api/albums/${albumId}/status`)
 }
 
 export async function fetchAlbum(albumId: string, options?: { signal?: AbortSignal }): Promise<AlbumIndex> {

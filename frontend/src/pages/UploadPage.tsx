@@ -4,6 +4,7 @@ import {
   abortMultipartUpload,
   completeMultipartUpload,
   createAlbum,
+  fetchAlbumStatus,
   finalizeAlbum,
   initiateMultipartUpload,
   presignMultipartPart,
@@ -88,7 +89,7 @@ function statusLabel(status: UploadStatus): string {
     case 'uploaded':
       return 'Uploaded'
     case 'finalizing':
-      return 'Finalizing'
+      return 'Processing'
     case 'ready':
       return 'Ready'
     case 'failed':
@@ -108,12 +109,40 @@ export function UploadPage() {
   const [items, setItems] = useState<UploadItem[]>([])
   const [queueRunning, setQueueRunning] = useState(false)
   const [activeUploads, setActiveUploads] = useState(0)
-  const [finalizing, setFinalizing] = useState(false)
   const [pageError, setPageError] = useState<string | null>(null)
 
   const updateItem = useCallback((itemID: string, next: Partial<UploadItem>) => {
     setItems((prev) => prev.map((item) => (item.id === itemID ? { ...item, ...next } : item)))
   }, [])
+
+  const applyFinalizeStatus = useCallback(
+    (
+      itemID: string,
+      result: { status: string; photoCount: number; lastError?: string },
+    ) => {
+      const normalized = String(result.status || '').toLowerCase()
+      if (normalized === 'ready') {
+        updateItem(itemID, {
+          status: 'ready',
+          photoCount: result.photoCount,
+          error: undefined,
+        })
+        return
+      }
+      if (normalized === 'failed') {
+        updateItem(itemID, {
+          status: 'failed',
+          error: result.lastError || 'finalization failed',
+        })
+        return
+      }
+      updateItem(itemID, {
+        status: 'finalizing',
+        error: undefined,
+      })
+    },
+    [updateItem],
+  )
 
   const runItemUpload = useCallback(
     async (item: UploadItem) => {
@@ -150,6 +179,9 @@ export function UploadPage() {
 
         await completeMultipartUpload(albumID, uploadID, [])
         updateItem(item.id, { status: 'uploaded', uploadedBytes: item.sizeBytes, error: undefined })
+
+        const finalize = await finalizeAlbum(albumID)
+        applyFinalizeStatus(item.id, finalize)
       } catch (err) {
         if (albumID && uploadID) {
           try {
@@ -169,7 +201,7 @@ export function UploadPage() {
         setActiveUploads((count) => Math.max(0, count - 1))
       }
     },
-    [updateItem],
+    [applyFinalizeStatus, updateItem],
   )
 
   useEffect(() => {
@@ -226,10 +258,12 @@ export function UploadPage() {
     setItems((prev) => prev.filter((item) => item.id !== itemID))
   }
 
-  const onRetryFailed = () => {
+  const onRetryFailedUploads = () => {
     setItems((prev) =>
       prev.map((item) => {
-        if (item.status !== 'failed' && item.status !== 'aborted') return item
+        const isUploadFailure =
+          item.status === 'aborted' || (item.status === 'failed' && item.uploadedBytes < item.sizeBytes)
+        if (!isUploadFailure) return item
         return {
           ...item,
           status: 'queued',
@@ -245,31 +279,53 @@ export function UploadPage() {
     setQueueRunning(true)
   }
 
-  const onFinalizeAll = async () => {
-    const targets = items.filter((item) => item.status === 'uploaded' && item.albumId)
+  const onRetryFinalize = useCallback(
+    async (itemID: string, albumID: string) => {
+      updateItem(itemID, { status: 'finalizing', error: undefined })
+      try {
+        const result = await finalizeAlbum(albumID)
+        applyFinalizeStatus(itemID, result)
+      } catch (err) {
+        updateItem(itemID, { status: 'failed', error: toErrorMessage(err) })
+      }
+    },
+    [applyFinalizeStatus, updateItem],
+  )
+
+  useEffect(() => {
+    const targets = items.filter((item) => item.status === 'finalizing' && item.albumId)
     if (targets.length === 0) return
 
-    setFinalizing(true)
-    for (const item of targets) {
-      if (!item.albumId) continue
-      updateItem(item.id, { status: 'finalizing', error: undefined })
-      try {
-        const result = await finalizeAlbum(item.albumId)
-        updateItem(item.id, {
-          status: 'ready',
-          photoCount: result.photoCount,
-          error: undefined,
-        })
-      } catch (err) {
-        updateItem(item.id, { status: 'failed', error: toErrorMessage(err) })
+    let cancelled = false
+    const poll = async () => {
+      for (const item of targets) {
+        if (!item.albumId) continue
+        try {
+          const result = await fetchAlbumStatus(item.albumId)
+          if (cancelled) return
+          applyFinalizeStatus(item.id, result)
+        } catch {
+          // Keep polling on transient status fetch failures.
+        }
       }
     }
-    setFinalizing(false)
-  }
+
+    void poll()
+    const timer = window.setInterval(() => {
+      void poll()
+    }, 2000)
+
+    return () => {
+      cancelled = true
+      window.clearInterval(timer)
+    }
+  }, [applyFinalizeStatus, items])
 
   const summary = useMemo(() => {
     const totalFiles = items.length
-    const uploadedFiles = items.filter((item) => item.status === 'uploaded' || item.status === 'ready').length
+    const uploadedFiles = items.filter(
+      (item) => item.status === 'uploaded' || item.status === 'finalizing' || item.status === 'ready',
+    ).length
     const readyFiles = items.filter((item) => item.status === 'ready').length
     const failedFiles = items.filter((item) => item.status === 'failed').length
     const totalBytes = items.reduce((sum, item) => sum + item.sizeBytes, 0)
@@ -292,8 +348,9 @@ export function UploadPage() {
   }, [items])
 
   const hasQueued = items.some((item) => item.status === 'queued')
-  const hasUploaded = items.some((item) => item.status === 'uploaded')
-  const hasFailed = items.some((item) => item.status === 'failed' || item.status === 'aborted')
+  const hasRetryableUploadFailure = items.some(
+    (item) => item.status === 'aborted' || (item.status === 'failed' && item.uploadedBytes < item.sizeBytes),
+  )
 
   return (
     <div className="upload-page" data-testid="upload-page">
@@ -311,7 +368,7 @@ export function UploadPage() {
         </header>
 
         <p className="upload-subtitle">
-          Queue many ZIP files, upload directly to S3, then finalize indexing in one batch.
+          Queue many ZIP files, upload directly to S3, then process each album automatically.
         </p>
 
         <div className="upload-actions">
@@ -344,20 +401,11 @@ export function UploadPage() {
           <button
             type="button"
             className="photo-nav-button"
-            onClick={onRetryFailed}
-            disabled={!hasFailed}
+            onClick={onRetryFailedUploads}
+            disabled={!hasRetryableUploadFailure}
             data-testid="upload-retry-failed"
           >
             Retry failed
-          </button>
-          <button
-            type="button"
-            className="photo-nav-button"
-            onClick={onFinalizeAll}
-            disabled={!hasUploaded || finalizing}
-            data-testid="upload-finalize-all"
-          >
-            {finalizing ? 'Finalizing...' : 'Finalize uploaded'}
           </button>
           <button
             type="button"
@@ -420,6 +468,16 @@ export function UploadPage() {
                       data-testid="upload-cancel-item"
                     >
                       Cancel
+                    </button>
+                  )}
+                  {item.status === 'failed' && item.albumId && item.uploadedBytes >= item.sizeBytes && (
+                    <button
+                      type="button"
+                      className="photo-nav-button"
+                      onClick={() => void onRetryFinalize(item.id, item.albumId!)}
+                      data-testid="upload-retry-finalize"
+                    >
+                      Retry finalize
                     </button>
                   )}
                   {item.albumId && (item.status === 'ready' || item.status === 'uploaded' || item.status === 'finalizing') && (

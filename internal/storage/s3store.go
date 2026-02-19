@@ -197,11 +197,34 @@ func (s *S3Store) PutObject(ctx context.Context, key string, body io.Reader, con
 }
 
 func (s *S3Store) PutJSON(ctx context.Context, key string, v any) error {
+	_, err := s.PutJSONIfMatch(ctx, key, "", v)
+	return err
+}
+
+func (s *S3Store) PutJSONIfMatch(ctx context.Context, key string, etag string, v any) (string, error) {
 	b, err := json.Marshal(v)
 	if err != nil {
-		return fmt.Errorf("marshal json: %w", err)
+		return "", fmt.Errorf("marshal json: %w", err)
 	}
-	return s.PutObject(ctx, key, bytes.NewReader(b), "application/json")
+
+	input := &s3.PutObjectInput{
+		Bucket:      aws.String(s.bucket),
+		Key:         aws.String(key),
+		Body:        bytes.NewReader(b),
+		ContentType: aws.String("application/json"),
+	}
+	if strings.TrimSpace(etag) != "" {
+		input.IfMatch = aws.String(etag)
+	}
+
+	out, err := s.client.PutObject(ctx, input)
+	if err != nil {
+		if isS3PreconditionFailed(err) {
+			return "", fmt.Errorf("%w: %s", ErrPreconditionFailed, key)
+		}
+		return "", fmt.Errorf("put json %s: %w", key, err)
+	}
+	return aws.ToString(out.ETag), nil
 }
 
 func (s *S3Store) GetObject(ctx context.Context, key string) (io.ReadCloser, string, error) {
@@ -271,16 +294,24 @@ func (s *S3Store) GetObjectRange(ctx context.Context, key string, start int64, e
 }
 
 func (s *S3Store) ReadJSON(ctx context.Context, key string, out any) error {
-	body, _, err := s.GetObject(ctx, key)
-	if err != nil {
-		return err
-	}
-	defer body.Close()
+	_, err := s.ReadJSONWithETag(ctx, key, out)
+	return err
+}
 
-	if err := json.NewDecoder(body).Decode(out); err != nil {
-		return fmt.Errorf("decode json %s: %w", key, err)
+func (s *S3Store) ReadJSONWithETag(ctx context.Context, key string, out any) (string, error) {
+	getOut, err := s.client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(s.bucket),
+		Key:    aws.String(key),
+	})
+	if err != nil {
+		return "", wrapObjectError("get object", key, err)
 	}
-	return nil
+	defer getOut.Body.Close()
+
+	if err := json.NewDecoder(getOut.Body).Decode(out); err != nil {
+		return "", fmt.Errorf("decode json %s: %w", key, err)
+	}
+	return aws.ToString(getOut.ETag), nil
 }
 
 func (s *S3Store) HeadObject(ctx context.Context, key string) (bool, int64, error) {
@@ -366,6 +397,17 @@ func isS3NotFound(err error) bool {
 	if errors.As(err, &apiErr) {
 		switch apiErr.ErrorCode() {
 		case "NoSuchKey", "NotFound", "NoSuchBucket":
+			return true
+		}
+	}
+	return false
+}
+
+func isS3PreconditionFailed(err error) bool {
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) {
+		switch apiErr.ErrorCode() {
+		case "PreconditionFailed":
 			return true
 		}
 	}

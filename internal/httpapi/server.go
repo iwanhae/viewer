@@ -63,6 +63,7 @@ func (s *Server) Router() http.Handler {
 		r.Get("/albums", s.listAlbums)
 		r.Get("/albums/search", s.searchAlbums)
 		r.Post("/albums/{albumId}/finalize", s.finalizeAlbum)
+		r.Get("/albums/{albumId}/status", s.getAlbumStatus)
 		r.Get("/albums/{albumId}", s.getAlbum)
 		r.Get("/feed", s.getFeed)
 		r.Get("/image/{albumId}/{index}", s.getImage)
@@ -238,25 +239,49 @@ func (s *Server) abortAlbumMultipart(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) finalizeAlbum(w http.ResponseWriter, r *http.Request) {
 	albumID := chi.URLParam(r, "albumId")
-	idx, err := s.albums.Finalize(r.Context(), albumID)
+	finalizeStatus, err := s.albums.RequestFinalize(r.Context(), albumID)
 	if err != nil {
 		status := http.StatusInternalServerError
-		code := "INDEXING_FAILED"
+		code := "INTERNAL"
 		if errors.Is(err, albums.ErrAlbumNotFound) || errors.Is(err, albums.ErrAlbumSourceNotFound) {
 			status = http.StatusNotFound
 			code = "NOT_FOUND"
 		}
-		if errors.Is(err, albums.ErrNoValidImages) {
-			status = http.StatusUnprocessableEntity
-		}
 		writeError(w, r, status, code, err.Error())
 		return
 	}
-	s.recommend.NotifyAlbumFinalized(r.Context(), albumID)
+	if s.recommend != nil {
+		s.recommend.ProcessAlbumAsync(albumID)
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{
+		"status":     finalizeStatus.Status,
+		"attempt":    finalizeStatus.Attempt,
+		"lastError":  finalizeStatus.LastError,
+		"photoCount": finalizeStatus.PhotoCount,
+		"updatedAt":  finalizeStatus.UpdatedAt,
+	})
+}
+
+func (s *Server) getAlbumStatus(w http.ResponseWriter, r *http.Request) {
+	albumID := chi.URLParam(r, "albumId")
+	status, err := s.albums.GetFinalizeStatus(r.Context(), albumID)
+	if err != nil {
+		httpStatus := http.StatusInternalServerError
+		code := "INTERNAL"
+		if errors.Is(err, albums.ErrAlbumNotFound) || errors.Is(err, albums.ErrAlbumSourceNotFound) {
+			httpStatus = http.StatusNotFound
+			code = "NOT_FOUND"
+		}
+		writeError(w, r, httpStatus, code, err.Error())
+		return
+	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"status":     "READY",
-		"photoCount": idx.PhotoCount,
+		"status":     status.Status,
+		"attempt":    status.Attempt,
+		"lastError":  status.LastError,
+		"photoCount": status.PhotoCount,
+		"updatedAt":  status.UpdatedAt,
 	})
 }
 

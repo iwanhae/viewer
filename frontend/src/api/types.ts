@@ -28,6 +28,16 @@ export type AlbumIndex = {
   photos: PhotoMeta[]
 }
 
+export type AlbumStatusState = 'queued' | 'processing' | 'ready' | 'failed'
+
+export type AlbumStatus = {
+  status: AlbumStatusState
+  attempt: number
+  lastError?: string
+  photoCount: number
+  updatedAt: string
+}
+
 export type AlbumIndexStatus = 'ready' | 'partial' | 'pending' | 'failed'
 
 export type AlbumSearchItem = {

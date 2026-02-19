@@ -37,13 +37,13 @@ func Run(ctx context.Context) error {
 
 	recommendService, err := recommend.NewService(cfg, albumService, imageService, store)
 	if err != nil {
-		return fmt.Errorf("recommendation service init failed: %w", err)
+		return fmt.Errorf("processing service init failed: %w", err)
 	}
 	if cfg.RecommenderRequired {
 		healthcheckCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		if err := recommendService.Healthcheck(healthcheckCtx); err != nil {
 			cancel()
-			return fmt.Errorf("recommendation service init failed: %w", err)
+			return fmt.Errorf("processing service init failed: %w", err)
 		}
 		cancel()
 	} else {
@@ -53,7 +53,7 @@ func Run(ctx context.Context) error {
 		}
 		cancel()
 	}
-	log.Printf("viewer: recommendation service enabled")
+	log.Printf("viewer: processing service enabled")
 
 	h := httpapi.New(albumService, feedService, imageService, recommendService, cfg.MaxUploadBytes).Router()
 	srv := &http.Server{
@@ -74,12 +74,12 @@ func Run(ctx context.Context) error {
 			return
 		case <-warmupDone:
 		}
-		log.Printf("viewer: warmup completed, starting recommendation workers")
+		log.Printf("viewer: warmup completed, starting processing workers")
 		if err := recommendService.Start(ctx); err != nil {
-			log.Printf("viewer: recommendation startup failed: %v", err)
+			log.Printf("viewer: processing startup failed: %v", err)
 			return
 		}
-		log.Printf("viewer: recommendation background workers started")
+		log.Printf("viewer: processing background workers started")
 	}()
 
 	return srv.ListenAndServe()

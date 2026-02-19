@@ -23,6 +23,34 @@ type AlbumIndex struct {
 	PhotoCount       int                       `json:"photoCount"`
 	Photos           []PhotoMeta               `json:"photos"`
 	Embeddings       map[string]PhotoEmbedding `json:"embeddings,omitempty"`
+	Processing       AlbumProcessingStatus     `json:"processing,omitempty"`
+}
+
+type AlbumProcessingState string
+
+const (
+	AlbumProcessingQueued     AlbumProcessingState = "queued"
+	AlbumProcessingProcessing AlbumProcessingState = "processing"
+	AlbumProcessingReady      AlbumProcessingState = "ready"
+	AlbumProcessingFailed     AlbumProcessingState = "failed"
+)
+
+type AlbumProcessingStatus struct {
+	Status     AlbumProcessingState `json:"status,omitempty"`
+	Attempt    int                  `json:"attempt,omitempty"`
+	LastError  string               `json:"lastError,omitempty"`
+	UpdatedAt  string               `json:"updatedAt,omitempty"`
+	ClaimedBy  string               `json:"claimedBy,omitempty"`
+	LeaseUntil string               `json:"leaseUntil,omitempty"`
+}
+
+func (s AlbumProcessingStatus) IsZero() bool {
+	return s.Status == "" &&
+		s.Attempt == 0 &&
+		s.LastError == "" &&
+		s.UpdatedAt == "" &&
+		s.ClaimedBy == "" &&
+		s.LeaseUntil == ""
 }
 
 type AlbumSummary struct {

@@ -56,7 +56,9 @@ type albumStore interface {
 	HeadObject(ctx context.Context, key string) (bool, int64, error)
 	GetObjectRange(ctx context.Context, key string, start int64, end int64) (io.ReadCloser, string, error)
 	PutJSON(ctx context.Context, key string, v any) error
+	PutJSONIfMatch(ctx context.Context, key string, etag string, v any) (string, error)
 	ReadJSON(ctx context.Context, key string, out any) error
+	ReadJSONWithETag(ctx context.Context, key string, out any) (string, error)
 	ForEachAlbumIndexKey(ctx context.Context, fn func(key string) error) error
 }
 
@@ -95,6 +97,14 @@ type CompletePart struct {
 	ETag       string
 }
 
+type FinalizeStatus struct {
+	Status     models.AlbumProcessingState
+	Attempt    int
+	LastError  string
+	PhotoCount int
+	UpdatedAt  string
+}
+
 type multipartSession struct {
 	AlbumID       string
 	Key           string
@@ -118,6 +128,8 @@ const (
 	multipartMaxParts       = 10_000
 	multipartMinPartSize    = int64(16 << 20) // 16 MiB
 	multipartSessionTTL     = 24 * time.Hour
+
+	finalizeCASRetries = 8
 )
 
 func (s *Service) CreateUpload(ctx context.Context, filename string, sizeBytes int64) (CreateUploadResult, error) {
@@ -260,6 +272,105 @@ func (s *Service) AbortMultipartUpload(ctx context.Context, albumID string, uplo
 	return nil
 }
 
+func (s *Service) RequestFinalize(ctx context.Context, albumID string) (FinalizeStatus, error) {
+	if strings.TrimSpace(albumID) == "" {
+		return FinalizeStatus{}, fmt.Errorf("albumId is required")
+	}
+
+	exists, size, err := s.store.HeadObject(ctx, sourceKey(albumID))
+	if err != nil {
+		return FinalizeStatus{}, err
+	}
+	if !exists || size <= 0 {
+		return FinalizeStatus{}, fmt.Errorf("%w: %s", ErrAlbumSourceNotFound, albumID)
+	}
+
+	for i := 0; i < finalizeCASRetries; i++ {
+		updatedAt := time.Now().UTC().Format(time.RFC3339)
+		var idx models.AlbumIndex
+		etag, err := s.store.ReadJSONWithETag(ctx, indexKey(albumID), &idx)
+		if err != nil {
+			if storage.IsNotFound(err) {
+				seed := models.AlbumIndex{
+					AlbumID:          albumID,
+					OriginalFilename: s.uploadHint(albumID, "source.zip"),
+					CreatedAt:        updatedAt,
+					PhotoCount:       0,
+					Photos:           []models.PhotoMeta{},
+					Embeddings:       map[string]models.PhotoEmbedding{},
+					Processing: models.AlbumProcessingStatus{
+						Status:    models.AlbumProcessingQueued,
+						Attempt:   0,
+						LastError: "",
+						UpdatedAt: updatedAt,
+					},
+				}
+				if err := s.store.PutJSON(ctx, indexKey(albumID), &seed); err != nil {
+					return FinalizeStatus{}, err
+				}
+				return finalizeStatusFromIndex(&seed), nil
+			}
+			return FinalizeStatus{}, err
+		}
+
+		if idx.AlbumID == "" {
+			idx.AlbumID = albumID
+		}
+		if idx.OriginalFilename == "" {
+			idx.OriginalFilename = s.uploadHint(albumID, "source.zip")
+		}
+		processing := normalizeProcessingStatus(idx.Processing, idx.PhotoCount, len(idx.Photos) > 0, updatedAt)
+		if processing.Status == models.AlbumProcessingReady {
+			return finalizeStatusFromFields(processing, idx.PhotoCount), nil
+		}
+		if processing.Status == models.AlbumProcessingProcessing {
+			return finalizeStatusFromFields(processing, idx.PhotoCount), nil
+		}
+		if processing.Status == models.AlbumProcessingFailed {
+			processing.Attempt = 0
+		}
+		processing.Status = models.AlbumProcessingQueued
+		processing.LastError = ""
+		processing.UpdatedAt = updatedAt
+		processing.ClaimedBy = ""
+		processing.LeaseUntil = ""
+		idx.Processing = processing
+
+		if _, err := s.store.PutJSONIfMatch(ctx, indexKey(albumID), etag, &idx); err != nil {
+			if storage.IsPreconditionFailed(err) {
+				continue
+			}
+			return FinalizeStatus{}, err
+		}
+		return finalizeStatusFromIndex(&idx), nil
+	}
+	return FinalizeStatus{}, fmt.Errorf("request finalize failed due to repeated update conflicts")
+}
+
+func (s *Service) GetFinalizeStatus(ctx context.Context, albumID string) (FinalizeStatus, error) {
+	if strings.TrimSpace(albumID) == "" {
+		return FinalizeStatus{}, fmt.Errorf("albumId is required")
+	}
+
+	var idx models.AlbumIndex
+	if err := s.store.ReadJSON(ctx, indexKey(albumID), &idx); err != nil {
+		if storage.IsNotFound(err) {
+			return FinalizeStatus{}, fmt.Errorf("%w: %s", ErrAlbumNotFound, albumID)
+		}
+		return FinalizeStatus{}, err
+	}
+	if idx.AlbumID == "" {
+		idx.AlbumID = albumID
+	}
+	processing := normalizeProcessingStatus(
+		idx.Processing,
+		idx.PhotoCount,
+		len(idx.Photos) > 0,
+		time.Now().UTC().Format(time.RFC3339),
+	)
+	return finalizeStatusFromFields(processing, idx.PhotoCount), nil
+}
+
 func (s *Service) Finalize(ctx context.Context, albumID string) (*models.AlbumIndex, error) {
 	if strings.TrimSpace(albumID) == "" {
 		return nil, fmt.Errorf("albumId is required")
@@ -306,6 +417,57 @@ func (s *Service) Finalize(ctx context.Context, albumID string) (*models.AlbumIn
 	s.mu.Unlock()
 
 	return idx, nil
+}
+
+func normalizeProcessingStatus(
+	processing models.AlbumProcessingStatus,
+	photoCount int,
+	hasPhotos bool,
+	defaultUpdatedAt string,
+) models.AlbumProcessingStatus {
+	if processing.Status == "" {
+		if photoCount > 0 || hasPhotos {
+			processing.Status = models.AlbumProcessingReady
+		} else {
+			processing.Status = models.AlbumProcessingQueued
+		}
+	}
+	if processing.UpdatedAt == "" {
+		processing.UpdatedAt = defaultUpdatedAt
+	}
+	return processing
+}
+
+func finalizeStatusFromIndex(idx *models.AlbumIndex) FinalizeStatus {
+	if idx == nil {
+		return FinalizeStatus{}
+	}
+	processing := normalizeProcessingStatus(
+		idx.Processing,
+		idx.PhotoCount,
+		len(idx.Photos) > 0,
+		time.Now().UTC().Format(time.RFC3339),
+	)
+	return finalizeStatusFromFields(processing, idx.PhotoCount)
+}
+
+func finalizeStatusFromFields(processing models.AlbumProcessingStatus, photoCount int) FinalizeStatus {
+	return FinalizeStatus{
+		Status:     processing.Status,
+		Attempt:    processing.Attempt,
+		LastError:  processing.LastError,
+		PhotoCount: photoCount,
+		UpdatedAt:  processing.UpdatedAt,
+	}
+}
+
+func (s *Service) uploadHint(albumID string, fallback string) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if hinted, ok := s.uploadHints[albumID]; ok && strings.TrimSpace(hinted) != "" {
+		return hinted
+	}
+	return fallback
 }
 
 func computeMultipartPartSize(sizeBytes int64) int64 {

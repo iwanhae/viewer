@@ -140,10 +140,7 @@ async function uploadAndFinalizeFromUploadPage(page: Page, zipPath: string) {
   try {
     await page.getByTestId('upload-pick-input').setInputFiles(zipPath)
     await page.getByTestId('upload-start').click()
-    await expect(page.getByTestId('upload-status').first()).toHaveText('Uploaded', { timeout: 180_000 })
-
-    await page.getByTestId('upload-finalize-all').click()
-    await expect(page.getByTestId('upload-status').first()).toHaveText('Ready', { timeout: 120_000 })
+    await expect(page.getByTestId('upload-status').first()).toHaveText('Ready', { timeout: 240_000 })
 
     await page.getByTestId('upload-back-wall').click()
     await expect.poll(() => new URL(page.url()).pathname).toBe('/')

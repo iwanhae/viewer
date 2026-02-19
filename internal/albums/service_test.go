@@ -380,11 +380,19 @@ func (f *fakeAlbumStore) PutJSON(ctx context.Context, key string, v any) error {
 	panic("unexpected call")
 }
 
+func (f *fakeAlbumStore) PutJSONIfMatch(ctx context.Context, key string, etag string, v any) (string, error) {
+	panic("unexpected call")
+}
+
 func (f *fakeAlbumStore) ReadJSON(ctx context.Context, key string, out any) error {
 	if f.readJSONFn == nil {
 		panic("unexpected call")
 	}
 	return f.readJSONFn(ctx, key, out)
+}
+
+func (f *fakeAlbumStore) ReadJSONWithETag(ctx context.Context, key string, out any) (string, error) {
+	panic("unexpected call")
 }
 
 func (f *fakeAlbumStore) ForEachAlbumIndexKey(ctx context.Context, fn func(key string) error) error {
