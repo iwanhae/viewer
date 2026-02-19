@@ -22,18 +22,17 @@ Optional tuning:
   - `RECO_TOPK_DEFAULT` default recommendation count (default `12`).
   - `RECO_TOPK_MAX` max recommendation count (default `48`).
 - Recommender service:
-  - `RECOMMENDER_ENDPOINT` endpoint for the Rust recommender service (example `http://127.0.0.1:18081`).
-  - `RECOMMENDER_REQUIRED` whether startup must fail when recommender is unavailable (`true` in development and compose; `false` in Docker image for first-run model downloads).
+  - `RECOMMENDER_ENDPOINT` endpoint for the Rust recommender service (example `http://127.0.0.1:18081`). Leave empty to disable recommender only when `RECOMMENDER_REQUIRED=false`.
+  - `RECOMMENDER_REQUIRED` whether startup must fail when recommender is unavailable (`true` in development and compose; `false` in Docker image for first-run model downloads). When `false` and endpoint is empty, recommender is disabled.
   - `RECOMMENDER_CONCURRENCY` number of background embedding workers (`0` means auto, default is adaptive `3x GOMAXPROCS`, min `8`, max `64`).
   - `RECOMMENDER_REQUEST_TIMEOUT_SECONDS` timeout per embed request (default `120`).
-- `SIGLIP2_MODEL_ID` model identifier for worker backends (default `google/siglip2-base-patch16-224`).
-- `SIGLIP2_DEVICE` embedding device hint (default `cpu`, CPU-only worker build).
+- `SIGLIP2_MODEL_ID` model identifier for the Rust worker (default `google/siglip2-base-patch16-224`).
 - `HF_HOME` Hugging Face cache root used by the Rust worker. In Docker runtime this is pre-populated at `/tmp/hf-home`.
 
 Rust recommender service endpoints:
 - `GET /ping`
 - `GET /healthz`
-- `POST /embed` with JSON `{"request_id","image_b64","model_id","device"}`
+- `POST /embed` with JSON `{"request_id","image_b64"}`
 
 Rust worker resolves model files through the Hugging Face cache (`HF_HOME`), downloading only if a required file is missing.
 

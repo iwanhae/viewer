@@ -29,8 +29,6 @@ type Config struct {
 	RecommenderRequired    bool
 	RecommenderConcurrency int
 	RecommenderTimeoutSec  int
-	Siglip2ModelID         string
-	Siglip2Device          string
 }
 
 func Load() (Config, error) {
@@ -63,8 +61,6 @@ func Load() (Config, error) {
 		RecommenderRequired:    getenvBool("RECOMMENDER_REQUIRED", true),
 		RecommenderConcurrency: getenvInt("RECOMMENDER_CONCURRENCY", defaultRecommenderConcurrency()),
 		RecommenderTimeoutSec:  getenvInt("RECOMMENDER_REQUEST_TIMEOUT_SECONDS", 120),
-		Siglip2ModelID:         getenv("SIGLIP2_MODEL_ID", "google/siglip2-base-patch16-224"),
-		Siglip2Device:          getenv("SIGLIP2_DEVICE", "cpu"),
 	}
 
 	if cfg.S3Bucket == "" {
@@ -97,7 +93,7 @@ func Load() (Config, error) {
 	if cfg.RecommenderTimeoutSec <= 0 {
 		cfg.RecommenderTimeoutSec = 120
 	}
-	if cfg.RecommenderEndpoint == "" {
+	if cfg.RecommenderRequired && cfg.RecommenderEndpoint == "" {
 		return Config{}, fmt.Errorf("RECOMMENDER_ENDPOINT is required")
 	}
 

@@ -86,8 +86,6 @@ func TestMetricsEndpointPrometheusPayload(t *testing.T) {
 		cfgpkg.Config{
 			RecommenderEndpoint:   "http://127.0.0.1:18081",
 			RecommenderTimeoutSec: 1,
-			Siglip2ModelID:        "test-model",
-			Siglip2Device:         "cpu",
 		},
 		nil,
 		nil,

@@ -46,6 +46,7 @@ func TestLoadRejectsNonPositiveRangeChunkSize(t *testing.T) {
 
 func TestLoadRequiresRecommenderEndpoint(t *testing.T) {
 	setRequiredEnv(t)
+	t.Setenv("RECOMMENDER_REQUIRED", "true")
 	t.Setenv("RECOMMENDER_ENDPOINT", "")
 
 	_, err := Load()
@@ -54,6 +55,20 @@ func TestLoadRequiresRecommenderEndpoint(t *testing.T) {
 	}
 	if got := err.Error(); !strings.Contains(got, "RECOMMENDER_ENDPOINT is required") {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestLoadAllowsMissingRecommenderEndpointWhenNotRequired(t *testing.T) {
+	setRequiredEnv(t)
+	t.Setenv("RECOMMENDER_REQUIRED", "false")
+	t.Setenv("RECOMMENDER_ENDPOINT", "")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := cfg.RecommenderEndpoint; got != "" {
+		t.Fatalf("RecommenderEndpoint=%q want empty", got)
 	}
 }
 
@@ -102,4 +117,5 @@ func setRequiredEnv(t *testing.T) {
 	t.Setenv("S3_BUCKET", "viewer")
 	t.Setenv("S3_ACCESS_KEY", "access")
 	t.Setenv("S3_SECRET_KEY", "secret")
+	t.Setenv("RECOMMENDER_ENDPOINT", "http://127.0.0.1:18081")
 }

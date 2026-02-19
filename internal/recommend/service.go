@@ -70,7 +70,7 @@ func NewService(cfg cfgpkg.Config, albumsService *albums.Service, imagesService 
 		albums:               albumsService,
 		images:               imagesService,
 		s3:                   s3Store,
-		embedder:             NewHTTPEmbedder(cfg.RecommenderEndpoint, cfg.Siglip2ModelID, cfg.Siglip2Device, time.Duration(cfg.RecommenderTimeoutSec)*time.Second),
+		embedder:             NewHTTPEmbedder(cfg.RecommenderEndpoint, time.Duration(cfg.RecommenderTimeoutSec)*time.Second),
 		photosByID:           make(map[string]PhotoRecord),
 		photoIDsByAlbum:      make(map[string]map[string]struct{}),
 		embeddingsByID:       make(map[string]EmbeddingRecord),
@@ -102,6 +102,11 @@ func (s *Service) Healthcheck(ctx context.Context) error {
 
 func (s *Service) Start(ctx context.Context) error {
 	s.startOnce.Do(func() {
+		if strings.TrimSpace(s.cfg.RecommenderEndpoint) == "" {
+			s.startErr = nil
+			return
+		}
+
 		go func() {
 			<-ctx.Done()
 			_ = s.embedder.Close()

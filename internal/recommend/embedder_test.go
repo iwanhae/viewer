@@ -1,9 +1,11 @@
 package recommend
 
 import (
+	"context"
 	"errors"
 	"net/url"
 	"testing"
+	"time"
 )
 
 type transientNetError struct{}
@@ -39,5 +41,18 @@ func TestIsTransientEmbedErrorStatusError(t *testing.T) {
 func TestIsTransientEmbedErrorRegularError(t *testing.T) {
 	if isTransientEmbedError(errors.New("permanent failure")) {
 		t.Fatalf("expected regular error to be non-transient")
+	}
+}
+
+func TestHTTPEmbedderReturnsConfigErrorWhenEndpointMissing(t *testing.T) {
+	embedder := NewHTTPEmbedder("", time.Second)
+
+	if err := embedder.Healthcheck(context.Background()); !errors.Is(err, errRecommenderEndpointNotConfigured) {
+		t.Fatalf("Healthcheck err=%v want=%v", err, errRecommenderEndpointNotConfigured)
+	}
+
+	_, _, err := embedder.Embed(context.Background(), []byte("image"))
+	if !errors.Is(err, errRecommenderEndpointNotConfigured) {
+		t.Fatalf("Embed err=%v want=%v", err, errRecommenderEndpointNotConfigured)
 	}
 }

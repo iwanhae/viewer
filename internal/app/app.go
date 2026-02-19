@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
 	"viewer/internal/albums"
@@ -39,21 +40,26 @@ func Run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("processing service init failed: %w", err)
 	}
-	if cfg.RecommenderRequired {
-		healthcheckCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		if err := recommendService.Healthcheck(healthcheckCtx); err != nil {
+	recommenderConfigured := strings.TrimSpace(cfg.RecommenderEndpoint) != ""
+	if recommenderConfigured {
+		if cfg.RecommenderRequired {
+			healthcheckCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			if err := recommendService.Healthcheck(healthcheckCtx); err != nil {
+				cancel()
+				return fmt.Errorf("processing service init failed: %w", err)
+			}
 			cancel()
-			return fmt.Errorf("processing service init failed: %w", err)
+		} else {
+			healthcheckCtx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+			if err := recommendService.Healthcheck(healthcheckCtx); err != nil {
+				log.Printf("viewer: recommender unavailable at startup, continuing in degraded mode: %v", err)
+			}
+			cancel()
 		}
-		cancel()
+		log.Printf("viewer: processing service enabled")
 	} else {
-		healthcheckCtx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
-		if err := recommendService.Healthcheck(healthcheckCtx); err != nil {
-			log.Printf("viewer: recommender unavailable at startup, continuing in degraded mode: %v", err)
-		}
-		cancel()
+		log.Printf("viewer: recommender disabled (RECOMMENDER_ENDPOINT is empty)")
 	}
-	log.Printf("viewer: processing service enabled")
 
 	h := httpapi.New(albumService, feedService, imageService, recommendService, cfg.MaxUploadBytes).Router()
 	srv := &http.Server{
@@ -73,6 +79,10 @@ func Run(ctx context.Context) error {
 		case <-ctx.Done():
 			return
 		case <-warmupDone:
+		}
+		if !recommenderConfigured {
+			log.Printf("viewer: warmup completed; processing workers disabled")
+			return
 		}
 		log.Printf("viewer: warmup completed, starting processing workers")
 		if err := recommendService.Start(ctx); err != nil {

@@ -16,6 +16,8 @@ import (
 	"time"
 )
 
+var errRecommenderEndpointNotConfigured = errors.New("recommender endpoint is not configured")
+
 type EmbeddingProvider interface {
 	Embed(ctx context.Context, imageBytes []byte) ([]float32, string, error)
 	Healthcheck(ctx context.Context) error
@@ -24,8 +26,6 @@ type EmbeddingProvider interface {
 
 type HTTPEmbedder struct {
 	endpoint       string
-	modelID        string
-	device         string
 	requestTimeout time.Duration
 
 	client        *http.Client
@@ -35,10 +35,7 @@ type HTTPEmbedder struct {
 
 type embedRequest struct {
 	RequestID string `json:"request_id"`
-	Op        string `json:"op,omitempty"`
 	ImageB64  string `json:"image_b64,omitempty"`
-	ModelID   string `json:"model_id"`
-	Device    string `json:"device"`
 }
 
 type embedResponse struct {
@@ -49,20 +46,16 @@ type embedResponse struct {
 	Traceback      string    `json:"traceback,omitempty"`
 	Backend        string    `json:"backend,omitempty"`
 	Model          string    `json:"model,omitempty"`
-	ModelID        string    `json:"model_id,omitempty"`
-	Device         string    `json:"device,omitempty"`
 	ImageSizeBytes int       `json:"image_size_bytes,omitempty"`
 	Embedding      []float32 `json:"embedding,omitempty"`
 }
 
-func NewHTTPEmbedder(endpoint string, modelID string, device string, requestTimeout time.Duration) *HTTPEmbedder {
+func NewHTTPEmbedder(endpoint string, requestTimeout time.Duration) *HTTPEmbedder {
 	if requestTimeout <= 0 {
 		requestTimeout = 120 * time.Second
 	}
 	return &HTTPEmbedder{
 		endpoint:       normalizeEndpoint(endpoint),
-		modelID:        modelID,
-		device:         device,
 		requestTimeout: requestTimeout,
 		client:         &http.Client{},
 		requestPrefix:  "request",
@@ -70,6 +63,9 @@ func NewHTTPEmbedder(endpoint string, modelID string, device string, requestTime
 }
 
 func (e *HTTPEmbedder) Healthcheck(ctx context.Context) error {
+	if strings.TrimSpace(e.endpoint) == "" {
+		return errRecommenderEndpointNotConfigured
+	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -110,6 +106,9 @@ func (e *HTTPEmbedder) Healthcheck(ctx context.Context) error {
 }
 
 func (e *HTTPEmbedder) Embed(ctx context.Context, imageBytes []byte) ([]float32, string, error) {
+	if strings.TrimSpace(e.endpoint) == "" {
+		return nil, "", errRecommenderEndpointNotConfigured
+	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -118,10 +117,7 @@ func (e *HTTPEmbedder) Embed(ctx context.Context, imageBytes []byte) ([]float32,
 
 	payload := embedRequest{
 		RequestID: e.nextRequestID(),
-		Op:        "embed",
 		ImageB64:  base64.StdEncoding.EncodeToString(imageBytes),
-		ModelID:   e.modelID,
-		Device:    e.device,
 	}
 
 	out, body, err := e.sendRequest(requestCtx, "/embed", payload)
@@ -137,11 +133,7 @@ func (e *HTTPEmbedder) Embed(ctx context.Context, imageBytes []byte) ([]float32,
 	if len(out.Embedding) == 0 {
 		return nil, out.Model, fmt.Errorf("worker returned empty embedding")
 	}
-	modelID := out.Model
-	if modelID == "" {
-		modelID = e.modelID
-	}
-	return out.Embedding, modelID, nil
+	return out.Embedding, out.Model, nil
 }
 
 func (e *HTTPEmbedder) sendRequest(ctx context.Context, path string, payload embedRequest) (embedResponse, string, error) {
@@ -269,12 +261,6 @@ func formatWorkerError(out embedResponse, body string) string {
 	}
 	if out.Model != "" {
 		parts = append(parts, "model="+out.Model)
-	}
-	if out.ModelID != "" {
-		parts = append(parts, "model_id="+out.ModelID)
-	}
-	if out.Device != "" {
-		parts = append(parts, "device="+out.Device)
 	}
 	if out.ImageSizeBytes > 0 {
 		parts = append(parts, fmt.Sprintf("image_bytes=%d", out.ImageSizeBytes))

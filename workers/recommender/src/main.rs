@@ -135,7 +135,6 @@ pub unsafe extern "C" fn hgemm_(
 
 const DEFAULT_LISTEN_ADDR: &str = "0.0.0.0:18081";
 const DEFAULT_MODEL_ID: &str = "google/siglip2-base-patch16-224";
-const DEFAULT_DEVICE: &str = "cpu";
 const DEFAULT_LOG_FILTER: &str = "info,recommender=info";
 const BACKEND_NAME: &str = "siglip2-candle";
 
@@ -143,7 +142,6 @@ const BACKEND_NAME: &str = "siglip2-candle";
 struct RuntimeConfig {
     listen_addr: String,
     model_id: String,
-    device: String,
 }
 
 impl RuntimeConfig {
@@ -151,7 +149,6 @@ impl RuntimeConfig {
         Self {
             listen_addr: env_or_default("RECOMMENDER_LISTEN_ADDR", DEFAULT_LISTEN_ADDR),
             model_id: env_or_default("SIGLIP2_MODEL_ID", DEFAULT_MODEL_ID),
-            device: env_or_default("SIGLIP2_DEVICE", DEFAULT_DEVICE),
         }
     }
 }
@@ -160,12 +157,6 @@ impl RuntimeConfig {
 struct EmbedRequest {
     #[serde(default)]
     request_id: String,
-    #[serde(default = "default_op")]
-    op: String,
-    #[serde(default)]
-    model_id: String,
-    #[serde(default)]
-    device: String,
     #[serde(default)]
     image_b64: String,
 }
@@ -184,10 +175,6 @@ struct EmbedResponse {
     backend: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     model: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    model_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    device: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     image_size_bytes: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -238,13 +225,7 @@ impl Worker {
         }
     }
 
-    fn embed(
-        &self,
-        image_bytes: &[u8],
-        model_id: &str,
-        device: &str,
-    ) -> Result<(Vec<f32>, String)> {
-        ensure_supported_device(device)?;
+    fn embed(&self, image_bytes: &[u8], model_id: &str) -> Result<(Vec<f32>, String)> {
         let loaded = self.ensure_model(model_id)?;
         let pixel_values = preprocess_image(image_bytes, loaded.config.vision_config.image_size)?;
         let features = loaded
@@ -274,10 +255,6 @@ struct HttpResponse {
     body: Vec<u8>,
 }
 
-fn default_op() -> String {
-    "embed".to_string()
-}
-
 fn env_or_default(key: &str, fallback: &str) -> String {
     match env::var(key) {
         Ok(value) => {
@@ -302,16 +279,6 @@ fn init_logging() -> Result<()> {
         .try_init()
         .map_err(|err| anyhow::anyhow!("initialize tracing subscriber: {err}"))?;
     Ok(())
-}
-
-fn ensure_supported_device(device: &str) -> Result<()> {
-    let normalized = device.trim();
-    if normalized.is_empty() || normalized.eq_ignore_ascii_case("cpu") {
-        return Ok(());
-    }
-    Err(anyhow::anyhow!(
-        "unsupported device '{normalized}', only cpu is supported in this build"
-    ))
 }
 
 fn log_error_chain(prefix: &str, err: &anyhow::Error) {
@@ -382,24 +349,20 @@ fn success_response(req: &EmbedRequest, model: String, embedding: Vec<f32>) -> E
         traceback: None,
         backend: Some(BACKEND_NAME.to_string()),
         model: Some(model),
-        model_id: Some(req.model_id.clone()),
-        device: Some(req.device.clone()),
         image_size_bytes: None,
         embedding: Some(embedding),
     }
 }
 
-fn ping_response(req: &EmbedRequest) -> EmbedResponse {
+fn ping_response(request_id: &str) -> EmbedResponse {
     EmbedResponse {
-        request_id: req.request_id.clone(),
+        request_id: request_id.to_string(),
         ok: true,
         error: None,
         error_stage: None,
         traceback: None,
         backend: Some(BACKEND_NAME.to_string()),
         model: Some(BACKEND_NAME.to_string()),
-        model_id: Some(req.model_id.clone()),
-        device: Some(req.device.clone()),
         image_size_bytes: None,
         embedding: None,
     }
@@ -409,8 +372,6 @@ fn error_response(
     req_id: String,
     err: anyhow::Error,
     error_stage: &str,
-    model_id: String,
-    device: String,
     image_size_bytes: usize,
 ) -> EmbedResponse {
     EmbedResponse {
@@ -421,8 +382,6 @@ fn error_response(
         traceback: None,
         backend: Some(BACKEND_NAME.to_string()),
         model: None,
-        model_id: Some(model_id),
-        device: Some(device),
         image_size_bytes: if image_size_bytes > 0 {
             Some(image_size_bytes)
         } else {
@@ -497,22 +456,10 @@ fn parse_embed_request(body: &[u8]) -> Result<EmbedRequest> {
     serde_json::from_slice::<EmbedRequest>(body).context("parse /embed request body")
 }
 
-fn apply_request_defaults(req: &mut EmbedRequest, config: &RuntimeConfig) {
-    req.model_id = req.model_id.trim().to_string();
-    if req.model_id.is_empty() {
-        req.model_id = config.model_id.clone();
-    }
-
-    req.device = req.device.trim().to_string();
-    if req.device.is_empty() {
-        req.device = config.device.clone();
-    }
-}
-
 fn decode_image_b64(raw: &str) -> Result<Vec<u8>> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
-        return Err(anyhow::anyhow!("image_b64 is required for op=embed"));
+        return Err(anyhow::anyhow!("image_b64 is required"));
     }
 
     let encoded = match trimmed.split_once(',') {
@@ -541,132 +488,41 @@ fn write_json_response(req_id: String, response: EmbedResponse) -> Result<HttpRe
 
 fn handle_embed(worker: &Arc<Worker>, config: &RuntimeConfig, body: &[u8]) -> Result<HttpResponse> {
     let request_started = Instant::now();
-    let mut req = parse_embed_request(body)?;
-    apply_request_defaults(&mut req, config);
-    let op = req.op.to_ascii_lowercase();
+    let req = parse_embed_request(body)?;
     info!(
         request_id = %req.request_id,
-        op = %op,
-        model_id = %req.model_id,
-        device = %req.device,
+        model_id = %config.model_id,
         "handling embed request"
     );
-
-    if op == "ping" {
-        if let Err(err) = ensure_supported_device(&req.device) {
-            warn!(
-                request_id = %req.request_id,
-                model_id = %req.model_id,
-                device = %req.device,
-                stage = "request",
-                error = %err,
-                "ping request failed validation"
-            );
-            return Ok(write_json_response(
-                req.request_id.clone(),
-                error_response(
-                    req.request_id,
-                    err,
-                    "request",
-                    req.model_id.clone(),
-                    req.device.clone(),
-                    0,
-                ),
-            )?);
-        }
-        if let Err(err) = worker.ensure_model(&req.model_id) {
-            error!(
-                request_id = %req.request_id,
-                model_id = %req.model_id,
-                device = %req.device,
-                stage = "init",
-                error = %err,
-                "ping request failed model initialization"
-            );
-            return Ok(write_json_response(
-                req.request_id.clone(),
-                error_response(
-                    req.request_id,
-                    err,
-                    "init",
-                    req.model_id.clone(),
-                    req.device.clone(),
-                    0,
-                ),
-            )?);
-        }
-        info!(
-            request_id = %req.request_id,
-            model_id = %req.model_id,
-            device = %req.device,
-            elapsed_ms = request_started.elapsed().as_millis() as u64,
-            "ping operation succeeded"
-        );
-        return Ok(write_json_response(
-            req.request_id.clone(),
-            ping_response(&req),
-        )?);
-    }
-    if op != "embed" {
-        warn!(
-            request_id = %req.request_id,
-            op = %op,
-            model_id = %req.model_id,
-            device = %req.device,
-            stage = "request",
-            "unsupported embed operation"
-        );
-        return Ok(write_json_response(
-            req.request_id.clone(),
-            error_response(
-                req.request_id,
-                anyhow::anyhow!("unsupported op '{op}'"),
-                "request",
-                req.model_id.clone(),
-                req.device.clone(),
-                0,
-            ),
-        )?);
-    }
 
     let decoded = match decode_image_b64(&req.image_b64) {
         Ok(decoded) => decoded,
         Err(err) => {
             warn!(
                 request_id = %req.request_id,
-                model_id = %req.model_id,
-                device = %req.device,
+                model_id = %config.model_id,
                 stage = "decode",
                 error = %err,
                 "failed to decode image payload"
             );
             return Ok(write_json_response(
                 req.request_id.clone(),
-                error_response(
-                    req.request_id,
-                    err,
-                    "decode",
-                    req.model_id.clone(),
-                    req.device.clone(),
-                    0,
-                ),
+                error_response(req.request_id, err, "decode", 0),
             )?);
         }
     };
     let image_size_bytes = decoded.len();
     debug!(
         request_id = %req.request_id,
-        model_id = %req.model_id,
-        device = %req.device,
+        model_id = %config.model_id,
         image_size_bytes,
         "decoded image payload"
     );
 
-    if let Err(err) = worker.ensure_model(&req.model_id) {
+    if let Err(err) = worker.ensure_model(&config.model_id) {
         error!(
             request_id = %req.request_id,
-            model_id = %req.model_id,
-            device = %req.device,
+            model_id = %config.model_id,
             image_size_bytes,
             stage = "init",
             error = %err,
@@ -674,25 +530,17 @@ fn handle_embed(worker: &Arc<Worker>, config: &RuntimeConfig, body: &[u8]) -> Re
         );
         return Ok(write_json_response(
             req.request_id.clone(),
-            error_response(
-                req.request_id,
-                err,
-                "init",
-                req.model_id.clone(),
-                req.device.clone(),
-                image_size_bytes,
-            ),
+            error_response(req.request_id, err, "init", image_size_bytes),
         )?);
     }
     let request_id = req.request_id.clone();
     let inference_started = Instant::now();
-    let result = worker.embed(&decoded, &req.model_id, &req.device);
+    let result = worker.embed(&decoded, &config.model_id);
     match result {
         Ok((embedding, model_id)) => {
             info!(
                 request_id = %request_id,
-                model_id = %req.model_id,
-                device = %req.device,
+                model_id = %config.model_id,
                 image_size_bytes,
                 embedding_len = embedding.len(),
                 inference_elapsed_ms = inference_started.elapsed().as_millis() as u64,
@@ -707,8 +555,7 @@ fn handle_embed(worker: &Arc<Worker>, config: &RuntimeConfig, body: &[u8]) -> Re
         Err(err) => {
             error!(
                 request_id = %request_id,
-                model_id = %req.model_id,
-                device = %req.device,
+                model_id = %config.model_id,
                 image_size_bytes,
                 stage = "inference",
                 error = %err,
@@ -718,14 +565,7 @@ fn handle_embed(worker: &Arc<Worker>, config: &RuntimeConfig, body: &[u8]) -> Re
             );
             Ok(write_json_response(
                 request_id.clone(),
-                error_response(
-                    request_id,
-                    err,
-                    "inference",
-                    req.model_id.clone(),
-                    req.device.clone(),
-                    image_size_bytes,
-                ),
+                error_response(request_id, err, "inference", image_size_bytes),
             )?)
         }
     }
@@ -740,29 +580,21 @@ fn handle_ping_or_healthz(
     debug!(
         request_id = %request_id,
         model_id = %config.model_id,
-        device = %config.device,
         "handling health check request"
     );
-    ensure_supported_device(&config.device).context("validate startup device")?;
-
-    let req = EmbedRequest {
-        request_id: request_id.to_string(),
-        op: "ping".to_string(),
-        model_id: config.model_id.clone(),
-        device: config.device.clone(),
-        image_b64: String::new(),
-    };
     worker
         .ensure_model(&config.model_id)
         .with_context(|| format!("initialize model '{}'", config.model_id))?;
     info!(
         request_id = %request_id,
         model_id = %config.model_id,
-        device = %config.device,
         elapsed_ms = started.elapsed().as_millis() as u64,
         "health check request succeeded"
     );
-    Ok(write_json_response(request_id.to_string(), ping_response(&req))?)
+    Ok(write_json_response(
+        request_id.to_string(),
+        ping_response(request_id),
+    )?)
 }
 
 fn handle_client(mut stream: TcpStream, worker: Arc<Worker>, config: Arc<RuntimeConfig>) {
@@ -780,8 +612,8 @@ fn handle_client(mut stream: TcpStream, worker: Arc<Worker>, config: Arc<Runtime
                 "received HTTP request"
             );
             match (req.method.as_str(), req.path.as_str()) {
-                ("GET", "/ping") => {
-                    handle_ping_or_healthz(&worker, &config, "ping").unwrap_or_else(|err| {
+                ("GET", "/ping") => handle_ping_or_healthz(&worker, &config, "ping")
+                    .unwrap_or_else(|err| {
                         error!(
                             method = "GET",
                             path = "/ping",
@@ -789,14 +621,7 @@ fn handle_client(mut stream: TcpStream, worker: Arc<Worker>, config: Arc<Runtime
                             error = %err,
                             "failed to serve /ping"
                         );
-                        let resp = error_response(
-                            "ping".to_string(),
-                            err,
-                            "ping",
-                            config.model_id.clone(),
-                            config.device.clone(),
-                            0,
-                        );
+                        let resp = error_response("ping".to_string(), err, "ping", 0);
                         write_json_response("ping".to_string(), resp).unwrap_or_else(|write_err| {
                             error!(
                                 method = "GET",
@@ -811,8 +636,7 @@ fn handle_client(mut stream: TcpStream, worker: Arc<Worker>, config: Arc<Runtime
                                 body: write_err.to_string().into_bytes(),
                             }
                         })
-                    })
-                }
+                    }),
                 ("GET", "/healthz") => handle_ping_or_healthz(&worker, &config, "healthz")
                     .unwrap_or_else(|err| {
                         error!(
@@ -822,14 +646,7 @@ fn handle_client(mut stream: TcpStream, worker: Arc<Worker>, config: Arc<Runtime
                             error = %err,
                             "failed to serve /healthz"
                         );
-                        let resp = error_response(
-                            "healthz".to_string(),
-                            err,
-                            "healthz",
-                            config.model_id.clone(),
-                            config.device.clone(),
-                            0,
-                        );
+                        let resp = error_response("healthz".to_string(), err, "healthz", 0);
                         write_json_response("healthz".to_string(), resp).unwrap_or_else(
                             |write_err| {
                                 error!(
@@ -858,14 +675,8 @@ fn handle_client(mut stream: TcpStream, worker: Arc<Worker>, config: Arc<Runtime
                             error = %err,
                             "failed to process /embed request"
                         );
-                        let resp = error_response(
-                            "request".to_string(),
-                            err,
-                            "request",
-                            config.model_id.clone(),
-                            config.device.clone(),
-                            req.body.len(),
-                        );
+                        let resp =
+                            error_response("request".to_string(), err, "request", req.body.len());
                         write_json_response("request".to_string(), resp).unwrap_or_else(
                             |write_err| {
                                 error!(
@@ -928,15 +739,6 @@ fn main() {
 
     let config = RuntimeConfig::from_env();
 
-    if let Err(err) = ensure_supported_device(&config.device) {
-        error!(
-            device = %config.device,
-            error = %err,
-            "unsupported startup device"
-        );
-        std::process::exit(1);
-    }
-
     let worker = Worker::default();
     if let Err(err) = worker.ensure_model(&config.model_id) {
         let hf_home = env::var("HF_HOME").unwrap_or_else(|_| "<default>".to_string());
@@ -964,7 +766,6 @@ fn main() {
     info!(
         listen_addr = %config.listen_addr,
         model_id = %config.model_id,
-        device = %config.device,
         "recommender listening"
     );
 
