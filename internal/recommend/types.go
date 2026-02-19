@@ -27,7 +27,6 @@ type EmbeddingRecord struct {
 	ImageID    string
 	Vector     []float32
 	Norm       float64
-	ModelID    string
 	UpdatedAt  string
 	Dimensions int
 }

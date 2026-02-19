@@ -559,11 +559,14 @@ func TestRefreshFromStorageWithProgressAndAlbumEmitsLoadedAlbums(t *testing.T) {
 	}
 
 	var loaded []string
+	var loadedMu sync.Mutex
 	if err := s.RefreshFromStorageWithProgressAndAlbum(
 		context.Background(),
 		nil,
 		func(idx models.AlbumIndex) {
+			loadedMu.Lock()
 			loaded = append(loaded, idx.AlbumID)
+			loadedMu.Unlock()
 		},
 	); err != nil {
 		t.Fatalf("expected no error, got %v", err)

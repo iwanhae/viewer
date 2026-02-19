@@ -165,6 +165,20 @@ func TestMetricsEndpointWithNilRecommendService(t *testing.T) {
 	mustMetricFloatValue(t, body, "viewer_embedding_progress_percent", 0, 1e-9)
 }
 
+func TestRecommendationsEndpointWithNilRecommendService(t *testing.T) {
+	router := New(nil, nil, nil, nil, 0).Router()
+	req := httptest.NewRequest(http.MethodGet, "/api/recommendations/album-a/0?limit=12", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d want=%d body=%s", rec.Code, http.StatusServiceUnavailable, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "\"code\":\"UNAVAILABLE\"") {
+		t.Fatalf("expected UNAVAILABLE error code in body, got: %s", rec.Body.String())
+	}
+}
+
 func requestWithURLParam(key string, value string) *http.Request {
 	req := httptest.NewRequest(http.MethodGet, "/api/image/album/0", nil)
 	rctx := chi.NewRouteContext()

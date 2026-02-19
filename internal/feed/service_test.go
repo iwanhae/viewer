@@ -105,7 +105,7 @@ func TestBuildDeterministicForSeedAndCursor(t *testing.T) {
 	}
 }
 
-func TestBuildSupportsLegacyOffsetCursor(t *testing.T) {
+func TestBuildRejectsLegacyOffsetCursor(t *testing.T) {
 	source := &stubAlbumSource{
 		albums: []*models.AlbumIndex{
 			{
@@ -123,23 +123,12 @@ func TestBuildSupportsLegacyOffsetCursor(t *testing.T) {
 	svc.snapshotTTL = 10 * time.Minute
 	svc.now = func() time.Time { return time.Unix(300, 0) }
 
-	legacyCursor := encodeLegacyCursor(t, int64(7), 6)
-	legacyResp, err := svc.Build(context.Background(), 3, legacyCursor, "ignored")
-	if err != nil {
-		t.Fatalf("legacy cursor build failed: %v", err)
-	}
-
-	newCursor, err := encodeCursor(&cursorState{Seed: 7, Page: 2})
-	if err != nil {
-		t.Fatalf("encode cursor failed: %v", err)
-	}
-	newResp, err := svc.Build(context.Background(), 3, newCursor, "ignored")
-	if err != nil {
-		t.Fatalf("new cursor build failed: %v", err)
-	}
-
-	if !reflect.DeepEqual(legacyResp.Items, newResp.Items) {
-		t.Fatalf("expected legacy cursor mapping to page cursor, got legacy=%+v new=%+v", legacyResp.Items, newResp.Items)
+	legacyCursor := encodeCursorPayload(t, map[string]any{
+		"seed":   int64(7),
+		"offset": 6,
+	})
+	if _, err := svc.Build(context.Background(), 3, legacyCursor, "ignored"); err == nil {
+		t.Fatalf("expected legacy offset cursor to fail")
 	}
 }
 
@@ -158,12 +147,49 @@ func TestBuildRejectsInvalidCursor(t *testing.T) {
 	}
 }
 
-func encodeLegacyCursor(t *testing.T, seed int64, offset int) string {
-	t.Helper()
-	payload := map[string]any{
-		"seed":   seed,
-		"offset": offset,
+func TestBuildClampsNegativePageCursor(t *testing.T) {
+	source := &stubAlbumSource{
+		albums: []*models.AlbumIndex{
+			{
+				AlbumID: "album-a",
+				Photos: []models.PhotoMeta{
+					{I: 0, W: 100, H: 80, Ratio: 1.25},
+					{I: 1, W: 100, H: 80, Ratio: 1.25},
+					{I: 2, W: 100, H: 80, Ratio: 1.25},
+				},
+			},
+		},
 	}
+	svc := NewService(nil)
+	svc.albums = source
+	svc.snapshotTTL = 10 * time.Minute
+	svc.now = func() time.Time { return time.Unix(400, 0) }
+
+	pageZeroCursor, err := encodeCursor(&cursorState{Seed: 9, Page: 0})
+	if err != nil {
+		t.Fatalf("encode page zero cursor failed: %v", err)
+	}
+	pageZeroResp, err := svc.Build(context.Background(), 3, pageZeroCursor, "ignored")
+	if err != nil {
+		t.Fatalf("build page zero failed: %v", err)
+	}
+
+	negativeCursor, err := encodeCursor(&cursorState{Seed: 9, Page: -3})
+	if err != nil {
+		t.Fatalf("encode negative cursor failed: %v", err)
+	}
+	negativeResp, err := svc.Build(context.Background(), 3, negativeCursor, "ignored")
+	if err != nil {
+		t.Fatalf("build negative cursor failed: %v", err)
+	}
+
+	if !reflect.DeepEqual(pageZeroResp.Items, negativeResp.Items) {
+		t.Fatalf("expected negative page cursor to clamp to first page, got page0=%+v negative=%+v", pageZeroResp.Items, negativeResp.Items)
+	}
+}
+
+func encodeCursorPayload(t *testing.T, payload map[string]any) string {
+	t.Helper()
 	b, err := json.Marshal(payload)
 	if err != nil {
 		t.Fatalf("marshal failed: %v", err)

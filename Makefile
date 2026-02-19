@@ -25,7 +25,6 @@ export NPM_CONFIG_CACHE ?= $(NPM_CACHE_DIR)
 .PHONY: build test test-e2e test-full run clean
 
 build:
-	go mod tidy
 	cargo build --release --manifest-path $(CARGO_MANIFEST)
 	mkdir -p bin
 	cp workers/recommender/target/release/recommender $(RECOMMENDER_BIN)

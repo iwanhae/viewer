@@ -11,7 +11,6 @@ type PhotoMeta struct {
 type PhotoEmbedding struct {
 	Status    string    `json:"status,omitempty"`
 	Vector    []float32 `json:"vector,omitempty"`
-	Model     string    `json:"model,omitempty"`
 	UpdatedAt string    `json:"updatedAt,omitempty"`
 	Error     string    `json:"error,omitempty"`
 }

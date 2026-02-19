@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"strings"
 	"time"
 
 	"viewer/internal/albums"
@@ -40,8 +39,8 @@ func Run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("processing service init failed: %w", err)
 	}
-	recommenderConfigured := strings.TrimSpace(cfg.RecommenderEndpoint) != ""
-	if recommenderConfigured {
+	recommenderEnabled := recommendService.Enabled()
+	if recommenderEnabled {
 		if cfg.RecommenderRequired {
 			healthcheckCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			if err := recommendService.Healthcheck(healthcheckCtx); err != nil {
@@ -80,7 +79,7 @@ func Run(ctx context.Context) error {
 			return
 		case <-warmupDone:
 		}
-		if !recommenderConfigured {
+		if !recommenderEnabled {
 			log.Printf("viewer: warmup completed; processing workers disabled")
 			return
 		}

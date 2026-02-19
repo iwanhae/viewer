@@ -374,6 +374,11 @@ func (s *Server) getImage(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) getRecommendations(w http.ResponseWriter, r *http.Request) {
+	if s.recommend == nil {
+		writeError(w, r, http.StatusServiceUnavailable, "UNAVAILABLE", "recommendations are not available")
+		return
+	}
+
 	albumID := chi.URLParam(r, "albumId")
 	idx, err := parseNonNegativePathIntParam(r, "index")
 	if err != nil {

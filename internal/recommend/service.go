@@ -100,9 +100,13 @@ func (s *Service) Healthcheck(ctx context.Context) error {
 	return s.embedder.Healthcheck(ctx)
 }
 
+func (s *Service) Enabled() bool {
+	return s != nil && strings.TrimSpace(s.cfg.RecommenderEndpoint) != ""
+}
+
 func (s *Service) Start(ctx context.Context) error {
 	s.startOnce.Do(func() {
-		if strings.TrimSpace(s.cfg.RecommenderEndpoint) == "" {
+		if !s.Enabled() {
 			s.startErr = nil
 			return
 		}
@@ -196,7 +200,6 @@ func (s *Service) applyAlbumIndexLocked(idx models.AlbumIndex) {
 				ImageID:    id,
 				Vector:     normalized,
 				Norm:       norm,
-				ModelID:    emb.Model,
 				UpdatedAt:  emb.UpdatedAt,
 				Dimensions: len(normalized),
 			}
@@ -677,7 +680,7 @@ func (s *Service) embedAlbumAndPersist(ctx context.Context, albumID string, phot
 			continue
 		}
 
-		vector, modelID, err := s.embedder.Embed(ctx, result.Bytes)
+		vector, _, err := s.embedder.Embed(ctx, result.Bytes)
 		if err != nil {
 			if isTransientEmbedError(err) {
 				transientIndexes = append(transientIndexes, photo.PhotoIndex)
@@ -696,7 +699,6 @@ func (s *Service) embedAlbumAndPersist(ctx context.Context, albumID string, phot
 		updates[photo.PhotoIndex] = models.PhotoEmbedding{
 			Status:    embeddingStatusReady,
 			Vector:    vector,
-			Model:     modelID,
 			UpdatedAt: time.Now().UTC().Format(time.RFC3339),
 		}
 	}
@@ -952,6 +954,7 @@ func (s *Service) Recommend(ctx context.Context, albumID string, photoIndex int,
 	exclude := map[string]struct{}{queryID: {}}
 	neighbors := findNeighbors(s.embeddingsByID, queryEmbedding.Vector, len(s.embeddingsByID), exclude)
 	items := make([]RecommendationItem, 0, limit)
+	seenAlbumIDs := make(map[string]struct{}, limit)
 	for _, n := range neighbors {
 		photo, ok := s.photosByID[n.ImageID]
 		if !ok {
@@ -960,6 +963,10 @@ func (s *Service) Recommend(ctx context.Context, albumID string, photoIndex int,
 		if photo.AlbumID == albumID {
 			continue
 		}
+		if _, seen := seenAlbumIDs[photo.AlbumID]; seen {
+			continue
+		}
+		seenAlbumIDs[photo.AlbumID] = struct{}{}
 		items = append(items, RecommendationItem{
 			AlbumID: photo.AlbumID,
 			I:       photo.PhotoIndex,

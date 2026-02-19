@@ -1,11 +1,13 @@
 package feed
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
+	"io"
 	"strconv"
 	"sync"
 	"time"
@@ -35,12 +37,6 @@ type cursorState struct {
 	Page int   `json:"page"`
 }
 
-type rawCursorState struct {
-	Seed   int64 `json:"seed"`
-	Page   *int  `json:"page,omitempty"`
-	Offset *int  `json:"offset,omitempty"`
-}
-
 type photoRef struct {
 	albumID string
 	photo   models.PhotoMeta
@@ -68,7 +64,7 @@ func (s *Service) Build(ctx context.Context, limit int, cursor string, seedParam
 		return models.FeedResponse{Items: []models.FeedItem{}}, nil
 	}
 
-	state, err := parseCursor(cursor, limit)
+	state, err := parseCursor(cursor)
 	if err != nil {
 		return models.FeedResponse{}, err
 	}
@@ -151,7 +147,7 @@ func parseSeed(seed string) int64 {
 	return int64(h.Sum64())
 }
 
-func parseCursor(raw string, limit int) (*cursorState, error) {
+func parseCursor(raw string) (*cursorState, error) {
 	if raw == "" {
 		return nil, nil
 	}
@@ -159,31 +155,19 @@ func parseCursor(raw string, limit int) (*cursorState, error) {
 	if err != nil {
 		return nil, fmt.Errorf("invalid cursor")
 	}
-	var st rawCursorState
-	if err := json.Unmarshal(decoded, &st); err != nil {
+	var st cursorState
+	decoder := json.NewDecoder(bytes.NewReader(decoded))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&st); err != nil {
 		return nil, fmt.Errorf("invalid cursor")
 	}
-	if st.Page != nil {
-		page := *st.Page
-		if page < 0 {
-			page = 0
-		}
-		return &cursorState{Seed: st.Seed, Page: page}, nil
-	}
-	if st.Offset == nil {
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
 		return nil, fmt.Errorf("invalid cursor")
 	}
-	offset := *st.Offset
-	if offset < 0 {
-		offset = 0
+	if st.Page < 0 {
+		st.Page = 0
 	}
-	if limit <= 0 {
-		limit = 80
-	}
-	return &cursorState{
-		Seed: st.Seed,
-		Page: offset / limit,
-	}, nil
+	return &st, nil
 }
 
 func encodeCursor(st *cursorState) (string, error) {

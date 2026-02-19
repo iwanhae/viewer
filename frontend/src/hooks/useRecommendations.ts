@@ -37,25 +37,14 @@ export function useRecommendations(
 
     void (async () => {
       try {
-        const fetchLimit = Math.max(limit * 4, 12)
-        const result = await fetchRecommendations(albumId, photoIndex, fetchLimit, {
+        const result = await fetchRecommendations(albumId, photoIndex, limit, {
           signal: abortController.signal,
         })
         if (abortController.signal.aborted) return
         if (!Array.isArray(result.items)) {
           setItems([])
         } else {
-          const seenAlbumIds = new Set<string>()
-          const dedupedItems: RecommendationItem[] = []
-          for (const item of result.items) {
-            if (seenAlbumIds.has(item.albumId)) continue
-            seenAlbumIds.add(item.albumId)
-            dedupedItems.push(item)
-            if (dedupedItems.length >= limit) {
-              break
-            }
-          }
-          setItems(dedupedItems)
+          setItems(result.items)
         }
         setStatus(result.status)
       } catch (err) {

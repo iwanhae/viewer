@@ -44,7 +44,6 @@ func TestApplyAlbumIndexReplacesOnlyTargetAlbumRecords(t *testing.T) {
 			"2": {
 				Status: embeddingStatusReady,
 				Vector: []float32{1, 1},
-				Model:  "m",
 			},
 		},
 	})
@@ -218,6 +217,41 @@ func TestRecommendExcludesSameAlbumAndReturnsPartial(t *testing.T) {
 	}
 	if resp.Items[0].AlbumID != "album-b" || resp.Items[1].AlbumID != "album-c" {
 		t.Fatalf("unexpected recommendation order: %+v", resp.Items)
+	}
+}
+
+func TestRecommendDeduplicatesByTargetAlbum(t *testing.T) {
+	s := &Service{
+		photosByID: map[string]PhotoRecord{
+			imageID("album-a", 0): {ImageID: imageID("album-a", 0), AlbumID: "album-a", PhotoIndex: 0},
+			imageID("album-b", 0): {ImageID: imageID("album-b", 0), AlbumID: "album-b", PhotoIndex: 0},
+			imageID("album-b", 1): {ImageID: imageID("album-b", 1), AlbumID: "album-b", PhotoIndex: 1},
+			imageID("album-c", 0): {ImageID: imageID("album-c", 0), AlbumID: "album-c", PhotoIndex: 0},
+		},
+		embeddingsByID: map[string]EmbeddingRecord{
+			imageID("album-a", 0): {ImageID: imageID("album-a", 0), Vector: []float32{1, 0}},
+			imageID("album-b", 0): {ImageID: imageID("album-b", 0), Vector: []float32{0.99, 0.01}},
+			imageID("album-b", 1): {ImageID: imageID("album-b", 1), Vector: []float32{0.98, 0.02}},
+			imageID("album-c", 0): {ImageID: imageID("album-c", 0), Vector: []float32{0.9, 0.1}},
+		},
+		failedByID: make(map[string]string),
+	}
+
+	resp, err := s.Recommend(context.Background(), "album-a", 0, 2)
+	if err != nil {
+		t.Fatalf("recommend failed: %v", err)
+	}
+	if resp.Status != "ready" {
+		t.Fatalf("expected ready status, got %q", resp.Status)
+	}
+	if len(resp.Items) != 2 {
+		t.Fatalf("expected 2 deduplicated items, got %d", len(resp.Items))
+	}
+	if resp.Items[0].AlbumID != "album-b" || resp.Items[0].I != 0 {
+		t.Fatalf("expected highest-ranked item from album-b first, got %+v", resp.Items[0])
+	}
+	if resp.Items[1].AlbumID != "album-c" {
+		t.Fatalf("expected second item from album-c, got %+v", resp.Items[1])
 	}
 }
 
