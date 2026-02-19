@@ -52,6 +52,7 @@ func (s *Server) Router() http.Handler {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"status":"ok"}`))
 	})
+	r.Get("/metrics", s.getMetrics)
 
 	r.Route("/api", func(r chi.Router) {
 		r.Post("/albums", s.createAlbum)
@@ -275,6 +276,38 @@ func (s *Server) getRangeCacheStats(w http.ResponseWriter, r *http.Request) {
 		"readErrors":    stats.ReadErrors,
 		"loadedBytes":   stats.LoadedBytes,
 	})
+}
+
+func (s *Server) getMetrics(w http.ResponseWriter, r *http.Request) {
+	progress := recommend.EmbeddingProgress{}
+	if s.recommend != nil {
+		progress = s.recommend.EmbeddingProgress()
+	}
+
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+
+	_, _ = fmt.Fprintf(w, "# HELP viewer_embedding_images_total Total number of images tracked by the embedding pipeline.\n")
+	_, _ = fmt.Fprintf(w, "# TYPE viewer_embedding_images_total gauge\n")
+	_, _ = fmt.Fprintf(w, "viewer_embedding_images_total %d\n", progress.Total)
+	_, _ = fmt.Fprintf(w, "# HELP viewer_embedding_images_ready Number of images with ready embeddings.\n")
+	_, _ = fmt.Fprintf(w, "# TYPE viewer_embedding_images_ready gauge\n")
+	_, _ = fmt.Fprintf(w, "viewer_embedding_images_ready %d\n", progress.Ready)
+	_, _ = fmt.Fprintf(w, "# HELP viewer_embedding_images_failed Number of images with failed embeddings.\n")
+	_, _ = fmt.Fprintf(w, "# TYPE viewer_embedding_images_failed gauge\n")
+	_, _ = fmt.Fprintf(w, "viewer_embedding_images_failed %d\n", progress.Failed)
+	_, _ = fmt.Fprintf(w, "# HELP viewer_embedding_images_pending Number of images pending embedding.\n")
+	_, _ = fmt.Fprintf(w, "# TYPE viewer_embedding_images_pending gauge\n")
+	_, _ = fmt.Fprintf(w, "viewer_embedding_images_pending %d\n", progress.Pending)
+	_, _ = fmt.Fprintf(w, "# HELP viewer_embedding_images_processed Number of images processed by embedding workers.\n")
+	_, _ = fmt.Fprintf(w, "# TYPE viewer_embedding_images_processed gauge\n")
+	_, _ = fmt.Fprintf(w, "viewer_embedding_images_processed %d\n", progress.Processed)
+	_, _ = fmt.Fprintf(w, "# HELP viewer_embedding_progress_ratio Ready embeddings divided by total images.\n")
+	_, _ = fmt.Fprintf(w, "# TYPE viewer_embedding_progress_ratio gauge\n")
+	_, _ = fmt.Fprintf(w, "viewer_embedding_progress_ratio %.6f\n", progress.Ratio)
+	_, _ = fmt.Fprintf(w, "# HELP viewer_embedding_progress_percent Ready embeddings as percentage of total images.\n")
+	_, _ = fmt.Fprintf(w, "# TYPE viewer_embedding_progress_percent gauge\n")
+	_, _ = fmt.Fprintf(w, "viewer_embedding_progress_percent %.6f\n", progress.Percent)
 }
 
 func recovererWithLog(next http.Handler) http.Handler {

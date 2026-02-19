@@ -524,6 +524,38 @@ func (s *Service) albumEmbeddingStats(albumID string) (total int, ready int, fai
 	return total, ready, failed, missing
 }
 
+func (s *Service) EmbeddingProgress() EmbeddingProgress {
+	if s == nil {
+		return EmbeddingProgress{}
+	}
+
+	s.mu.RLock()
+	total := len(s.photosByID)
+	ready := len(s.embeddingsByID)
+	failed := len(s.failedByID)
+	pending := 0
+	for _, missing := range s.missingByAlbum {
+		pending += len(missing)
+	}
+	s.mu.RUnlock()
+
+	processed := ready + failed
+	ratio := 0.0
+	if total > 0 {
+		ratio = float64(ready) / float64(total)
+	}
+
+	return EmbeddingProgress{
+		Total:     total,
+		Ready:     ready,
+		Failed:    failed,
+		Pending:   pending,
+		Processed: processed,
+		Ratio:     ratio,
+		Percent:   ratio * 100,
+	}
+}
+
 func (s *Service) Recommend(ctx context.Context, albumID string, photoIndex int, limit int) (RecommendationResponse, error) {
 	if limit <= 0 {
 		limit = s.cfg.RecoTopKDefault

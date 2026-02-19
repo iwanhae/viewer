@@ -46,6 +46,16 @@ type RecommendationResponse struct {
 	Status string               `json:"status"`
 }
 
+type EmbeddingProgress struct {
+	Total     int
+	Ready     int
+	Failed    int
+	Pending   int
+	Processed int
+	Ratio     float64
+	Percent   float64
+}
+
 func imageID(albumID string, photoIndex int) string {
 	return fmt.Sprintf("%s:%d", albumID, photoIndex)
 }

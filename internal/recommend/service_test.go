@@ -2,6 +2,7 @@ package recommend
 
 import (
 	"context"
+	"math"
 	"math/rand"
 	"testing"
 
@@ -283,5 +284,50 @@ func TestRecommendFailedWhenQueryEmbeddingFailed(t *testing.T) {
 	}
 	if resp.Status != "failed" {
 		t.Fatalf("expected failed status, got %q", resp.Status)
+	}
+}
+
+func TestEmbeddingProgressEmptyService(t *testing.T) {
+	var svc *Service
+	got := svc.EmbeddingProgress()
+	if got.Total != 0 || got.Ready != 0 || got.Failed != 0 || got.Pending != 0 || got.Processed != 0 {
+		t.Fatalf("expected zero progress for nil service, got %+v", got)
+	}
+	if got.Ratio != 0 || got.Percent != 0 {
+		t.Fatalf("expected zero progress ratio for nil service, got ratio=%f percent=%f", got.Ratio, got.Percent)
+	}
+}
+
+func TestEmbeddingProgressCountsAndRatios(t *testing.T) {
+	s := &Service{
+		photosByID: map[string]PhotoRecord{
+			imageID("album-a", 0): {ImageID: imageID("album-a", 0), AlbumID: "album-a", PhotoIndex: 0},
+			imageID("album-a", 1): {ImageID: imageID("album-a", 1), AlbumID: "album-a", PhotoIndex: 1},
+			imageID("album-b", 0): {ImageID: imageID("album-b", 0), AlbumID: "album-b", PhotoIndex: 0},
+			imageID("album-b", 1): {ImageID: imageID("album-b", 1), AlbumID: "album-b", PhotoIndex: 1},
+		},
+		embeddingsByID: map[string]EmbeddingRecord{
+			imageID("album-a", 0): {ImageID: imageID("album-a", 0), Vector: []float32{1, 0}},
+			imageID("album-b", 0): {ImageID: imageID("album-b", 0), Vector: []float32{0, 1}},
+		},
+		failedByID: map[string]string{
+			imageID("album-a", 1): "embed failed",
+		},
+		missingByAlbum: map[string]map[int]struct{}{
+			"album-b": {
+				1: {},
+			},
+		},
+	}
+
+	got := s.EmbeddingProgress()
+	if got.Total != 4 || got.Ready != 2 || got.Failed != 1 || got.Pending != 1 || got.Processed != 3 {
+		t.Fatalf("unexpected embedding progress counts: %+v", got)
+	}
+	if math.Abs(got.Ratio-0.5) > 1e-9 {
+		t.Fatalf("ratio=%f want=0.5", got.Ratio)
+	}
+	if math.Abs(got.Percent-50) > 1e-9 {
+		t.Fatalf("percent=%f want=50", got.Percent)
 	}
 }

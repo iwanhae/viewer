@@ -3,11 +3,18 @@ package httpapi
 import (
 	"bytes"
 	"context"
+	"fmt"
+	"math"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/go-chi/chi/v5"
+	cfgpkg "viewer/internal/config"
+	"viewer/internal/models"
+	"viewer/internal/recommend"
 )
 
 func TestParseOptionalIntQuery(t *testing.T) {
@@ -74,9 +81,139 @@ func TestJSONBodyRejectsTrailingContent(t *testing.T) {
 	}
 }
 
+func TestMetricsEndpointPrometheusPayload(t *testing.T) {
+	recommendService, err := recommend.NewService(
+		cfgpkg.Config{
+			RecommenderEndpoint:   "http://127.0.0.1:18081",
+			RecommenderTimeoutSec: 1,
+			Siglip2ModelID:        "test-model",
+			Siglip2Device:         "cpu",
+		},
+		nil,
+		nil,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("new recommend service: %v", err)
+	}
+	recommendService.IngestAlbumIndex(models.AlbumIndex{
+		AlbumID: "album-a",
+		Photos: []models.PhotoMeta{
+			{I: 0, Name: "a.jpg"},
+			{I: 1, Name: "b.jpg"},
+			{I: 2, Name: "c.jpg"},
+		},
+		Embeddings: map[string]models.PhotoEmbedding{
+			"0": {Status: "ready", Vector: []float32{1, 2, 3}},
+			"1": {Status: "failed", Error: "embed failed"},
+		},
+	})
+
+	router := New(nil, nil, nil, recommendService, 0).Router()
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d want=%d body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	contentType := rec.Header().Get("Content-Type")
+	if !strings.Contains(contentType, "text/plain") {
+		t.Fatalf("content type=%q want text/plain", contentType)
+	}
+
+	body := rec.Body.String()
+	required := []string{
+		"viewer_embedding_images_total",
+		"viewer_embedding_images_ready",
+		"viewer_embedding_images_failed",
+		"viewer_embedding_images_pending",
+		"viewer_embedding_images_processed",
+		"viewer_embedding_progress_ratio",
+		"viewer_embedding_progress_percent",
+	}
+	for _, metricName := range required {
+		if !strings.Contains(body, metricName) {
+			t.Fatalf("missing metric %q in payload:\n%s", metricName, body)
+		}
+	}
+
+	mustMetricIntValue(t, body, "viewer_embedding_images_total", 3)
+	mustMetricIntValue(t, body, "viewer_embedding_images_ready", 1)
+	mustMetricIntValue(t, body, "viewer_embedding_images_failed", 1)
+	mustMetricIntValue(t, body, "viewer_embedding_images_pending", 1)
+	mustMetricIntValue(t, body, "viewer_embedding_images_processed", 2)
+	mustMetricFloatValue(t, body, "viewer_embedding_progress_ratio", 1.0/3.0, 1e-6)
+	mustMetricFloatValue(t, body, "viewer_embedding_progress_percent", (100.0 / 3.0), 1e-4)
+}
+
+func TestMetricsEndpointWithNilRecommendService(t *testing.T) {
+	router := New(nil, nil, nil, nil, 0).Router()
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d want=%d body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	body := rec.Body.String()
+	mustMetricIntValue(t, body, "viewer_embedding_images_total", 0)
+	mustMetricIntValue(t, body, "viewer_embedding_images_ready", 0)
+	mustMetricIntValue(t, body, "viewer_embedding_images_failed", 0)
+	mustMetricIntValue(t, body, "viewer_embedding_images_pending", 0)
+	mustMetricIntValue(t, body, "viewer_embedding_images_processed", 0)
+	mustMetricFloatValue(t, body, "viewer_embedding_progress_ratio", 0, 1e-9)
+	mustMetricFloatValue(t, body, "viewer_embedding_progress_percent", 0, 1e-9)
+}
+
 func requestWithURLParam(key string, value string) *http.Request {
 	req := httptest.NewRequest(http.MethodGet, "/api/image/album/0", nil)
 	rctx := chi.NewRouteContext()
 	rctx.URLParams.Add(key, value)
 	return req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+}
+
+func metricValue(body string, name string) (string, error) {
+	targetPrefix := name + " "
+	for _, line := range strings.Split(body, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		if strings.HasPrefix(trimmed, targetPrefix) {
+			return strings.TrimSpace(strings.TrimPrefix(trimmed, targetPrefix)), nil
+		}
+	}
+	return "", fmt.Errorf("metric %s not found", name)
+}
+
+func mustMetricIntValue(t *testing.T, body string, name string, want int) {
+	t.Helper()
+	raw, err := metricValue(body, name)
+	if err != nil {
+		t.Fatalf("%v", err)
+	}
+	got, err := strconv.Atoi(raw)
+	if err != nil {
+		t.Fatalf("parse metric %s value %q as int: %v", name, raw, err)
+	}
+	if got != want {
+		t.Fatalf("metric %s=%d want=%d", name, got, want)
+	}
+}
+
+func mustMetricFloatValue(t *testing.T, body string, name string, want float64, tolerance float64) {
+	t.Helper()
+	raw, err := metricValue(body, name)
+	if err != nil {
+		t.Fatalf("%v", err)
+	}
+	got, err := strconv.ParseFloat(raw, 64)
+	if err != nil {
+		t.Fatalf("parse metric %s value %q as float: %v", name, raw, err)
+	}
+	if math.Abs(got-want) > tolerance {
+		t.Fatalf("metric %s=%f want=%f tolerance=%f", name, got, want, tolerance)
+	}
 }
