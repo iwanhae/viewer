@@ -41,8 +41,7 @@ type RecommendationItem struct {
 }
 
 type RecommendationResponse struct {
-	Items  []RecommendationItem `json:"items"`
-	Status string               `json:"status"`
+	Items []RecommendationItem `json:"items"`
 }
 
 type EmbeddingProgress struct {

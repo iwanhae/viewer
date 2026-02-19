@@ -11,7 +11,6 @@ import (
 	"testing"
 	"time"
 
-	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"viewer/internal/models"
 )
 
@@ -125,9 +124,6 @@ func TestSearchAlbumsByNamePrefixMatchesCaseInsensitiveAndOrdersByCreatedAt(t *t
 					{I: 0},
 					{I: 1},
 				},
-				Embeddings: map[string]models.PhotoEmbedding{
-					"0": {Status: "ready", Vector: []float32{0.1}},
-				},
 			},
 			"album-old": {
 				AlbumID:          "album-old",
@@ -136,9 +132,6 @@ func TestSearchAlbumsByNamePrefixMatchesCaseInsensitiveAndOrdersByCreatedAt(t *t
 				PhotoCount:       1,
 				Photos: []models.PhotoMeta{
 					{I: 0},
-				},
-				Embeddings: map[string]models.PhotoEmbedding{
-					"0": {Status: "ready", Vector: []float32{0.2}},
 				},
 			},
 			"album-other": {
@@ -163,15 +156,6 @@ func TestSearchAlbumsByNamePrefixMatchesCaseInsensitiveAndOrdersByCreatedAt(t *t
 	if got[0].AlbumID != "album-new" || got[1].AlbumID != "album-old" {
 		t.Fatalf("unexpected ordering: %+v", got)
 	}
-	if got[0].IndexStatus != models.AlbumIndexStatusPartial {
-		t.Fatalf("expected partial status for first result, got %q", got[0].IndexStatus)
-	}
-	if got[0].IndexedCount != 1 || got[0].FailedCount != 0 || got[0].TotalCount != 2 {
-		t.Fatalf("unexpected counts for first result: %+v", got[0])
-	}
-	if got[1].IndexStatus != models.AlbumIndexStatusReady {
-		t.Fatalf("expected ready status for second result, got %q", got[1].IndexStatus)
-	}
 }
 
 func TestSearchAlbumsByNamePrefixSupportsEmptyQueryAndLimit(t *testing.T) {
@@ -192,100 +176,6 @@ func TestSearchAlbumsByNamePrefixSupportsEmptyQueryAndLimit(t *testing.T) {
 	}
 	if got[0].AlbumID != "album-b" {
 		t.Fatalf("expected newest album first, got %q", got[0].AlbumID)
-	}
-}
-
-func TestAlbumIndexStatusCounts(t *testing.T) {
-	tests := []struct {
-		name        string
-		album       *models.AlbumIndex
-		wantStatus  models.AlbumIndexStatus
-		wantIndexed int
-		wantFailed  int
-		wantTotal   int
-	}{
-		{
-			name: "ready when all embeddings are ready",
-			album: &models.AlbumIndex{
-				Photos: []models.PhotoMeta{{I: 0}},
-				Embeddings: map[string]models.PhotoEmbedding{
-					"0": {Status: "ready", Vector: []float32{0.1}},
-				},
-			},
-			wantStatus:  models.AlbumIndexStatusReady,
-			wantIndexed: 1,
-			wantFailed:  0,
-			wantTotal:   1,
-		},
-		{
-			name: "partial when some embeddings are ready",
-			album: &models.AlbumIndex{
-				Photos: []models.PhotoMeta{{I: 0}, {I: 1}},
-				Embeddings: map[string]models.PhotoEmbedding{
-					"0": {Status: "ready", Vector: []float32{0.1}},
-				},
-			},
-			wantStatus:  models.AlbumIndexStatusPartial,
-			wantIndexed: 1,
-			wantFailed:  0,
-			wantTotal:   2,
-		},
-		{
-			name: "pending when no ready or failed embeddings exist",
-			album: &models.AlbumIndex{
-				Photos: []models.PhotoMeta{{I: 0}},
-				Embeddings: map[string]models.PhotoEmbedding{
-					"0": {Status: "ready"},
-				},
-			},
-			wantStatus:  models.AlbumIndexStatusPending,
-			wantIndexed: 0,
-			wantFailed:  0,
-			wantTotal:   1,
-		},
-		{
-			name: "failed when failed exists but no ready embeddings",
-			album: &models.AlbumIndex{
-				Photos: []models.PhotoMeta{{I: 0}, {I: 1}},
-				Embeddings: map[string]models.PhotoEmbedding{
-					"0": {Status: "failed"},
-				},
-			},
-			wantStatus:  models.AlbumIndexStatusFailed,
-			wantIndexed: 0,
-			wantFailed:  1,
-			wantTotal:   2,
-		},
-		{
-			name: "uses photo count fallback when photos are absent",
-			album: &models.AlbumIndex{
-				PhotoCount: 3,
-			},
-			wantStatus:  models.AlbumIndexStatusPending,
-			wantIndexed: 0,
-			wantFailed:  0,
-			wantTotal:   3,
-		},
-	}
-
-	for _, tc := range tests {
-		tc := tc
-		t.Run(tc.name, func(t *testing.T) {
-			gotStatus, gotIndexed, gotFailed, gotTotal := albumIndexStatusCounts(tc.album)
-			if gotStatus != tc.wantStatus || gotIndexed != tc.wantIndexed || gotFailed != tc.wantFailed || gotTotal != tc.wantTotal {
-				t.Fatalf(
-					"status counts mismatch: got=(%q,%d,%d,%d) want=(%q,%d,%d,%d)",
-					gotStatus,
-					gotIndexed,
-					gotFailed,
-					gotTotal,
-					tc.wantStatus,
-					tc.wantIndexed,
-					tc.wantFailed,
-					tc.wantTotal,
-				)
-			}
-		})
 	}
 }
 
@@ -348,23 +238,7 @@ type fakeAlbumStore struct {
 	readJSONFn             func(ctx context.Context, key string, out any) error
 }
 
-func (f *fakeAlbumStore) CreateMultipartUpload(ctx context.Context, key string, contentType string) (string, error) {
-	panic("unexpected call")
-}
-
-func (f *fakeAlbumStore) PresignUploadPart(ctx context.Context, key string, uploadID string, partNumber int32, ttl time.Duration) (string, map[string]string, error) {
-	panic("unexpected call")
-}
-
-func (f *fakeAlbumStore) ListMultipartUploadParts(ctx context.Context, key string, uploadID string) ([]s3types.CompletedPart, error) {
-	panic("unexpected call")
-}
-
-func (f *fakeAlbumStore) CompleteMultipartUpload(ctx context.Context, key string, uploadID string, parts []s3types.CompletedPart) error {
-	panic("unexpected call")
-}
-
-func (f *fakeAlbumStore) AbortMultipartUpload(ctx context.Context, key string, uploadID string) error {
+func (f *fakeAlbumStore) PresignPut(ctx context.Context, key string, ttl time.Duration) (string, map[string]string, error) {
 	panic("unexpected call")
 }
 
@@ -380,19 +254,11 @@ func (f *fakeAlbumStore) PutJSON(ctx context.Context, key string, v any) error {
 	panic("unexpected call")
 }
 
-func (f *fakeAlbumStore) PutJSONIfMatch(ctx context.Context, key string, etag string, v any) (string, error) {
-	panic("unexpected call")
-}
-
 func (f *fakeAlbumStore) ReadJSON(ctx context.Context, key string, out any) error {
 	if f.readJSONFn == nil {
 		panic("unexpected call")
 	}
 	return f.readJSONFn(ctx, key, out)
-}
-
-func (f *fakeAlbumStore) ReadJSONWithETag(ctx context.Context, key string, out any) (string, error) {
-	panic("unexpected call")
 }
 
 func (f *fakeAlbumStore) ForEachAlbumIndexKey(ctx context.Context, fn func(key string) error) error {

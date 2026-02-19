@@ -2,20 +2,14 @@ import { cacheAlbum, getCachedAlbum as getCachedAlbumValue } from './albumCache'
 import { ensureOK, requestJSON } from './http'
 import type {
   AlbumIndex,
-  AlbumStatus,
-  AlbumStatusState,
   AlbumSearchResponse,
   FeedResponse,
   RecommendationItem,
   RecommendationResponse,
-  RecommendationStatus,
 } from './types'
 
 export type {
   AlbumIndex,
-  AlbumStatus,
-  AlbumStatusState,
-  AlbumIndexStatus,
   AlbumSearchItem,
   AlbumSearchResponse,
   FeedItem,
@@ -23,7 +17,6 @@ export type {
   PhotoMeta,
   RecommendationItem,
   RecommendationResponse,
-  RecommendationStatus,
 } from './types'
 
 export function getCachedAlbum(albumId: string): AlbumIndex | null {
@@ -36,7 +29,6 @@ export function seedCachedAlbum(album: AlbumIndex): void {
 
 type RawRecommendationResponse = {
   items: RecommendationItem[] | null
-  status: RecommendationStatus
 }
 
 export async function fetchFeed(params?: {
@@ -54,90 +46,48 @@ export async function fetchFeed(params?: {
 
 export async function createAlbum(file: File): Promise<{
   albumId: string
-  upload: {
-    strategy: string
-    key: string
-    partSizeBytes: number
-    maxParts: number
-  }
+  uploadUrl: string
+  uploadHeaders: Record<string, string>
+  objectKey: string
 }> {
-  return await requestJSON('/api/albums', {
+  const created = await requestJSON<{
+    albumId: string
+    uploadUrl: string
+    uploadHeaders?: Record<string, string>
+    objectKey: string
+  }>('/api/albums', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ filename: file.name, sizeBytes: file.size }),
   })
+  return {
+    albumId: created.albumId,
+    uploadUrl: created.uploadUrl,
+    uploadHeaders: created.uploadHeaders ?? {},
+    objectKey: created.objectKey,
+  }
 }
 
-export async function initiateMultipartUpload(albumId: string, file: File): Promise<{
-  uploadId: string
-  partSizeBytes: number
-  partCount: number
-}> {
-  return await requestJSON(`/api/albums/${albumId}/multipart/initiate`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      sizeBytes: file.size,
-      contentType: file.type || 'application/zip',
-    }),
-  })
-}
-
-export async function presignMultipartPart(
-  albumId: string,
-  uploadId: string,
-  partNumber: number,
-): Promise<{ url: string; headers: Record<string, string> }> {
-  return await requestJSON(`/api/albums/${albumId}/multipart/part-url`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ uploadId, partNumber }),
-  })
-}
-
-export async function uploadMultipartPart(
-  url: string,
-  body: Blob,
+export async function uploadAlbumObject(
+  uploadURL: string,
+  file: File,
   headers: Record<string, string>,
   signal?: AbortSignal,
 ): Promise<void> {
-  await ensureOK(url, {
+  await ensureOK(uploadURL, {
     method: 'PUT',
     headers,
-    body,
+    body: file,
     signal,
   })
 }
 
-export async function completeMultipartUpload(
-  albumId: string,
-  uploadId: string,
-  parts: Array<{ partNumber: number; etag: string }> = [],
-): Promise<{ status: string }> {
-  return await requestJSON(`/api/albums/${albumId}/multipart/complete`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ uploadId, parts }),
-  })
-}
-
-export async function abortMultipartUpload(
-  albumId: string,
-  uploadId: string,
-): Promise<{ status: string }> {
-  return await requestJSON(`/api/albums/${albumId}/multipart/abort`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ uploadId }),
-  })
-}
-
-export async function finalizeAlbum(albumId: string): Promise<AlbumStatus> {
+export async function finalizeAlbum(albumId: string): Promise<{
+  albumId: string
+  photoCount: number
+  createdAt: string
+}> {
   return await requestJSON(`/api/albums/${albumId}/finalize`, { method: 'POST' })
-}
-
-export async function fetchAlbumStatus(albumId: string): Promise<AlbumStatus> {
-  return await requestJSON(`/api/albums/${albumId}/status`)
 }
 
 export async function fetchAlbum(albumId: string, options?: { signal?: AbortSignal }): Promise<AlbumIndex> {
@@ -173,7 +123,6 @@ export async function fetchRecommendations(
     { signal: options?.signal },
   )
   return {
-    status: data.status,
     items: Array.isArray(data.items) ? data.items : [],
   }
 }

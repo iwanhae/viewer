@@ -30,14 +30,14 @@ func Run(ctx context.Context) error {
 
 	albumService := albums.NewService(cfg, store, albums.NewIndexer())
 	feedService := feed.NewService(albumService)
-	imageService, err := images.NewService(albumService, store, cfg.CacheDir, cfg.ZipCacheDir, cfg.RangeChunkSize)
+	imageService, err := images.NewService(albumService, store, cfg.CacheDir, cfg.ZipCacheDir)
 	if err != nil {
 		return err
 	}
 
-	recommendService, err := recommend.NewService(cfg, albumService, imageService, store)
+	recommendService, err := recommend.NewService(cfg, imageService, store)
 	if err != nil {
-		return fmt.Errorf("processing service init failed: %w", err)
+		return fmt.Errorf("recommendation service init failed: %w", err)
 	}
 	recommenderEnabled := recommendService.Enabled()
 	if recommenderEnabled {
@@ -45,7 +45,7 @@ func Run(ctx context.Context) error {
 			healthcheckCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			if err := recommendService.Healthcheck(healthcheckCtx); err != nil {
 				cancel()
-				return fmt.Errorf("processing service init failed: %w", err)
+				return fmt.Errorf("recommendation service init failed: %w", err)
 			}
 			cancel()
 		} else {
@@ -55,12 +55,12 @@ func Run(ctx context.Context) error {
 			}
 			cancel()
 		}
-		log.Printf("viewer: processing service enabled")
+		log.Printf("viewer: recommendation service enabled")
 	} else {
 		log.Printf("viewer: recommender disabled (RECOMMENDER_ENDPOINT is empty)")
 	}
 
-	h := httpapi.New(albumService, feedService, imageService, recommendService, cfg.MaxUploadBytes).Router()
+	h := httpapi.New(albumService, feedService, imageService, recommendService).Router()
 	srv := &http.Server{
 		Addr:              fmt.Sprintf(":%d", cfg.Port),
 		Handler:           h,
@@ -80,15 +80,15 @@ func Run(ctx context.Context) error {
 		case <-warmupDone:
 		}
 		if !recommenderEnabled {
-			log.Printf("viewer: warmup completed; processing workers disabled")
+			log.Printf("viewer: warmup completed; embedding workers disabled")
 			return
 		}
-		log.Printf("viewer: warmup completed, starting processing workers")
+		log.Printf("viewer: warmup completed, starting embedding workers")
 		if err := recommendService.Start(ctx); err != nil {
-			log.Printf("viewer: processing startup failed: %v", err)
+			log.Printf("viewer: embedding worker startup failed: %v", err)
 			return
 		}
-		log.Printf("viewer: processing background workers started")
+		log.Printf("viewer: embedding background workers started")
 	}()
 
 	return srv.ListenAndServe()

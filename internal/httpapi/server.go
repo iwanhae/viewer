@@ -24,20 +24,18 @@ import (
 )
 
 type Server struct {
-	albums         *albums.Service
-	feed           *feed.Service
-	images         *images.Service
-	recommend      *recommend.Service
-	maxUploadBytes int64
+	albums    *albums.Service
+	feed      *feed.Service
+	images    *images.Service
+	recommend *recommend.Service
 }
 
-func New(albumsService *albums.Service, feedService *feed.Service, imageService *images.Service, recommendService *recommend.Service, maxUploadBytes int64) *Server {
+func New(albumsService *albums.Service, feedService *feed.Service, imageService *images.Service, recommendService *recommend.Service) *Server {
 	return &Server{
-		albums:         albumsService,
-		feed:           feedService,
-		images:         imageService,
-		recommend:      recommendService,
-		maxUploadBytes: maxUploadBytes,
+		albums:    albumsService,
+		feed:      feedService,
+		images:    imageService,
+		recommend: recommendService,
 	}
 }
 
@@ -56,19 +54,13 @@ func (s *Server) Router() http.Handler {
 
 	r.Route("/api", func(r chi.Router) {
 		r.Post("/albums", s.createAlbum)
-		r.Post("/albums/{albumId}/multipart/initiate", s.initiateAlbumMultipart)
-		r.Post("/albums/{albumId}/multipart/part-url", s.presignAlbumMultipartPart)
-		r.Post("/albums/{albumId}/multipart/complete", s.completeAlbumMultipart)
-		r.Post("/albums/{albumId}/multipart/abort", s.abortAlbumMultipart)
 		r.Get("/albums", s.listAlbums)
 		r.Get("/albums/search", s.searchAlbums)
 		r.Post("/albums/{albumId}/finalize", s.finalizeAlbum)
-		r.Get("/albums/{albumId}/status", s.getAlbumStatus)
 		r.Get("/albums/{albumId}", s.getAlbum)
 		r.Get("/feed", s.getFeed)
 		r.Get("/image/{albumId}/{index}", s.getImage)
 		r.Get("/recommendations/{albumId}/{index}", s.getRecommendations)
-		r.Get("/debug/range-cache-stats", s.getRangeCacheStats)
 	})
 
 	staticHandler := web.Handler()
@@ -91,30 +83,6 @@ type createAlbumRequest struct {
 	SizeBytes int64  `json:"sizeBytes"`
 }
 
-type initiateMultipartRequest struct {
-	SizeBytes   int64  `json:"sizeBytes"`
-	ContentType string `json:"contentType,omitempty"`
-}
-
-type presignMultipartPartRequest struct {
-	UploadID   string `json:"uploadId"`
-	PartNumber int32  `json:"partNumber"`
-}
-
-type completeMultipartRequest struct {
-	UploadID string                `json:"uploadId"`
-	Parts    []completePartRequest `json:"parts,omitempty"`
-}
-
-type completePartRequest struct {
-	PartNumber int32  `json:"partNumber"`
-	ETag       string `json:"etag"`
-}
-
-type abortMultipartRequest struct {
-	UploadID string `json:"uploadId"`
-}
-
 func (s *Server) createAlbum(w http.ResponseWriter, r *http.Request) {
 	var req createAlbumRequest
 	if err := jsonBody(r, &req); err != nil {
@@ -128,118 +96,16 @@ func (s *Server) createAlbum(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"albumId": res.AlbumID,
-		"upload": map[string]any{
-			"strategy":      res.Strategy,
-			"key":           res.Key,
-			"partSizeBytes": res.PartSizeBytes,
-			"maxParts":      res.MaxParts,
-		},
+		"albumId":       res.AlbumID,
+		"uploadUrl":     res.UploadURL,
+		"uploadHeaders": res.Headers,
+		"objectKey":     res.Key,
 	})
-}
-
-func (s *Server) initiateAlbumMultipart(w http.ResponseWriter, r *http.Request) {
-	albumID := chi.URLParam(r, "albumId")
-	var req initiateMultipartRequest
-	if err := jsonBody(r, &req); err != nil {
-		writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", err.Error())
-		return
-	}
-
-	res, err := s.albums.InitiateMultipartUpload(r.Context(), albumID, req.SizeBytes, req.ContentType)
-	if err != nil {
-		writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", err.Error())
-		return
-	}
-
-	writeJSON(w, http.StatusOK, map[string]any{
-		"uploadId":      res.UploadID,
-		"partSizeBytes": res.PartSizeBytes,
-		"partCount":     res.PartCount,
-	})
-}
-
-func (s *Server) presignAlbumMultipartPart(w http.ResponseWriter, r *http.Request) {
-	albumID := chi.URLParam(r, "albumId")
-	var req presignMultipartPartRequest
-	if err := jsonBody(r, &req); err != nil {
-		writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", err.Error())
-		return
-	}
-
-	res, err := s.albums.PresignMultipartUploadPart(r.Context(), albumID, req.UploadID, req.PartNumber)
-	if err != nil {
-		status := http.StatusBadRequest
-		code := "INVALID_REQUEST"
-		if errors.Is(err, albums.ErrMultipartNotFound) {
-			status = http.StatusNotFound
-			code = "NOT_FOUND"
-		}
-		writeError(w, r, status, code, err.Error())
-		return
-	}
-
-	writeJSON(w, http.StatusOK, map[string]any{
-		"url":     res.URL,
-		"headers": res.Headers,
-	})
-}
-
-func (s *Server) completeAlbumMultipart(w http.ResponseWriter, r *http.Request) {
-	albumID := chi.URLParam(r, "albumId")
-	var req completeMultipartRequest
-	if err := jsonBody(r, &req); err != nil {
-		writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", err.Error())
-		return
-	}
-
-	parts := make([]albums.CompletePart, 0, len(req.Parts))
-	for _, part := range req.Parts {
-		parts = append(parts, albums.CompletePart{
-			PartNumber: part.PartNumber,
-			ETag:       part.ETag,
-		})
-	}
-
-	if err := s.albums.CompleteMultipartUpload(r.Context(), albumID, req.UploadID, parts); err != nil {
-		status := http.StatusBadRequest
-		code := "INVALID_REQUEST"
-		if errors.Is(err, albums.ErrMultipartNotFound) {
-			status = http.StatusNotFound
-			code = "NOT_FOUND"
-		}
-		writeError(w, r, status, code, err.Error())
-		return
-	}
-
-	writeJSON(w, http.StatusOK, map[string]any{"status": "UPLOADED"})
-}
-
-func (s *Server) abortAlbumMultipart(w http.ResponseWriter, r *http.Request) {
-	albumID := chi.URLParam(r, "albumId")
-	var req abortMultipartRequest
-	if err := jsonBody(r, &req); err != nil {
-		writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", err.Error())
-		return
-	}
-
-	if err := s.albums.AbortMultipartUpload(r.Context(), albumID, req.UploadID); err != nil {
-		status := http.StatusBadRequest
-		code := "INVALID_REQUEST"
-		if errors.Is(err, albums.ErrMultipartNotFound) {
-			status = http.StatusNotFound
-			code = "NOT_FOUND"
-		}
-		writeError(w, r, status, code, err.Error())
-		return
-	}
-
-	writeJSON(w, http.StatusOK, map[string]any{"status": "ABORTED"})
 }
 
 func (s *Server) finalizeAlbum(w http.ResponseWriter, r *http.Request) {
 	albumID := chi.URLParam(r, "albumId")
-	finalizeStatus, err := s.albums.RequestFinalize(r.Context(), albumID)
+	idx, err := s.albums.Finalize(r.Context(), albumID)
 	if err != nil {
 		status := http.StatusInternalServerError
 		code := "INTERNAL"
@@ -251,37 +117,12 @@ func (s *Server) finalizeAlbum(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if s.recommend != nil {
-		s.recommend.ProcessAlbumAsync(albumID)
+		s.recommend.IngestAlbumIndex(*idx)
 	}
-	writeJSON(w, http.StatusAccepted, map[string]any{
-		"status":     finalizeStatus.Status,
-		"attempt":    finalizeStatus.Attempt,
-		"lastError":  finalizeStatus.LastError,
-		"photoCount": finalizeStatus.PhotoCount,
-		"updatedAt":  finalizeStatus.UpdatedAt,
-	})
-}
-
-func (s *Server) getAlbumStatus(w http.ResponseWriter, r *http.Request) {
-	albumID := chi.URLParam(r, "albumId")
-	status, err := s.albums.GetFinalizeStatus(r.Context(), albumID)
-	if err != nil {
-		httpStatus := http.StatusInternalServerError
-		code := "INTERNAL"
-		if errors.Is(err, albums.ErrAlbumNotFound) || errors.Is(err, albums.ErrAlbumSourceNotFound) {
-			httpStatus = http.StatusNotFound
-			code = "NOT_FOUND"
-		}
-		writeError(w, r, httpStatus, code, err.Error())
-		return
-	}
-
 	writeJSON(w, http.StatusOK, map[string]any{
-		"status":     status.Status,
-		"attempt":    status.Attempt,
-		"lastError":  status.LastError,
-		"photoCount": status.PhotoCount,
-		"updatedAt":  status.UpdatedAt,
+		"albumId":    idx.AlbumID,
+		"photoCount": idx.PhotoCount,
+		"createdAt":  idx.CreatedAt,
 	})
 }
 
@@ -374,7 +215,7 @@ func (s *Server) getImage(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) getRecommendations(w http.ResponseWriter, r *http.Request) {
-	if s.recommend == nil {
+	if s.recommend == nil || !s.recommend.Enabled() {
 		writeError(w, r, http.StatusServiceUnavailable, "UNAVAILABLE", "recommendations are not available")
 		return
 	}
@@ -400,18 +241,6 @@ func (s *Server) getRecommendations(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, result)
-}
-
-func (s *Server) getRangeCacheStats(w http.ResponseWriter, r *http.Request) {
-	stats := s.images.RangeCacheStats()
-	writeJSON(w, http.StatusOK, map[string]any{
-		"fetchRequests": stats.FetchRequests,
-		"fetchBytes":    stats.FetchBytes,
-		"cacheHits":     stats.CacheHits,
-		"cacheMisses":   stats.CacheMisses,
-		"readErrors":    stats.ReadErrors,
-		"loadedBytes":   stats.LoadedBytes,
-	})
 }
 
 func (s *Server) getMetrics(w http.ResponseWriter, r *http.Request) {
@@ -553,7 +382,9 @@ func Warmup(ctx context.Context, albumsService *albums.Service, recommendService
 			)
 		},
 		func(idx models.AlbumIndex) {
-			recommendService.IngestAlbumIndex(idx)
+			if recommendService != nil {
+				recommendService.IngestAlbumIndex(idx)
+			}
 		},
 	); err != nil {
 		log.Printf("album cache warmup skipped: %v", err)

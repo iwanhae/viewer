@@ -17,7 +17,6 @@ At minimum configure S3 values:
 - `S3_SECRET_KEY`
 
 Optional tuning:
-- `RANGE_CHUNK_SIZE_BYTES` controls S3 byte-range cache chunk size for ZIP reads (default `131072`).
 - Recommendation feature:
   - `RECO_TOPK_DEFAULT` default recommendation count (default `12`).
   - `RECO_TOPK_MAX` max recommendation count (default `48`).
@@ -39,7 +38,7 @@ Rust worker resolves model files through the Hugging Face cache (`HF_HOME`), dow
 Recommendation vectors are persisted in each album's `albums/<album-id>/index.json` under an `embeddings` section.
 Background embedding now runs album-by-album: workers pick a random album with missing vectors, embed all pending photos in that album, then persist metadata in one write.
 Recommendation responses are cross-album only: photos from the same album as the query are excluded from results.
-If no cross-album neighbors exist for an embedded query photo, the recommendation status returns `ready` with an empty `items` list.
+If no cross-album neighbors exist for an embedded query photo, recommendations return an empty `items` list.
 
 In the Docker image, the container entrypoint starts both the Rust recommender service and the Go server.
 The image prefetches `config.json` and `model.safetensors` for `SIGLIP2_MODEL_ID` at build time, so pod startup does not require Hugging Face egress.
@@ -50,7 +49,7 @@ To build an MKL-accelerated recommender for x86_64 images, pass `--build-arg REC
 `RECOMMENDER_ACCEL` defaults to `none`; if `mkl` is requested on non-`amd64` targets, the Dockerfile falls back to a non-MKL recommender build.
 
 ## Commands
-- `make build` runs `go mod tidy`, builds `bin/recommender` in release mode, builds frontend assets, and compiles `bin/viewer`.
+- `make build` builds `bin/recommender` in release mode, builds frontend assets, and compiles `bin/viewer`.
 - `make test` runs fast Go unit/integration tests only (`go test ./cmd/... ./internal/...`) using values from `.env.test`.
 - `make test-full` runs the full regression pipeline: `make build`, `make test`, then Playwright e2e (screenshots saved to `samples/` by default).
 - `make test-full` binds the app to `TEST_PORT` (default `18080`) and sets `E2E_BASE_URL` automatically.

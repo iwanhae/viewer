@@ -2,19 +2,15 @@ package recommend
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log"
 	"math/rand"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/google/uuid"
-	"viewer/internal/albums"
 	cfgpkg "viewer/internal/config"
 	"viewer/internal/images"
 	"viewer/internal/models"
@@ -23,7 +19,6 @@ import (
 
 type Service struct {
 	cfg    cfgpkg.Config
-	albums *albums.Service
 	images *images.Service
 	s3     *storage.S3Store
 
@@ -47,46 +42,25 @@ type Service struct {
 	albumLockMu sync.Mutex
 	albumLocks  map[string]*sync.Mutex
 
-	imageLoadSem    chan struct{}
-	processingHints chan string
-
-	processingWorkerID   string
-	processingLease      time.Duration
-	processingRetryDelay time.Duration
-	processingPoll       time.Duration
-	processingMaxAttempt int
+	imageLoadSem chan struct{}
 }
 
-const (
-	defaultProcessingLease      = 30 * time.Minute
-	defaultProcessingRetryDelay = 3 * time.Second
-	defaultProcessingPoll       = 750 * time.Millisecond
-	defaultProcessingMaxAttempt = 3
-)
-
-func NewService(cfg cfgpkg.Config, albumsService *albums.Service, imagesService *images.Service, s3Store *storage.S3Store) (*Service, error) {
+func NewService(cfg cfgpkg.Config, imagesService *images.Service, s3Store *storage.S3Store) (*Service, error) {
 	return &Service{
-		cfg:                  cfg,
-		albums:               albumsService,
-		images:               imagesService,
-		s3:                   s3Store,
-		embedder:             NewHTTPEmbedder(cfg.RecommenderEndpoint, time.Duration(cfg.RecommenderTimeoutSec)*time.Second),
-		photosByID:           make(map[string]PhotoRecord),
-		photoIDsByAlbum:      make(map[string]map[string]struct{}),
-		embeddingsByID:       make(map[string]EmbeddingRecord),
-		failedByID:           make(map[string]string),
-		missingByAlbum:       make(map[string]map[int]struct{}),
-		albumsWithMissing:    make([]string, 0),
-		albumMissingPos:      make(map[string]int),
-		rng:                  rand.New(rand.NewSource(time.Now().UnixNano())),
-		albumLocks:           make(map[string]*sync.Mutex),
-		imageLoadSem:         make(chan struct{}, 1),
-		processingHints:      make(chan string, 256),
-		processingWorkerID:   uuid.NewString(),
-		processingLease:      defaultProcessingLease,
-		processingRetryDelay: defaultProcessingRetryDelay,
-		processingPoll:       defaultProcessingPoll,
-		processingMaxAttempt: defaultProcessingMaxAttempt,
+		cfg:               cfg,
+		images:            imagesService,
+		s3:                s3Store,
+		embedder:          NewHTTPEmbedder(cfg.RecommenderEndpoint, time.Duration(cfg.RecommenderTimeoutSec)*time.Second),
+		photosByID:        make(map[string]PhotoRecord),
+		photoIDsByAlbum:   make(map[string]map[string]struct{}),
+		embeddingsByID:    make(map[string]EmbeddingRecord),
+		failedByID:        make(map[string]string),
+		missingByAlbum:    make(map[string]map[int]struct{}),
+		albumsWithMissing: make([]string, 0),
+		albumMissingPos:   make(map[string]int),
+		rng:               rand.New(rand.NewSource(time.Now().UnixNano())),
+		albumLocks:        make(map[string]*sync.Mutex),
+		imageLoadSem:      make(chan struct{}, 1),
 	}, nil
 }
 
@@ -115,8 +89,6 @@ func (s *Service) Start(ctx context.Context) error {
 			<-ctx.Done()
 			_ = s.embedder.Close()
 		}()
-
-		go s.processingLoop(ctx)
 
 		concurrency := s.cfg.RecommenderConcurrency
 		if concurrency <= 0 {
@@ -213,46 +185,6 @@ func (s *Service) applyAlbumIndexLocked(idx models.AlbumIndex) {
 	s.setMissingForAlbumLocked(albumID, missing)
 }
 
-func (s *Service) NotifyAlbumFinalized(ctx context.Context, albumID string) {
-	go func() {
-		if err := s.syncAlbum(ctx, albumID); err != nil {
-			log.Printf("recommend: finalize sync failed album=%s err=%v", albumID, err)
-		}
-	}()
-}
-
-func (s *Service) EnqueueAlbumProcessing(albumID string) {
-	if s == nil {
-		return
-	}
-	albumID = strings.TrimSpace(albumID)
-	if albumID == "" || s.processingHints == nil {
-		return
-	}
-
-	select {
-	case s.processingHints <- albumID:
-	default:
-	}
-}
-
-func (s *Service) ProcessAlbumAsync(albumID string) {
-	if s == nil {
-		return
-	}
-	albumID = strings.TrimSpace(albumID)
-	if albumID == "" {
-		return
-	}
-
-	s.EnqueueAlbumProcessing(albumID)
-	go func() {
-		if err := s.processAlbumByID(context.Background(), albumID); err != nil {
-			log.Printf("processing worker: immediate process failed album=%s err=%v", albumID, err)
-		}
-	}()
-}
-
 func (s *Service) syncAlbum(ctx context.Context, albumID string) error {
 	var idx models.AlbumIndex
 	if err := s.s3.ReadJSON(ctx, albumIndexKey(albumID), &idx); err != nil {
@@ -263,295 +195,6 @@ func (s *Service) syncAlbum(ctx context.Context, albumID string) error {
 	}
 	s.applyAlbumIndex(idx)
 	return nil
-}
-
-func (s *Service) processingLoop(ctx context.Context) {
-	idleTicker := time.NewTicker(s.processingPoll)
-	defer idleTicker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case albumID := <-s.processingHints:
-			if err := s.processAlbumByID(ctx, albumID); err != nil {
-				log.Printf("processing worker: direct claim failed album=%s err=%v", albumID, err)
-			}
-			continue
-		default:
-		}
-
-		claimed, err := s.processOneQueuedAlbum(ctx)
-		if err != nil {
-			log.Printf("processing worker: scan failed err=%v", err)
-		}
-		if claimed {
-			continue
-		}
-
-		select {
-		case <-ctx.Done():
-			return
-		case albumID := <-s.processingHints:
-			if err := s.processAlbumByID(ctx, albumID); err != nil {
-				log.Printf("processing worker: direct claim failed album=%s err=%v", albumID, err)
-			}
-		case <-idleTicker.C:
-		}
-	}
-}
-
-func (s *Service) processAlbumByID(ctx context.Context, albumID string) error {
-	albumID = strings.TrimSpace(albumID)
-	if albumID == "" {
-		return nil
-	}
-	for i := 0; i < 20; i++ {
-		claimed, err := s.claimProcessingJobByKey(ctx, albumIndexKey(albumID), albumID)
-		if err != nil {
-			return err
-		}
-		if claimed {
-			s.runFinalizeJob(ctx, albumID)
-			return nil
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(200 * time.Millisecond):
-		}
-	}
-	return nil
-}
-
-func (s *Service) processOneQueuedAlbum(ctx context.Context) (bool, error) {
-	if s == nil || s.s3 == nil || s.albums == nil {
-		return false, nil
-	}
-
-	keys, err := s.s3.ListAlbumIndexKeys(ctx)
-	if err != nil {
-		return false, err
-	}
-	if len(keys) == 0 {
-		return false, nil
-	}
-
-	sort.Strings(keys)
-	for _, key := range keys {
-		albumID := albumIDFromIndexKey(key)
-		if albumID == "" {
-			continue
-		}
-		claimed, err := s.claimProcessingJobByKey(ctx, key, albumID)
-		if err != nil {
-			return false, err
-		}
-		if !claimed {
-			continue
-		}
-		s.runFinalizeJob(ctx, albumID)
-		return true, nil
-	}
-	return false, nil
-}
-
-func (s *Service) claimProcessingJobByKey(ctx context.Context, key string, fallbackAlbumID string) (bool, error) {
-	now := time.Now().UTC()
-
-	var idx models.AlbumIndex
-	etag, err := s.s3.ReadJSONWithETag(ctx, key, &idx)
-	if err != nil {
-		if storage.IsNotFound(err) {
-			return false, nil
-		}
-		return false, err
-	}
-
-	albumID := strings.TrimSpace(idx.AlbumID)
-	if albumID == "" {
-		albumID = strings.TrimSpace(fallbackAlbumID)
-	}
-	if albumID == "" {
-		return false, nil
-	}
-
-	processing := normalizeProcessingStatus(idx.Processing, idx.PhotoCount, len(idx.Photos) > 0, now)
-	if !isProcessingClaimable(processing, now) {
-		return false, nil
-	}
-	if processing.Attempt >= s.processingMaxAttempt {
-		return false, nil
-	}
-
-	processing.Status = models.AlbumProcessingProcessing
-	processing.Attempt++
-	processing.LastError = ""
-	processing.UpdatedAt = now.Format(time.RFC3339)
-	processing.ClaimedBy = s.processingWorkerID
-	processing.LeaseUntil = now.Add(s.processingLease).Format(time.RFC3339)
-	idx.Processing = processing
-	idx.AlbumID = albumID
-
-	if _, err := s.s3.PutJSONIfMatch(ctx, key, etag, &idx); err != nil {
-		if storage.IsPreconditionFailed(err) {
-			return false, nil
-		}
-		return false, err
-	}
-	return true, nil
-}
-
-func (s *Service) runFinalizeJob(ctx context.Context, albumID string) {
-	idx, err := s.albums.Finalize(ctx, albumID)
-	if err != nil {
-		if markErr := s.markAlbumProcessingFailure(ctx, albumID, err); markErr != nil {
-			log.Printf("processing worker: album finalize failed album=%s err=%v mark_err=%v", albumID, err, markErr)
-			return
-		}
-		log.Printf("processing worker: album finalize failed album=%s err=%v", albumID, err)
-		return
-	}
-
-	if markErr := s.markAlbumProcessingReady(ctx, albumID, idx.PhotoCount); markErr != nil {
-		log.Printf("processing worker: finalize complete but status update failed album=%s err=%v", albumID, markErr)
-		return
-	}
-
-	s.NotifyAlbumFinalized(ctx, albumID)
-	log.Printf("processing worker: album ready album=%s photo_count=%d", albumID, idx.PhotoCount)
-}
-
-func (s *Service) markAlbumProcessingReady(ctx context.Context, albumID string, photoCount int) error {
-	key := albumIndexKey(albumID)
-	for i := 0; i < 8; i++ {
-		now := time.Now().UTC()
-		var idx models.AlbumIndex
-		etag, err := s.s3.ReadJSONWithETag(ctx, key, &idx)
-		if err != nil {
-			return err
-		}
-		if idx.AlbumID == "" {
-			idx.AlbumID = albumID
-		}
-		if photoCount > idx.PhotoCount {
-			idx.PhotoCount = photoCount
-		}
-		processing := normalizeProcessingStatus(idx.Processing, idx.PhotoCount, len(idx.Photos) > 0, now)
-		processing.Status = models.AlbumProcessingReady
-		processing.LastError = ""
-		processing.UpdatedAt = now.Format(time.RFC3339)
-		processing.ClaimedBy = ""
-		processing.LeaseUntil = ""
-		idx.Processing = processing
-
-		if _, err := s.s3.PutJSONIfMatch(ctx, key, etag, &idx); err != nil {
-			if storage.IsPreconditionFailed(err) {
-				continue
-			}
-			return err
-		}
-		s.applyAlbumIndex(idx)
-		return nil
-	}
-	return fmt.Errorf("mark album ready conflict: %s", albumID)
-}
-
-func (s *Service) markAlbumProcessingFailure(ctx context.Context, albumID string, jobErr error) error {
-	key := albumIndexKey(albumID)
-	for i := 0; i < 8; i++ {
-		now := time.Now().UTC()
-		var idx models.AlbumIndex
-		etag, err := s.s3.ReadJSONWithETag(ctx, key, &idx)
-		if err != nil {
-			return err
-		}
-		if idx.AlbumID == "" {
-			idx.AlbumID = albumID
-		}
-		processing := normalizeProcessingStatus(idx.Processing, idx.PhotoCount, len(idx.Photos) > 0, now)
-		if processing.Attempt >= s.processingMaxAttempt {
-			processing.Status = models.AlbumProcessingFailed
-			processing.LeaseUntil = ""
-		} else {
-			processing.Status = models.AlbumProcessingQueued
-			processing.LeaseUntil = now.Add(s.processingRetryDelay).Format(time.RFC3339)
-		}
-		processing.LastError = truncateErr(jobErr, 512)
-		processing.UpdatedAt = now.Format(time.RFC3339)
-		processing.ClaimedBy = ""
-		idx.Processing = processing
-
-		if _, err := s.s3.PutJSONIfMatch(ctx, key, etag, &idx); err != nil {
-			if storage.IsPreconditionFailed(err) {
-				continue
-			}
-			return err
-		}
-		return nil
-	}
-	return fmt.Errorf("mark album failed conflict: %s", albumID)
-}
-
-func normalizeProcessingStatus(
-	processing models.AlbumProcessingStatus,
-	photoCount int,
-	hasPhotos bool,
-	now time.Time,
-) models.AlbumProcessingStatus {
-	if processing.Status == "" {
-		if photoCount > 0 || hasPhotos {
-			processing.Status = models.AlbumProcessingReady
-		} else {
-			processing.Status = models.AlbumProcessingQueued
-		}
-	}
-	if processing.UpdatedAt == "" {
-		processing.UpdatedAt = now.Format(time.RFC3339)
-	}
-	return processing
-}
-
-func isProcessingClaimable(status models.AlbumProcessingStatus, now time.Time) bool {
-	switch status.Status {
-	case models.AlbumProcessingQueued:
-		return leaseExpiredOrUnset(status.LeaseUntil, now)
-	case models.AlbumProcessingProcessing:
-		return leaseExpiredOrUnset(status.LeaseUntil, now)
-	default:
-		return false
-	}
-}
-
-func leaseExpiredOrUnset(raw string, now time.Time) bool {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return true
-	}
-	t, err := time.Parse(time.RFC3339, raw)
-	if err != nil {
-		return true
-	}
-	return !t.After(now)
-}
-
-func albumIDFromIndexKey(key string) string {
-	parts := strings.Split(filepath.Dir(key), "/")
-	if len(parts) == 0 {
-		return ""
-	}
-	return parts[len(parts)-1]
-}
-
-func truncateErr(err error, max int) string {
-	if err == nil {
-		return ""
-	}
-	text := strings.TrimSpace(err.Error())
-	if max <= 0 || len(text) <= max {
-		return text
-	}
-	return text[:max]
 }
 
 func (s *Service) workerLoop(ctx context.Context) {
@@ -926,7 +569,7 @@ func (s *Service) Recommend(ctx context.Context, albumID string, photoIndex int,
 	s.mu.RUnlock()
 	if !hasPhoto {
 		if err := s.syncAlbum(ctx, albumID); err != nil {
-			if storage.IsNotFound(err) || errors.Is(err, albums.ErrAlbumNotFound) {
+			if storage.IsNotFound(err) {
 				return RecommendationResponse{}, fmt.Errorf("%w: %s:%d", ErrPhotoNotFound, albumID, photoIndex)
 			}
 			return RecommendationResponse{}, err
@@ -942,12 +585,12 @@ func (s *Service) Recommend(ctx context.Context, albumID string, photoIndex int,
 	s.mu.RLock()
 	if _, failed := s.failedByID[queryID]; failed {
 		s.mu.RUnlock()
-		return RecommendationResponse{Items: nil, Status: "failed"}, nil
+		return RecommendationResponse{Items: []RecommendationItem{}}, nil
 	}
 	queryEmbedding, ok := s.embeddingsByID[queryID]
 	if !ok || len(queryEmbedding.Vector) == 0 {
 		s.mu.RUnlock()
-		return RecommendationResponse{Items: nil, Status: "pending"}, nil
+		return RecommendationResponse{Items: []RecommendationItem{}}, nil
 	}
 
 	// Recommendations are cross-album only.
@@ -981,11 +624,7 @@ func (s *Service) Recommend(ctx context.Context, albumID string, photoIndex int,
 	}
 	s.mu.RUnlock()
 
-	status := "ready"
-	if len(items) > 0 && len(items) < limit {
-		status = "partial"
-	}
-	return RecommendationResponse{Items: items, Status: status}, nil
+	return RecommendationResponse{Items: items}, nil
 }
 
 func (s *Service) ensureIndexesLocked() {

@@ -1,11 +1,7 @@
 import { useEffect, useState } from 'react'
-import {
-  fetchRecommendations,
-  type RecommendationItem,
-  type RecommendationStatus,
-} from '../api/client'
+import { fetchRecommendations, type RecommendationItem } from '../api/client'
 
-type RecommendationLoadStatus = RecommendationStatus | 'idle' | 'loading'
+type RecommendationLoadStatus = 'idle' | 'loading' | 'ready'
 
 type UseRecommendationsResult = {
   items: RecommendationItem[]
@@ -46,7 +42,7 @@ export function useRecommendations(
         } else {
           setItems(result.items)
         }
-        setStatus(result.status)
+        setStatus('ready')
       } catch (err) {
         if (abortController.signal.aborted) return
         setItems([])

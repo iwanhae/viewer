@@ -55,7 +55,7 @@ export function PhotoPage() {
 
   const {
     items: recommendations,
-    status: recommendationStatus,
+    status: recommendationLoadStatus,
     error: recommendationError,
   } = useRecommendations(album?.albumId ?? '', photo?.i ?? null, recommendationLimit)
 
@@ -79,11 +79,11 @@ export function PhotoPage() {
   }, [recommendations])
 
   useEffect(() => {
-    if (recommendationStatus !== 'ready' && recommendationStatus !== 'partial') return
+    if (recommendationLoadStatus !== 'ready') return
     setHasMoreRecommendations(recommendations.length >= recommendationLimit)
-  }, [recommendations.length, recommendationLimit, recommendationStatus])
+  }, [recommendations.length, recommendationLimit, recommendationLoadStatus])
 
-  const isRecommendationLoading = recommendationStatus === 'loading'
+  const isRecommendationLoading = recommendationLoadStatus === 'loading'
   const canShowLoadMore =
     displayedRecommendations.length > 0 && hasMoreRecommendations && recommendationError === null
 
@@ -166,23 +166,13 @@ export function PhotoPage() {
                 {isRecommendationLoading ? '  Loading more...' : ''}
               </p>
             </div>
-            {recommendationStatus === 'loading' && (
+            {recommendationLoadStatus === 'loading' && (
               <p className="photo-recommendations-note">Finding similar images...</p>
-            )}
-            {recommendationStatus === 'pending' && (
-              <p className="photo-recommendations-note">
-                Recommendations are being prepared in background.
-              </p>
-            )}
-            {recommendationStatus === 'failed' && (
-              <p className="photo-recommendations-note">
-                Embedding failed for this photo. Skipping recommendations.
-              </p>
             )}
             {recommendationError && (
               <p className="photo-recommendations-note">Recommendations unavailable right now.</p>
             )}
-            {(recommendationStatus === 'ready' || recommendationStatus === 'partial') &&
+            {recommendationLoadStatus === 'ready' &&
               displayedRecommendations.length === 0 && (
                 <p className="photo-recommendations-note">No similar images found yet.</p>
               )}

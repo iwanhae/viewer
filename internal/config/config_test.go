@@ -5,45 +5,6 @@ import (
 	"testing"
 )
 
-func TestLoadDefaultRangeChunkSize(t *testing.T) {
-	setRequiredEnv(t)
-	t.Setenv("RANGE_CHUNK_SIZE_BYTES", "")
-
-	cfg, err := Load()
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-	if got, want := cfg.RangeChunkSize, int64(1<<17); got != want {
-		t.Fatalf("RangeChunkSize=%d want=%d", got, want)
-	}
-}
-
-func TestLoadCustomRangeChunkSize(t *testing.T) {
-	setRequiredEnv(t)
-	t.Setenv("RANGE_CHUNK_SIZE_BYTES", "262144")
-
-	cfg, err := Load()
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-	if got, want := cfg.RangeChunkSize, int64(262144); got != want {
-		t.Fatalf("RangeChunkSize=%d want=%d", got, want)
-	}
-}
-
-func TestLoadRejectsNonPositiveRangeChunkSize(t *testing.T) {
-	setRequiredEnv(t)
-	t.Setenv("RANGE_CHUNK_SIZE_BYTES", "0")
-
-	_, err := Load()
-	if err == nil {
-		t.Fatalf("Load expected error for non-positive RANGE_CHUNK_SIZE_BYTES")
-	}
-	if got := err.Error(); !strings.Contains(got, "RANGE_CHUNK_SIZE_BYTES must be > 0") {
-		t.Fatalf("unexpected error: %v", err)
-	}
-}
-
 func TestLoadRequiresRecommenderEndpoint(t *testing.T) {
 	setRequiredEnv(t)
 	t.Setenv("RECOMMENDER_REQUIRED", "true")

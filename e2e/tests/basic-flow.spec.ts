@@ -83,7 +83,7 @@ async function uploadAndFinalizeFromUploadPage(page: Page, zipPath: string) {
   const multipartRoute = async (route: Route) => {
     const request = route.request()
     const url = request.url()
-    if (!url.includes('X-Amz-Algorithm=') || !url.includes('uploadId=')) {
+    if (!url.includes('X-Amz-Algorithm=')) {
       await route.continue()
       return
     }
@@ -103,12 +103,7 @@ async function uploadAndFinalizeFromUploadPage(page: Page, zipPath: string) {
     }
 
     if (request.method() === 'PUT') {
-      const parsedURL = new URL(url)
-      const partNumber = Number(parsedURL.searchParams.get('partNumber') ?? '1')
-      const payload =
-        Number.isFinite(partNumber) && partNumber > 1 && request.postDataBuffer()
-          ? request.postDataBuffer()!
-          : zipBytes
+      const payload = request.postDataBuffer() ?? zipBytes
       const requestHeaders = request.headers()
       delete requestHeaders.host
       delete requestHeaders['content-length']
@@ -140,7 +135,7 @@ async function uploadAndFinalizeFromUploadPage(page: Page, zipPath: string) {
   try {
     await page.getByTestId('upload-pick-input').setInputFiles(zipPath)
     await page.getByTestId('upload-start').click()
-    await expect(page.getByTestId('upload-status').first()).toHaveText(/Ready|Processing \(manual refresh\)/, {
+    await expect(page.getByTestId('upload-status').first()).toHaveText(/Ready|Finalizing/, {
       timeout: 240_000,
     })
 

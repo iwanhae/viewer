@@ -20,7 +20,6 @@ type Config struct {
 	MaxUploadBytes         int64
 	CacheDir               string
 	ZipCacheDir            string
-	RangeChunkSize         int64
 	WarmupFetchConcurrency int
 	FeedDefaultSize        int
 	RecoTopKDefault        int
@@ -37,7 +36,6 @@ func Load() (Config, error) {
 	maxUploadBytes := getenvInt64("MAX_UPLOAD_BYTES", 1024*1024*1024)
 	cacheDir := getenv("CACHE_DIR", ".cache/images")
 	zipCacheDir := getenv("ZIP_CACHE_DIR", ".cache/zips")
-	rangeChunkSize := getenvInt64("RANGE_CHUNK_SIZE_BYTES", 1<<17)
 	recommenderEndpoint := os.Getenv("RECOMMENDER_ENDPOINT")
 
 	cfg := Config{
@@ -52,7 +50,6 @@ func Load() (Config, error) {
 		MaxUploadBytes:         maxUploadBytes,
 		CacheDir:               cacheDir,
 		ZipCacheDir:            zipCacheDir,
-		RangeChunkSize:         rangeChunkSize,
 		WarmupFetchConcurrency: getenvInt("WARMUP_FETCH_CONCURRENCY", 0),
 		FeedDefaultSize:        getenvInt("FEED_DEFAULT_LIMIT", 80),
 		RecoTopKDefault:        getenvInt("RECO_TOPK_DEFAULT", 12),
@@ -74,9 +71,6 @@ func Load() (Config, error) {
 	}
 	if cfg.S3Endpoint == "" {
 		return Config{}, fmt.Errorf("S3_ENDPOINT is required")
-	}
-	if cfg.RangeChunkSize <= 0 {
-		return Config{}, fmt.Errorf("RANGE_CHUNK_SIZE_BYTES must be > 0")
 	}
 	if cfg.WarmupFetchConcurrency < 0 {
 		cfg.WarmupFetchConcurrency = 0

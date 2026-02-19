@@ -1,16 +1,9 @@
 import { useEffect, useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { fetchAlbumSearch, type AlbumSearchItem, type AlbumIndexStatus } from '../api/client'
+import { fetchAlbumSearch, type AlbumSearchItem } from '../api/client'
 
 const SEARCH_LIMIT = 20
 const SEARCH_DEBOUNCE_MS = 200
-
-const statusLabelByValue: Record<AlbumIndexStatus, string> = {
-  ready: 'Ready',
-  partial: 'Partial',
-  pending: 'Pending',
-  failed: 'Failed',
-}
 
 function formatCreatedAt(value: string): string {
   const parsed = new Date(value)
@@ -18,14 +11,6 @@ function formatCreatedAt(value: string): string {
     return value
   }
   return parsed.toLocaleString()
-}
-
-function indexedSummary(item: AlbumSearchItem): string {
-  const base = `${item.indexedCount}/${item.totalCount} indexed`
-  if (item.failedCount <= 0) {
-    return base
-  }
-  return `${base}  ${item.failedCount} failed`
 }
 
 export function AlbumSearchPage() {
@@ -146,18 +131,11 @@ export function AlbumSearchPage() {
             >
               <div className="album-search-item-head">
                 <p className="album-search-name">{item.originalFilename || '(untitled album)'}</p>
-                <span
-                  className={`album-search-status album-search-status-${item.indexStatus}`}
-                  data-testid="album-search-status"
-                >
-                  {statusLabelByValue[item.indexStatus]}
-                </span>
               </div>
               <p className="album-search-item-meta">
                 {item.photoCount} photos  {formatCreatedAt(item.createdAt)}
               </p>
               <p className="album-search-item-meta album-search-item-meta-id">ID: {item.albumId}</p>
-              <p className="album-search-item-meta">{indexedSummary(item)}</p>
             </button>
           ))}
         </div>

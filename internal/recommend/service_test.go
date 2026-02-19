@@ -183,7 +183,7 @@ func TestRequeueMissingPhotosRestoresPendingSet(t *testing.T) {
 	}
 }
 
-func TestRecommendExcludesSameAlbumAndReturnsPartial(t *testing.T) {
+func TestRecommendExcludesSameAlbum(t *testing.T) {
 	s := &Service{
 		photosByID: map[string]PhotoRecord{
 			imageID("album-a", 0): {ImageID: imageID("album-a", 0), AlbumID: "album-a", PhotoIndex: 0},
@@ -203,9 +203,6 @@ func TestRecommendExcludesSameAlbumAndReturnsPartial(t *testing.T) {
 	resp, err := s.Recommend(context.Background(), "album-a", 0, 3)
 	if err != nil {
 		t.Fatalf("recommend failed: %v", err)
-	}
-	if resp.Status != "partial" {
-		t.Fatalf("expected partial status, got %q", resp.Status)
 	}
 	if len(resp.Items) != 2 {
 		t.Fatalf("expected 2 cross-album items, got %d", len(resp.Items))
@@ -241,9 +238,6 @@ func TestRecommendDeduplicatesByTargetAlbum(t *testing.T) {
 	if err != nil {
 		t.Fatalf("recommend failed: %v", err)
 	}
-	if resp.Status != "ready" {
-		t.Fatalf("expected ready status, got %q", resp.Status)
-	}
 	if len(resp.Items) != 2 {
 		t.Fatalf("expected 2 deduplicated items, got %d", len(resp.Items))
 	}
@@ -255,7 +249,7 @@ func TestRecommendDeduplicatesByTargetAlbum(t *testing.T) {
 	}
 }
 
-func TestRecommendReturnsReadyWhenOnlySameAlbumCandidates(t *testing.T) {
+func TestRecommendReturnsEmptyWhenOnlySameAlbumCandidates(t *testing.T) {
 	s := &Service{
 		photosByID: map[string]PhotoRecord{
 			imageID("album-a", 0): {ImageID: imageID("album-a", 0), AlbumID: "album-a", PhotoIndex: 0},
@@ -272,15 +266,12 @@ func TestRecommendReturnsReadyWhenOnlySameAlbumCandidates(t *testing.T) {
 	if err != nil {
 		t.Fatalf("recommend failed: %v", err)
 	}
-	if resp.Status != "ready" {
-		t.Fatalf("expected ready status for filtered-empty result, got %q", resp.Status)
-	}
 	if len(resp.Items) != 0 {
 		t.Fatalf("expected no recommendations, got %d", len(resp.Items))
 	}
 }
 
-func TestRecommendPendingWhenQueryEmbeddingMissing(t *testing.T) {
+func TestRecommendReturnsEmptyWhenQueryEmbeddingMissing(t *testing.T) {
 	s := &Service{
 		photosByID: map[string]PhotoRecord{
 			imageID("album-a", 0): {ImageID: imageID("album-a", 0), AlbumID: "album-a", PhotoIndex: 0},
@@ -296,12 +287,12 @@ func TestRecommendPendingWhenQueryEmbeddingMissing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("recommend failed: %v", err)
 	}
-	if resp.Status != "pending" {
-		t.Fatalf("expected pending status, got %q", resp.Status)
+	if len(resp.Items) != 0 {
+		t.Fatalf("expected no recommendations, got %d", len(resp.Items))
 	}
 }
 
-func TestRecommendFailedWhenQueryEmbeddingFailed(t *testing.T) {
+func TestRecommendReturnsEmptyWhenQueryEmbeddingFailed(t *testing.T) {
 	s := &Service{
 		photosByID: map[string]PhotoRecord{
 			imageID("album-a", 0): {ImageID: imageID("album-a", 0), AlbumID: "album-a", PhotoIndex: 0},
@@ -316,8 +307,8 @@ func TestRecommendFailedWhenQueryEmbeddingFailed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("recommend failed: %v", err)
 	}
-	if resp.Status != "failed" {
-		t.Fatalf("expected failed status, got %q", resp.Status)
+	if len(resp.Items) != 0 {
+		t.Fatalf("expected no recommendations, got %d", len(resp.Items))
 	}
 }
 

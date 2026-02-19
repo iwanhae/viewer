@@ -22,34 +22,6 @@ type AlbumIndex struct {
 	PhotoCount       int                       `json:"photoCount"`
 	Photos           []PhotoMeta               `json:"photos"`
 	Embeddings       map[string]PhotoEmbedding `json:"embeddings,omitempty"`
-	Processing       AlbumProcessingStatus     `json:"processing,omitempty"`
-}
-
-type AlbumProcessingState string
-
-const (
-	AlbumProcessingQueued     AlbumProcessingState = "queued"
-	AlbumProcessingProcessing AlbumProcessingState = "processing"
-	AlbumProcessingReady      AlbumProcessingState = "ready"
-	AlbumProcessingFailed     AlbumProcessingState = "failed"
-)
-
-type AlbumProcessingStatus struct {
-	Status     AlbumProcessingState `json:"status,omitempty"`
-	Attempt    int                  `json:"attempt,omitempty"`
-	LastError  string               `json:"lastError,omitempty"`
-	UpdatedAt  string               `json:"updatedAt,omitempty"`
-	ClaimedBy  string               `json:"claimedBy,omitempty"`
-	LeaseUntil string               `json:"leaseUntil,omitempty"`
-}
-
-func (s AlbumProcessingStatus) IsZero() bool {
-	return s.Status == "" &&
-		s.Attempt == 0 &&
-		s.LastError == "" &&
-		s.UpdatedAt == "" &&
-		s.ClaimedBy == "" &&
-		s.LeaseUntil == ""
 }
 
 type AlbumSummary struct {
@@ -59,24 +31,11 @@ type AlbumSummary struct {
 	CreatedAt        string `json:"createdAt"`
 }
 
-type AlbumIndexStatus string
-
-const (
-	AlbumIndexStatusReady   AlbumIndexStatus = "ready"
-	AlbumIndexStatusPartial AlbumIndexStatus = "partial"
-	AlbumIndexStatusPending AlbumIndexStatus = "pending"
-	AlbumIndexStatusFailed  AlbumIndexStatus = "failed"
-)
-
 type AlbumSearchItem struct {
-	AlbumID          string           `json:"albumId"`
-	OriginalFilename string           `json:"originalFilename"`
-	PhotoCount       int              `json:"photoCount"`
-	CreatedAt        string           `json:"createdAt"`
-	IndexStatus      AlbumIndexStatus `json:"indexStatus"`
-	IndexedCount     int              `json:"indexedCount"`
-	FailedCount      int              `json:"failedCount"`
-	TotalCount       int              `json:"totalCount"`
+	AlbumID          string `json:"albumId"`
+	OriginalFilename string `json:"originalFilename"`
+	PhotoCount       int    `json:"photoCount"`
+	CreatedAt        string `json:"createdAt"`
 }
 
 type FeedItem struct {

@@ -89,7 +89,6 @@ func TestMetricsEndpointPrometheusPayload(t *testing.T) {
 		},
 		nil,
 		nil,
-		nil,
 	)
 	if err != nil {
 		t.Fatalf("new recommend service: %v", err)
@@ -107,7 +106,7 @@ func TestMetricsEndpointPrometheusPayload(t *testing.T) {
 		},
 	})
 
-	router := New(nil, nil, nil, recommendService, 0).Router()
+	router := New(nil, nil, nil, recommendService).Router()
 	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
@@ -146,7 +145,7 @@ func TestMetricsEndpointPrometheusPayload(t *testing.T) {
 }
 
 func TestMetricsEndpointWithNilRecommendService(t *testing.T) {
-	router := New(nil, nil, nil, nil, 0).Router()
+	router := New(nil, nil, nil, nil).Router()
 	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
@@ -166,7 +165,7 @@ func TestMetricsEndpointWithNilRecommendService(t *testing.T) {
 }
 
 func TestRecommendationsEndpointWithNilRecommendService(t *testing.T) {
-	router := New(nil, nil, nil, nil, 0).Router()
+	router := New(nil, nil, nil, nil).Router()
 	req := httptest.NewRequest(http.MethodGet, "/api/recommendations/album-a/0?limit=12", nil)
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)

@@ -8,13 +8,11 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/google/uuid"
 	cfgpkg "viewer/internal/config"
 	"viewer/internal/models"
@@ -29,7 +27,6 @@ type Service struct {
 	mu                     sync.RWMutex
 	albumCache             map[string]*models.AlbumIndex
 	uploadHints            map[string]string
-	multipartSessions      map[string]multipartSession
 	albumSummariesSnapshot []models.AlbumSummary
 	allAlbumsSnapshot      []*models.AlbumIndex
 }
@@ -48,71 +45,29 @@ type RefreshProgress struct {
 }
 
 type albumStore interface {
-	CreateMultipartUpload(ctx context.Context, key string, contentType string) (string, error)
-	PresignUploadPart(ctx context.Context, key string, uploadID string, partNumber int32, ttl time.Duration) (string, map[string]string, error)
-	ListMultipartUploadParts(ctx context.Context, key string, uploadID string) ([]s3types.CompletedPart, error)
-	CompleteMultipartUpload(ctx context.Context, key string, uploadID string, parts []s3types.CompletedPart) error
-	AbortMultipartUpload(ctx context.Context, key string, uploadID string) error
+	PresignPut(ctx context.Context, key string, ttl time.Duration) (string, map[string]string, error)
 	HeadObject(ctx context.Context, key string) (bool, int64, error)
 	GetObjectRange(ctx context.Context, key string, start int64, end int64) (io.ReadCloser, string, error)
 	PutJSON(ctx context.Context, key string, v any) error
-	PutJSONIfMatch(ctx context.Context, key string, etag string, v any) (string, error)
 	ReadJSON(ctx context.Context, key string, out any) error
-	ReadJSONWithETag(ctx context.Context, key string, out any) (string, error)
 	ForEachAlbumIndexKey(ctx context.Context, fn func(key string) error) error
 }
 
 func NewService(cfg cfgpkg.Config, store *storage.S3Store, indexer *Indexer) *Service {
 	return &Service{
-		cfg:               cfg,
-		store:             store,
-		indexer:           indexer,
-		albumCache:        make(map[string]*models.AlbumIndex),
-		uploadHints:       make(map[string]string),
-		multipartSessions: make(map[string]multipartSession),
+		cfg:         cfg,
+		store:       store,
+		indexer:     indexer,
+		albumCache:  make(map[string]*models.AlbumIndex),
+		uploadHints: make(map[string]string),
 	}
 }
 
 type CreateUploadResult struct {
-	AlbumID       string
-	Key           string
-	Strategy      string
-	PartSizeBytes int64
-	MaxParts      int
-}
-
-type InitiateMultipartResult struct {
-	UploadID      string
-	PartSizeBytes int64
-	PartCount     int
-}
-
-type PresignPartResult struct {
-	URL     string
-	Headers map[string]string
-}
-
-type CompletePart struct {
-	PartNumber int32
-	ETag       string
-}
-
-type FinalizeStatus struct {
-	Status     models.AlbumProcessingState
-	Attempt    int
-	LastError  string
-	PhotoCount int
-	UpdatedAt  string
-}
-
-type multipartSession struct {
-	AlbumID       string
-	Key           string
-	UploadID      string
-	SizeBytes     int64
-	PartSizeBytes int64
-	PartCount     int
-	CreatedAt     time.Time
+	AlbumID   string
+	Key       string
+	UploadURL string
+	Headers   map[string]string
 }
 
 func sourceKey(albumID string) string {
@@ -123,17 +78,7 @@ func indexKey(albumID string) string {
 	return fmt.Sprintf("albums/%s/index.json", albumID)
 }
 
-const (
-	multipartUploadStrategy = "s3_multipart"
-	multipartMaxParts       = 10_000
-	multipartMinPartSize    = int64(16 << 20) // 16 MiB
-	multipartSessionTTL     = 24 * time.Hour
-
-	finalizeCASRetries = 8
-)
-
 func (s *Service) CreateUpload(ctx context.Context, filename string, sizeBytes int64) (CreateUploadResult, error) {
-	_ = ctx
 	if strings.TrimSpace(filename) == "" {
 		return CreateUploadResult{}, fmt.Errorf("filename is required")
 	}
@@ -145,230 +90,25 @@ func (s *Service) CreateUpload(ctx context.Context, filename string, sizeBytes i
 	}
 
 	albumID := uuid.NewString()
-	partSize := computeMultipartPartSize(sizeBytes)
+	key := sourceKey(albumID)
+	url, headers, err := s.store.PresignPut(ctx, key, s.cfg.PresignTTL)
+	if err != nil {
+		return CreateUploadResult{}, err
+	}
+	if headers == nil {
+		headers = map[string]string{}
+	}
 
 	s.mu.Lock()
 	s.uploadHints[albumID] = filename
 	s.mu.Unlock()
 
 	return CreateUploadResult{
-		AlbumID:       albumID,
-		Key:           sourceKey(albumID),
-		Strategy:      multipartUploadStrategy,
-		PartSizeBytes: partSize,
-		MaxParts:      multipartMaxParts,
+		AlbumID:   albumID,
+		Key:       key,
+		UploadURL: url,
+		Headers:   headers,
 	}, nil
-}
-
-func (s *Service) InitiateMultipartUpload(ctx context.Context, albumID string, sizeBytes int64, contentType string) (InitiateMultipartResult, error) {
-	if strings.TrimSpace(albumID) == "" {
-		return InitiateMultipartResult{}, fmt.Errorf("albumId is required")
-	}
-	if sizeBytes <= 0 {
-		return InitiateMultipartResult{}, fmt.Errorf("sizeBytes must be > 0")
-	}
-	if sizeBytes > s.cfg.MaxUploadBytes {
-		return InitiateMultipartResult{}, fmt.Errorf("sizeBytes exceeds MAX_UPLOAD_BYTES")
-	}
-
-	partSize := computeMultipartPartSize(sizeBytes)
-	partCount := int((sizeBytes + partSize - 1) / partSize)
-	if partCount <= 0 || partCount > multipartMaxParts {
-		return InitiateMultipartResult{}, fmt.Errorf("multipart part count exceeds limit")
-	}
-
-	normalizedContentType := strings.TrimSpace(contentType)
-	if normalizedContentType == "" {
-		normalizedContentType = "application/zip"
-	}
-
-	uploadID, err := s.store.CreateMultipartUpload(ctx, sourceKey(albumID), normalizedContentType)
-	if err != nil {
-		return InitiateMultipartResult{}, err
-	}
-
-	session := multipartSession{
-		AlbumID:       albumID,
-		Key:           sourceKey(albumID),
-		UploadID:      uploadID,
-		SizeBytes:     sizeBytes,
-		PartSizeBytes: partSize,
-		PartCount:     partCount,
-		CreatedAt:     time.Now().UTC(),
-	}
-
-	s.mu.Lock()
-	s.cleanupMultipartSessionsLocked(time.Now().UTC())
-	s.multipartSessions[multipartSessionKey(albumID, uploadID)] = session
-	s.mu.Unlock()
-
-	return InitiateMultipartResult{
-		UploadID:      uploadID,
-		PartSizeBytes: partSize,
-		PartCount:     partCount,
-	}, nil
-}
-
-func (s *Service) PresignMultipartUploadPart(ctx context.Context, albumID string, uploadID string, partNumber int32) (PresignPartResult, error) {
-	session, err := s.getMultipartSession(albumID, uploadID)
-	if err != nil {
-		return PresignPartResult{}, err
-	}
-	if partNumber <= 0 {
-		return PresignPartResult{}, fmt.Errorf("partNumber must be > 0")
-	}
-	if int(partNumber) > session.PartCount {
-		return PresignPartResult{}, fmt.Errorf("partNumber exceeds expected count")
-	}
-
-	url, headers, err := s.store.PresignUploadPart(ctx, session.Key, session.UploadID, partNumber, s.cfg.PresignTTL)
-	if err != nil {
-		return PresignPartResult{}, err
-	}
-	return PresignPartResult{URL: url, Headers: headers}, nil
-}
-
-func (s *Service) CompleteMultipartUpload(ctx context.Context, albumID string, uploadID string, parts []CompletePart) error {
-	session, err := s.getMultipartSession(albumID, uploadID)
-	if err != nil {
-		return err
-	}
-
-	completedParts := make([]s3types.CompletedPart, 0, session.PartCount)
-	if len(parts) == 0 {
-		completedParts, err = s.store.ListMultipartUploadParts(ctx, session.Key, session.UploadID)
-		if err != nil {
-			return err
-		}
-	} else {
-		completedParts = toCompletedParts(parts)
-	}
-	if err := validateCompletedParts(completedParts, session.PartCount); err != nil {
-		return err
-	}
-
-	if err := s.store.CompleteMultipartUpload(ctx, session.Key, session.UploadID, completedParts); err != nil {
-		return err
-	}
-
-	s.mu.Lock()
-	delete(s.multipartSessions, multipartSessionKey(albumID, uploadID))
-	s.mu.Unlock()
-	return nil
-}
-
-func (s *Service) AbortMultipartUpload(ctx context.Context, albumID string, uploadID string) error {
-	session, err := s.getMultipartSession(albumID, uploadID)
-	if err != nil {
-		return err
-	}
-	if err := s.store.AbortMultipartUpload(ctx, session.Key, session.UploadID); err != nil {
-		return err
-	}
-
-	s.mu.Lock()
-	delete(s.multipartSessions, multipartSessionKey(albumID, uploadID))
-	s.mu.Unlock()
-	return nil
-}
-
-func (s *Service) RequestFinalize(ctx context.Context, albumID string) (FinalizeStatus, error) {
-	if strings.TrimSpace(albumID) == "" {
-		return FinalizeStatus{}, fmt.Errorf("albumId is required")
-	}
-
-	exists, size, err := s.store.HeadObject(ctx, sourceKey(albumID))
-	if err != nil {
-		return FinalizeStatus{}, err
-	}
-	if !exists || size <= 0 {
-		return FinalizeStatus{}, fmt.Errorf("%w: %s", ErrAlbumSourceNotFound, albumID)
-	}
-
-	for i := 0; i < finalizeCASRetries; i++ {
-		updatedAt := time.Now().UTC().Format(time.RFC3339)
-		var idx models.AlbumIndex
-		etag, err := s.store.ReadJSONWithETag(ctx, indexKey(albumID), &idx)
-		if err != nil {
-			if storage.IsNotFound(err) {
-				seed := models.AlbumIndex{
-					AlbumID:          albumID,
-					OriginalFilename: s.uploadHint(albumID, "source.zip"),
-					CreatedAt:        updatedAt,
-					PhotoCount:       0,
-					Photos:           []models.PhotoMeta{},
-					Embeddings:       map[string]models.PhotoEmbedding{},
-					Processing: models.AlbumProcessingStatus{
-						Status:    models.AlbumProcessingQueued,
-						Attempt:   0,
-						LastError: "",
-						UpdatedAt: updatedAt,
-					},
-				}
-				if err := s.store.PutJSON(ctx, indexKey(albumID), &seed); err != nil {
-					return FinalizeStatus{}, err
-				}
-				return finalizeStatusFromIndex(&seed), nil
-			}
-			return FinalizeStatus{}, err
-		}
-
-		if idx.AlbumID == "" {
-			idx.AlbumID = albumID
-		}
-		if idx.OriginalFilename == "" {
-			idx.OriginalFilename = s.uploadHint(albumID, "source.zip")
-		}
-		processing := normalizeProcessingStatus(idx.Processing, idx.PhotoCount, len(idx.Photos) > 0, updatedAt)
-		if processing.Status == models.AlbumProcessingReady {
-			return finalizeStatusFromFields(processing, idx.PhotoCount), nil
-		}
-		if processing.Status == models.AlbumProcessingProcessing {
-			return finalizeStatusFromFields(processing, idx.PhotoCount), nil
-		}
-		if processing.Status == models.AlbumProcessingFailed {
-			processing.Attempt = 0
-		}
-		processing.Status = models.AlbumProcessingQueued
-		processing.LastError = ""
-		processing.UpdatedAt = updatedAt
-		processing.ClaimedBy = ""
-		processing.LeaseUntil = ""
-		idx.Processing = processing
-
-		if _, err := s.store.PutJSONIfMatch(ctx, indexKey(albumID), etag, &idx); err != nil {
-			if storage.IsPreconditionFailed(err) {
-				continue
-			}
-			return FinalizeStatus{}, err
-		}
-		return finalizeStatusFromIndex(&idx), nil
-	}
-	return FinalizeStatus{}, fmt.Errorf("request finalize failed due to repeated update conflicts")
-}
-
-func (s *Service) GetFinalizeStatus(ctx context.Context, albumID string) (FinalizeStatus, error) {
-	if strings.TrimSpace(albumID) == "" {
-		return FinalizeStatus{}, fmt.Errorf("albumId is required")
-	}
-
-	var idx models.AlbumIndex
-	if err := s.store.ReadJSON(ctx, indexKey(albumID), &idx); err != nil {
-		if storage.IsNotFound(err) {
-			return FinalizeStatus{}, fmt.Errorf("%w: %s", ErrAlbumNotFound, albumID)
-		}
-		return FinalizeStatus{}, err
-	}
-	if idx.AlbumID == "" {
-		idx.AlbumID = albumID
-	}
-	processing := normalizeProcessingStatus(
-		idx.Processing,
-		idx.PhotoCount,
-		len(idx.Photos) > 0,
-		time.Now().UTC().Format(time.RFC3339),
-	)
-	return finalizeStatusFromFields(processing, idx.PhotoCount), nil
 }
 
 func (s *Service) Finalize(ctx context.Context, albumID string) (*models.AlbumIndex, error) {
@@ -417,159 +157,6 @@ func (s *Service) Finalize(ctx context.Context, albumID string) (*models.AlbumIn
 	s.mu.Unlock()
 
 	return idx, nil
-}
-
-func normalizeProcessingStatus(
-	processing models.AlbumProcessingStatus,
-	photoCount int,
-	hasPhotos bool,
-	defaultUpdatedAt string,
-) models.AlbumProcessingStatus {
-	if processing.Status == "" {
-		if photoCount > 0 || hasPhotos {
-			processing.Status = models.AlbumProcessingReady
-		} else {
-			processing.Status = models.AlbumProcessingQueued
-		}
-	}
-	if processing.UpdatedAt == "" {
-		processing.UpdatedAt = defaultUpdatedAt
-	}
-	return processing
-}
-
-func finalizeStatusFromIndex(idx *models.AlbumIndex) FinalizeStatus {
-	if idx == nil {
-		return FinalizeStatus{}
-	}
-	processing := normalizeProcessingStatus(
-		idx.Processing,
-		idx.PhotoCount,
-		len(idx.Photos) > 0,
-		time.Now().UTC().Format(time.RFC3339),
-	)
-	return finalizeStatusFromFields(processing, idx.PhotoCount)
-}
-
-func finalizeStatusFromFields(processing models.AlbumProcessingStatus, photoCount int) FinalizeStatus {
-	return FinalizeStatus{
-		Status:     processing.Status,
-		Attempt:    processing.Attempt,
-		LastError:  processing.LastError,
-		PhotoCount: photoCount,
-		UpdatedAt:  processing.UpdatedAt,
-	}
-}
-
-func (s *Service) uploadHint(albumID string, fallback string) string {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if hinted, ok := s.uploadHints[albumID]; ok && strings.TrimSpace(hinted) != "" {
-		return hinted
-	}
-	return fallback
-}
-
-func computeMultipartPartSize(sizeBytes int64) int64 {
-	partSize := multipartMinPartSize
-	minimumByPartCount := (sizeBytes + multipartMaxParts - 1) / multipartMaxParts
-	if minimumByPartCount > partSize {
-		partSize = minimumByPartCount
-	}
-
-	const miB = int64(1 << 20)
-	if remainder := partSize % miB; remainder != 0 {
-		partSize += miB - remainder
-	}
-	return partSize
-}
-
-func multipartSessionKey(albumID string, uploadID string) string {
-	return albumID + ":" + uploadID
-}
-
-func (s *Service) cleanupMultipartSessionsLocked(now time.Time) {
-	for key, session := range s.multipartSessions {
-		if now.Sub(session.CreatedAt) > multipartSessionTTL {
-			delete(s.multipartSessions, key)
-		}
-	}
-}
-
-func (s *Service) getMultipartSession(albumID string, uploadID string) (multipartSession, error) {
-	if strings.TrimSpace(albumID) == "" {
-		return multipartSession{}, fmt.Errorf("albumId is required")
-	}
-	if strings.TrimSpace(uploadID) == "" {
-		return multipartSession{}, fmt.Errorf("uploadId is required")
-	}
-
-	now := time.Now().UTC()
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.cleanupMultipartSessionsLocked(now)
-
-	session, ok := s.multipartSessions[multipartSessionKey(albumID, uploadID)]
-	if !ok {
-		return multipartSession{}, fmt.Errorf("%w: %s", ErrMultipartNotFound, uploadID)
-	}
-	return session, nil
-}
-
-func toCompletedParts(parts []CompletePart) []s3types.CompletedPart {
-	completed := make([]s3types.CompletedPart, 0, len(parts))
-	for _, part := range parts {
-		etag := strings.TrimSpace(part.ETag)
-		completed = append(completed, s3types.CompletedPart{
-			PartNumber: int32Ptr(part.PartNumber),
-			ETag:       stringPtr(etag),
-		})
-	}
-	return completed
-}
-
-func validateCompletedParts(parts []s3types.CompletedPart, expectedPartCount int) error {
-	if len(parts) == 0 {
-		return fmt.Errorf("at least one completed part is required")
-	}
-	if expectedPartCount > 0 && len(parts) != expectedPartCount {
-		return fmt.Errorf("expected %d parts, got %d", expectedPartCount, len(parts))
-	}
-
-	sort.Slice(parts, func(i, j int) bool {
-		return derefInt32(parts[i].PartNumber) < derefInt32(parts[j].PartNumber)
-	})
-
-	expectedPartNumber := int32(1)
-	for i := range parts {
-		part := parts[i]
-		if part.PartNumber == nil || *part.PartNumber <= 0 {
-			return fmt.Errorf("invalid part number at index %d", i)
-		}
-		if part.ETag == nil || strings.TrimSpace(*part.ETag) == "" {
-			return fmt.Errorf("missing ETag for part %d", *part.PartNumber)
-		}
-		if *part.PartNumber != expectedPartNumber {
-			return fmt.Errorf("missing or duplicate part number %d", expectedPartNumber)
-		}
-		expectedPartNumber++
-	}
-	return nil
-}
-
-func int32Ptr(v int32) *int32 {
-	return &v
-}
-
-func stringPtr(v string) *string {
-	return &v
-}
-
-func derefInt32(v *int32) int32 {
-	if v == nil {
-		return 0
-	}
-	return *v
 }
 
 type s3ObjectReaderAt struct {
@@ -930,57 +517,10 @@ func cloneAlbumIndex(idx *models.AlbumIndex) *models.AlbumIndex {
 }
 
 func albumSearchItemFromIndex(idx *models.AlbumIndex) models.AlbumSearchItem {
-	indexStatus, indexedCount, failedCount, totalCount := albumIndexStatusCounts(idx)
 	return models.AlbumSearchItem{
 		AlbumID:          idx.AlbumID,
 		OriginalFilename: idx.OriginalFilename,
 		PhotoCount:       idx.PhotoCount,
 		CreatedAt:        idx.CreatedAt,
-		IndexStatus:      indexStatus,
-		IndexedCount:     indexedCount,
-		FailedCount:      failedCount,
-		TotalCount:       totalCount,
 	}
-}
-
-func albumIndexStatusCounts(idx *models.AlbumIndex) (models.AlbumIndexStatus, int, int, int) {
-	if idx == nil {
-		return models.AlbumIndexStatusPending, 0, 0, 0
-	}
-
-	readyCount := 0
-	failedCount := 0
-	totalCount := len(idx.Photos)
-	if totalCount == 0 && idx.PhotoCount > 0 {
-		totalCount = idx.PhotoCount
-	}
-
-	for _, photo := range idx.Photos {
-		embedding, ok := idx.Embeddings[strconv.Itoa(photo.I)]
-		if !ok {
-			continue
-		}
-		switch embedding.Status {
-		case "ready":
-			if len(embedding.Vector) > 0 {
-				readyCount++
-			}
-		case "failed":
-			failedCount++
-		}
-	}
-
-	if totalCount == 0 {
-		return models.AlbumIndexStatusPending, readyCount, failedCount, totalCount
-	}
-	if readyCount == totalCount {
-		return models.AlbumIndexStatusReady, readyCount, failedCount, totalCount
-	}
-	if readyCount > 0 {
-		return models.AlbumIndexStatusPartial, readyCount, failedCount, totalCount
-	}
-	if failedCount > 0 {
-		return models.AlbumIndexStatusFailed, readyCount, failedCount, totalCount
-	}
-	return models.AlbumIndexStatusPending, readyCount, failedCount, totalCount
 }
