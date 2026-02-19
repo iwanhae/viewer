@@ -52,8 +52,9 @@ To build an MKL-accelerated recommender for x86_64 images, pass `--build-arg REC
 
 ## Commands
 - `make build` runs `go mod tidy`, builds `bin/recommender` in release mode, builds frontend assets, and compiles `bin/viewer`.
-- `make test` runs `make build`, then `go test ./...`, then Playwright e2e and saves screenshots to `samples/` by default.
-- `make test` binds the app to `TEST_PORT` (default `18080`) and sets `E2E_BASE_URL` automatically.
+- `make test` runs fast Go unit/integration tests only (`go test ./cmd/... ./internal/...`) using values from `.env.test`.
+- `make test-full` runs the full regression pipeline: `make build`, `make test`, then Playwright e2e (screenshots saved to `samples/` by default).
+- `make test-full` binds the app to `TEST_PORT` (default `18080`) and sets `E2E_BASE_URL` automatically.
 - `make run` starts `bin/viewer` (loads `.env` if present, does not rebuild binaries).
 - `make clean` removes build outputs and dependency caches.
 

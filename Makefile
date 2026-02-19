@@ -9,12 +9,20 @@ E2E_DIR := e2e
 CACHE_DIR := .cache
 RECOMMENDER_LOG := $(CACHE_DIR)/recommender-server.log
 VIEWER_LOG := $(CACHE_DIR)/e2e-server.log
+GO_CACHE_DIR := $(abspath $(CACHE_DIR)/go-build)
+NPM_CACHE_DIR := $(abspath $(CACHE_DIR)/npm)
 
 TEST_PORT ?= 18080
 RECOMMENDER_LISTEN_ADDR ?= 127.0.0.1:18081
 SCREENSHOT_DIR ?= ./samples
 
-.PHONY: build test run clean
+GO_TEST_PKGS := ./cmd/... ./internal/...
+ENV_TEST_HELP := missing .env.test (copy from .env.test.example and fill S3 credentials)
+
+export GOCACHE ?= $(GO_CACHE_DIR)
+export NPM_CONFIG_CACHE ?= $(NPM_CACHE_DIR)
+
+.PHONY: build test test-e2e test-full run clean
 
 build:
 	go mod tidy
@@ -25,16 +33,20 @@ build:
 	npm --prefix $(FRONTEND_DIR) run build
 	go build -o $(BIN) ./cmd/viewer
 
-test: build
+test:
 	set -a; \
 	if [ -f .env.test ]; then \
 		. ./.env.test; \
 	else \
-		echo "missing .env.test (copy from .env.test.example and fill S3 credentials)"; \
+		echo "$(ENV_TEST_HELP)"; \
 		exit 1; \
 	fi; \
 	set +a; \
-	go test ./...
+	go test $(GO_TEST_PKGS)
+
+test-full: build test test-e2e
+
+test-e2e:
 	npm --prefix $(E2E_DIR) ci
 	npx --prefix $(E2E_DIR) playwright install --with-deps chromium
 	mkdir -p $(CACHE_DIR)
@@ -42,7 +54,7 @@ test: build
 	if [ -f .env.test ]; then \
 		. ./.env.test; \
 	else \
-		echo "missing .env.test (copy from .env.test.example and fill S3 credentials)"; \
+		echo "$(ENV_TEST_HELP)"; \
 		exit 1; \
 	fi; \
 	set +a; \
