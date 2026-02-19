@@ -32,12 +32,10 @@ type RawRecommendationResponse = {
 }
 
 export async function fetchFeed(params?: {
-  cursor?: string
   seed?: string
   signal?: AbortSignal
 }): Promise<FeedResponse> {
   const query = new URLSearchParams({ limit: '80' })
-  if (params?.cursor) query.set('cursor', params.cursor)
   if (params?.seed) query.set('seed', params.seed)
   return await requestJSON<FeedResponse>(`/api/feed?${query.toString()}`, {
     signal: params?.signal,

@@ -2,7 +2,6 @@ package albums
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"path/filepath"
@@ -202,19 +201,7 @@ func (r *s3ObjectReaderAt) ReadAt(p []byte, off int64) (int, error) {
 	return n, nil
 }
 
-func (s *Service) RefreshFromStorage(ctx context.Context) error {
-	return s.refreshFromStorage(ctx, nil, nil)
-}
-
-func (s *Service) RefreshFromStorageWithProgress(ctx context.Context, onProgress func(RefreshProgress)) error {
-	return s.refreshFromStorage(ctx, onProgress, nil)
-}
-
 func (s *Service) RefreshFromStorageWithProgressAndAlbum(ctx context.Context, onProgress func(RefreshProgress), onAlbum func(models.AlbumIndex)) error {
-	return s.refreshFromStorage(ctx, onProgress, onAlbum)
-}
-
-func (s *Service) refreshFromStorage(ctx context.Context, onProgress func(RefreshProgress), onAlbum func(models.AlbumIndex)) error {
 	workerCount := warmupWorkerCount(s.cfg.WarmupFetchConcurrency)
 	keyCh := make(chan string, workerCount*2)
 	resultCh := make(chan RefreshProgress, workerCount*2)
@@ -327,17 +314,6 @@ func warmupWorkerCount(configured int) int {
 	return workers
 }
 
-func mergeAlbumCaches(existing map[string]*models.AlbumIndex, scanned map[string]*models.AlbumIndex) map[string]*models.AlbumIndex {
-	merged := make(map[string]*models.AlbumIndex, len(existing)+len(scanned))
-	for albumID, idx := range existing {
-		merged[albumID] = idx
-	}
-	for albumID, idx := range scanned {
-		merged[albumID] = idx
-	}
-	return merged
-}
-
 func (s *Service) GetAlbum(ctx context.Context, albumID string) (*models.AlbumIndex, error) {
 	s.mu.RLock()
 	if idx, ok := s.albumCache[albumID]; ok {
@@ -438,16 +414,6 @@ func (s *Service) AllAlbums() []*models.AlbumIndex {
 	out := cloneAlbumIndexSlice(s.allAlbumsSnapshot)
 	s.mu.Unlock()
 	return out
-}
-
-func (s *Service) DumpAlbumJSON(albumID string) ([]byte, error) {
-	s.mu.RLock()
-	idx, ok := s.albumCache[albumID]
-	s.mu.RUnlock()
-	if !ok {
-		return nil, fmt.Errorf("%w: %s", ErrAlbumNotFound, albumID)
-	}
-	return json.Marshal(idx)
 }
 
 func (s *Service) invalidateSnapshotsLocked() {

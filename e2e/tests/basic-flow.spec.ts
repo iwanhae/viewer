@@ -134,7 +134,6 @@ async function uploadAndFinalizeFromUploadPage(page: Page, zipPath: string) {
 
   try {
     await page.getByTestId('upload-pick-input').setInputFiles(zipPath)
-    await page.getByTestId('upload-start').click()
     await expect(page.getByTestId('upload-status').first()).toHaveText(/Ready|Finalizing/, {
       timeout: 240_000,
     })

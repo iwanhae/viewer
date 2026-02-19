@@ -174,7 +174,6 @@ func (s *Server) getFeed(w http.ResponseWriter, r *http.Request) {
 	resp, err := s.feed.Build(
 		r.Context(),
 		limit,
-		r.URL.Query().Get("cursor"),
 		r.URL.Query().Get("seed"),
 	)
 	if err != nil {

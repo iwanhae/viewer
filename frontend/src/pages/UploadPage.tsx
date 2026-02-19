@@ -1,8 +1,8 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { createAlbum, finalizeAlbum, uploadAlbumObject } from '../api/client'
 
-type UploadStatus = 'queued' | 'creating' | 'uploading' | 'finalizing' | 'ready' | 'failed' | 'aborted'
+type UploadStatus = 'uploading' | 'finalizing' | 'ready' | 'failed' | 'canceled'
 
 type UploadItem = {
   id: string
@@ -15,8 +15,6 @@ type UploadItem = {
   photoCount?: number
   error?: string
 }
-
-const uploadConcurrency = 1
 
 function nextItemID(): string {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
@@ -57,10 +55,6 @@ function formatBytes(bytes: number): string {
 
 function statusLabel(status: UploadStatus): string {
   switch (status) {
-    case 'queued':
-      return 'Queued'
-    case 'creating':
-      return 'Creating album'
     case 'uploading':
       return 'Uploading'
     case 'finalizing':
@@ -69,7 +63,7 @@ function statusLabel(status: UploadStatus): string {
       return 'Ready'
     case 'failed':
       return 'Failed'
-    case 'aborted':
+    case 'canceled':
       return 'Canceled'
     default:
       return status
@@ -80,10 +74,9 @@ export function UploadPage() {
   const navigate = useNavigate()
   const fileInputRef = useRef<HTMLInputElement | null>(null)
   const controllersRef = useRef(new Map<string, AbortController>())
+  const uploadQueueRef = useRef<Promise<void>>(Promise.resolve())
 
   const [items, setItems] = useState<UploadItem[]>([])
-  const [queueRunning, setQueueRunning] = useState(false)
-  const [activeUploads, setActiveUploads] = useState(0)
   const [pageError, setPageError] = useState<string | null>(null)
 
   const updateItem = useCallback((itemID: string, next: Partial<UploadItem>) => {
@@ -94,11 +87,9 @@ export function UploadPage() {
     async (item: UploadItem) => {
       const controller = new AbortController()
       controllersRef.current.set(item.id, controller)
-      setActiveUploads((count) => count + 1)
 
       let albumID = item.albumId ?? ''
       try {
-        updateItem(item.id, { status: 'creating', error: undefined, uploadedBytes: 0 })
         const created = await createAlbum(item.file)
         albumID = created.albumId
         updateItem(item.id, { albumId: albumID, status: 'uploading' })
@@ -114,30 +105,23 @@ export function UploadPage() {
         })
       } catch (err) {
         if (isAbortError(err)) {
-          updateItem(item.id, { status: 'aborted', error: undefined })
+          updateItem(item.id, { status: 'canceled', error: undefined })
         } else {
           updateItem(item.id, { status: 'failed', error: toErrorMessage(err) })
         }
       } finally {
         controllersRef.current.delete(item.id)
-        setActiveUploads((count) => Math.max(0, count - 1))
       }
     },
     [updateItem],
   )
 
-  useEffect(() => {
-    if (!queueRunning) return
-    if (activeUploads >= uploadConcurrency) return
-
-    const availableSlots = uploadConcurrency - activeUploads
-    const queued = items.filter((item) => item.status === 'queued').slice(0, availableSlots)
-    if (queued.length === 0) return
-
-    for (const item of queued) {
-      void runItemUpload(item)
-    }
-  }, [activeUploads, items, queueRunning, runItemUpload])
+  const enqueueUpload = useCallback(
+    (item: UploadItem) => {
+      uploadQueueRef.current = uploadQueueRef.current.then(() => runItemUpload(item)).catch(() => undefined)
+    },
+    [runItemUpload],
+  )
 
   const onPickFiles = (event: React.ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(event.target.files ?? [])
@@ -150,7 +134,7 @@ export function UploadPage() {
         file,
         name: file.name,
         sizeBytes: file.size,
-        status: 'queued',
+        status: 'uploading',
         uploadedBytes: 0,
       }))
 
@@ -159,6 +143,9 @@ export function UploadPage() {
     } else {
       setPageError(null)
       setItems((prev) => [...prev, ...picked])
+      for (const item of picked) {
+        enqueueUpload(item)
+      }
     }
 
     if (event.target) {
@@ -181,13 +168,18 @@ export function UploadPage() {
   }
 
   const onRetryFailedUploads = () => {
+    const retryable = items.filter((item) => item.status === 'canceled' || item.status === 'failed')
+    if (retryable.length === 0) {
+      return
+    }
+
     setItems((prev) =>
       prev.map((item) => {
-        const isUploadFailure = item.status === 'aborted' || item.status === 'failed'
+        const isUploadFailure = item.status === 'canceled' || item.status === 'failed'
         if (!isUploadFailure) return item
         return {
           ...item,
-          status: 'queued',
+          status: 'uploading',
           uploadedBytes: 0,
           albumId: undefined,
           photoCount: undefined,
@@ -195,14 +187,23 @@ export function UploadPage() {
         }
       }),
     )
-    setQueueRunning(true)
+    for (const item of retryable) {
+      enqueueUpload({
+        ...item,
+        status: 'uploading',
+        uploadedBytes: 0,
+        albumId: undefined,
+        photoCount: undefined,
+        error: undefined,
+      })
+    }
   }
 
   const summary = useMemo(() => {
     const totalFiles = items.length
     const uploadedFiles = items.filter((item) => item.status === 'finalizing' || item.status === 'ready').length
     const readyFiles = items.filter((item) => item.status === 'ready').length
-    const failedFiles = items.filter((item) => item.status === 'failed').length
+    const failedFiles = items.filter((item) => item.status === 'failed' || item.status === 'canceled').length
     const totalBytes = items.reduce((sum, item) => sum + item.sizeBytes, 0)
     const uploadedBytes = items.reduce(
       (sum, item) =>
@@ -224,8 +225,7 @@ export function UploadPage() {
     }
   }, [items])
 
-  const hasQueued = items.some((item) => item.status === 'queued')
-  const hasRetryable = items.some((item) => item.status === 'aborted' || item.status === 'failed')
+  const hasRetryable = items.some((item) => item.status === 'canceled' || item.status === 'failed')
 
   return (
     <div className="upload-page" data-testid="upload-page">
@@ -242,7 +242,7 @@ export function UploadPage() {
           <h1 className="upload-title">Album Uploads</h1>
         </header>
         <p className="upload-subtitle">
-          Queue many ZIP files, upload directly to object storage, and finalize each album immediately.
+          Upload ZIP files directly to object storage. Uploads start immediately after selection.
         </p>
 
         <div className="upload-actions">
@@ -253,24 +253,6 @@ export function UploadPage() {
             data-testid="upload-add-button"
           >
             Add ZIP files
-          </button>
-          <button
-            type="button"
-            className="photo-nav-button"
-            onClick={() => setQueueRunning(true)}
-            disabled={!hasQueued}
-            data-testid="upload-start"
-          >
-            Start uploads
-          </button>
-          <button
-            type="button"
-            className="photo-nav-button"
-            onClick={() => setQueueRunning(false)}
-            disabled={!queueRunning}
-            data-testid="upload-pause"
-          >
-            Pause queue
           </button>
           <button
             type="button"
@@ -315,7 +297,7 @@ export function UploadPage() {
 
         <div className="upload-list" data-testid="upload-list">
           {items.length === 0 && (
-            <p className="upload-empty">No files queued yet. Add one or more ZIP files to begin.</p>
+            <p className="upload-empty">No files selected yet. Add one or more ZIP files to begin.</p>
           )}
           {items.map((item) => {
             const pct = item.sizeBytes > 0 ? Math.min(100, Math.round((item.uploadedBytes / item.sizeBytes) * 100)) : 0

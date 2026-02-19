@@ -9,7 +9,6 @@ export type FeedItem = {
 
 export type FeedResponse = {
   items: FeedItem[]
-  nextCursor?: string
 }
 
 export type PhotoMeta = {

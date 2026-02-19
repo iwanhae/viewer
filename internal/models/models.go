@@ -48,6 +48,5 @@ type FeedItem struct {
 }
 
 type FeedResponse struct {
-	Items      []FeedItem `json:"items"`
-	NextCursor string     `json:"nextCursor,omitempty"`
+	Items []FeedItem `json:"items"`
 }
