@@ -4,7 +4,6 @@ import {
   abortMultipartUpload,
   completeMultipartUpload,
   createAlbum,
-  fetchAlbumStatus,
   finalizeAlbum,
   initiateMultipartUpload,
   presignMultipartPart,
@@ -89,7 +88,7 @@ function statusLabel(status: UploadStatus): string {
     case 'uploaded':
       return 'Uploaded'
     case 'finalizing':
-      return 'Processing'
+      return 'Processing (manual refresh)'
     case 'ready':
       return 'Ready'
     case 'failed':
@@ -291,35 +290,6 @@ export function UploadPage() {
     },
     [applyFinalizeStatus, updateItem],
   )
-
-  useEffect(() => {
-    const targets = items.filter((item) => item.status === 'finalizing' && item.albumId)
-    if (targets.length === 0) return
-
-    let cancelled = false
-    const poll = async () => {
-      for (const item of targets) {
-        if (!item.albumId) continue
-        try {
-          const result = await fetchAlbumStatus(item.albumId)
-          if (cancelled) return
-          applyFinalizeStatus(item.id, result)
-        } catch {
-          // Keep polling on transient status fetch failures.
-        }
-      }
-    }
-
-    void poll()
-    const timer = window.setInterval(() => {
-      void poll()
-    }, 2000)
-
-    return () => {
-      cancelled = true
-      window.clearInterval(timer)
-    }
-  }, [applyFinalizeStatus, items])
 
   const summary = useMemo(() => {
     const totalFiles = items.length
