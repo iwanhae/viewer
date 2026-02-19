@@ -3,12 +3,14 @@ import { WallPage } from './pages/WallPage'
 import { ViewerPage } from './pages/ViewerPage'
 import { PhotoPage } from './pages/PhotoPage'
 import { AlbumSearchPage } from './pages/AlbumSearchPage'
+import { UploadPage } from './pages/UploadPage'
 
 export default function App() {
   return (
     <BrowserRouter>
       <Routes>
         <Route path="/" element={<WallPage />} />
+        <Route path="/upload" element={<UploadPage />} />
         <Route path="/albums/find" element={<AlbumSearchPage />} />
         <Route path="/album/:albumId" element={<ViewerPage />} />
         <Route path="/album/:albumId/:photoIndex" element={<PhotoPage />} />

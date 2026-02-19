@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"os"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -15,6 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/google/uuid"
 	cfgpkg "viewer/internal/config"
 	"viewer/internal/models"
@@ -29,6 +29,7 @@ type Service struct {
 	mu                     sync.RWMutex
 	albumCache             map[string]*models.AlbumIndex
 	uploadHints            map[string]string
+	multipartSessions      map[string]multipartSession
 	albumSummariesSnapshot []models.AlbumSummary
 	allAlbumsSnapshot      []*models.AlbumIndex
 }
@@ -47,10 +48,13 @@ type RefreshProgress struct {
 }
 
 type albumStore interface {
-	PresignPut(ctx context.Context, key string, ttl time.Duration) (string, map[string]string, error)
-	PutObject(ctx context.Context, key string, body io.Reader, contentType string) error
+	CreateMultipartUpload(ctx context.Context, key string, contentType string) (string, error)
+	PresignUploadPart(ctx context.Context, key string, uploadID string, partNumber int32, ttl time.Duration) (string, map[string]string, error)
+	ListMultipartUploadParts(ctx context.Context, key string, uploadID string) ([]s3types.CompletedPart, error)
+	CompleteMultipartUpload(ctx context.Context, key string, uploadID string, parts []s3types.CompletedPart) error
+	AbortMultipartUpload(ctx context.Context, key string, uploadID string) error
 	HeadObject(ctx context.Context, key string) (bool, int64, error)
-	GetObject(ctx context.Context, key string) (io.ReadCloser, string, error)
+	GetObjectRange(ctx context.Context, key string, start int64, end int64) (io.ReadCloser, string, error)
 	PutJSON(ctx context.Context, key string, v any) error
 	ReadJSON(ctx context.Context, key string, out any) error
 	ForEachAlbumIndexKey(ctx context.Context, fn func(key string) error) error
@@ -58,18 +62,47 @@ type albumStore interface {
 
 func NewService(cfg cfgpkg.Config, store *storage.S3Store, indexer *Indexer) *Service {
 	return &Service{
-		cfg:         cfg,
-		store:       store,
-		indexer:     indexer,
-		albumCache:  make(map[string]*models.AlbumIndex),
-		uploadHints: make(map[string]string),
+		cfg:               cfg,
+		store:             store,
+		indexer:           indexer,
+		albumCache:        make(map[string]*models.AlbumIndex),
+		uploadHints:       make(map[string]string),
+		multipartSessions: make(map[string]multipartSession),
 	}
 }
 
 type CreateUploadResult struct {
-	AlbumID string
+	AlbumID       string
+	Key           string
+	Strategy      string
+	PartSizeBytes int64
+	MaxParts      int
+}
+
+type InitiateMultipartResult struct {
+	UploadID      string
+	PartSizeBytes int64
+	PartCount     int
+}
+
+type PresignPartResult struct {
 	URL     string
 	Headers map[string]string
+}
+
+type CompletePart struct {
+	PartNumber int32
+	ETag       string
+}
+
+type multipartSession struct {
+	AlbumID       string
+	Key           string
+	UploadID      string
+	SizeBytes     int64
+	PartSizeBytes int64
+	PartCount     int
+	CreatedAt     time.Time
 }
 
 func sourceKey(albumID string) string {
@@ -80,7 +113,15 @@ func indexKey(albumID string) string {
 	return fmt.Sprintf("albums/%s/index.json", albumID)
 }
 
+const (
+	multipartUploadStrategy = "s3_multipart"
+	multipartMaxParts       = 10_000
+	multipartMinPartSize    = int64(16 << 20) // 16 MiB
+	multipartSessionTTL     = 24 * time.Hour
+)
+
 func (s *Service) CreateUpload(ctx context.Context, filename string, sizeBytes int64) (CreateUploadResult, error) {
+	_ = ctx
 	if strings.TrimSpace(filename) == "" {
 		return CreateUploadResult{}, fmt.Errorf("filename is required")
 	}
@@ -92,38 +133,130 @@ func (s *Service) CreateUpload(ctx context.Context, filename string, sizeBytes i
 	}
 
 	albumID := uuid.NewString()
-	url, headers, err := s.store.PresignPut(ctx, sourceKey(albumID), s.cfg.PresignTTL)
-	if err != nil {
-		return CreateUploadResult{}, err
-	}
+	partSize := computeMultipartPartSize(sizeBytes)
 
 	s.mu.Lock()
 	s.uploadHints[albumID] = filename
 	s.mu.Unlock()
 
 	return CreateUploadResult{
-		AlbumID: albumID,
-		URL:     url,
-		Headers: headers,
+		AlbumID:       albumID,
+		Key:           sourceKey(albumID),
+		Strategy:      multipartUploadStrategy,
+		PartSizeBytes: partSize,
+		MaxParts:      multipartMaxParts,
 	}, nil
 }
 
-func (s *Service) UploadSource(ctx context.Context, albumID string, filename string, reader io.Reader) error {
+func (s *Service) InitiateMultipartUpload(ctx context.Context, albumID string, sizeBytes int64, contentType string) (InitiateMultipartResult, error) {
 	if strings.TrimSpace(albumID) == "" {
-		return fmt.Errorf("albumId is required")
+		return InitiateMultipartResult{}, fmt.Errorf("albumId is required")
 	}
-	if reader == nil {
-		return fmt.Errorf("file is required")
+	if sizeBytes <= 0 {
+		return InitiateMultipartResult{}, fmt.Errorf("sizeBytes must be > 0")
 	}
-	if err := s.store.PutObject(ctx, sourceKey(albumID), reader, "application/zip"); err != nil {
+	if sizeBytes > s.cfg.MaxUploadBytes {
+		return InitiateMultipartResult{}, fmt.Errorf("sizeBytes exceeds MAX_UPLOAD_BYTES")
+	}
+
+	partSize := computeMultipartPartSize(sizeBytes)
+	partCount := int((sizeBytes + partSize - 1) / partSize)
+	if partCount <= 0 || partCount > multipartMaxParts {
+		return InitiateMultipartResult{}, fmt.Errorf("multipart part count exceeds limit")
+	}
+
+	normalizedContentType := strings.TrimSpace(contentType)
+	if normalizedContentType == "" {
+		normalizedContentType = "application/zip"
+	}
+
+	uploadID, err := s.store.CreateMultipartUpload(ctx, sourceKey(albumID), normalizedContentType)
+	if err != nil {
+		return InitiateMultipartResult{}, err
+	}
+
+	session := multipartSession{
+		AlbumID:       albumID,
+		Key:           sourceKey(albumID),
+		UploadID:      uploadID,
+		SizeBytes:     sizeBytes,
+		PartSizeBytes: partSize,
+		PartCount:     partCount,
+		CreatedAt:     time.Now().UTC(),
+	}
+
+	s.mu.Lock()
+	s.cleanupMultipartSessionsLocked(time.Now().UTC())
+	s.multipartSessions[multipartSessionKey(albumID, uploadID)] = session
+	s.mu.Unlock()
+
+	return InitiateMultipartResult{
+		UploadID:      uploadID,
+		PartSizeBytes: partSize,
+		PartCount:     partCount,
+	}, nil
+}
+
+func (s *Service) PresignMultipartUploadPart(ctx context.Context, albumID string, uploadID string, partNumber int32) (PresignPartResult, error) {
+	session, err := s.getMultipartSession(albumID, uploadID)
+	if err != nil {
+		return PresignPartResult{}, err
+	}
+	if partNumber <= 0 {
+		return PresignPartResult{}, fmt.Errorf("partNumber must be > 0")
+	}
+	if int(partNumber) > session.PartCount {
+		return PresignPartResult{}, fmt.Errorf("partNumber exceeds expected count")
+	}
+
+	url, headers, err := s.store.PresignUploadPart(ctx, session.Key, session.UploadID, partNumber, s.cfg.PresignTTL)
+	if err != nil {
+		return PresignPartResult{}, err
+	}
+	return PresignPartResult{URL: url, Headers: headers}, nil
+}
+
+func (s *Service) CompleteMultipartUpload(ctx context.Context, albumID string, uploadID string, parts []CompletePart) error {
+	session, err := s.getMultipartSession(albumID, uploadID)
+	if err != nil {
 		return err
 	}
 
-	if strings.TrimSpace(filename) != "" {
-		s.mu.Lock()
-		s.uploadHints[albumID] = filename
-		s.mu.Unlock()
+	completedParts := make([]s3types.CompletedPart, 0, session.PartCount)
+	if len(parts) == 0 {
+		completedParts, err = s.store.ListMultipartUploadParts(ctx, session.Key, session.UploadID)
+		if err != nil {
+			return err
+		}
+	} else {
+		completedParts = toCompletedParts(parts)
 	}
+	if err := validateCompletedParts(completedParts, session.PartCount); err != nil {
+		return err
+	}
+
+	if err := s.store.CompleteMultipartUpload(ctx, session.Key, session.UploadID, completedParts); err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	delete(s.multipartSessions, multipartSessionKey(albumID, uploadID))
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *Service) AbortMultipartUpload(ctx context.Context, albumID string, uploadID string) error {
+	session, err := s.getMultipartSession(albumID, uploadID)
+	if err != nil {
+		return err
+	}
+	if err := s.store.AbortMultipartUpload(ctx, session.Key, session.UploadID); err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	delete(s.multipartSessions, multipartSessionKey(albumID, uploadID))
+	s.mu.Unlock()
 	return nil
 }
 
@@ -132,33 +265,16 @@ func (s *Service) Finalize(ctx context.Context, albumID string) (*models.AlbumIn
 		return nil, fmt.Errorf("albumId is required")
 	}
 
-	exists, _, err := s.store.HeadObject(ctx, sourceKey(albumID))
+	sourceObjectKey := sourceKey(albumID)
+	exists, size, err := s.store.HeadObject(ctx, sourceObjectKey)
 	if err != nil {
 		return nil, err
 	}
 	if !exists {
 		return nil, fmt.Errorf("%w: %s", ErrAlbumSourceNotFound, albumID)
 	}
-
-	body, _, err := s.store.GetObject(ctx, sourceKey(albumID))
-	if err != nil {
-		return nil, err
-	}
-	defer body.Close()
-
-	tmpFile, err := os.CreateTemp("", "viewer-album-*.zip")
-	if err != nil {
-		return nil, fmt.Errorf("create temp file: %w", err)
-	}
-	tmpPath := tmpFile.Name()
-	defer os.Remove(tmpPath)
-
-	if _, err := io.Copy(tmpFile, body); err != nil {
-		tmpFile.Close()
-		return nil, fmt.Errorf("download zip: %w", err)
-	}
-	if err := tmpFile.Close(); err != nil {
-		return nil, fmt.Errorf("close temp file: %w", err)
+	if size <= 0 {
+		return nil, fmt.Errorf("%w: %s", ErrAlbumSourceNotFound, albumID)
 	}
 
 	originalFilename := "source.zip"
@@ -168,7 +284,13 @@ func (s *Service) Finalize(ctx context.Context, albumID string) (*models.AlbumIn
 	}
 	s.mu.RUnlock()
 
-	idx, err := s.indexer.BuildFromZip(tmpPath, albumID, originalFilename)
+	readerAt := &s3ObjectReaderAt{
+		ctx:   ctx,
+		store: s.store,
+		key:   sourceObjectKey,
+		size:  size,
+	}
+	idx, err := s.indexer.BuildFromZipReaderAt(readerAt, size, albumID, originalFilename)
 	if err != nil {
 		return nil, err
 	}
@@ -184,6 +306,151 @@ func (s *Service) Finalize(ctx context.Context, albumID string) (*models.AlbumIn
 	s.mu.Unlock()
 
 	return idx, nil
+}
+
+func computeMultipartPartSize(sizeBytes int64) int64 {
+	partSize := multipartMinPartSize
+	minimumByPartCount := (sizeBytes + multipartMaxParts - 1) / multipartMaxParts
+	if minimumByPartCount > partSize {
+		partSize = minimumByPartCount
+	}
+
+	const miB = int64(1 << 20)
+	if remainder := partSize % miB; remainder != 0 {
+		partSize += miB - remainder
+	}
+	return partSize
+}
+
+func multipartSessionKey(albumID string, uploadID string) string {
+	return albumID + ":" + uploadID
+}
+
+func (s *Service) cleanupMultipartSessionsLocked(now time.Time) {
+	for key, session := range s.multipartSessions {
+		if now.Sub(session.CreatedAt) > multipartSessionTTL {
+			delete(s.multipartSessions, key)
+		}
+	}
+}
+
+func (s *Service) getMultipartSession(albumID string, uploadID string) (multipartSession, error) {
+	if strings.TrimSpace(albumID) == "" {
+		return multipartSession{}, fmt.Errorf("albumId is required")
+	}
+	if strings.TrimSpace(uploadID) == "" {
+		return multipartSession{}, fmt.Errorf("uploadId is required")
+	}
+
+	now := time.Now().UTC()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cleanupMultipartSessionsLocked(now)
+
+	session, ok := s.multipartSessions[multipartSessionKey(albumID, uploadID)]
+	if !ok {
+		return multipartSession{}, fmt.Errorf("%w: %s", ErrMultipartNotFound, uploadID)
+	}
+	return session, nil
+}
+
+func toCompletedParts(parts []CompletePart) []s3types.CompletedPart {
+	completed := make([]s3types.CompletedPart, 0, len(parts))
+	for _, part := range parts {
+		etag := strings.TrimSpace(part.ETag)
+		completed = append(completed, s3types.CompletedPart{
+			PartNumber: int32Ptr(part.PartNumber),
+			ETag:       stringPtr(etag),
+		})
+	}
+	return completed
+}
+
+func validateCompletedParts(parts []s3types.CompletedPart, expectedPartCount int) error {
+	if len(parts) == 0 {
+		return fmt.Errorf("at least one completed part is required")
+	}
+	if expectedPartCount > 0 && len(parts) != expectedPartCount {
+		return fmt.Errorf("expected %d parts, got %d", expectedPartCount, len(parts))
+	}
+
+	sort.Slice(parts, func(i, j int) bool {
+		return derefInt32(parts[i].PartNumber) < derefInt32(parts[j].PartNumber)
+	})
+
+	expectedPartNumber := int32(1)
+	for i := range parts {
+		part := parts[i]
+		if part.PartNumber == nil || *part.PartNumber <= 0 {
+			return fmt.Errorf("invalid part number at index %d", i)
+		}
+		if part.ETag == nil || strings.TrimSpace(*part.ETag) == "" {
+			return fmt.Errorf("missing ETag for part %d", *part.PartNumber)
+		}
+		if *part.PartNumber != expectedPartNumber {
+			return fmt.Errorf("missing or duplicate part number %d", expectedPartNumber)
+		}
+		expectedPartNumber++
+	}
+	return nil
+}
+
+func int32Ptr(v int32) *int32 {
+	return &v
+}
+
+func stringPtr(v string) *string {
+	return &v
+}
+
+func derefInt32(v *int32) int32 {
+	if v == nil {
+		return 0
+	}
+	return *v
+}
+
+type s3ObjectReaderAt struct {
+	ctx   context.Context
+	store albumStore
+	key   string
+	size  int64
+}
+
+func (r *s3ObjectReaderAt) ReadAt(p []byte, off int64) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if r == nil || r.store == nil {
+		return 0, fmt.Errorf("range reader is not initialized")
+	}
+	if off < 0 {
+		return 0, fmt.Errorf("negative offset: %d", off)
+	}
+	if off >= r.size {
+		return 0, io.EOF
+	}
+
+	toRead := int64(len(p))
+	if max := r.size - off; toRead > max {
+		toRead = max
+	}
+	start := off
+	end := off + toRead - 1
+	body, _, err := r.store.GetObjectRange(r.ctx, r.key, start, end)
+	if err != nil {
+		return 0, err
+	}
+	defer body.Close()
+
+	n, readErr := io.ReadFull(body, p[:int(toRead)])
+	if readErr != nil {
+		return n, fmt.Errorf("read object range %s %d-%d: %w", r.key, start, end, readErr)
+	}
+	if int64(n) < int64(len(p)) {
+		return n, io.EOF
+	}
+	return n, nil
 }
 
 func (s *Service) RefreshFromStorage(ctx context.Context) error {

@@ -7,6 +7,7 @@ import (
 	"image"
 	_ "image/jpeg"
 	_ "image/png"
+	"io"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -31,12 +32,18 @@ func NewIndexer() *Indexer {
 	return &Indexer{}
 }
 
-func (i *Indexer) BuildFromZip(zipPath string, albumID string, originalFilename string) (*models.AlbumIndex, error) {
-	r, err := zip.OpenReader(zipPath)
+func (i *Indexer) BuildFromZipReaderAt(readerAt io.ReaderAt, size int64, albumID string, originalFilename string) (*models.AlbumIndex, error) {
+	if readerAt == nil {
+		return nil, fmt.Errorf("zip reader is required")
+	}
+	if size <= 0 {
+		return nil, fmt.Errorf("zip size must be > 0")
+	}
+
+	r, err := zip.NewReader(readerAt, size)
 	if err != nil {
 		return nil, fmt.Errorf("open zip: %w", err)
 	}
-	defer r.Close()
 
 	entries := make([]*zip.File, 0, len(r.File))
 	for _, f := range r.File {

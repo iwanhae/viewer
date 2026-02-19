@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"viewer/internal/models"
 )
 
@@ -347,11 +348,23 @@ type fakeAlbumStore struct {
 	readJSONFn             func(ctx context.Context, key string, out any) error
 }
 
-func (f *fakeAlbumStore) PresignPut(ctx context.Context, key string, ttl time.Duration) (string, map[string]string, error) {
+func (f *fakeAlbumStore) CreateMultipartUpload(ctx context.Context, key string, contentType string) (string, error) {
 	panic("unexpected call")
 }
 
-func (f *fakeAlbumStore) PutObject(ctx context.Context, key string, body io.Reader, contentType string) error {
+func (f *fakeAlbumStore) PresignUploadPart(ctx context.Context, key string, uploadID string, partNumber int32, ttl time.Duration) (string, map[string]string, error) {
+	panic("unexpected call")
+}
+
+func (f *fakeAlbumStore) ListMultipartUploadParts(ctx context.Context, key string, uploadID string) ([]s3types.CompletedPart, error) {
+	panic("unexpected call")
+}
+
+func (f *fakeAlbumStore) CompleteMultipartUpload(ctx context.Context, key string, uploadID string, parts []s3types.CompletedPart) error {
+	panic("unexpected call")
+}
+
+func (f *fakeAlbumStore) AbortMultipartUpload(ctx context.Context, key string, uploadID string) error {
 	panic("unexpected call")
 }
 
@@ -359,7 +372,7 @@ func (f *fakeAlbumStore) HeadObject(ctx context.Context, key string) (bool, int6
 	panic("unexpected call")
 }
 
-func (f *fakeAlbumStore) GetObject(ctx context.Context, key string) (io.ReadCloser, string, error) {
+func (f *fakeAlbumStore) GetObjectRange(ctx context.Context, key string, start int64, end int64) (io.ReadCloser, string, error) {
 	panic("unexpected call")
 }
 

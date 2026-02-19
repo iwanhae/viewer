@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 	"time"
 
@@ -64,6 +65,122 @@ func (s *S3Store) PresignPut(ctx context.Context, key string, ttl time.Duration)
 		return "", nil, fmt.Errorf("presign put: %w", err)
 	}
 	return out.URL, map[string]string{}, nil
+}
+
+func (s *S3Store) CreateMultipartUpload(ctx context.Context, key string, contentType string) (string, error) {
+	input := &s3.CreateMultipartUploadInput{
+		Bucket: aws.String(s.bucket),
+		Key:    aws.String(key),
+	}
+	if strings.TrimSpace(contentType) != "" {
+		input.ContentType = aws.String(contentType)
+	}
+
+	out, err := s.client.CreateMultipartUpload(ctx, input)
+	if err != nil {
+		return "", fmt.Errorf("create multipart upload %s: %w", key, err)
+	}
+	if out.UploadId == nil || strings.TrimSpace(*out.UploadId) == "" {
+		return "", fmt.Errorf("create multipart upload %s: missing upload id", key)
+	}
+	return *out.UploadId, nil
+}
+
+func (s *S3Store) PresignUploadPart(ctx context.Context, key string, uploadID string, partNumber int32, ttl time.Duration) (string, map[string]string, error) {
+	if strings.TrimSpace(uploadID) == "" {
+		return "", nil, fmt.Errorf("upload id is required")
+	}
+	if partNumber <= 0 {
+		return "", nil, fmt.Errorf("part number must be > 0")
+	}
+
+	out, err := s.presigner.PresignUploadPart(ctx, &s3.UploadPartInput{
+		Bucket:     aws.String(s.bucket),
+		Key:        aws.String(key),
+		UploadId:   aws.String(uploadID),
+		PartNumber: aws.Int32(partNumber),
+	}, s3.WithPresignExpires(ttl))
+	if err != nil {
+		return "", nil, fmt.Errorf("presign upload part %s part=%d: %w", key, partNumber, err)
+	}
+	return out.URL, map[string]string{}, nil
+}
+
+func (s *S3Store) ListMultipartUploadParts(ctx context.Context, key string, uploadID string) ([]types.CompletedPart, error) {
+	if strings.TrimSpace(uploadID) == "" {
+		return nil, fmt.Errorf("upload id is required")
+	}
+
+	parts := make([]types.CompletedPart, 0, 64)
+	var marker *string
+	for {
+		out, err := s.client.ListParts(ctx, &s3.ListPartsInput{
+			Bucket:           aws.String(s.bucket),
+			Key:              aws.String(key),
+			UploadId:         aws.String(uploadID),
+			PartNumberMarker: marker,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("list multipart parts %s: %w", key, err)
+		}
+		for _, part := range out.Parts {
+			if part.PartNumber == nil || part.ETag == nil {
+				continue
+			}
+			parts = append(parts, types.CompletedPart{
+				ETag:       aws.String(*part.ETag),
+				PartNumber: aws.Int32(*part.PartNumber),
+			})
+		}
+
+		if out.IsTruncated == nil || !*out.IsTruncated {
+			break
+		}
+		marker = out.NextPartNumberMarker
+	}
+
+	sort.Slice(parts, func(i, j int) bool {
+		return aws.ToInt32(parts[i].PartNumber) < aws.ToInt32(parts[j].PartNumber)
+	})
+	return parts, nil
+}
+
+func (s *S3Store) CompleteMultipartUpload(ctx context.Context, key string, uploadID string, parts []types.CompletedPart) error {
+	if strings.TrimSpace(uploadID) == "" {
+		return fmt.Errorf("upload id is required")
+	}
+	if len(parts) == 0 {
+		return fmt.Errorf("at least one uploaded part is required")
+	}
+
+	_, err := s.client.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
+		Bucket:   aws.String(s.bucket),
+		Key:      aws.String(key),
+		UploadId: aws.String(uploadID),
+		MultipartUpload: &types.CompletedMultipartUpload{
+			Parts: parts,
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("complete multipart upload %s: %w", key, err)
+	}
+	return nil
+}
+
+func (s *S3Store) AbortMultipartUpload(ctx context.Context, key string, uploadID string) error {
+	if strings.TrimSpace(uploadID) == "" {
+		return fmt.Errorf("upload id is required")
+	}
+
+	_, err := s.client.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{
+		Bucket:   aws.String(s.bucket),
+		Key:      aws.String(key),
+		UploadId: aws.String(uploadID),
+	})
+	if err != nil {
+		return fmt.Errorf("abort multipart upload %s: %w", key, err)
+	}
+	return nil
 }
 
 func (s *S3Store) PutObject(ctx context.Context, key string, body io.Reader, contentType string) error {

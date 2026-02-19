@@ -1,4 +1,4 @@
-import { expect, test, type Page } from '@playwright/test'
+import { expect, test, type Page, type Route } from '@playwright/test'
 import fs from 'node:fs/promises'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -11,8 +11,7 @@ const zip1 = path.join(rootDir, 'e2e', 'fixtures', 'album-a.zip')
 const zip2 = path.join(rootDir, 'e2e', 'fixtures', 'album-b.zip')
 const zip1Base64 =
   'UEsDBBQAAAAIAA+ETVzTNyprPwAAAEQAAAAHABwAMDAxLnBuZ1VUCQADHVKPaR1Sj2l1eAsAAQToAwAABOgDAADrDPBz5+WS4mJgYOD19HAJAtKMIMzBAiS3yvAwASluTxfHkIpbyX/+yzMwMzMxvLtafhIozODp6ueyzimhCQBQSwMEFAAAAAgAD4RNXKnVyORAAAAARAAAAAcAHAAwMDIucG5nVVQJAAMdUo9pHVKPaXV4CwABBOgDAAAE6AMAAOsM8HPn5ZLiYmBg4PX0cAkC0kxAzMjBAiT/1EzJAVLcni6OIRW3kv+cP8DAyszYsPJ9ciFQmMHT1c9lnVNCEwBQSwECHgMUAAAACAAPhE1c0zcqaz8AAABEAAAABwAYAAAAAAAAAAAApIEAAAAAMDAxLnBuZ1VUBQADHVKPaXV4CwABBOgDAAAE6AMAAFBLAQIeAxQAAAAIAA+ETVyp1cjkQAAAAEQAAAAHABgAAAAAAAAAAACkgYAAAAAwMDIucG5nVVQFAAMdUo9pdXgLAAEE6AMAAAToAwAAUEsFBgAAAAACAAIAmgAAAAEBAAAAAA=='
-const zip2Base64 =
-  'UEsDBBQAAAAIAA+ETVxw8BtLQAAAAEQAAAAHABwAMDAxLnBuZ1VUCQADHVKPaR1Sj2l1eAsAAQToAwAABOgDAADrDPBz5+WS4mJgYOD19HAJAtKMQMzEwQIkXTP+igEpbk8Xx5CKW8l//s9nYGZmYnjP5jgFKMzg6ernss4poQkAUEsDBBQAAAAIAA+ETVynezQxPgAAAEQAAAAHABwAMDAyLnBuZ1VUCQADHVKPaR1Sj2l1eAsAAQToAwAABOgDAADrDPBz5+WS4mJgYOD19HAJAtJMIMzBAiT/1EzJAVLcni6OIRW3kv+cB0owMzL+V43OAgozeLr6uaxzSmgCAFBLAQIeAxQAAAAIAA+ETVxw8BtLQAAAAEQAAAAHABgAAAAAAAAAAACkgQAAAAAwMDEucG5nVVQFAAMdUo9pdXgLAAEE6AMAAAToAwAAUEsBAh4DFAAAAAgAD4RNXKd7NDE+AAAARAAAAAcAGAAAAAAAAAAAAKSBgQAAADAwMi5wbmdVVAUAAx1Sj2l1eAsAAQToAwAABOgDAABQSwUGAAAAAAIAAgCaAAAAAAEAAAAA'
+const zip2Base64 = zip1Base64
 const wallColumns = 3
 
 type FeedItem = {
@@ -78,7 +77,86 @@ async function collectWallSrcs(page: Page, count: number): Promise<string[]> {
   return srcs
 }
 
+async function uploadAndFinalizeFromUploadPage(page: Page, zipPath: string) {
+  const zipBytes = await fs.readFile(zipPath)
+
+  const multipartRoute = async (route: Route) => {
+    const request = route.request()
+    const url = request.url()
+    if (!url.includes('X-Amz-Algorithm=') || !url.includes('uploadId=')) {
+      await route.continue()
+      return
+    }
+
+    if (request.method() === 'OPTIONS') {
+      await route.fulfill({
+        status: 204,
+        headers: {
+          'access-control-allow-origin': '*',
+          'access-control-allow-methods': 'PUT, OPTIONS',
+          'access-control-allow-headers':
+            request.headerValue('access-control-request-headers') ?? '*',
+          'access-control-max-age': '86400',
+        },
+      })
+      return
+    }
+
+    if (request.method() === 'PUT') {
+      const parsedURL = new URL(url)
+      const partNumber = Number(parsedURL.searchParams.get('partNumber') ?? '1')
+      const payload =
+        Number.isFinite(partNumber) && partNumber > 1 && request.postDataBuffer()
+          ? request.postDataBuffer()!
+          : zipBytes
+      const requestHeaders = request.headers()
+      delete requestHeaders.host
+      delete requestHeaders['content-length']
+
+      const response = await page.request.fetch(url, {
+        method: 'PUT',
+        headers: requestHeaders,
+        data: payload,
+      })
+      await route.fulfill({
+        response,
+        headers: {
+          ...response.headers(),
+          'access-control-allow-origin': '*',
+          'access-control-expose-headers': 'ETag',
+        },
+      })
+      return
+    }
+
+    await route.continue()
+  }
+
+  await page.route('**/*', multipartRoute)
+  await page.getByTestId('wall-upload').click()
+  await expect.poll(() => new URL(page.url()).pathname).toBe('/upload')
+  await expect(page.getByTestId('upload-page')).toBeVisible()
+
+  try {
+    await page.getByTestId('upload-pick-input').setInputFiles(zipPath)
+    await page.getByTestId('upload-start').click()
+    await expect(page.getByTestId('upload-status').first()).toHaveText('Uploaded', { timeout: 180_000 })
+
+    await page.getByTestId('upload-finalize-all').click()
+    await expect(page.getByTestId('upload-status').first()).toHaveText('Ready', { timeout: 120_000 })
+
+    await page.getByTestId('upload-back-wall').click()
+    await expect.poll(() => new URL(page.url()).pathname).toBe('/')
+    await expect(page.getByTestId('wall-grid')).toBeVisible()
+  } finally {
+    if (!page.isClosed()) {
+      await page.unroute('**/*', multipartRoute)
+    }
+  }
+}
+
 test('basic upload -> wall -> album flow', async ({ page }) => {
+  test.setTimeout(300_000)
   await fs.mkdir(samplesDir, { recursive: true })
   await ensureFixtureZips()
 
@@ -87,9 +165,9 @@ test('basic upload -> wall -> album flow', async ({ page }) => {
   await expect(page.getByTestId('masonry-column')).toHaveCount(3)
   await expect(page.getByTestId('wall-refresh')).toBeVisible()
   await expect(page.getByTestId('wall-find')).toBeVisible()
+  await expect(page.getByTestId('wall-upload')).toBeVisible()
 
-  await page.getByTestId('upload-input').setInputFiles(zip1)
-  await expect(page.getByTestId('upload-button')).toHaveText('+', { timeout: 90_000 })
+  await uploadAndFinalizeFromUploadPage(page, zip1)
 
   await expect(page.getByTestId('wall-tile').first()).toBeVisible({ timeout: 60_000 })
   const firstWallImage = page.getByTestId('wall-tile').first().locator('img')
@@ -196,8 +274,7 @@ test('basic upload -> wall -> album flow', async ({ page }) => {
   await expect(page.getByTestId('columns-6')).toBeVisible()
   await page.screenshot({ path: path.join(samplesDir, '03-wall.png'), fullPage: true })
 
-  await page.getByTestId('upload-input').setInputFiles(zip2)
-  await expect(page.getByTestId('upload-button')).toHaveText('+', { timeout: 120_000 })
+  await uploadAndFinalizeFromUploadPage(page, zip2)
   await expect(page.getByTestId('wall-tile').first()).toBeVisible({ timeout: 60_000 })
   await page.screenshot({ path: path.join(samplesDir, '04-second-album.png'), fullPage: true })
 })

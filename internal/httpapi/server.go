@@ -56,7 +56,10 @@ func (s *Server) Router() http.Handler {
 
 	r.Route("/api", func(r chi.Router) {
 		r.Post("/albums", s.createAlbum)
-		r.Post("/albums/{albumId}/upload", s.uploadAlbumSource)
+		r.Post("/albums/{albumId}/multipart/initiate", s.initiateAlbumMultipart)
+		r.Post("/albums/{albumId}/multipart/part-url", s.presignAlbumMultipartPart)
+		r.Post("/albums/{albumId}/multipart/complete", s.completeAlbumMultipart)
+		r.Post("/albums/{albumId}/multipart/abort", s.abortAlbumMultipart)
 		r.Get("/albums", s.listAlbums)
 		r.Get("/albums/search", s.searchAlbums)
 		r.Post("/albums/{albumId}/finalize", s.finalizeAlbum)
@@ -87,6 +90,30 @@ type createAlbumRequest struct {
 	SizeBytes int64  `json:"sizeBytes"`
 }
 
+type initiateMultipartRequest struct {
+	SizeBytes   int64  `json:"sizeBytes"`
+	ContentType string `json:"contentType,omitempty"`
+}
+
+type presignMultipartPartRequest struct {
+	UploadID   string `json:"uploadId"`
+	PartNumber int32  `json:"partNumber"`
+}
+
+type completeMultipartRequest struct {
+	UploadID string                `json:"uploadId"`
+	Parts    []completePartRequest `json:"parts,omitempty"`
+}
+
+type completePartRequest struct {
+	PartNumber int32  `json:"partNumber"`
+	ETag       string `json:"etag"`
+}
+
+type abortMultipartRequest struct {
+	UploadID string `json:"uploadId"`
+}
+
 func (s *Server) createAlbum(w http.ResponseWriter, r *http.Request) {
 	var req createAlbumRequest
 	if err := jsonBody(r, &req); err != nil {
@@ -102,32 +129,111 @@ func (s *Server) createAlbum(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"albumId": res.AlbumID,
 		"upload": map[string]any{
-			"method":  "PUT",
-			"url":     res.URL,
-			"headers": res.Headers,
+			"strategy":      res.Strategy,
+			"key":           res.Key,
+			"partSizeBytes": res.PartSizeBytes,
+			"maxParts":      res.MaxParts,
 		},
 	})
 }
 
-func (s *Server) uploadAlbumSource(w http.ResponseWriter, r *http.Request) {
-	if s.maxUploadBytes > 0 {
-		r.Body = http.MaxBytesReader(w, r.Body, s.maxUploadBytes)
-	}
-
+func (s *Server) initiateAlbumMultipart(w http.ResponseWriter, r *http.Request) {
 	albumID := chi.URLParam(r, "albumId")
-	file, header, err := r.FormFile("file")
-	if err != nil {
-		writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", "missing file form field")
+	var req initiateMultipartRequest
+	if err := jsonBody(r, &req); err != nil {
+		writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", err.Error())
 		return
 	}
-	defer file.Close()
 
-	if err := s.albums.UploadSource(r.Context(), albumID, header.Filename, file); err != nil {
-		writeError(w, r, http.StatusInternalServerError, "INTERNAL", err.Error())
+	res, err := s.albums.InitiateMultipartUpload(r.Context(), albumID, req.SizeBytes, req.ContentType)
+	if err != nil {
+		writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"uploadId":      res.UploadID,
+		"partSizeBytes": res.PartSizeBytes,
+		"partCount":     res.PartCount,
+	})
+}
+
+func (s *Server) presignAlbumMultipartPart(w http.ResponseWriter, r *http.Request) {
+	albumID := chi.URLParam(r, "albumId")
+	var req presignMultipartPartRequest
+	if err := jsonBody(r, &req); err != nil {
+		writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", err.Error())
+		return
+	}
+
+	res, err := s.albums.PresignMultipartUploadPart(r.Context(), albumID, req.UploadID, req.PartNumber)
+	if err != nil {
+		status := http.StatusBadRequest
+		code := "INVALID_REQUEST"
+		if errors.Is(err, albums.ErrMultipartNotFound) {
+			status = http.StatusNotFound
+			code = "NOT_FOUND"
+		}
+		writeError(w, r, status, code, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"url":     res.URL,
+		"headers": res.Headers,
+	})
+}
+
+func (s *Server) completeAlbumMultipart(w http.ResponseWriter, r *http.Request) {
+	albumID := chi.URLParam(r, "albumId")
+	var req completeMultipartRequest
+	if err := jsonBody(r, &req); err != nil {
+		writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", err.Error())
+		return
+	}
+
+	parts := make([]albums.CompletePart, 0, len(req.Parts))
+	for _, part := range req.Parts {
+		parts = append(parts, albums.CompletePart{
+			PartNumber: part.PartNumber,
+			ETag:       part.ETag,
+		})
+	}
+
+	if err := s.albums.CompleteMultipartUpload(r.Context(), albumID, req.UploadID, parts); err != nil {
+		status := http.StatusBadRequest
+		code := "INVALID_REQUEST"
+		if errors.Is(err, albums.ErrMultipartNotFound) {
+			status = http.StatusNotFound
+			code = "NOT_FOUND"
+		}
+		writeError(w, r, status, code, err.Error())
 		return
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{"status": "UPLOADED"})
+}
+
+func (s *Server) abortAlbumMultipart(w http.ResponseWriter, r *http.Request) {
+	albumID := chi.URLParam(r, "albumId")
+	var req abortMultipartRequest
+	if err := jsonBody(r, &req); err != nil {
+		writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", err.Error())
+		return
+	}
+
+	if err := s.albums.AbortMultipartUpload(r.Context(), albumID, req.UploadID); err != nil {
+		status := http.StatusBadRequest
+		code := "INVALID_REQUEST"
+		if errors.Is(err, albums.ErrMultipartNotFound) {
+			status = http.StatusNotFound
+			code = "NOT_FOUND"
+		}
+		writeError(w, r, status, code, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ABORTED"})
 }
 
 func (s *Server) finalizeAlbum(w http.ResponseWriter, r *http.Request) {

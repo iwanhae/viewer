@@ -19,18 +19,54 @@ async function createAndFinalizeAlbum(
 
   const created = (await createRes.json()) as {
     albumId: string
-    upload: {
+    upload: { strategy: string }
+  }
+
+  expect(created.upload.strategy).toBe('s3_multipart')
+
+  const initiateRes = await request.post(`/api/albums/${created.albumId}/multipart/initiate`, {
+    data: {
+      sizeBytes: zipBuffer.length,
+      contentType: 'application/zip',
+    },
+  })
+  expect(initiateRes.ok()).toBeTruthy()
+  const initiated = (await initiateRes.json()) as {
+    uploadId: string
+    partSizeBytes: number
+    partCount: number
+  }
+
+  for (let partNumber = 1; partNumber <= initiated.partCount; partNumber++) {
+    const partURLRes = await request.post(`/api/albums/${created.albumId}/multipart/part-url`, {
+      data: {
+        uploadId: initiated.uploadId,
+        partNumber,
+      },
+    })
+    expect(partURLRes.ok()).toBeTruthy()
+    const partURL = (await partURLRes.json()) as {
       url: string
       headers: Record<string, string>
     }
+
+    const offset = (partNumber - 1) * initiated.partSizeBytes
+    const partPayload = zipBuffer.subarray(offset, Math.min(offset + initiated.partSizeBytes, zipBuffer.length))
+    const uploadRes = await request.fetch(partURL.url, {
+      method: 'PUT',
+      headers: partURL.headers,
+      data: partPayload,
+    })
+    expect(uploadRes.ok()).toBeTruthy()
   }
 
-  const uploadRes = await request.fetch(created.upload.url, {
-    method: 'PUT',
-    headers: created.upload.headers,
-    data: zipBuffer,
+  const completeRes = await request.post(`/api/albums/${created.albumId}/multipart/complete`, {
+    data: {
+      uploadId: initiated.uploadId,
+      parts: [],
+    },
   })
-  expect(uploadRes.ok()).toBeTruthy()
+  expect(completeRes.ok()).toBeTruthy()
 
   const finalizeRes = await request.post(`/api/albums/${created.albumId}/finalize`)
   expect(finalizeRes.ok()).toBeTruthy()

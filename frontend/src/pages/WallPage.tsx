@@ -1,11 +1,5 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
-import {
-  createAlbum,
-  finalizeAlbum,
-  uploadZip,
-  uploadZipFallback,
-} from '../api/client'
 import { useFeed } from '../hooks/useFeed'
 import { readColumnPreference, writeColumnPreference } from '../utils/columnPreference'
 import { writeLastWallSeed } from '../utils/wallSeed'
@@ -28,16 +22,12 @@ export function WallPage() {
   const [columns, setColumns] = useState(() =>
     readColumnPreference(WALL_COLUMNS_KEY, columnOptions, DEFAULT_COLUMNS),
   )
-  const [uploadError, setUploadError] = useState<string | null>(null)
-  const [uploading, setUploading] = useState(false)
 
-  const fileInputRef = useRef<HTMLInputElement | null>(null)
   const navigate = useNavigate()
   const [searchParams, setSearchParams] = useSearchParams()
   const seed = searchParams.get('seed') ?? ''
 
-  const { items, loading, error: feedError, refetch } = useFeed(seed)
-  const error = uploadError ?? feedError
+  const { items, loading, error } = useFeed(seed)
 
   useEffect(() => {
     if (seed) return
@@ -67,42 +57,6 @@ export function WallPage() {
       next.set('seed', nextSeed)
       return next
     })
-  }
-
-  const onPickFile = async (event: React.ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0]
-    if (!file) return
-
-    setUploading(true)
-    setUploadError(null)
-    try {
-      const created = await createAlbum(file)
-      try {
-        await uploadZip(created.upload.url, file, created.upload.headers)
-      } catch {
-        await uploadZipFallback(created.albumId, file)
-      }
-      await finalizeAlbum(created.albumId)
-
-      if (seed) {
-        await refetch()
-      } else {
-        const nextSeed = nextTimestampSeed()
-        setSearchParams(
-          (prev) => {
-            const next = new URLSearchParams(prev)
-            next.set('seed', nextSeed)
-            return next
-          },
-          { replace: true },
-        )
-      }
-    } catch (err) {
-      setUploadError((err as Error).message)
-    } finally {
-      setUploading(false)
-      if (event.target) event.target.value = ''
-    }
   }
 
   return (
@@ -151,7 +105,7 @@ export function WallPage() {
         <button
           className="upload wall-refresh"
           onClick={onRefresh}
-          disabled={loading || uploading}
+          disabled={loading}
           data-testid="wall-refresh"
         >
           Refresh
@@ -164,21 +118,12 @@ export function WallPage() {
           Find
         </button>
         <button
-          className="upload"
-          onClick={() => fileInputRef.current?.click()}
-          disabled={uploading}
-          data-testid="upload-button"
+          className="upload wall-upload"
+          onClick={() => navigate('/upload')}
+          data-testid="wall-upload"
         >
-          {uploading ? 'Uploading...' : '+'}
+          Upload
         </button>
-        <input
-          ref={fileInputRef}
-          type="file"
-          accept=".zip"
-          hidden
-          onChange={onPickFile}
-          data-testid="upload-input"
-        />
       </div>
 
       {loading && <div className="status">Loading...</div>}
