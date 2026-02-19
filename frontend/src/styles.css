@@ -113,6 +113,12 @@ body,
   font-size: 14px;
 }
 
+.wall-find {
+  padding: 0 14px;
+  min-width: 68px;
+  font-size: 14px;
+}
+
 .status {
   position: fixed;
   top: 16px;
@@ -463,6 +469,157 @@ body,
   color: #1f2933;
 }
 
+.album-search-page {
+  min-height: 100vh;
+  padding: max(16px, env(safe-area-inset-top)) 14px max(24px, env(safe-area-inset-bottom));
+}
+
+.album-search-shell {
+  width: min(960px, 100%);
+  margin: 0 auto;
+  border: 1px solid rgba(31, 41, 51, 0.1);
+  border-radius: 20px;
+  background: rgba(255, 255, 255, 0.84);
+  backdrop-filter: blur(12px);
+  padding: 16px;
+  display: grid;
+  gap: 12px;
+}
+
+.album-search-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.album-search-title {
+  margin: 0;
+  font-size: clamp(1.1rem, 1.8vw, 1.5rem);
+  letter-spacing: 0.01em;
+}
+
+.album-search-label {
+  font-size: 12px;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: #475569;
+  font-weight: 600;
+}
+
+.album-search-input {
+  width: 100%;
+  min-height: 42px;
+  border-radius: 12px;
+  border: 1px solid rgba(31, 41, 51, 0.22);
+  padding: 0 12px;
+  background: rgba(255, 255, 255, 0.95);
+  color: #0f172a;
+  font-size: 15px;
+}
+
+.album-search-input:focus-visible {
+  outline: 2px solid #1f2933;
+  outline-offset: 1px;
+}
+
+.album-search-note {
+  margin: 0;
+  font-size: 13px;
+  color: #475569;
+}
+
+.album-search-note-error {
+  color: #a01f28;
+}
+
+.album-search-list {
+  display: grid;
+  gap: 10px;
+}
+
+.album-search-item {
+  width: 100%;
+  border: 1px solid rgba(31, 41, 51, 0.14);
+  border-radius: 14px;
+  background:
+    linear-gradient(150deg, rgba(255, 255, 255, 0.94), rgba(228, 239, 247, 0.84)),
+    #f8fbfd;
+  padding: 12px;
+  display: grid;
+  gap: 6px;
+  text-align: left;
+  color: #0f172a;
+  cursor: pointer;
+}
+
+.album-search-item:hover {
+  border-color: rgba(31, 41, 51, 0.28);
+}
+
+.album-search-item:focus-visible {
+  outline: 2px solid #1f2933;
+  outline-offset: 1px;
+}
+
+.album-search-item-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.album-search-name {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 700;
+  line-height: 1.2;
+  word-break: break-word;
+}
+
+.album-search-status {
+  flex: 0 0 auto;
+  border-radius: 999px;
+  padding: 4px 8px;
+  font-size: 11px;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  font-weight: 700;
+}
+
+.album-search-status-ready {
+  background: rgba(5, 150, 105, 0.16);
+  color: #065f46;
+}
+
+.album-search-status-partial {
+  background: rgba(217, 119, 6, 0.16);
+  color: #92400e;
+}
+
+.album-search-status-pending {
+  background: rgba(59, 130, 246, 0.15);
+  color: #1d4ed8;
+}
+
+.album-search-status-failed {
+  background: rgba(220, 38, 38, 0.15);
+  color: #991b1b;
+}
+
+.album-search-item-meta {
+  margin: 0;
+  color: #334155;
+  font-size: 12px;
+  word-break: break-word;
+}
+
+.album-search-item-meta-id {
+  color: #475569;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 11px;
+}
+
 @media (min-width: 1024px) {
   .photo-shell {
     grid-template-columns: minmax(0, 1.8fr) minmax(320px, 1fr);
@@ -474,7 +631,6 @@ body,
     width: calc(100vw - 20px);
     justify-content: space-between;
   }
-
 }
 
 @media (max-width: 640px) {

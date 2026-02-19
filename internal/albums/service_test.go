@@ -112,6 +112,182 @@ func TestListAlbumsSnapshotInvalidatesOnCacheMutation(t *testing.T) {
 	}
 }
 
+func TestSearchAlbumsByNamePrefixMatchesCaseInsensitiveAndOrdersByCreatedAt(t *testing.T) {
+	s := &Service{
+		albumCache: map[string]*models.AlbumIndex{
+			"album-new": {
+				AlbumID:          "album-new",
+				OriginalFilename: "Holiday Trip.zip",
+				CreatedAt:        "2026-02-17T10:00:00Z",
+				PhotoCount:       2,
+				Photos: []models.PhotoMeta{
+					{I: 0},
+					{I: 1},
+				},
+				Embeddings: map[string]models.PhotoEmbedding{
+					"0": {Status: "ready", Vector: []float32{0.1}},
+				},
+			},
+			"album-old": {
+				AlbumID:          "album-old",
+				OriginalFilename: "holiday family.zip",
+				CreatedAt:        "2026-02-16T10:00:00Z",
+				PhotoCount:       1,
+				Photos: []models.PhotoMeta{
+					{I: 0},
+				},
+				Embeddings: map[string]models.PhotoEmbedding{
+					"0": {Status: "ready", Vector: []float32{0.2}},
+				},
+			},
+			"album-other": {
+				AlbumID:          "album-other",
+				OriginalFilename: "Weekend.zip",
+				CreatedAt:        "2026-02-18T10:00:00Z",
+				PhotoCount:       1,
+				Photos: []models.PhotoMeta{
+					{I: 0},
+				},
+			},
+		},
+	}
+
+	got, err := s.SearchAlbumsByNamePrefix(context.Background(), "  HoLiDaY ", 10)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("expected 2 albums, got %d", len(got))
+	}
+	if got[0].AlbumID != "album-new" || got[1].AlbumID != "album-old" {
+		t.Fatalf("unexpected ordering: %+v", got)
+	}
+	if got[0].IndexStatus != models.AlbumIndexStatusPartial {
+		t.Fatalf("expected partial status for first result, got %q", got[0].IndexStatus)
+	}
+	if got[0].IndexedCount != 1 || got[0].FailedCount != 0 || got[0].TotalCount != 2 {
+		t.Fatalf("unexpected counts for first result: %+v", got[0])
+	}
+	if got[1].IndexStatus != models.AlbumIndexStatusReady {
+		t.Fatalf("expected ready status for second result, got %q", got[1].IndexStatus)
+	}
+}
+
+func TestSearchAlbumsByNamePrefixSupportsEmptyQueryAndLimit(t *testing.T) {
+	s := &Service{
+		albumCache: map[string]*models.AlbumIndex{
+			"album-a": {AlbumID: "album-a", OriginalFilename: "A.zip", CreatedAt: "2026-02-15T10:00:00Z"},
+			"album-b": {AlbumID: "album-b", OriginalFilename: "B.zip", CreatedAt: "2026-02-17T10:00:00Z"},
+			"album-c": {AlbumID: "album-c", OriginalFilename: "C.zip", CreatedAt: "2026-02-16T10:00:00Z"},
+		},
+	}
+
+	got, err := s.SearchAlbumsByNamePrefix(context.Background(), "", 1)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("expected 1 album due to limit, got %d", len(got))
+	}
+	if got[0].AlbumID != "album-b" {
+		t.Fatalf("expected newest album first, got %q", got[0].AlbumID)
+	}
+}
+
+func TestAlbumIndexStatusCounts(t *testing.T) {
+	tests := []struct {
+		name        string
+		album       *models.AlbumIndex
+		wantStatus  models.AlbumIndexStatus
+		wantIndexed int
+		wantFailed  int
+		wantTotal   int
+	}{
+		{
+			name: "ready when all embeddings are ready",
+			album: &models.AlbumIndex{
+				Photos: []models.PhotoMeta{{I: 0}},
+				Embeddings: map[string]models.PhotoEmbedding{
+					"0": {Status: "ready", Vector: []float32{0.1}},
+				},
+			},
+			wantStatus:  models.AlbumIndexStatusReady,
+			wantIndexed: 1,
+			wantFailed:  0,
+			wantTotal:   1,
+		},
+		{
+			name: "partial when some embeddings are ready",
+			album: &models.AlbumIndex{
+				Photos: []models.PhotoMeta{{I: 0}, {I: 1}},
+				Embeddings: map[string]models.PhotoEmbedding{
+					"0": {Status: "ready", Vector: []float32{0.1}},
+				},
+			},
+			wantStatus:  models.AlbumIndexStatusPartial,
+			wantIndexed: 1,
+			wantFailed:  0,
+			wantTotal:   2,
+		},
+		{
+			name: "pending when no ready or failed embeddings exist",
+			album: &models.AlbumIndex{
+				Photos: []models.PhotoMeta{{I: 0}},
+				Embeddings: map[string]models.PhotoEmbedding{
+					"0": {Status: "ready"},
+				},
+			},
+			wantStatus:  models.AlbumIndexStatusPending,
+			wantIndexed: 0,
+			wantFailed:  0,
+			wantTotal:   1,
+		},
+		{
+			name: "failed when failed exists but no ready embeddings",
+			album: &models.AlbumIndex{
+				Photos: []models.PhotoMeta{{I: 0}, {I: 1}},
+				Embeddings: map[string]models.PhotoEmbedding{
+					"0": {Status: "failed"},
+				},
+			},
+			wantStatus:  models.AlbumIndexStatusFailed,
+			wantIndexed: 0,
+			wantFailed:  1,
+			wantTotal:   2,
+		},
+		{
+			name: "uses photo count fallback when photos are absent",
+			album: &models.AlbumIndex{
+				PhotoCount: 3,
+			},
+			wantStatus:  models.AlbumIndexStatusPending,
+			wantIndexed: 0,
+			wantFailed:  0,
+			wantTotal:   3,
+		},
+	}
+
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			gotStatus, gotIndexed, gotFailed, gotTotal := albumIndexStatusCounts(tc.album)
+			if gotStatus != tc.wantStatus || gotIndexed != tc.wantIndexed || gotFailed != tc.wantFailed || gotTotal != tc.wantTotal {
+				t.Fatalf(
+					"status counts mismatch: got=(%q,%d,%d,%d) want=(%q,%d,%d,%d)",
+					gotStatus,
+					gotIndexed,
+					gotFailed,
+					gotTotal,
+					tc.wantStatus,
+					tc.wantIndexed,
+					tc.wantFailed,
+					tc.wantTotal,
+				)
+			}
+		})
+	}
+}
+
 func TestMergeAlbumCachesPreservesExistingAndOverwritesScanned(t *testing.T) {
 	existing := map[string]*models.AlbumIndex{
 		"from-memory": {AlbumID: "from-memory", CreatedAt: "2026-02-15T00:00:01Z"},

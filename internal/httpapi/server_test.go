@@ -33,6 +33,11 @@ func TestParseOptionalIntQuery(t *testing.T) {
 	if _, err := parseOptionalIntQuery(invalidReq, "limit", 80, 1, 200); err == nil {
 		t.Fatalf("expected error for out-of-range limit")
 	}
+
+	tooLargeReq := httptest.NewRequest(http.MethodGet, "/api/feed?limit=201", nil)
+	if _, err := parseOptionalIntQuery(tooLargeReq, "limit", 80, 1, 200); err == nil {
+		t.Fatalf("expected error for too large limit")
+	}
 }
 
 func TestParseNonNegativePathIntParam(t *testing.T) {

@@ -3,12 +3,15 @@ import { expect, test, type APIRequestContext } from '@playwright/test'
 const zipBase64 =
   'UEsDBBQAAAAIAA+ETVzTNyprPwAAAEQAAAAHABwAMDAxLnBuZ1VUCQADHVKPaR1Sj2l1eAsAAQToAwAABOgDAADrDPBz5+WS4mJgYOD19HAJAtKMIMzBAiS3yvAwASluTxfHkIpbyX/+yzMwMzMxvLtafhIozODp6ueyzimhCQBQSwMEFAAAAAgAD4RNXKnVyORAAAAARAAAAAcAHAAwMDIucG5nVVQJAAMdUo9pHVKPaXV4CwABBOgDAAAE6AMAAOsM8HPn5ZLiYmBg4PX0cAkC0kxAzMjBAiT/1EzJAVLcni6OIRW3kv+cP8DAyszYsPJ9ciFQmMHT1c9lnVNCEwBQSwECHgMUAAAACAAPhE1c0zcqaz8AAABEAAAABwAYAAAAAAAAAAAApIEAAAAAMDAxLnBuZ1VUBQADHVKPaXV4CwABBOgDAAAE6AMAAFBLAQIeAxQAAAAIAA+ETVyp1cjkQAAAAEQAAAAHABgAAAAAAAAAAACkgYAAAAAwMDIucG5nVVQFAAMdUo9pdXgLAAEE6AMAAAToAwAAUEsFBgAAAAACAAIAmgAAAAEBAAAAAA=='
 
-async function createAndFinalizeAlbum(request: APIRequestContext): Promise<string> {
+async function createAndFinalizeAlbum(
+  request: APIRequestContext,
+  filename = 'album.zip',
+): Promise<string> {
   const zipBuffer = Buffer.from(zipBase64, 'base64')
 
   const createRes = await request.post('/api/albums', {
     data: {
-      filename: 'album.zip',
+      filename,
       sizeBytes: zipBuffer.length,
     },
   })
@@ -77,4 +80,41 @@ test('recommendation api contract returns not found and valid status envelope', 
   }
   expect(['pending', 'ready', 'partial', 'failed']).toContain(payload.status)
   expect(payload.items === null || Array.isArray(payload.items)).toBeTruthy()
+})
+
+test('album search api supports prefix match and returns status metadata', async ({ page }) => {
+  const prefix = `search-target-${Date.now()}`
+  const albumId = await createAndFinalizeAlbum(page.request, `${prefix}-album.zip`)
+
+  const searchRes = await page.request.get(
+    `/api/albums/search?q=${encodeURIComponent(prefix)}&limit=10`,
+  )
+  expect(searchRes.ok()).toBeTruthy()
+
+  const payload = (await searchRes.json()) as {
+    albums?: Array<{
+      albumId: string
+      originalFilename: string
+      indexStatus: string
+      indexedCount: number
+      failedCount: number
+      totalCount: number
+    }>
+  }
+
+  expect(Array.isArray(payload.albums)).toBeTruthy()
+  const matched = payload.albums?.find((item) => item.albumId === albumId)
+  expect(matched).toBeTruthy()
+  expect(matched?.originalFilename).toContain(prefix)
+  expect(['pending', 'ready', 'partial', 'failed']).toContain(matched?.indexStatus ?? '')
+  expect(typeof matched?.indexedCount).toBe('number')
+  expect(typeof matched?.failedCount).toBe('number')
+  expect(typeof matched?.totalCount).toBe('number')
+})
+
+test('album search api validates limit', async ({ page }) => {
+  const res = await page.request.get('/api/albums/search?limit=0')
+  expect(res.status()).toBe(400)
+  const body = (await res.json()) as { error?: { code?: string } }
+  expect(body.error?.code).toBe('INVALID_REQUEST')
 })

@@ -57,6 +57,7 @@ func (s *Server) Router() http.Handler {
 		r.Post("/albums", s.createAlbum)
 		r.Post("/albums/{albumId}/upload", s.uploadAlbumSource)
 		r.Get("/albums", s.listAlbums)
+		r.Get("/albums/search", s.searchAlbums)
 		r.Post("/albums/{albumId}/finalize", s.finalizeAlbum)
 		r.Get("/albums/{albumId}", s.getAlbum)
 		r.Get("/feed", s.getFeed)
@@ -173,6 +174,21 @@ func (s *Server) listAlbums(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"albums": albumsList})
+}
+
+func (s *Server) searchAlbums(w http.ResponseWriter, r *http.Request) {
+	limit, err := parseOptionalIntQuery(r, "limit", 20, 1, 100)
+	if err != nil {
+		writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", "invalid limit")
+		return
+	}
+
+	results, err := s.albums.SearchAlbumsByNamePrefix(r.Context(), r.URL.Query().Get("q"), limit)
+	if err != nil {
+		writeError(w, r, http.StatusInternalServerError, "INTERNAL", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"albums": results})
 }
 
 func (s *Server) getFeed(w http.ResponseWriter, r *http.Request) {

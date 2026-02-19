@@ -157,6 +157,13 @@ export function WallPage() {
           Refresh
         </button>
         <button
+          className="upload wall-find"
+          onClick={() => navigate('/albums/find')}
+          data-testid="wall-find"
+        >
+          Find
+        </button>
+        <button
           className="upload"
           onClick={() => fileInputRef.current?.click()}
           disabled={uploading}

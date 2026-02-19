@@ -28,6 +28,23 @@ export type AlbumIndex = {
   photos: PhotoMeta[]
 }
 
+export type AlbumIndexStatus = 'ready' | 'partial' | 'pending' | 'failed'
+
+export type AlbumSearchItem = {
+  albumId: string
+  originalFilename: string
+  photoCount: number
+  createdAt: string
+  indexStatus: AlbumIndexStatus
+  indexedCount: number
+  failedCount: number
+  totalCount: number
+}
+
+export type AlbumSearchResponse = {
+  albums: AlbumSearchItem[]
+}
+
 export type RecommendationItem = {
   albumId: string
   i: number

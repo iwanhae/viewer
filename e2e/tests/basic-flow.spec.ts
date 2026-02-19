@@ -86,6 +86,7 @@ test('basic upload -> wall -> album flow', async ({ page }) => {
   await expect(page.getByTestId('wall-grid')).toBeVisible()
   await expect(page.getByTestId('masonry-column')).toHaveCount(3)
   await expect(page.getByTestId('wall-refresh')).toBeVisible()
+  await expect(page.getByTestId('wall-find')).toBeVisible()
 
   await page.getByTestId('upload-input').setInputFiles(zip1)
   await expect(page.getByTestId('upload-button')).toHaveText('+', { timeout: 90_000 })
@@ -100,6 +101,18 @@ test('basic upload -> wall -> album flow', async ({ page }) => {
   expect(originalResponse.ok()).toBeTruthy()
   expect(wallResponse.headers()['content-type']).toBe(originalResponse.headers()['content-type'])
   expect(await wallResponse.body()).toEqual(await originalResponse.body())
+
+  await page.getByTestId('wall-find').click()
+  await expect.poll(() => new URL(page.url()).pathname).toBe('/albums/find')
+  await expect(page.getByTestId('album-search-page')).toBeVisible()
+  const searchInput = page.getByTestId('album-search-input')
+  await expect(searchInput).toBeVisible()
+  await searchInput.fill('album-a')
+  await expect(page.getByTestId('album-search-item').first()).toBeVisible({ timeout: 60_000 })
+  await page.getByTestId('album-search-item').first().click()
+  await expect(page.getByTestId('album-grid')).toBeVisible({ timeout: 60_000 })
+  await page.getByTestId('album-back').click()
+  await expect(page.getByTestId('wall-grid')).toBeVisible()
 
   const initialSeed = new URL(page.url()).searchParams.get('seed')
   expect(initialSeed).toBeTruthy()

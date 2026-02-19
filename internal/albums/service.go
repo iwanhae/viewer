@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -368,6 +369,43 @@ func (s *Service) ListAlbums(ctx context.Context) ([]models.AlbumSummary, error)
 	return out, nil
 }
 
+func (s *Service) SearchAlbumsByNamePrefix(ctx context.Context, q string, limit int) ([]models.AlbumSearchItem, error) {
+	_ = ctx
+	if limit <= 0 {
+		limit = 20
+	}
+
+	normalizedQuery := strings.ToLower(strings.TrimSpace(q))
+
+	s.mu.RLock()
+	items := make([]models.AlbumSearchItem, 0, len(s.albumCache))
+	for _, idx := range s.albumCache {
+		if idx == nil {
+			continue
+		}
+		if normalizedQuery != "" && !strings.HasPrefix(strings.ToLower(idx.OriginalFilename), normalizedQuery) {
+			continue
+		}
+		items = append(items, albumSearchItemFromIndex(idx))
+	}
+	s.mu.RUnlock()
+
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].CreatedAt != items[j].CreatedAt {
+			return items[i].CreatedAt > items[j].CreatedAt
+		}
+		if items[i].OriginalFilename != items[j].OriginalFilename {
+			return items[i].OriginalFilename < items[j].OriginalFilename
+		}
+		return items[i].AlbumID < items[j].AlbumID
+	})
+
+	if len(items) > limit {
+		items = items[:limit]
+	}
+	return items, nil
+}
+
 func (s *Service) AllAlbums() []*models.AlbumIndex {
 	s.mu.RLock()
 	if s.allAlbumsSnapshot != nil {
@@ -449,5 +487,71 @@ func cloneAlbumIndex(idx *models.AlbumIndex) *models.AlbumIndex {
 	}
 	dup := *idx
 	dup.Photos = append([]models.PhotoMeta(nil), idx.Photos...)
+	if idx.Embeddings != nil {
+		dup.Embeddings = make(map[string]models.PhotoEmbedding, len(idx.Embeddings))
+		for key, value := range idx.Embeddings {
+			embeddingCopy := value
+			if value.Vector != nil {
+				embeddingCopy.Vector = append([]float32(nil), value.Vector...)
+			}
+			dup.Embeddings[key] = embeddingCopy
+		}
+	}
 	return &dup
+}
+
+func albumSearchItemFromIndex(idx *models.AlbumIndex) models.AlbumSearchItem {
+	indexStatus, indexedCount, failedCount, totalCount := albumIndexStatusCounts(idx)
+	return models.AlbumSearchItem{
+		AlbumID:          idx.AlbumID,
+		OriginalFilename: idx.OriginalFilename,
+		PhotoCount:       idx.PhotoCount,
+		CreatedAt:        idx.CreatedAt,
+		IndexStatus:      indexStatus,
+		IndexedCount:     indexedCount,
+		FailedCount:      failedCount,
+		TotalCount:       totalCount,
+	}
+}
+
+func albumIndexStatusCounts(idx *models.AlbumIndex) (models.AlbumIndexStatus, int, int, int) {
+	if idx == nil {
+		return models.AlbumIndexStatusPending, 0, 0, 0
+	}
+
+	readyCount := 0
+	failedCount := 0
+	totalCount := len(idx.Photos)
+	if totalCount == 0 && idx.PhotoCount > 0 {
+		totalCount = idx.PhotoCount
+	}
+
+	for _, photo := range idx.Photos {
+		embedding, ok := idx.Embeddings[strconv.Itoa(photo.I)]
+		if !ok {
+			continue
+		}
+		switch embedding.Status {
+		case "ready":
+			if len(embedding.Vector) > 0 {
+				readyCount++
+			}
+		case "failed":
+			failedCount++
+		}
+	}
+
+	if totalCount == 0 {
+		return models.AlbumIndexStatusPending, readyCount, failedCount, totalCount
+	}
+	if readyCount == totalCount {
+		return models.AlbumIndexStatusReady, readyCount, failedCount, totalCount
+	}
+	if readyCount > 0 {
+		return models.AlbumIndexStatusPartial, readyCount, failedCount, totalCount
+	}
+	if failedCount > 0 {
+		return models.AlbumIndexStatusFailed, readyCount, failedCount, totalCount
+	}
+	return models.AlbumIndexStatusPending, readyCount, failedCount, totalCount
 }

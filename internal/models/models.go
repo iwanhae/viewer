@@ -32,6 +32,26 @@ type AlbumSummary struct {
 	CreatedAt        string `json:"createdAt"`
 }
 
+type AlbumIndexStatus string
+
+const (
+	AlbumIndexStatusReady   AlbumIndexStatus = "ready"
+	AlbumIndexStatusPartial AlbumIndexStatus = "partial"
+	AlbumIndexStatusPending AlbumIndexStatus = "pending"
+	AlbumIndexStatusFailed  AlbumIndexStatus = "failed"
+)
+
+type AlbumSearchItem struct {
+	AlbumID          string           `json:"albumId"`
+	OriginalFilename string           `json:"originalFilename"`
+	PhotoCount       int              `json:"photoCount"`
+	CreatedAt        string           `json:"createdAt"`
+	IndexStatus      AlbumIndexStatus `json:"indexStatus"`
+	IndexedCount     int              `json:"indexedCount"`
+	FailedCount      int              `json:"failedCount"`
+	TotalCount       int              `json:"totalCount"`
+}
+
 type FeedItem struct {
 	AlbumID string  `json:"albumId"`
 	I       int     `json:"i"`

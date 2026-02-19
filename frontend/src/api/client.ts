@@ -2,6 +2,7 @@ import { cacheAlbum, getCachedAlbum as getCachedAlbumValue } from './albumCache'
 import { ensureOK, requestJSON } from './http'
 import type {
   AlbumIndex,
+  AlbumSearchResponse,
   FeedResponse,
   RecommendationItem,
   RecommendationResponse,
@@ -10,6 +11,9 @@ import type {
 
 export type {
   AlbumIndex,
+  AlbumIndexStatus,
+  AlbumSearchItem,
+  AlbumSearchResponse,
   FeedItem,
   FeedResponse,
   PhotoMeta,
@@ -80,6 +84,20 @@ export async function fetchAlbum(albumId: string, options?: { signal?: AbortSign
   const album = await requestJSON<AlbumIndex>(`/api/albums/${albumId}`, { signal: options?.signal })
   cacheAlbum(album)
   return album
+}
+
+export async function fetchAlbumSearch(params?: {
+  q?: string
+  limit?: number
+  signal?: AbortSignal
+}): Promise<AlbumSearchResponse> {
+  const query = new URLSearchParams()
+  if (params?.q !== undefined) query.set('q', params.q)
+  if (params?.limit !== undefined) query.set('limit', String(params.limit))
+
+  const suffix = query.toString()
+  const path = suffix ? `/api/albums/search?${suffix}` : '/api/albums/search'
+  return await requestJSON<AlbumSearchResponse>(path, { signal: params?.signal })
 }
 
 export async function fetchRecommendations(
