@@ -4,7 +4,6 @@ export type FeedItem = {
   w: number
   h: number
   ratio: number
-  src: string
 }
 
 export type FeedResponse = {
@@ -44,7 +43,6 @@ export type RecommendationItem = {
   w: number
   h: number
   score: number
-	src: string
 }
 
 export type RecommendationResponse = {

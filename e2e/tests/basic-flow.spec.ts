@@ -15,7 +15,8 @@ const zip2Base64 = zip1Base64
 const wallColumns = 3
 
 type FeedItem = {
-  src: string
+  albumId: string
+  i: number
   w: number
   h: number
 }
@@ -55,7 +56,7 @@ function distributeMasonry<T>(items: T[], columnCount: number, weight: (item: T)
 
 function wallOrderSrcs(items: FeedItem[], columns: number): string[] {
   return distributeMasonry(items, columns, (item) => item.h / Math.max(item.w, 1))
-    .flatMap((column) => column.map((item) => item.src))
+    .flatMap((column) => column.map((item) => `/api/image/${item.albumId}/${item.i}`))
 }
 
 async function fetchFeedForSeed(page: Page, seed: string): Promise<FeedResponse> {

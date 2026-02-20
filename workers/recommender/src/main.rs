@@ -136,7 +136,6 @@ pub unsafe extern "C" fn hgemm_(
 const DEFAULT_LISTEN_ADDR: &str = "0.0.0.0:18081";
 const DEFAULT_MODEL_ID: &str = "google/siglip2-base-patch16-224";
 const DEFAULT_LOG_FILTER: &str = "info,recommender=info";
-const BACKEND_NAME: &str = "siglip2-candle";
 
 #[derive(Debug, Clone)]
 struct RuntimeConfig {
@@ -167,16 +166,6 @@ struct EmbedResponse {
     ok: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error_stage: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    traceback: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    backend: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    model: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    image_size_bytes: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     embedding: Option<Vec<f32>>,
 }
@@ -225,7 +214,7 @@ impl Worker {
         }
     }
 
-    fn embed(&self, image_bytes: &[u8], model_id: &str) -> Result<(Vec<f32>, String)> {
+    fn embed(&self, image_bytes: &[u8], model_id: &str) -> Result<Vec<f32>> {
         let loaded = self.ensure_model(model_id)?;
         let pixel_values = preprocess_image(image_bytes, loaded.config.vision_config.image_size)?;
         let features = loaded
@@ -237,7 +226,7 @@ impl Worker {
             .context("flatten image features")?
             .to_vec1::<f32>()
             .context("convert image features to vector")?;
-        Ok((embedding, format!("{BACKEND_NAME}:{model_id}")))
+        Ok(embedding)
     }
 }
 
@@ -340,16 +329,11 @@ fn preprocess_image(image_bytes: &[u8], image_size: usize) -> Result<Tensor> {
     Ok(tensor)
 }
 
-fn success_response(req: &EmbedRequest, model: String, embedding: Vec<f32>) -> EmbedResponse {
+fn success_response(req: &EmbedRequest, embedding: Vec<f32>) -> EmbedResponse {
     EmbedResponse {
         request_id: req.request_id.clone(),
         ok: true,
         error: None,
-        error_stage: None,
-        traceback: None,
-        backend: Some(BACKEND_NAME.to_string()),
-        model: Some(model),
-        image_size_bytes: None,
         embedding: Some(embedding),
     }
 }
@@ -359,34 +343,15 @@ fn ping_response(request_id: &str) -> EmbedResponse {
         request_id: request_id.to_string(),
         ok: true,
         error: None,
-        error_stage: None,
-        traceback: None,
-        backend: Some(BACKEND_NAME.to_string()),
-        model: Some(BACKEND_NAME.to_string()),
-        image_size_bytes: None,
         embedding: None,
     }
 }
 
-fn error_response(
-    req_id: String,
-    err: anyhow::Error,
-    error_stage: &str,
-    image_size_bytes: usize,
-) -> EmbedResponse {
+fn error_response(req_id: String, err: anyhow::Error) -> EmbedResponse {
     EmbedResponse {
         request_id: req_id,
         ok: false,
         error: Some(err.to_string()),
-        error_stage: Some(error_stage.to_string()),
-        traceback: None,
-        backend: Some(BACKEND_NAME.to_string()),
-        model: None,
-        image_size_bytes: if image_size_bytes > 0 {
-            Some(image_size_bytes)
-        } else {
-            None
-        },
         embedding: None,
     }
 }
@@ -507,7 +472,7 @@ fn handle_embed(worker: &Arc<Worker>, config: &RuntimeConfig, body: &[u8]) -> Re
             );
             return Ok(write_json_response(
                 req.request_id.clone(),
-                error_response(req.request_id, err, "decode", 0),
+                error_response(req.request_id, err),
             )?);
         }
     };
@@ -530,14 +495,14 @@ fn handle_embed(worker: &Arc<Worker>, config: &RuntimeConfig, body: &[u8]) -> Re
         );
         return Ok(write_json_response(
             req.request_id.clone(),
-            error_response(req.request_id, err, "init", image_size_bytes),
+            error_response(req.request_id, err),
         )?);
     }
     let request_id = req.request_id.clone();
     let inference_started = Instant::now();
     let result = worker.embed(&decoded, &config.model_id);
     match result {
-        Ok((embedding, model_id)) => {
+        Ok(embedding) => {
             info!(
                 request_id = %request_id,
                 model_id = %config.model_id,
@@ -549,7 +514,7 @@ fn handle_embed(worker: &Arc<Worker>, config: &RuntimeConfig, body: &[u8]) -> Re
             );
             Ok(write_json_response(
                 request_id,
-                success_response(&req, model_id, embedding),
+                success_response(&req, embedding),
             )?)
         }
         Err(err) => {
@@ -565,7 +530,7 @@ fn handle_embed(worker: &Arc<Worker>, config: &RuntimeConfig, body: &[u8]) -> Re
             );
             Ok(write_json_response(
                 request_id.clone(),
-                error_response(request_id, err, "inference", image_size_bytes),
+                error_response(request_id, err),
             )?)
         }
     }
@@ -621,7 +586,7 @@ fn handle_client(mut stream: TcpStream, worker: Arc<Worker>, config: Arc<Runtime
                             error = %err,
                             "failed to serve /ping"
                         );
-                        let resp = error_response("ping".to_string(), err, "ping", 0);
+                        let resp = error_response("ping".to_string(), err);
                         write_json_response("ping".to_string(), resp).unwrap_or_else(|write_err| {
                             error!(
                                 method = "GET",
@@ -646,7 +611,7 @@ fn handle_client(mut stream: TcpStream, worker: Arc<Worker>, config: Arc<Runtime
                             error = %err,
                             "failed to serve /healthz"
                         );
-                        let resp = error_response("healthz".to_string(), err, "healthz", 0);
+                        let resp = error_response("healthz".to_string(), err);
                         write_json_response("healthz".to_string(), resp).unwrap_or_else(
                             |write_err| {
                                 error!(
@@ -675,8 +640,7 @@ fn handle_client(mut stream: TcpStream, worker: Arc<Worker>, config: Arc<Runtime
                             error = %err,
                             "failed to process /embed request"
                         );
-                        let resp =
-                            error_response("request".to_string(), err, "request", req.body.len());
+                        let resp = error_response("request".to_string(), err);
                         write_json_response("request".to_string(), resp).unwrap_or_else(
                             |write_err| {
                                 error!(

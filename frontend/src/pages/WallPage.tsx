@@ -72,7 +72,7 @@ export function WallPage() {
             data-testid="wall-tile"
           >
             <img
-              src={item.src}
+              src={`/api/image/${item.albumId}/${item.i}`}
               alt=""
               loading="lazy"
               style={{ aspectRatio: `${item.w} / ${item.h}` }}

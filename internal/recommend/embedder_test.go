@@ -51,7 +51,7 @@ func TestHTTPEmbedderReturnsConfigErrorWhenEndpointMissing(t *testing.T) {
 		t.Fatalf("Healthcheck err=%v want=%v", err, errRecommenderEndpointNotConfigured)
 	}
 
-	_, _, err := embedder.Embed(context.Background(), []byte("image"))
+	_, err := embedder.Embed(context.Background(), []byte("image"))
 	if !errors.Is(err, errRecommenderEndpointNotConfigured) {
 		t.Fatalf("Embed err=%v want=%v", err, errRecommenderEndpointNotConfigured)
 	}

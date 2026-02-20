@@ -15,7 +15,7 @@ func findNeighbors(embeddings map[string]EmbeddingRecord, query []float32, limit
 	if limit <= 0 {
 		return nil
 	}
-	queryNormed, _ := normalizeVector(query)
+	queryNormed := normalizeVector(query)
 	if len(queryNormed) == 0 {
 		return nil
 	}
@@ -41,9 +41,9 @@ func findNeighbors(embeddings map[string]EmbeddingRecord, query []float32, limit
 	return neighbors
 }
 
-func normalizeVector(in []float32) ([]float32, float64) {
+func normalizeVector(in []float32) []float32 {
 	if len(in) == 0 {
-		return nil, 0
+		return nil
 	}
 	norm := 0.0
 	for _, value := range in {
@@ -57,7 +57,7 @@ func normalizeVector(in []float32) ([]float32, float64) {
 	for idx, value := range in {
 		out[idx] = float32(float64(value) / norm)
 	}
-	return out, norm
+	return out
 }
 
 func cosineNormalized(a []float32, b []float32) float64 {

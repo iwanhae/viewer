@@ -197,17 +197,6 @@ func (s *S3Store) HeadObject(ctx context.Context, key string) (bool, int64, erro
 	return true, size, nil
 }
 
-func (s *S3Store) ListAlbumIndexKeys(ctx context.Context) ([]string, error) {
-	keys := make([]string, 0, 128)
-	if err := s.ForEachAlbumIndexKey(ctx, func(key string) error {
-		keys = append(keys, key)
-		return nil
-	}); err != nil {
-		return nil, err
-	}
-	return keys, nil
-}
-
 func (s *S3Store) ForEachAlbumIndexKey(ctx context.Context, fn func(key string) error) error {
 	if fn == nil {
 		return nil

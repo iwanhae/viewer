@@ -1,16 +1,13 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useMemo } from 'react'
 import { useLocation, useNavigate, useParams } from 'react-router-dom'
-import { seedCachedAlbum, type AlbumIndex, type RecommendationItem } from '../api/client'
+import { seedCachedAlbum, type AlbumIndex } from '../api/client'
 import { useAlbum } from '../hooks/useAlbum'
 import { useRecommendations } from '../hooks/useRecommendations'
 import { MasonryWall } from '../components/MasonryWall'
 
-type RecommendationGridItem =
-  | { kind: 'photo'; recommendation: RecommendationItem }
-  | { kind: 'load-more' }
+const recommendationLimit = 24
 
 export function PhotoPage() {
-  const recommendationPageSize = 12
   const { albumId = '', photoIndex: rawPhotoIndex = '' } = useParams<{
     albumId: string
     photoIndex: string
@@ -37,9 +34,6 @@ export function PhotoPage() {
 
   const { album, loading, error } = useAlbum(albumId, locationAlbum)
   const recommendationColumnCount = 3
-  const [recommendationLimit, setRecommendationLimit] = useState(recommendationPageSize)
-  const [displayedRecommendations, setDisplayedRecommendations] = useState<RecommendationItem[]>([])
-  const [hasMoreRecommendations, setHasMoreRecommendations] = useState(true)
 
   const photo = useMemo(() => {
     if (!album || photoIndex === null) return null
@@ -59,44 +53,7 @@ export function PhotoPage() {
     error: recommendationError,
   } = useRecommendations(album?.albumId ?? '', photo?.i ?? null, recommendationLimit)
 
-  useEffect(() => {
-    setRecommendationLimit(recommendationPageSize)
-    setDisplayedRecommendations([])
-    setHasMoreRecommendations(true)
-  }, [album?.albumId, photo?.i])
-
-  useEffect(() => {
-    if (recommendations.length === 0) return
-    setDisplayedRecommendations((current) => {
-      if (current.length === 0) return recommendations
-      const existingKeys = new Set(current.map((item) => `${item.albumId}-${item.i}`))
-      const appended = recommendations.filter(
-        (item) => !existingKeys.has(`${item.albumId}-${item.i}`),
-      )
-      if (appended.length === 0) return current
-      return [...current, ...appended]
-    })
-  }, [recommendations])
-
-  useEffect(() => {
-    if (recommendationLoadStatus !== 'ready') return
-    setHasMoreRecommendations(recommendations.length >= recommendationLimit)
-  }, [recommendations.length, recommendationLimit, recommendationLoadStatus])
-
   const isRecommendationLoading = recommendationLoadStatus === 'loading'
-  const canShowLoadMore =
-    displayedRecommendations.length > 0 && hasMoreRecommendations && recommendationError === null
-
-  const recommendationGridItems = useMemo<RecommendationGridItem[]>(() => {
-    const photoItems: RecommendationGridItem[] = displayedRecommendations.map((item) => ({
-      kind: 'photo',
-      recommendation: item,
-    }))
-    if (canShowLoadMore) {
-      photoItems.push({ kind: 'load-more' })
-    }
-    return photoItems
-  }, [canShowLoadMore, displayedRecommendations])
 
   if (!albumId) {
     return <div className="photo-error">Missing album ID</div>
@@ -162,8 +119,8 @@ export function PhotoPage() {
             <div className="photo-recommendations-header">
               <h2 className="photo-recommendations-title">Similar images</h2>
               <p className="photo-recommendations-meta">
-                {displayedRecommendations.length} shown
-                {isRecommendationLoading ? '  Loading more...' : ''}
+                {recommendations.length} shown
+                {isRecommendationLoading ? '  Loading...' : ''}
               </p>
             </div>
             {recommendationLoadStatus === 'loading' && (
@@ -172,66 +129,32 @@ export function PhotoPage() {
             {recommendationError && (
               <p className="photo-recommendations-note">Recommendations unavailable right now.</p>
             )}
-            {recommendationLoadStatus === 'ready' &&
-              displayedRecommendations.length === 0 && (
-                <p className="photo-recommendations-note">No similar images found yet.</p>
-              )}
-            {recommendationGridItems.length > 0 && (
+            {recommendationLoadStatus === 'ready' && recommendations.length === 0 && (
+              <p className="photo-recommendations-note">No similar images found yet.</p>
+            )}
+            {recommendations.length > 0 && (
               <MasonryWall
-                items={recommendationGridItems}
+                items={recommendations}
                 columnCount={recommendationColumnCount}
-                getItemWeight={(item) =>
-                  item.kind === 'photo'
-                    ? item.recommendation.h / Math.max(item.recommendation.w, 1)
-                    : 0.32
-                }
+                getItemWeight={(item) => item.h / Math.max(item.w, 1)}
                 renderItem={(item) => (
-                  item.kind === 'photo' ? (
-                    <button
-                      className="photo-recommendation-tile"
-                      onClick={() =>
-                        navigate(`/album/${item.recommendation.albumId}/${item.recommendation.i}`)
-                      }
-                      aria-label={`Open similar image ${item.recommendation.i + 1}`}
-                      data-testid="photo-recommendation-tile"
-                    >
-                      <img
-                        src={item.recommendation.src}
-                        alt=""
-                        loading="lazy"
-                        style={{
-                          aspectRatio: `${item.recommendation.w} / ${item.recommendation.h}`,
-                        }}
-                      />
-                    </button>
-                  ) : (
-                    <button
-                      className="photo-recommendation-load-more-tile"
-                      type="button"
-                      onClick={() =>
-                        setRecommendationLimit((current) => current + recommendationPageSize)
-                      }
-                      disabled={isRecommendationLoading}
-                      data-testid="photo-recommendations-load-more"
-                    >
-                      <span className="photo-recommendation-load-more-title">
-                        {isRecommendationLoading
-                          ? 'Loading more...'
-                          : 'Load more similar images'}
-                      </span>
-                      <span className="photo-recommendation-load-more-subtitle">
-                        {isRecommendationLoading
-                          ? 'Searching for more albums'
-                          : `Show ${recommendationPageSize} more`}
-                      </span>
-                    </button>
-                  )
+                  <button
+                    className="photo-recommendation-tile"
+                    onClick={() => navigate(`/album/${item.albumId}/${item.i}`)}
+                    aria-label={`Open similar image ${item.i + 1}`}
+                    data-testid="photo-recommendation-tile"
+                  >
+                    <img
+                      src={`/api/image/${item.albumId}/${item.i}`}
+                      alt=""
+                      loading="lazy"
+                      style={{
+                        aspectRatio: `${item.w} / ${item.h}`,
+                      }}
+                    />
+                  </button>
                 )}
-                getItemKey={(item) =>
-                  item.kind === 'photo'
-                    ? `${item.recommendation.albumId}-${item.recommendation.i}`
-                    : 'load-more'
-                }
+                getItemKey={(item) => `${item.albumId}-${item.i}`}
                 containerClassName="photo-recommendation-grid"
                 containerTestId="photo-recommendation-grid"
                 columnTestId="photo-recommendation-column"

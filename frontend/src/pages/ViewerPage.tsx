@@ -45,15 +45,6 @@ export function ViewerPage() {
     })
   }, [album, anchorIndex])
 
-  const imageWidth = useMemo(() => {
-    if (typeof window === 'undefined') return 480
-
-    const estimated = Math.floor(window.innerWidth / Math.max(1, columnCount))
-    if (estimated < 64) return 64
-    if (estimated > 2048) return 2048
-    return estimated
-  }, [columnCount])
-
   const albumPhotos = useMemo(() => album?.photos ?? [], [album?.photos])
 
   const onBackToWall = () => {
@@ -93,7 +84,7 @@ export function ViewerPage() {
             aria-label={`Open details for image ${photo.i + 1}`}
           >
             <img
-              src={`/api/image/${album.albumId}/${photo.i}?mode=wall&w=${imageWidth}`}
+              src={`/api/image/${album.albumId}/${photo.i}`}
               alt=""
               loading="lazy"
               style={{ aspectRatio: `${photo.w} / ${photo.h}` }}

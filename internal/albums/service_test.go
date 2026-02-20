@@ -7,7 +7,6 @@ import (
 	"reflect"
 	"sort"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -69,49 +68,6 @@ func TestAllAlbumsReturnsCopies(t *testing.T) {
 	}
 }
 
-func TestListAlbumsDoesNotBlockOnEmptyCache(t *testing.T) {
-	s := &Service{
-		albumCache: map[string]*models.AlbumIndex{},
-	}
-
-	albumsList, err := s.ListAlbums(context.Background())
-	if err != nil {
-		t.Fatalf("expected no error, got %v", err)
-	}
-	if len(albumsList) != 0 {
-		t.Fatalf("expected empty albums list, got %d", len(albumsList))
-	}
-}
-
-func TestListAlbumsSnapshotInvalidatesOnCacheMutation(t *testing.T) {
-	s := &Service{
-		albumCache: map[string]*models.AlbumIndex{
-			"album-a": {AlbumID: "album-a", CreatedAt: "2026-02-15T00:00:01Z"},
-		},
-	}
-
-	first, err := s.ListAlbums(context.Background())
-	if err != nil {
-		t.Fatalf("expected no error, got %v", err)
-	}
-	if len(first) != 1 {
-		t.Fatalf("expected one album in first snapshot, got %d", len(first))
-	}
-
-	s.mu.Lock()
-	s.albumCache["album-b"] = &models.AlbumIndex{AlbumID: "album-b", CreatedAt: "2026-02-15T00:00:02Z"}
-	s.invalidateSnapshotsLocked()
-	s.mu.Unlock()
-
-	second, err := s.ListAlbums(context.Background())
-	if err != nil {
-		t.Fatalf("expected no error, got %v", err)
-	}
-	if len(second) != 2 {
-		t.Fatalf("expected two albums after invalidation, got %d", len(second))
-	}
-}
-
 func TestSearchAlbumsByNamePrefixMatchesCaseInsensitiveAndOrdersByCreatedAt(t *testing.T) {
 	s := &Service{
 		albumCache: map[string]*models.AlbumIndex{
@@ -120,28 +76,18 @@ func TestSearchAlbumsByNamePrefixMatchesCaseInsensitiveAndOrdersByCreatedAt(t *t
 				OriginalFilename: "Holiday Trip.zip",
 				CreatedAt:        "2026-02-17T10:00:00Z",
 				PhotoCount:       2,
-				Photos: []models.PhotoMeta{
-					{I: 0},
-					{I: 1},
-				},
 			},
 			"album-old": {
 				AlbumID:          "album-old",
 				OriginalFilename: "holiday family.zip",
 				CreatedAt:        "2026-02-16T10:00:00Z",
 				PhotoCount:       1,
-				Photos: []models.PhotoMeta{
-					{I: 0},
-				},
 			},
 			"album-other": {
 				AlbumID:          "album-other",
 				OriginalFilename: "Weekend.zip",
 				CreatedAt:        "2026-02-18T10:00:00Z",
 				PhotoCount:       1,
-				Photos: []models.PhotoMeta{
-					{I: 0},
-				},
 			},
 		},
 	}
@@ -176,35 +122,6 @@ func TestSearchAlbumsByNamePrefixSupportsEmptyQueryAndLimit(t *testing.T) {
 	}
 	if got[0].AlbumID != "album-b" {
 		t.Fatalf("expected newest album first, got %q", got[0].AlbumID)
-	}
-}
-
-func TestAllAlbumsSnapshotReturnsDefensiveCopies(t *testing.T) {
-	s := &Service{
-		albumCache: map[string]*models.AlbumIndex{
-			"album-a": {
-				AlbumID:   "album-a",
-				CreatedAt: "2026-02-15T00:00:01Z",
-				Photos: []models.PhotoMeta{
-					{I: 0, Name: "001.png", W: 100, H: 100},
-				},
-			},
-		},
-	}
-
-	first := s.AllAlbums()
-	if len(first) != 1 {
-		t.Fatalf("expected one album, got %d", len(first))
-	}
-	first[0].AlbumID = "changed"
-	first[0].Photos[0].Name = "changed.png"
-
-	second := s.AllAlbums()
-	if second[0].AlbumID != "album-a" {
-		t.Fatalf("expected cached snapshot clone to keep original album id, got %q", second[0].AlbumID)
-	}
-	if second[0].Photos[0].Name != "001.png" {
-		t.Fatalf("expected cached snapshot clone to keep original photo name, got %q", second[0].Photos[0].Name)
 	}
 }
 
@@ -243,84 +160,6 @@ func (f *fakeAlbumStore) ForEachAlbumIndexKey(ctx context.Context, fn func(key s
 	return f.forEachAlbumIndexKeyFn(ctx, fn)
 }
 
-func TestRefreshFromStorageStreamsBeforeListingCompletes(t *testing.T) {
-	releaseSecond := make(chan struct{})
-	firstRead := make(chan struct{})
-	callDone := make(chan error, 1)
-
-	s := &Service{
-		store: &fakeAlbumStore{
-			forEachAlbumIndexKeyFn: func(ctx context.Context, fn func(key string) error) error {
-				if err := fn("albums/album-a/index.json"); err != nil {
-					return err
-				}
-				<-releaseSecond
-				if err := fn("albums/album-b/index.json"); err != nil {
-					return err
-				}
-				return nil
-			},
-			readJSONFn: func(ctx context.Context, key string, out any) error {
-				idx := out.(*models.AlbumIndex)
-				if strings.Contains(key, "album-a") {
-					idx.AlbumID = "album-a"
-					close(firstRead)
-					return nil
-				}
-				idx.AlbumID = "album-b"
-				return nil
-			},
-		},
-		albumCache: make(map[string]*models.AlbumIndex),
-	}
-
-	var mu sync.Mutex
-	var firstProgress *RefreshProgress
-	go func() {
-		callDone <- s.RefreshFromStorageWithProgressAndAlbum(context.Background(), func(progress RefreshProgress) {
-			mu.Lock()
-			defer mu.Unlock()
-			if firstProgress == nil {
-				cp := progress
-				firstProgress = &cp
-			}
-		}, nil)
-	}()
-
-	select {
-	case <-firstRead:
-	case <-time.After(2 * time.Second):
-		t.Fatalf("timed out waiting for first album read")
-	}
-
-	deadline := time.After(2 * time.Second)
-	for {
-		mu.Lock()
-		got := firstProgress
-		mu.Unlock()
-		if got != nil {
-			if got.ListingDone {
-				t.Fatalf("expected first progress before listing completes")
-			}
-			if got.Discovered != 1 || got.Processed != 1 || got.Succeeded != 1 || got.Failed != 0 {
-				t.Fatalf("unexpected first progress: %+v", *got)
-			}
-			break
-		}
-		select {
-		case <-deadline:
-			t.Fatalf("timed out waiting for progress callback")
-		default:
-			time.Sleep(10 * time.Millisecond)
-		}
-	}
-
-	close(releaseSecond)
-	if err := <-callDone; err != nil {
-		t.Fatalf("expected no error, got %v", err)
-	}
-}
-
 func TestRefreshFromStorageTracksFailuresAndFallbackAlbumID(t *testing.T) {
 	s := &Service{
 		store: &fakeAlbumStore{
@@ -354,10 +193,8 @@ func TestRefreshFromStorageTracksFailuresAndFallbackAlbumID(t *testing.T) {
 		albumCache: make(map[string]*models.AlbumIndex),
 	}
 
-	var last RefreshProgress
-	if err := s.RefreshFromStorageWithProgressAndAlbum(context.Background(), func(progress RefreshProgress) {
-		last = progress
-	}, nil); err != nil {
+	summary, err := s.RefreshFromStorage(context.Background(), nil)
+	if err != nil {
 		t.Fatalf("expected no error, got %v", err)
 	}
 
@@ -367,12 +204,12 @@ func TestRefreshFromStorageTracksFailuresAndFallbackAlbumID(t *testing.T) {
 	if len(s.albumCache) != 1 {
 		t.Fatalf("expected exactly one cached album, got %d", len(s.albumCache))
 	}
-	if last.Discovered != 3 || last.Processed != 3 || last.Succeeded != 1 || last.Failed != 2 {
-		t.Fatalf("unexpected final counters: %+v", last)
+	if summary.Discovered != 3 || summary.Loaded != 1 || summary.Failed != 2 {
+		t.Fatalf("unexpected refresh summary: %+v", summary)
 	}
 }
 
-func TestRefreshFromStorageWithProgressAndAlbumEmitsLoadedAlbums(t *testing.T) {
+func TestRefreshFromStorageEmitsLoadedAlbums(t *testing.T) {
 	s := &Service{
 		store: &fakeAlbumStore{
 			forEachAlbumIndexKeyFn: func(ctx context.Context, fn func(key string) error) error {
@@ -400,16 +237,10 @@ func TestRefreshFromStorageWithProgressAndAlbumEmitsLoadedAlbums(t *testing.T) {
 	}
 
 	var loaded []string
-	var loadedMu sync.Mutex
-	if err := s.RefreshFromStorageWithProgressAndAlbum(
-		context.Background(),
-		nil,
-		func(idx models.AlbumIndex) {
-			loadedMu.Lock()
-			loaded = append(loaded, idx.AlbumID)
-			loadedMu.Unlock()
-		},
-	); err != nil {
+	summary, err := s.RefreshFromStorage(context.Background(), func(idx models.AlbumIndex) {
+		loaded = append(loaded, idx.AlbumID)
+	})
+	if err != nil {
 		t.Fatalf("expected no error, got %v", err)
 	}
 
@@ -417,13 +248,34 @@ func TestRefreshFromStorageWithProgressAndAlbumEmitsLoadedAlbums(t *testing.T) {
 	if !reflect.DeepEqual(loaded, []string{"album-a", "album-b"}) {
 		t.Fatalf("unexpected loaded albums: %v", loaded)
 	}
+	if summary.Discovered != 2 || summary.Loaded != 2 || summary.Failed != 0 {
+		t.Fatalf("unexpected refresh summary: %+v", summary)
+	}
 }
 
-func TestWarmupWorkerCount(t *testing.T) {
-	if got := warmupWorkerCount(7); got != 7 {
-		t.Fatalf("expected configured worker count, got %d", got)
+func TestRefreshFromStorageReturnsListingError(t *testing.T) {
+	s := &Service{
+		store: &fakeAlbumStore{
+			forEachAlbumIndexKeyFn: func(ctx context.Context, fn func(key string) error) error {
+				if err := fn("albums/album-a/index.json"); err != nil {
+					return err
+				}
+				return errors.New("listing failed")
+			},
+			readJSONFn: func(ctx context.Context, key string, out any) error {
+				idx := out.(*models.AlbumIndex)
+				idx.AlbumID = "album-a"
+				return nil
+			},
+		},
+		albumCache: make(map[string]*models.AlbumIndex),
 	}
-	if got := warmupWorkerCount(100); got != 100 {
-		t.Fatalf("expected configured worker count without clamping, got %d", got)
+
+	summary, err := s.RefreshFromStorage(context.Background(), nil)
+	if err == nil {
+		t.Fatalf("expected listing error")
+	}
+	if summary.Discovered != 1 || summary.Loaded != 1 || summary.Failed != 0 {
+		t.Fatalf("unexpected partial summary before listing error: %+v", summary)
 	}
 }

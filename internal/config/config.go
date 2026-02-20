@@ -21,7 +21,6 @@ type Config struct {
 	CacheDir               string
 	ZipCacheDir            string
 	WarmupFetchConcurrency int
-	FeedDefaultSize        int
 	RecoTopKDefault        int
 	RecoTopKMax            int
 	RecommenderEndpoint    string
@@ -51,7 +50,6 @@ func Load() (Config, error) {
 		CacheDir:               cacheDir,
 		ZipCacheDir:            zipCacheDir,
 		WarmupFetchConcurrency: getenvInt("WARMUP_FETCH_CONCURRENCY", 0),
-		FeedDefaultSize:        getenvInt("FEED_DEFAULT_LIMIT", 80),
 		RecoTopKDefault:        getenvInt("RECO_TOPK_DEFAULT", 12),
 		RecoTopKMax:            getenvInt("RECO_TOPK_MAX", 48),
 		RecommenderEndpoint:    recommenderEndpoint,

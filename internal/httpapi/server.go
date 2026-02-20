@@ -54,7 +54,6 @@ func (s *Server) Router() http.Handler {
 
 	r.Route("/api", func(r chi.Router) {
 		r.Post("/albums", s.createAlbum)
-		r.Get("/albums", s.listAlbums)
 		r.Get("/albums/search", s.searchAlbums)
 		r.Post("/albums/{albumId}/finalize", s.finalizeAlbum)
 		r.Get("/albums/{albumId}", s.getAlbum)
@@ -138,15 +137,6 @@ func (s *Server) getAlbum(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, idx)
-}
-
-func (s *Server) listAlbums(w http.ResponseWriter, r *http.Request) {
-	albumsList, err := s.albums.ListAlbums(r.Context())
-	if err != nil {
-		writeError(w, r, http.StatusInternalServerError, "INTERNAL", err.Error())
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"albums": albumsList})
 }
 
 func (s *Server) searchAlbums(w http.ResponseWriter, r *http.Request) {
@@ -345,55 +335,21 @@ func Warmup(ctx context.Context, albumsService *albums.Service, recommendService
 	startedAt := time.Now()
 	log.Printf("album cache warmup started")
 
-	loadedCount := 0
-	failedCount := 0
-	if err := albumsService.RefreshFromStorageWithProgressAndAlbum(
-		ctx,
-		func(progress albums.RefreshProgress) {
-			stage := "listing"
-			if progress.ListingDone {
-				stage = "draining"
-			}
-			if progress.Err != nil {
-				failedCount++
-				log.Printf(
-					"album cache warmup stage=%s discovered=%d processed=%d succeeded=%d failed=%d status=failed key=%s err=%v",
-					stage,
-					progress.Discovered,
-					progress.Processed,
-					progress.Succeeded,
-					progress.Failed,
-					progress.Key,
-					progress.Err,
-				)
-				return
-			}
-
-			loadedCount++
-			log.Printf(
-				"album cache warmup stage=%s discovered=%d processed=%d succeeded=%d failed=%d status=ok album_id=%s",
-				stage,
-				progress.Discovered,
-				progress.Processed,
-				progress.Succeeded,
-				progress.Failed,
-				progress.AlbumID,
-			)
-		},
-		func(idx models.AlbumIndex) {
-			if recommendService != nil {
-				recommendService.IngestAlbumIndex(idx)
-			}
-		},
-	); err != nil {
+	summary, err := albumsService.RefreshFromStorage(ctx, func(idx models.AlbumIndex) {
+		if recommendService != nil {
+			recommendService.IngestAlbumIndex(idx)
+		}
+	})
+	if err != nil {
 		log.Printf("album cache warmup skipped: %v", err)
 		return
 	}
 
 	log.Printf(
-		"album cache warmup finished loaded=%d failed=%d duration=%s",
-		loadedCount,
-		failedCount,
+		"album cache warmup finished discovered=%d loaded=%d failed=%d duration=%s",
+		summary.Discovered,
+		summary.Loaded,
+		summary.Failed,
 		time.Since(startedAt).Round(time.Millisecond),
 	)
 }

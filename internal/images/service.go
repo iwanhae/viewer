@@ -87,82 +87,51 @@ func (s *Service) GetImageByEntry(ctx context.Context, albumID string, entryName
 	if strings.TrimSpace(albumID) == "" {
 		return ImageResult{}, fmt.Errorf("album id is required")
 	}
-	if strings.TrimSpace(entryName) == "" {
+	cleanEntryName := strings.TrimSpace(entryName)
+	if cleanEntryName == "" {
 		return ImageResult{}, fmt.Errorf("entry name is required")
-	}
-
-	entries, err := s.GetImagesByEntries(ctx, albumID, []string{entryName})
-	if err != nil {
-		return ImageResult{}, err
-	}
-	result, ok := entries[entryName]
-	if !ok {
-		return ImageResult{}, fmt.Errorf("%w: %s", ErrImageEntryNotFound, entryName)
-	}
-	return result, nil
-}
-
-func (s *Service) GetImagesByEntries(ctx context.Context, albumID string, entryNames []string) (map[string]ImageResult, error) {
-	if strings.TrimSpace(albumID) == "" {
-		return nil, fmt.Errorf("album id is required")
-	}
-	if len(entryNames) == 0 {
-		return map[string]ImageResult{}, nil
-	}
-
-	wanted := make(map[string]struct{}, len(entryNames))
-	for _, entryName := range entryNames {
-		clean := strings.TrimSpace(entryName)
-		if clean == "" {
-			return nil, fmt.Errorf("entry name is required")
-		}
-		wanted[clean] = struct{}{}
 	}
 
 	key := sourceKey(albumID)
 	exists, size, err := s.store.HeadObject(ctx, key)
 	if err != nil {
-		return nil, err
+		return ImageResult{}, err
 	}
 	if !exists || size <= 0 {
-		return nil, fmt.Errorf("%w: %s", albums.ErrAlbumSourceNotFound, albumID)
+		return ImageResult{}, fmt.Errorf("%w: %s", albums.ErrAlbumSourceNotFound, albumID)
 	}
 
 	handle, err := s.rangeCache.Open(ctx, key, size)
 	if err != nil {
-		return nil, fmt.Errorf("open range cache: %w", err)
+		return ImageResult{}, fmt.Errorf("open range cache: %w", err)
 	}
 	defer handle.Close()
 
 	r, err := zip.NewReader(handle, size)
 	if err != nil {
-		return nil, fmt.Errorf("open zip: %w", err)
+		return ImageResult{}, fmt.Errorf("open zip: %w", err)
 	}
 
-	results := make(map[string]ImageResult, len(wanted))
 	for _, f := range r.File {
-		if _, ok := wanted[f.Name]; !ok {
+		if f.Name != cleanEntryName {
 			continue
 		}
 		rc, err := f.Open()
 		if err != nil {
-			return nil, fmt.Errorf("open zip entry: %w", err)
+			return ImageResult{}, fmt.Errorf("open zip entry: %w", err)
 		}
 		data, err := io.ReadAll(rc)
 		rc.Close()
 		if err != nil {
-			return nil, fmt.Errorf("read zip entry: %w", err)
+			return ImageResult{}, fmt.Errorf("read zip entry: %w", err)
 		}
-		results[f.Name] = ImageResult{
+		return ImageResult{
 			Bytes:       data,
 			ContentType: contentTypeForEntry(f.Name),
-		}
-		if len(results) >= len(wanted) {
-			break
-		}
+		}, nil
 	}
 
-	return results, nil
+	return ImageResult{}, fmt.Errorf("%w: %s", ErrImageEntryNotFound, cleanEntryName)
 }
 
 func contentTypeForEntry(entryName string) string {

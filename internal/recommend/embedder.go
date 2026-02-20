@@ -19,7 +19,7 @@ import (
 var errRecommenderEndpointNotConfigured = errors.New("recommender endpoint is not configured")
 
 type EmbeddingProvider interface {
-	Embed(ctx context.Context, imageBytes []byte) ([]float32, string, error)
+	Embed(ctx context.Context, imageBytes []byte) ([]float32, error)
 	Healthcheck(ctx context.Context) error
 	Close() error
 }
@@ -39,15 +39,10 @@ type embedRequest struct {
 }
 
 type embedResponse struct {
-	RequestID      string    `json:"request_id"`
-	OK             bool      `json:"ok"`
-	Error          string    `json:"error,omitempty"`
-	ErrorStage     string    `json:"error_stage,omitempty"`
-	Traceback      string    `json:"traceback,omitempty"`
-	Backend        string    `json:"backend,omitempty"`
-	Model          string    `json:"model,omitempty"`
-	ImageSizeBytes int       `json:"image_size_bytes,omitempty"`
-	Embedding      []float32 `json:"embedding,omitempty"`
+	RequestID string    `json:"request_id"`
+	OK        bool      `json:"ok"`
+	Error     string    `json:"error,omitempty"`
+	Embedding []float32 `json:"embedding,omitempty"`
 }
 
 func NewHTTPEmbedder(endpoint string, requestTimeout time.Duration) *HTTPEmbedder {
@@ -105,9 +100,9 @@ func (e *HTTPEmbedder) Healthcheck(ctx context.Context) error {
 	return nil
 }
 
-func (e *HTTPEmbedder) Embed(ctx context.Context, imageBytes []byte) ([]float32, string, error) {
+func (e *HTTPEmbedder) Embed(ctx context.Context, imageBytes []byte) ([]float32, error) {
 	if strings.TrimSpace(e.endpoint) == "" {
-		return nil, "", errRecommenderEndpointNotConfigured
+		return nil, errRecommenderEndpointNotConfigured
 	}
 	if ctx == nil {
 		ctx = context.Background()
@@ -122,18 +117,18 @@ func (e *HTTPEmbedder) Embed(ctx context.Context, imageBytes []byte) ([]float32,
 
 	out, body, err := e.sendRequest(requestCtx, "/embed", payload)
 	if err != nil {
-		return nil, "", err
+		return nil, err
 	}
 	if !out.OK {
 		if out.Error == "" {
-			return nil, out.Model, errors.New("embedding failed")
+			return nil, errors.New("embedding failed")
 		}
-		return nil, out.Model, errors.New(formatWorkerError(out, body))
+		return nil, errors.New(formatWorkerError(out, body))
 	}
 	if len(out.Embedding) == 0 {
-		return nil, out.Model, fmt.Errorf("worker returned empty embedding")
+		return nil, fmt.Errorf("worker returned empty embedding")
 	}
-	return out.Embedding, out.Model, nil
+	return out.Embedding, nil
 }
 
 func (e *HTTPEmbedder) sendRequest(ctx context.Context, path string, payload embedRequest) (embedResponse, string, error) {
@@ -252,21 +247,6 @@ func formatWorkerError(out embedResponse, body string) string {
 	parts := []string{}
 	if out.Error != "" {
 		parts = append(parts, out.Error)
-	}
-	if out.ErrorStage != "" {
-		parts = append(parts, "stage="+out.ErrorStage)
-	}
-	if out.Backend != "" {
-		parts = append(parts, "backend="+out.Backend)
-	}
-	if out.Model != "" {
-		parts = append(parts, "model="+out.Model)
-	}
-	if out.ImageSizeBytes > 0 {
-		parts = append(parts, fmt.Sprintf("image_bytes=%d", out.ImageSizeBytes))
-	}
-	if out.Traceback != "" {
-		parts = append(parts, "traceback="+truncateText(out.Traceback, 8<<10))
 	}
 	if body != "" {
 		parts = append(parts, "body="+truncateText(body, 8<<10))

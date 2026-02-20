@@ -2,7 +2,6 @@ package feed
 
 import (
 	"context"
-	"fmt"
 	"hash/fnv"
 	"strconv"
 	"sync"
@@ -68,7 +67,6 @@ func (s *Service) Build(ctx context.Context, limit int, seedParam string) (model
 			W:       ref.photo.W,
 			H:       ref.photo.H,
 			Ratio:   ref.photo.Ratio,
-			Src:     fmt.Sprintf("/api/image/%s/%d?mode=wall&w=480", ref.albumID, ref.photo.I),
 		})
 	}
 	return models.FeedResponse{Items: items}, nil

@@ -5,11 +5,9 @@ import (
 	"fmt"
 	"io"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -23,24 +21,15 @@ type Service struct {
 	store   albumStore
 	indexer *Indexer
 
-	mu                     sync.RWMutex
-	albumCache             map[string]*models.AlbumIndex
-	uploadHints            map[string]string
-	albumSummariesSnapshot []models.AlbumSummary
-	allAlbumsSnapshot      []*models.AlbumIndex
+	mu          sync.RWMutex
+	albumCache  map[string]*models.AlbumIndex
+	uploadHints map[string]string
 }
 
-type RefreshProgress struct {
-	Done        int
-	Total       int
-	Discovered  int
-	Processed   int
-	Succeeded   int
-	Failed      int
-	ListingDone bool
-	AlbumID     string
-	Key         string
-	Err         error
+type RefreshSummary struct {
+	Discovered int
+	Loaded     int
+	Failed     int
 }
 
 type albumStore interface {
@@ -150,12 +139,11 @@ func (s *Service) Finalize(ctx context.Context, albumID string) (*models.AlbumIn
 	}
 
 	s.mu.Lock()
-	s.albumCache[albumID] = idx
-	s.invalidateSnapshotsLocked()
+	s.albumCache[albumID] = cloneAlbumIndex(idx)
 	delete(s.uploadHints, albumID)
 	s.mu.Unlock()
 
-	return idx, nil
+	return cloneAlbumIndex(idx), nil
 }
 
 type s3ObjectReaderAt struct {
@@ -201,125 +189,51 @@ func (r *s3ObjectReaderAt) ReadAt(p []byte, off int64) (int, error) {
 	return n, nil
 }
 
-func (s *Service) RefreshFromStorageWithProgressAndAlbum(ctx context.Context, onProgress func(RefreshProgress), onAlbum func(models.AlbumIndex)) error {
-	workerCount := warmupWorkerCount(s.cfg.WarmupFetchConcurrency)
-	keyCh := make(chan string, workerCount*2)
-	resultCh := make(chan RefreshProgress, workerCount*2)
+func (s *Service) RefreshFromStorage(ctx context.Context, onAlbum func(models.AlbumIndex)) (RefreshSummary, error) {
+	summary := RefreshSummary{}
+	err := s.store.ForEachAlbumIndexKey(ctx, func(key string) error {
+		summary.Discovered++
 
-	var discovered atomic.Int64
-	var processed atomic.Int64
-	var succeeded atomic.Int64
-	var failed atomic.Int64
-	var listingDone atomic.Bool
-
-	producerDone := make(chan error, 1)
-	go func() {
-		defer close(keyCh)
-		err := s.store.ForEachAlbumIndexKey(ctx, func(key string) error {
-			select {
-			case keyCh <- key:
-				discovered.Add(1)
-				return nil
-			case <-ctx.Done():
-				return ctx.Err()
-			}
-		})
-		listingDone.Store(true)
-		producerDone <- err
-	}()
-
-	var workers sync.WaitGroup
-	for i := 0; i < workerCount; i++ {
-		workers.Add(1)
-		go func() {
-			defer workers.Done()
-			for key := range keyCh {
-				progress := RefreshProgress{Key: key}
-				var idx models.AlbumIndex
-				if err := s.store.ReadJSON(ctx, key, &idx); err != nil {
-					progress.Err = err
-					resultCh <- progress
-					continue
-				}
-
-				if idx.AlbumID == "" {
-					parts := strings.Split(filepath.Dir(key), "/")
-					if len(parts) > 0 {
-						idx.AlbumID = parts[len(parts)-1]
-					}
-				}
-				if idx.AlbumID == "" {
-					progress.Err = fmt.Errorf("missing album id")
-					resultCh <- progress
-					continue
-				}
-
-				cached := new(models.AlbumIndex)
-				*cached = idx
-				s.mu.Lock()
-				s.albumCache[idx.AlbumID] = cached
-				s.invalidateSnapshotsLocked()
-				s.mu.Unlock()
-				if onAlbum != nil {
-					onAlbum(idx)
-				}
-
-				progress.AlbumID = idx.AlbumID
-				resultCh <- progress
-			}
-		}()
-	}
-
-	go func() {
-		workers.Wait()
-		close(resultCh)
-	}()
-
-	for progress := range resultCh {
-		done := processed.Add(1)
-		if progress.Err != nil {
-			failed.Add(1)
-		} else {
-			succeeded.Add(1)
+		var idx models.AlbumIndex
+		if err := s.store.ReadJSON(ctx, key, &idx); err != nil {
+			summary.Failed++
+			return nil
 		}
-		progress.Done = int(done)
-		progress.Total = int(discovered.Load())
-		progress.Discovered = int(discovered.Load())
-		progress.Processed = int(done)
-		progress.Succeeded = int(succeeded.Load())
-		progress.Failed = int(failed.Load())
-		progress.ListingDone = listingDone.Load()
-		if onProgress != nil {
-			onProgress(progress)
+
+		if idx.AlbumID == "" {
+			parts := strings.Split(filepath.Dir(key), "/")
+			if len(parts) > 0 {
+				idx.AlbumID = parts[len(parts)-1]
+			}
 		}
-	}
+		if strings.TrimSpace(idx.AlbumID) == "" {
+			summary.Failed++
+			return nil
+		}
 
-	if err := <-producerDone; err != nil {
-		return err
-	}
-	return nil
-}
+		cached := cloneAlbumIndex(&idx)
+		s.mu.Lock()
+		s.albumCache[idx.AlbumID] = cached
+		s.mu.Unlock()
 
-func warmupWorkerCount(configured int) int {
-	if configured > 0 {
-		return configured
+		if onAlbum != nil {
+			onAlbum(*cloneAlbumIndex(cached))
+		}
+		summary.Loaded++
+		return nil
+	})
+	if err != nil {
+		return summary, err
 	}
-	workers := runtime.GOMAXPROCS(0) * 2
-	if workers < 2 {
-		return 2
-	}
-	if workers > 32 {
-		return 32
-	}
-	return workers
+	return summary, nil
 }
 
 func (s *Service) GetAlbum(ctx context.Context, albumID string) (*models.AlbumIndex, error) {
 	s.mu.RLock()
 	if idx, ok := s.albumCache[albumID]; ok {
-		dup := *idx
+		dup := cloneAlbumIndex(idx)
 		s.mu.RUnlock()
-		return &dup, nil
+		return dup, nil
 	}
 	s.mu.RUnlock()
 
@@ -334,31 +248,12 @@ func (s *Service) GetAlbum(ctx context.Context, albumID string) (*models.AlbumIn
 		idx.AlbumID = albumID
 	}
 
+	cached := cloneAlbumIndex(&idx)
 	s.mu.Lock()
-	s.albumCache[albumID] = &idx
-	s.invalidateSnapshotsLocked()
+	s.albumCache[albumID] = cached
 	s.mu.Unlock()
 
-	return &idx, nil
-}
-
-func (s *Service) ListAlbums(ctx context.Context) ([]models.AlbumSummary, error) {
-	_ = ctx
-	s.mu.RLock()
-	if s.albumSummariesSnapshot != nil {
-		out := cloneAlbumSummarySlice(s.albumSummariesSnapshot)
-		s.mu.RUnlock()
-		return out, nil
-	}
-	s.mu.RUnlock()
-
-	s.mu.Lock()
-	if s.albumSummariesSnapshot == nil || s.allAlbumsSnapshot == nil {
-		s.rebuildSnapshotsLocked()
-	}
-	out := cloneAlbumSummarySlice(s.albumSummariesSnapshot)
-	s.mu.Unlock()
-	return out, nil
+	return cloneAlbumIndex(cached), nil
 }
 
 func (s *Service) SearchAlbumsByNamePrefix(ctx context.Context, q string, limit int) ([]models.AlbumSearchItem, error) {
@@ -400,43 +295,12 @@ func (s *Service) SearchAlbumsByNamePrefix(ctx context.Context, q string, limit 
 
 func (s *Service) AllAlbums() []*models.AlbumIndex {
 	s.mu.RLock()
-	if s.allAlbumsSnapshot != nil {
-		out := cloneAlbumIndexSlice(s.allAlbumsSnapshot)
-		s.mu.RUnlock()
-		return out
+	albumsList := make([]*models.AlbumIndex, 0, len(s.albumCache))
+	for _, idx := range s.albumCache {
+		albumsList = append(albumsList, cloneAlbumIndex(idx))
 	}
 	s.mu.RUnlock()
 
-	s.mu.Lock()
-	if s.albumSummariesSnapshot == nil || s.allAlbumsSnapshot == nil {
-		s.rebuildSnapshotsLocked()
-	}
-	out := cloneAlbumIndexSlice(s.allAlbumsSnapshot)
-	s.mu.Unlock()
-	return out
-}
-
-func (s *Service) invalidateSnapshotsLocked() {
-	s.albumSummariesSnapshot = nil
-	s.allAlbumsSnapshot = nil
-}
-
-func (s *Service) rebuildSnapshotsLocked() {
-	summaries := make([]models.AlbumSummary, 0, len(s.albumCache))
-	albumsList := make([]*models.AlbumIndex, 0, len(s.albumCache))
-	for _, idx := range s.albumCache {
-		summaries = append(summaries, models.AlbumSummary{
-			AlbumID:          idx.AlbumID,
-			OriginalFilename: idx.OriginalFilename,
-			PhotoCount:       idx.PhotoCount,
-			CreatedAt:        idx.CreatedAt,
-		})
-		albumsList = append(albumsList, cloneAlbumIndex(idx))
-	}
-
-	sort.Slice(summaries, func(i, j int) bool {
-		return summaries[i].CreatedAt > summaries[j].CreatedAt
-	})
 	sort.Slice(albumsList, func(i, j int) bool {
 		if albumsList[i].AlbumID != albumsList[j].AlbumID {
 			return albumsList[i].AlbumID < albumsList[j].AlbumID
@@ -447,20 +311,7 @@ func (s *Service) rebuildSnapshotsLocked() {
 		return albumsList[i].OriginalFilename < albumsList[j].OriginalFilename
 	})
 
-	s.albumSummariesSnapshot = summaries
-	s.allAlbumsSnapshot = albumsList
-}
-
-func cloneAlbumSummarySlice(in []models.AlbumSummary) []models.AlbumSummary {
-	return append([]models.AlbumSummary(nil), in...)
-}
-
-func cloneAlbumIndexSlice(in []*models.AlbumIndex) []*models.AlbumIndex {
-	out := make([]*models.AlbumIndex, 0, len(in))
-	for _, idx := range in {
-		out = append(out, cloneAlbumIndex(idx))
-	}
-	return out
+	return albumsList
 }
 
 func cloneAlbumIndex(idx *models.AlbumIndex) *models.AlbumIndex {

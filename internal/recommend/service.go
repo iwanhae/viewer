@@ -152,7 +152,6 @@ func (s *Service) applyAlbumIndexLocked(idx models.AlbumIndex) {
 			Width:      photo.W,
 			Height:     photo.H,
 			Ratio:      photo.Ratio,
-			CreatedAt:  idx.CreatedAt,
 		}
 		s.photosByID[id] = rec
 
@@ -167,13 +166,10 @@ func (s *Service) applyAlbumIndexLocked(idx models.AlbumIndex) {
 				missing[photo.I] = struct{}{}
 				continue
 			}
-			normalized, norm := normalizeVector(emb.Vector)
+			normalized := normalizeVector(emb.Vector)
 			s.embeddingsByID[id] = EmbeddingRecord{
-				ImageID:    id,
-				Vector:     normalized,
-				Norm:       norm,
-				UpdatedAt:  emb.UpdatedAt,
-				Dimensions: len(normalized),
+				ImageID: id,
+				Vector:  normalized,
 			}
 		case embeddingStatusFailed:
 			s.failedByID[id] = emb.Error
@@ -323,7 +319,7 @@ func (s *Service) embedAlbumAndPersist(ctx context.Context, albumID string, phot
 			continue
 		}
 
-		vector, _, err := s.embedder.Embed(ctx, result.Bytes)
+		vector, err := s.embedder.Embed(ctx, result.Bytes)
 		if err != nil {
 			if isTransientEmbedError(err) {
 				transientIndexes = append(transientIndexes, photo.PhotoIndex)
@@ -616,7 +612,6 @@ func (s *Service) Recommend(ctx context.Context, albumID string, photoIndex int,
 			W:       photo.Width,
 			H:       photo.Height,
 			Score:   n.Score,
-			Src:     fmt.Sprintf("/api/image/%s/%d?mode=wall&w=480", photo.AlbumID, photo.PhotoIndex),
 		})
 		if len(items) >= limit {
 			break

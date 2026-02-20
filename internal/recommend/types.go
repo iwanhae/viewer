@@ -7,9 +7,8 @@ import (
 )
 
 const (
-	embeddingStatusMissing = "missing"
-	embeddingStatusReady   = "ready"
-	embeddingStatusFailed  = "failed"
+	embeddingStatusReady  = "ready"
+	embeddingStatusFailed = "failed"
 )
 
 type PhotoRecord struct {
@@ -20,15 +19,11 @@ type PhotoRecord struct {
 	Width      int
 	Height     int
 	Ratio      float64
-	CreatedAt  string
 }
 
 type EmbeddingRecord struct {
-	ImageID    string
-	Vector     []float32
-	Norm       float64
-	UpdatedAt  string
-	Dimensions int
+	ImageID string
+	Vector  []float32
 }
 
 type RecommendationItem struct {
@@ -37,7 +32,6 @@ type RecommendationItem struct {
 	W       int     `json:"w"`
 	H       int     `json:"h"`
 	Score   float64 `json:"score"`
-	Src     string  `json:"src"`
 }
 
 type RecommendationResponse struct {

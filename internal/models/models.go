@@ -24,13 +24,6 @@ type AlbumIndex struct {
 	Embeddings       map[string]PhotoEmbedding `json:"embeddings,omitempty"`
 }
 
-type AlbumSummary struct {
-	AlbumID          string `json:"albumId"`
-	OriginalFilename string `json:"originalFilename"`
-	PhotoCount       int    `json:"photoCount"`
-	CreatedAt        string `json:"createdAt"`
-}
-
 type AlbumSearchItem struct {
 	AlbumID          string `json:"albumId"`
 	OriginalFilename string `json:"originalFilename"`
@@ -44,7 +37,6 @@ type FeedItem struct {
 	W       int     `json:"w"`
 	H       int     `json:"h"`
 	Ratio   float64 `json:"ratio"`
-	Src     string  `json:"src"`
 }
 
 type FeedResponse struct {
