@@ -126,8 +126,9 @@ func TestSearchAlbumsByNamePrefixSupportsEmptyQueryAndLimit(t *testing.T) {
 }
 
 type fakeAlbumStore struct {
-	forEachAlbumIndexKeyFn func(ctx context.Context, fn func(key string) error) error
-	readJSONFn             func(ctx context.Context, key string, out any) error
+	forEachAlbumObjectKeyFn func(ctx context.Context, fn func(key string) error) error
+	forEachAlbumIndexKeyFn  func(ctx context.Context, fn func(key string) error) error
+	readJSONFn              func(ctx context.Context, key string, out any) error
 }
 
 func (f *fakeAlbumStore) PresignPut(ctx context.Context, key string, ttl time.Duration) (string, map[string]string, error) {
@@ -158,6 +159,13 @@ func (f *fakeAlbumStore) ForEachAlbumIndexKey(ctx context.Context, fn func(key s
 		panic("unexpected call")
 	}
 	return f.forEachAlbumIndexKeyFn(ctx, fn)
+}
+
+func (f *fakeAlbumStore) ForEachAlbumObjectKey(ctx context.Context, fn func(key string) error) error {
+	if f.forEachAlbumObjectKeyFn == nil {
+		panic("unexpected call")
+	}
+	return f.forEachAlbumObjectKeyFn(ctx, fn)
 }
 
 func TestRefreshFromStorageTracksFailuresAndFallbackAlbumID(t *testing.T) {
@@ -277,5 +285,136 @@ func TestRefreshFromStorageReturnsListingError(t *testing.T) {
 	}
 	if summary.Discovered != 1 || summary.Loaded != 1 || summary.Failed != 0 {
 		t.Fatalf("unexpected partial summary before listing error: %+v", summary)
+	}
+}
+
+func TestQueuePendingFinalizationsQueuesPendingAndSkipsTracked(t *testing.T) {
+	s := &Service{
+		store: &fakeAlbumStore{
+			forEachAlbumObjectKeyFn: func(ctx context.Context, fn func(key string) error) error {
+				for _, key := range []string{
+					"albums/a-new/source.zip",
+					"albums/a-failed/source.zip",
+					"albums/a-queued/source.zip",
+					"albums/a-processing/source.zip",
+					"albums/a-succeeded/source.zip",
+					"albums/z-indexed/source.zip",
+					"albums/z-indexed/index.json",
+					"albums/invalid",
+				} {
+					if err := fn(key); err != nil {
+						return err
+					}
+				}
+				return nil
+			},
+		},
+		finalizeJobs: map[string]*FinalizeState{
+			"a-failed": {
+				AlbumID:   "a-failed",
+				Status:    FinalizeStatusFailed,
+				Error:     "previous error",
+				UpdatedAt: "2026-02-19T00:00:00Z",
+			},
+			"a-queued": {
+				AlbumID:   "a-queued",
+				Status:    FinalizeStatusQueued,
+				UpdatedAt: "2026-02-19T00:00:00Z",
+			},
+			"a-processing": {
+				AlbumID:   "a-processing",
+				Status:    FinalizeStatusProcessing,
+				UpdatedAt: "2026-02-19T00:00:00Z",
+			},
+			"a-succeeded": {
+				AlbumID:   "a-succeeded",
+				Status:    FinalizeStatusSucceeded,
+				UpdatedAt: "2026-02-19T00:00:00Z",
+			},
+		},
+		finalizeQueue: make(chan string, 10),
+	}
+
+	summary, err := s.QueuePendingFinalizations(context.Background())
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if summary.ObjectsDiscovered != 8 {
+		t.Fatalf("objects discovered=%d want=8", summary.ObjectsDiscovered)
+	}
+	if summary.SourceObjects != 6 {
+		t.Fatalf("source objects=%d want=6", summary.SourceObjects)
+	}
+	if summary.IndexObjects != 1 {
+		t.Fatalf("index objects=%d want=1", summary.IndexObjects)
+	}
+	if summary.PendingCandidates != 5 {
+		t.Fatalf("pending candidates=%d want=5", summary.PendingCandidates)
+	}
+	if summary.Enqueued != 2 {
+		t.Fatalf("enqueued=%d want=2", summary.Enqueued)
+	}
+	if summary.AlreadyTracked != 3 {
+		t.Fatalf("already tracked=%d want=3", summary.AlreadyTracked)
+	}
+	if summary.EnqueueFailed != 0 {
+		t.Fatalf("enqueue failed=%d want=0", summary.EnqueueFailed)
+	}
+
+	queued := make([]string, 0, 2)
+	for len(queued) < 2 {
+		select {
+		case albumID := <-s.finalizeQueue:
+			queued = append(queued, albumID)
+		default:
+			t.Fatalf("expected 2 queued albums, got %v", queued)
+		}
+	}
+	if queued[0] != "a-failed" || queued[1] != "a-new" {
+		t.Fatalf("unexpected queue order: %v", queued)
+	}
+
+	if state := s.finalizeJobs["a-failed"]; state == nil || state.Status != FinalizeStatusQueued || state.Error != "" {
+		t.Fatalf("failed album should be reset and queued, got %+v", state)
+	}
+	if state := s.finalizeJobs["a-new"]; state == nil || state.Status != FinalizeStatusQueued {
+		t.Fatalf("new album should be queued, got %+v", state)
+	}
+}
+
+func TestQueuePendingFinalizationsMarksQueueFullAsFailed(t *testing.T) {
+	s := &Service{
+		store: &fakeAlbumStore{
+			forEachAlbumObjectKeyFn: func(ctx context.Context, fn func(key string) error) error {
+				return fn("albums/full/source.zip")
+			},
+		},
+		finalizeJobs:  make(map[string]*FinalizeState),
+		finalizeQueue: make(chan string),
+	}
+
+	summary, err := s.QueuePendingFinalizations(context.Background())
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if summary.PendingCandidates != 1 {
+		t.Fatalf("pending candidates=%d want=1", summary.PendingCandidates)
+	}
+	if summary.Enqueued != 0 {
+		t.Fatalf("enqueued=%d want=0", summary.Enqueued)
+	}
+	if summary.EnqueueFailed != 1 {
+		t.Fatalf("enqueue failed=%d want=1", summary.EnqueueFailed)
+	}
+
+	state := s.finalizeJobs["full"]
+	if state == nil {
+		t.Fatalf("expected failed state to be recorded")
+	}
+	if state.Status != FinalizeStatusFailed {
+		t.Fatalf("status=%s want=%s", state.Status, FinalizeStatusFailed)
+	}
+	if state.Error != "finalize queue is full" {
+		t.Fatalf("error=%q want=finalize queue is full", state.Error)
 	}
 }

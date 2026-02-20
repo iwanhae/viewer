@@ -201,6 +201,18 @@ func (s *S3Store) ForEachAlbumIndexKey(ctx context.Context, fn func(key string) 
 	if fn == nil {
 		return nil
 	}
+	return s.ForEachAlbumObjectKey(ctx, func(key string) error {
+		if !strings.HasSuffix(key, "/index.json") {
+			return nil
+		}
+		return fn(key)
+	})
+}
+
+func (s *S3Store) ForEachAlbumObjectKey(ctx context.Context, fn func(key string) error) error {
+	if fn == nil {
+		return nil
+	}
 	var token *string
 	for {
 		out, err := s.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
@@ -214,9 +226,6 @@ func (s *S3Store) ForEachAlbumIndexKey(ctx context.Context, fn func(key string) 
 
 		for _, obj := range out.Contents {
 			if obj.Key == nil {
-				continue
-			}
-			if !strings.HasSuffix(*obj.Key, "/index.json") {
 				continue
 			}
 			if err := fn(*obj.Key); err != nil {

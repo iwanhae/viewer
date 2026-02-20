@@ -367,4 +367,23 @@ func Warmup(ctx context.Context, albumsService *albums.Service, recommendService
 		summary.Failed,
 		time.Since(startedAt).Round(time.Millisecond),
 	)
+
+	pendingStartedAt := time.Now()
+	log.Printf("pending upload finalize scan started")
+	pendingSummary, err := albumsService.QueuePendingFinalizations(ctx)
+	if err != nil {
+		log.Printf("pending upload finalize scan skipped: %v", err)
+		return
+	}
+	log.Printf(
+		"pending upload finalize scan finished objects=%d sources=%d indexes=%d pending=%d enqueued=%d tracked=%d enqueue_failed=%d duration=%s",
+		pendingSummary.ObjectsDiscovered,
+		pendingSummary.SourceObjects,
+		pendingSummary.IndexObjects,
+		pendingSummary.PendingCandidates,
+		pendingSummary.Enqueued,
+		pendingSummary.AlreadyTracked,
+		pendingSummary.EnqueueFailed,
+		time.Since(pendingStartedAt).Round(time.Millisecond),
+	)
 }

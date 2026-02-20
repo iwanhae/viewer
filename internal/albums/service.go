@@ -37,6 +37,16 @@ type RefreshSummary struct {
 	Failed     int
 }
 
+type PendingFinalizeSummary struct {
+	ObjectsDiscovered int
+	SourceObjects     int
+	IndexObjects      int
+	PendingCandidates int
+	Enqueued          int
+	AlreadyTracked    int
+	EnqueueFailed     int
+}
+
 type FinalizeStatus string
 
 const (
@@ -63,6 +73,7 @@ type albumStore interface {
 	GetObjectRange(ctx context.Context, key string, start int64, end int64) (io.ReadCloser, string, error)
 	PutJSON(ctx context.Context, key string, v any) error
 	ReadJSON(ctx context.Context, key string, out any) error
+	ForEachAlbumObjectKey(ctx context.Context, fn func(key string) error) error
 	ForEachAlbumIndexKey(ctx context.Context, fn func(key string) error) error
 }
 
@@ -215,6 +226,60 @@ func (s *Service) processFinalize(ctx context.Context, albumID string) {
 	}
 }
 
+func (s *Service) QueuePendingFinalizations(ctx context.Context) (PendingFinalizeSummary, error) {
+	summary := PendingFinalizeSummary{}
+	sourceAlbums := make(map[string]struct{})
+	indexedAlbums := make(map[string]struct{})
+
+	if err := s.store.ForEachAlbumObjectKey(ctx, func(key string) error {
+		summary.ObjectsDiscovered++
+
+		albumID, objectName, ok := parseAlbumObjectKey(key)
+		if !ok {
+			return nil
+		}
+		switch objectName {
+		case "source.zip":
+			sourceAlbums[albumID] = struct{}{}
+			summary.SourceObjects++
+		case "index.json":
+			indexedAlbums[albumID] = struct{}{}
+			summary.IndexObjects++
+		}
+		return nil
+	}); err != nil {
+		return summary, err
+	}
+
+	pending := make([]string, 0, len(sourceAlbums))
+	for albumID := range sourceAlbums {
+		if _, ok := indexedAlbums[albumID]; ok {
+			continue
+		}
+		pending = append(pending, albumID)
+	}
+	sort.Strings(pending)
+	summary.PendingCandidates = len(pending)
+
+	s.ensureFinalizeQueueInitialized()
+	for _, albumID := range pending {
+		enqueued, alreadyTracked, err := s.queueFinalizeWithoutExistenceChecks(albumID)
+		if err != nil {
+			summary.EnqueueFailed++
+			continue
+		}
+		if alreadyTracked {
+			summary.AlreadyTracked++
+			continue
+		}
+		if enqueued {
+			summary.Enqueued++
+		}
+	}
+
+	return summary, nil
+}
+
 func (s *Service) RequestFinalize(ctx context.Context, albumID string) (FinalizeState, error) {
 	albumID = strings.TrimSpace(albumID)
 	if albumID == "" {
@@ -289,15 +354,7 @@ func (s *Service) RequestFinalize(ctx context.Context, albumID string) (Finalize
 
 	if shouldEnqueue {
 		if err := s.enqueueFinalize(albumID); err != nil {
-			s.mu.Lock()
-			if failed, ok := s.finalizeJobs[albumID]; ok && failed != nil {
-				failed.Status = FinalizeStatusFailed
-				failed.PhotoCount = 0
-				failed.CreatedAt = ""
-				failed.Error = "finalize queue is full"
-				failed.UpdatedAt = time.Now().UTC().Format(time.RFC3339Nano)
-			}
-			s.mu.Unlock()
+			s.markFinalizeQueueFailure(albumID)
 			return FinalizeState{}, err
 		}
 	}
@@ -352,6 +409,77 @@ func (s *Service) enqueueFinalize(albumID string) error {
 	default:
 		return fmt.Errorf("finalize queue is full")
 	}
+}
+
+func (s *Service) ensureFinalizeQueueInitialized() {
+	s.mu.Lock()
+	if s.finalizeJobs == nil {
+		s.finalizeJobs = make(map[string]*FinalizeState)
+	}
+	if s.finalizeQueue == nil {
+		s.finalizeQueue = make(chan string, defaultFinalizeQueueSize)
+	}
+	s.mu.Unlock()
+}
+
+func (s *Service) queueFinalizeWithoutExistenceChecks(albumID string) (bool, bool, error) {
+	albumID = strings.TrimSpace(albumID)
+	if albumID == "" {
+		return false, false, fmt.Errorf("albumId is required")
+	}
+
+	updatedAt := time.Now().UTC().Format(time.RFC3339Nano)
+	shouldEnqueue := false
+
+	s.mu.Lock()
+	if s.finalizeJobs == nil {
+		s.finalizeJobs = make(map[string]*FinalizeState)
+	}
+	state, ok := s.finalizeJobs[albumID]
+	if !ok || state == nil {
+		state = &FinalizeState{
+			AlbumID:   albumID,
+			Status:    FinalizeStatusQueued,
+			UpdatedAt: updatedAt,
+		}
+		s.finalizeJobs[albumID] = state
+		shouldEnqueue = true
+	} else {
+		switch state.Status {
+		case FinalizeStatusQueued, FinalizeStatusProcessing, FinalizeStatusSucceeded:
+			s.mu.Unlock()
+			return false, true, nil
+		default:
+			state.Status = FinalizeStatusQueued
+			state.PhotoCount = 0
+			state.CreatedAt = ""
+			state.Error = ""
+			state.UpdatedAt = updatedAt
+			shouldEnqueue = true
+		}
+	}
+	s.mu.Unlock()
+
+	if shouldEnqueue {
+		if err := s.enqueueFinalize(albumID); err != nil {
+			s.markFinalizeQueueFailure(albumID)
+			return false, false, err
+		}
+	}
+
+	return shouldEnqueue, false, nil
+}
+
+func (s *Service) markFinalizeQueueFailure(albumID string) {
+	s.mu.Lock()
+	if failed, ok := s.finalizeJobs[albumID]; ok && failed != nil {
+		failed.Status = FinalizeStatusFailed
+		failed.PhotoCount = 0
+		failed.CreatedAt = ""
+		failed.Error = "finalize queue is full"
+		failed.UpdatedAt = time.Now().UTC().Format(time.RFC3339Nano)
+	}
+	s.mu.Unlock()
 }
 
 func (s *Service) Finalize(ctx context.Context, albumID string) (*models.AlbumIndex, error) {
@@ -609,6 +737,17 @@ func cloneFinalizeState(state *FinalizeState) FinalizeState {
 func cloneFinalizeStatePtr(state FinalizeState) *FinalizeState {
 	dup := state
 	return &dup
+}
+
+func parseAlbumObjectKey(key string) (string, string, bool) {
+	parts := strings.Split(strings.TrimSpace(key), "/")
+	if len(parts) != 3 {
+		return "", "", false
+	}
+	if parts[0] != "albums" || strings.TrimSpace(parts[1]) == "" || strings.TrimSpace(parts[2]) == "" {
+		return "", "", false
+	}
+	return parts[1], parts[2], true
 }
 
 func albumSearchItemFromIndex(idx *models.AlbumIndex) models.AlbumSearchItem {
