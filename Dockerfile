@@ -75,25 +75,38 @@ COPY --from=model-prefetch --chown=65532:65532 /opt/hf-home /tmp/hf-home
 RUN mkdir -p /tmp/viewer-cache/images /tmp/viewer-cache/zips && \
     chown -R 65532:65532 /app /tmp/viewer-cache /tmp/hf-home
 
-FROM ${MODEL_BASE_IMAGE} AS runtime
-ARG SIGLIP2_MODEL_ID
+FROM debian:bookworm-slim AS runtime-viewer
 
 COPY --from=backend-build --chown=65532:65532 /out/viewer /app/viewer
-COPY --from=recommender-build --chown=65532:65532 /out/recommender /app/recommender
-COPY --chown=65532:65532 docker/entrypoint.sh /app/entrypoint.sh
 
-RUN chmod +x /app/entrypoint.sh
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates && \
+    rm -rf /var/lib/apt/lists/* && \
+    mkdir -p /tmp/viewer-cache/images /tmp/viewer-cache/zips && \
+    chown -R 65532:65532 /app /tmp/viewer-cache
 
 USER 65532:65532
 
 ENV PORT=8080 \
     CACHE_DIR=/tmp/viewer-cache/images \
     ZIP_CACHE_DIR=/tmp/viewer-cache/zips \
-    RECOMMENDER_REQUIRED=false \
-    HF_HOME=/tmp/hf-home \
-    SIGLIP2_MODEL_ID="${SIGLIP2_MODEL_ID}" \
-    RECOMMENDER_LISTEN_ADDR="0.0.0.0:18081" \
-    RECOMMENDER_ENDPOINT="http://127.0.0.1:18081"
+    RECOMMENDER_REQUIRED=false
 
 EXPOSE 8080
-ENTRYPOINT ["/app/entrypoint.sh"]
+ENTRYPOINT ["/app/viewer"]
+
+FROM ${MODEL_BASE_IMAGE} AS runtime-recommender
+ARG SIGLIP2_MODEL_ID
+
+COPY --from=recommender-build --chown=65532:65532 /out/recommender /app/recommender
+
+USER 65532:65532
+
+ENV HF_HOME=/tmp/hf-home \
+    SIGLIP2_MODEL_ID="${SIGLIP2_MODEL_ID}" \
+    RECOMMENDER_LISTEN_ADDR="0.0.0.0:18081"
+
+EXPOSE 18081
+ENTRYPOINT ["/app/recommender"]
+
+FROM runtime-viewer AS runtime

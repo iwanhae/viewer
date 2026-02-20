@@ -22,7 +22,7 @@ Optional tuning:
   - `RECO_TOPK_MAX` max recommendation count (default `48`).
 - Recommender service:
   - `RECOMMENDER_ENDPOINT` endpoint for the Rust recommender service (example `http://127.0.0.1:18081`). Leave empty to disable recommender only when `RECOMMENDER_REQUIRED=false`.
-  - `RECOMMENDER_REQUIRED` whether startup must fail when recommender is unavailable (`true` in development and compose; `false` in Docker image for first-run model downloads). When `false` and endpoint is empty, recommender is disabled.
+  - `RECOMMENDER_REQUIRED` whether startup must fail when recommender is unavailable (default `true`; viewer Docker image sets `false`). When `false` and endpoint is empty, recommender is disabled.
   - `RECOMMENDER_CONCURRENCY` number of background embedding workers (`0` means auto, default is adaptive `3x GOMAXPROCS`, min `8`, max `64`).
   - `RECOMMENDER_REQUEST_TIMEOUT_SECONDS` timeout per embed request (default `120`).
 - `SIGLIP2_MODEL_ID` model identifier for the Rust worker (default `google/siglip2-base-patch16-224`).
@@ -40,10 +40,14 @@ Background embedding now runs album-by-album: workers pick a random album with m
 Recommendation responses are cross-album only: photos from the same album as the query are excluded from results.
 If no cross-album neighbors exist for an embedded query photo, recommendations return an empty `items` list.
 
-In the Docker image, the container entrypoint starts both the Rust recommender service and the Go server.
-The image prefetches `config.json` and `model.safetensors` for `SIGLIP2_MODEL_ID` at build time, so pod startup does not require Hugging Face egress.
-CI publishes a reusable model base image (`model-siglip2-base-patch16-224`) and app images can reuse it with `--build-arg MODEL_BASE_IMAGE=<registry/repo:tag>`.
-Local `docker build` keeps working without overrides by defaulting `MODEL_BASE_IMAGE` to the in-file `model-base` stage.
+Docker images are split by service:
+- `runtime-viewer` (default `docker build .`) contains only the Go viewer server and frontend assets.
+- `runtime-recommender` contains only the Rust recommender service.
+- CI publishes viewer as `ghcr.io/<owner>/<repo>` and recommender as `ghcr.io/<owner>/<repo>-recommender`.
+
+The recommender image prefetches `config.json` and `model.safetensors` for `SIGLIP2_MODEL_ID` at build time via the `model-base` stage, so pod startup does not require Hugging Face egress.
+CI publishes a reusable model base image (`model-siglip2-base-patch16-224`), and recommender builds can reuse it with `--build-arg MODEL_BASE_IMAGE=<registry/repo:tag>`.
+For local recommender builds, `MODEL_BASE_IMAGE` defaults to the in-file `model-base` stage.
 To use a different model in Docker, build with `--build-arg SIGLIP2_MODEL_ID=<repo-id>` and publish a corresponding model base image tag.
 To build an MKL-accelerated recommender for x86_64 images, pass `--build-arg RECOMMENDER_ACCEL=mkl --platform linux/amd64`.
 `RECOMMENDER_ACCEL` defaults to `none`; if `mkl` is requested on non-`amd64` targets, the Dockerfile falls back to a non-MKL recommender build.
