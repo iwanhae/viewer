@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import {
   createAlbum,
@@ -11,6 +11,7 @@ import {
 
 type UploadStatus = 'uploading' | 'finalizing' | 'ready' | 'failed' | 'canceled'
 const finalizePollIntervalMs = 10_000
+const uploadWorkerCount = 3
 
 type UploadItem = {
   id: string
@@ -110,13 +111,32 @@ export function UploadPage() {
   const navigate = useNavigate()
   const fileInputRef = useRef<HTMLInputElement | null>(null)
   const controllersRef = useRef(new Map<string, AbortController>())
-  const uploadQueueRef = useRef<Promise<void>>(Promise.resolve())
+  const itemsRef = useRef<UploadItem[]>([])
+  const pendingQueueRef = useRef<string[]>([])
+  const activeWorkersRef = useRef(0)
 
   const [items, setItems] = useState<UploadItem[]>([])
   const [pageError, setPageError] = useState<string | null>(null)
 
   const updateItem = useCallback((itemID: string, next: Partial<UploadItem>) => {
-    setItems((prev) => prev.map((item) => (item.id === itemID ? { ...item, ...next } : item)))
+    setItems((prev) => {
+      const updated = prev.map((item) => (item.id === itemID ? { ...item, ...next } : item))
+      itemsRef.current = updated
+      return updated
+    })
+  }, [])
+
+  useEffect(() => {
+    itemsRef.current = items
+  }, [items])
+
+  const removeQueuedItem = useCallback((itemID: string): boolean => {
+    const index = pendingQueueRef.current.indexOf(itemID)
+    if (index < 0) {
+      return false
+    }
+    pendingQueueRef.current.splice(index, 1)
+    return true
   }, [])
 
   const pollFinalizeUntilTerminal = useCallback(
@@ -187,11 +207,48 @@ export function UploadPage() {
     [pollFinalizeUntilTerminal, updateItem],
   )
 
-  const enqueueUpload = useCallback(
-    (item: UploadItem) => {
-      uploadQueueRef.current = uploadQueueRef.current.then(() => runItemUpload(item)).catch(() => undefined)
+  const runQueuedUpload = useCallback(
+    async (itemID: string) => {
+      const item = itemsRef.current.find((candidate) => candidate.id === itemID)
+      if (!item || item.status !== 'uploading' || controllersRef.current.has(itemID)) {
+        return
+      }
+      await runItemUpload(item)
     },
     [runItemUpload],
+  )
+
+  const pumpQueue = useCallback(() => {
+    while (activeWorkersRef.current < uploadWorkerCount && pendingQueueRef.current.length > 0) {
+      const nextID = pendingQueueRef.current.shift()
+      if (!nextID) {
+        continue
+      }
+
+      const item = itemsRef.current.find((candidate) => candidate.id === nextID)
+      if (!item || item.status !== 'uploading' || controllersRef.current.has(nextID)) {
+        continue
+      }
+
+      activeWorkersRef.current += 1
+      void runQueuedUpload(nextID)
+        .catch(() => undefined)
+        .finally(() => {
+          activeWorkersRef.current = Math.max(0, activeWorkersRef.current - 1)
+          pumpQueue()
+        })
+    }
+  }, [runQueuedUpload])
+
+  const enqueueUpload = useCallback(
+    (itemID: string) => {
+      if (controllersRef.current.has(itemID) || pendingQueueRef.current.includes(itemID)) {
+        return
+      }
+      pendingQueueRef.current.push(itemID)
+      pumpQueue()
+    },
+    [pumpQueue],
   )
 
   const onPickFiles = (event: React.ChangeEvent<HTMLInputElement>) => {
@@ -213,9 +270,13 @@ export function UploadPage() {
       setPageError('Select at least one .zip file.')
     } else {
       setPageError(null)
-      setItems((prev) => [...prev, ...picked])
+      setItems((prev) => {
+        const updated = [...prev, ...picked]
+        itemsRef.current = updated
+        return updated
+      })
       for (const item of picked) {
-        enqueueUpload(item)
+        enqueueUpload(item.id)
       }
     }
 
@@ -226,8 +287,13 @@ export function UploadPage() {
 
   const onCancelItem = (itemID: string) => {
     const controller = controllersRef.current.get(itemID)
-    if (!controller) return
-    controller.abort()
+    if (controller) {
+      controller.abort()
+      return
+    }
+    if (removeQueuedItem(itemID)) {
+      updateItem(itemID, { status: 'canceled', finalizeStatus: undefined, error: undefined })
+    }
   }
 
   const onRemoveItem = (itemID: string) => {
@@ -235,7 +301,12 @@ export function UploadPage() {
     if (controller) {
       controller.abort()
     }
-    setItems((prev) => prev.filter((item) => item.id !== itemID))
+    removeQueuedItem(itemID)
+    setItems((prev) => {
+      const updated = prev.filter((item) => item.id !== itemID)
+      itemsRef.current = updated
+      return updated
+    })
   }
 
   const onRetryFailedUploads = () => {
@@ -244,8 +315,8 @@ export function UploadPage() {
       return
     }
 
-    setItems((prev) =>
-      prev.map((item) => {
+    setItems((prev) => {
+      const updated = prev.map((item) => {
         const isUploadFailure = item.status === 'canceled' || item.status === 'failed'
         if (!isUploadFailure) return item
         return {
@@ -257,18 +328,13 @@ export function UploadPage() {
           finalizeStatus: undefined,
           error: undefined,
         }
-      }),
-    )
-    for (const item of retryable) {
-      enqueueUpload({
-        ...item,
-        status: 'uploading',
-        uploadedBytes: 0,
-        albumId: undefined,
-        photoCount: undefined,
-        finalizeStatus: undefined,
-        error: undefined,
       })
+      itemsRef.current = updated
+      return updated
+    })
+    for (const item of retryable) {
+      removeQueuedItem(item.id)
+      enqueueUpload(item.id)
     }
   }
 
