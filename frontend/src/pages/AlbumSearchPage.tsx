@@ -93,6 +93,7 @@ export function AlbumSearchPage() {
         <label className="album-search-label" htmlFor="album-search-input">
           Album name
         </label>
+        <p className="album-search-note">Only indexed albums appear here.</p>
         <input
           id="album-search-input"
           className="album-search-input"

@@ -707,7 +707,8 @@ body,
   color: #92400e;
 }
 
-.upload-item-status-ready {
+.upload-item-status-ready,
+.upload-item-status-submitted {
   background: rgba(5, 150, 105, 0.16);
   color: #065f46;
 }

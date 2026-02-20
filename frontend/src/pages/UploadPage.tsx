@@ -1,16 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import {
-  createAlbum,
-  fetchFinalizeStatus,
-  finalizeAlbum,
-  type FinalizeResponse,
-  type FinalizeStatus,
-  uploadAlbumObject,
-} from '../api/client'
+import { createAlbum, finalizeAlbum, uploadAlbumObject } from '../api/client'
 
-type UploadStatus = 'uploading' | 'finalizing' | 'ready' | 'failed' | 'canceled'
-const finalizePollIntervalMs = 10_000
+type UploadStatus = 'uploading' | 'submitted' | 'failed' | 'canceled'
 const uploadWorkerCount = 3
 
 type UploadItem = {
@@ -21,8 +13,6 @@ type UploadItem = {
   status: UploadStatus
   uploadedBytes: number
   albumId?: string
-  photoCount?: number
-  finalizeStatus?: FinalizeStatus
   error?: string
 }
 
@@ -63,17 +53,12 @@ function formatBytes(bytes: number): string {
   return `${value.toFixed(precision)} ${units[idx]}`
 }
 
-function statusLabel(status: UploadStatus, finalizeStatus?: FinalizeStatus): string {
+function statusLabel(status: UploadStatus): string {
   switch (status) {
     case 'uploading':
       return 'Uploading'
-    case 'finalizing':
-      if (finalizeStatus === 'QUEUED') {
-        return 'Queued'
-      }
-      return 'Finalizing'
-    case 'ready':
-      return 'Ready'
+    case 'submitted':
+      return 'Submitted'
     case 'failed':
       return 'Failed'
     case 'canceled':
@@ -81,30 +66,6 @@ function statusLabel(status: UploadStatus, finalizeStatus?: FinalizeStatus): str
     default:
       return status
   }
-}
-
-function isPendingFinalize(status: FinalizeStatus): boolean {
-  return status === 'QUEUED' || status === 'PROCESSING'
-}
-
-function waitWithAbort(ms: number, signal: AbortSignal): Promise<void> {
-  if (signal.aborted) {
-    return Promise.reject(new DOMException('aborted', 'AbortError'))
-  }
-  return new Promise((resolve, reject) => {
-    const timer = window.setTimeout(() => {
-      signal.removeEventListener('abort', onAbort)
-      resolve()
-    }, ms)
-
-    const onAbort = () => {
-      window.clearTimeout(timer)
-      signal.removeEventListener('abort', onAbort)
-      reject(new DOMException('aborted', 'AbortError'))
-    }
-
-    signal.addEventListener('abort', onAbort, { once: true })
-  })
 }
 
 export function UploadPage() {
@@ -139,24 +100,6 @@ export function UploadPage() {
     return true
   }, [])
 
-  const pollFinalizeUntilTerminal = useCallback(
-    async (
-      albumId: string,
-      initial: FinalizeResponse,
-      signal: AbortSignal,
-      onUpdate: (status: FinalizeStatus) => void,
-    ): Promise<FinalizeResponse> => {
-      let state = initial
-      while (isPendingFinalize(state.status)) {
-        onUpdate(state.status)
-        await waitWithAbort(finalizePollIntervalMs, signal)
-        state = await fetchFinalizeStatus(albumId, { signal })
-      }
-      return state
-    },
-    [],
-  )
-
   const runItemUpload = useCallback(
     async (item: UploadItem) => {
       const controller = new AbortController()
@@ -169,42 +112,21 @@ export function UploadPage() {
         updateItem(item.id, { albumId: albumID, status: 'uploading' })
 
         await uploadAlbumObject(created.uploadUrl, item.file, created.uploadHeaders, controller.signal)
-        updateItem(item.id, { uploadedBytes: item.sizeBytes, status: 'finalizing', finalizeStatus: 'QUEUED' })
+        updateItem(item.id, { uploadedBytes: item.sizeBytes })
 
-        const accepted = await finalizeAlbum(albumID, { signal: controller.signal })
-        let finalized = accepted
-        if (isPendingFinalize(finalized.status)) {
-          finalized = await pollFinalizeUntilTerminal(albumID, finalized, controller.signal, (next) => {
-            updateItem(item.id, { status: 'finalizing', finalizeStatus: next })
-          })
-        }
-
-        if (finalized.status === 'SUCCEEDED') {
-          updateItem(item.id, {
-            status: 'ready',
-            finalizeStatus: undefined,
-            photoCount: finalized.photoCount,
-            error: undefined,
-          })
-          return
-        }
-
-        updateItem(item.id, {
-          status: 'failed',
-          finalizeStatus: undefined,
-          error: finalized.error || 'finalize failed',
-        })
+        await finalizeAlbum(albumID, { signal: controller.signal })
+        updateItem(item.id, { status: 'submitted', error: undefined })
       } catch (err) {
         if (isAbortError(err)) {
-          updateItem(item.id, { status: 'canceled', finalizeStatus: undefined, error: undefined })
+          updateItem(item.id, { status: 'canceled', error: undefined })
         } else {
-          updateItem(item.id, { status: 'failed', finalizeStatus: undefined, error: toErrorMessage(err) })
+          updateItem(item.id, { status: 'failed', error: toErrorMessage(err) })
         }
       } finally {
         controllersRef.current.delete(item.id)
       }
     },
-    [pollFinalizeUntilTerminal, updateItem],
+    [updateItem],
   )
 
   const runQueuedUpload = useCallback(
@@ -292,7 +214,7 @@ export function UploadPage() {
       return
     }
     if (removeQueuedItem(itemID)) {
-      updateItem(itemID, { status: 'canceled', finalizeStatus: undefined, error: undefined })
+      updateItem(itemID, { status: 'canceled', error: undefined })
     }
   }
 
@@ -324,8 +246,6 @@ export function UploadPage() {
           status: 'uploading',
           uploadedBytes: 0,
           albumId: undefined,
-          photoCount: undefined,
-          finalizeStatus: undefined,
           error: undefined,
         }
       })
@@ -340,23 +260,18 @@ export function UploadPage() {
 
   const summary = useMemo(() => {
     const totalFiles = items.length
-    const uploadedFiles = items.filter((item) => item.status === 'finalizing' || item.status === 'ready').length
-    const readyFiles = items.filter((item) => item.status === 'ready').length
+    const submittedFiles = items.filter((item) => item.status === 'submitted').length
     const failedFiles = items.filter((item) => item.status === 'failed' || item.status === 'canceled').length
     const totalBytes = items.reduce((sum, item) => sum + item.sizeBytes, 0)
     const uploadedBytes = items.reduce(
       (sum, item) =>
-        sum +
-        (item.status === 'ready' || item.status === 'finalizing'
-          ? item.sizeBytes
-          : Math.min(item.uploadedBytes, item.sizeBytes)),
+        sum + (item.status === 'submitted' ? item.sizeBytes : Math.min(item.uploadedBytes, item.sizeBytes)),
       0,
     )
     const progressPct = totalBytes > 0 ? Math.round((uploadedBytes / totalBytes) * 100) : 0
     return {
       totalFiles,
-      uploadedFiles,
-      readyFiles,
+      submittedFiles,
       failedFiles,
       totalBytes,
       uploadedBytes,
@@ -381,7 +296,7 @@ export function UploadPage() {
           <h1 className="upload-title">Album Uploads</h1>
         </header>
         <p className="upload-subtitle">
-          Upload ZIP files directly to object storage. Uploads start immediately after selection.
+          Upload ZIP files directly to object storage. Files are submitted for background indexing after upload.
         </p>
 
         <div className="upload-actions">
@@ -424,12 +339,12 @@ export function UploadPage() {
 
         <section className="upload-summary" data-testid="upload-summary">
           <p>
-            {summary.uploadedFiles}/{summary.totalFiles} uploaded, {summary.readyFiles} ready, {summary.failedFiles}{' '}
-            failed
+            {summary.submittedFiles}/{summary.totalFiles} submitted, {summary.failedFiles} failed
           </p>
           <p>
             {formatBytes(summary.uploadedBytes)} / {formatBytes(summary.totalBytes)} ({summary.progressPct}%)
           </p>
+          <p>Use Find albums to open albums once indexing is complete.</p>
         </section>
 
         {pageError && <p className="upload-page-error">{pageError}</p>}
@@ -448,16 +363,15 @@ export function UploadPage() {
                     className={`upload-item-status upload-item-status-${item.status}`}
                     data-testid="upload-status"
                   >
-                    {statusLabel(item.status, item.finalizeStatus)}
+                    {statusLabel(item.status)}
                   </span>
                 </div>
                 <p className="upload-item-meta">
                   {formatBytes(item.sizeBytes)} | {pct}% uploaded
-                  {item.photoCount !== undefined ? ` | ${item.photoCount} photos indexed` : ''}
                 </p>
                 {item.error && <p className="upload-item-error">{item.error}</p>}
                 <div className="upload-item-actions">
-                  {(item.status === 'uploading' || item.status === 'finalizing') && (
+                  {item.status === 'uploading' && (
                     <button
                       type="button"
                       className="photo-nav-button"
@@ -465,16 +379,6 @@ export function UploadPage() {
                       data-testid="upload-cancel-item"
                     >
                       Cancel
-                    </button>
-                  )}
-                  {item.albumId && item.status === 'ready' && (
-                    <button
-                      type="button"
-                      className="photo-nav-button"
-                      onClick={() => navigate(`/album/${item.albumId}`)}
-                      data-testid="upload-open-album"
-                    >
-                      Open album
                     </button>
                   )}
                   <button
