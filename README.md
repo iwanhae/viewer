@@ -46,9 +46,7 @@ Docker images are split by service:
 - CI publishes viewer as `ghcr.io/<owner>/<repo>` and recommender as `ghcr.io/<owner>/<repo>-recommender`.
 
 The recommender image prefetches `config.json` and `model.safetensors` for `SIGLIP2_MODEL_ID` at build time via the `model-base` stage, so pod startup does not require Hugging Face egress.
-CI publishes a reusable model base image (`model-siglip2-base-patch16-224`), and recommender builds can reuse it with `--build-arg MODEL_BASE_IMAGE=<registry/repo:tag>`.
-For local recommender builds, `MODEL_BASE_IMAGE` defaults to the in-file `model-base` stage.
-To use a different model in Docker, build with `--build-arg SIGLIP2_MODEL_ID=<repo-id>` and publish a corresponding model base image tag.
+To use a different model in Docker, build with `--build-arg SIGLIP2_MODEL_ID=<repo-id>`.
 To build an MKL-accelerated recommender for x86_64 images, pass `--build-arg RECOMMENDER_ACCEL=mkl --platform linux/amd64`.
 `RECOMMENDER_ACCEL` defaults to `none`; if `mkl` is requested on non-`amd64` targets, the Dockerfile falls back to a non-MKL recommender build.
 
