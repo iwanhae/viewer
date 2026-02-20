@@ -48,3 +48,14 @@ export type RecommendationItem = {
 export type RecommendationResponse = {
   items: RecommendationItem[]
 }
+
+export type FinalizeStatus = 'QUEUED' | 'PROCESSING' | 'SUCCEEDED' | 'FAILED'
+
+export type FinalizeResponse = {
+  albumId: string
+  status: FinalizeStatus
+  photoCount?: number
+  createdAt?: string
+  error?: string
+  updatedAt: string
+}

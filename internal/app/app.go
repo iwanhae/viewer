@@ -12,6 +12,7 @@ import (
 	"viewer/internal/feed"
 	"viewer/internal/httpapi"
 	"viewer/internal/images"
+	"viewer/internal/models"
 	"viewer/internal/recommend"
 	"viewer/internal/storage"
 )
@@ -39,6 +40,13 @@ func Run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("recommendation service init failed: %w", err)
 	}
+	albumService.SetFinalizeSuccessHook(func(idx models.AlbumIndex) {
+		if recommendService != nil {
+			recommendService.IngestAlbumIndex(idx)
+		}
+	})
+	albumService.StartFinalizeWorker(ctx)
+
 	recommenderEnabled := recommendService.Enabled()
 	if recommenderEnabled {
 		if cfg.RecommenderRequired {

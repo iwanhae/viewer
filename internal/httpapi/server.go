@@ -56,6 +56,7 @@ func (s *Server) Router() http.Handler {
 		r.Post("/albums", s.createAlbum)
 		r.Get("/albums/search", s.searchAlbums)
 		r.Post("/albums/{albumId}/finalize", s.finalizeAlbum)
+		r.Get("/albums/{albumId}/finalize", s.getFinalizeStatus)
 		r.Get("/albums/{albumId}", s.getAlbum)
 		r.Get("/feed", s.getFeed)
 		r.Get("/image/{albumId}/{index}", s.getImage)
@@ -104,7 +105,7 @@ func (s *Server) createAlbum(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) finalizeAlbum(w http.ResponseWriter, r *http.Request) {
 	albumID := chi.URLParam(r, "albumId")
-	idx, err := s.albums.Finalize(r.Context(), albumID)
+	state, err := s.albums.RequestFinalize(r.Context(), albumID)
 	if err != nil {
 		status := http.StatusInternalServerError
 		code := "INTERNAL"
@@ -115,14 +116,28 @@ func (s *Server) finalizeAlbum(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, status, code, err.Error())
 		return
 	}
-	if s.recommend != nil {
-		s.recommend.IngestAlbumIndex(*idx)
+
+	status := http.StatusAccepted
+	if state.Status == albums.FinalizeStatusSucceeded {
+		status = http.StatusOK
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"albumId":    idx.AlbumID,
-		"photoCount": idx.PhotoCount,
-		"createdAt":  idx.CreatedAt,
-	})
+	writeJSON(w, status, state)
+}
+
+func (s *Server) getFinalizeStatus(w http.ResponseWriter, r *http.Request) {
+	albumID := chi.URLParam(r, "albumId")
+	state, err := s.albums.GetFinalizeStatus(r.Context(), albumID)
+	if err != nil {
+		status := http.StatusInternalServerError
+		code := "INTERNAL"
+		if errors.Is(err, albums.ErrAlbumNotFound) {
+			status = http.StatusNotFound
+			code = "NOT_FOUND"
+		}
+		writeError(w, r, status, code, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, state)
 }
 
 func (s *Server) getAlbum(w http.ResponseWriter, r *http.Request) {

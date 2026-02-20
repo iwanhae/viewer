@@ -4,6 +4,8 @@ import type {
   AlbumIndex,
   AlbumSearchResponse,
   FeedResponse,
+  FinalizeResponse,
+  FinalizeStatus,
   RecommendationItem,
   RecommendationResponse,
 } from './types'
@@ -14,6 +16,8 @@ export type {
   AlbumSearchResponse,
   FeedItem,
   FeedResponse,
+  FinalizeResponse,
+  FinalizeStatus,
   PhotoMeta,
   RecommendationItem,
   RecommendationResponse,
@@ -80,12 +84,20 @@ export async function uploadAlbumObject(
   })
 }
 
-export async function finalizeAlbum(albumId: string): Promise<{
-  albumId: string
-  photoCount: number
-  createdAt: string
-}> {
-  return await requestJSON(`/api/albums/${albumId}/finalize`, { method: 'POST' })
+export async function finalizeAlbum(albumId: string, options?: { signal?: AbortSignal }): Promise<FinalizeResponse> {
+  return await requestJSON<FinalizeResponse>(`/api/albums/${albumId}/finalize`, {
+    method: 'POST',
+    signal: options?.signal,
+  })
+}
+
+export async function fetchFinalizeStatus(
+  albumId: string,
+  options?: { signal?: AbortSignal },
+): Promise<FinalizeResponse> {
+  return await requestJSON<FinalizeResponse>(`/api/albums/${albumId}/finalize`, {
+    signal: options?.signal,
+  })
 }
 
 export async function fetchAlbum(albumId: string, options?: { signal?: AbortSignal }): Promise<AlbumIndex> {

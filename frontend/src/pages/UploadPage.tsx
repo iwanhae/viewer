@@ -1,8 +1,16 @@
 import { useCallback, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { createAlbum, finalizeAlbum, uploadAlbumObject } from '../api/client'
+import {
+  createAlbum,
+  fetchFinalizeStatus,
+  finalizeAlbum,
+  type FinalizeResponse,
+  type FinalizeStatus,
+  uploadAlbumObject,
+} from '../api/client'
 
 type UploadStatus = 'uploading' | 'finalizing' | 'ready' | 'failed' | 'canceled'
+const finalizePollIntervalMs = 10_000
 
 type UploadItem = {
   id: string
@@ -13,6 +21,7 @@ type UploadItem = {
   uploadedBytes: number
   albumId?: string
   photoCount?: number
+  finalizeStatus?: FinalizeStatus
   error?: string
 }
 
@@ -53,11 +62,14 @@ function formatBytes(bytes: number): string {
   return `${value.toFixed(precision)} ${units[idx]}`
 }
 
-function statusLabel(status: UploadStatus): string {
+function statusLabel(status: UploadStatus, finalizeStatus?: FinalizeStatus): string {
   switch (status) {
     case 'uploading':
       return 'Uploading'
     case 'finalizing':
+      if (finalizeStatus === 'QUEUED') {
+        return 'Queued'
+      }
       return 'Finalizing'
     case 'ready':
       return 'Ready'
@@ -68,6 +80,30 @@ function statusLabel(status: UploadStatus): string {
     default:
       return status
   }
+}
+
+function isPendingFinalize(status: FinalizeStatus): boolean {
+  return status === 'QUEUED' || status === 'PROCESSING'
+}
+
+function waitWithAbort(ms: number, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) {
+    return Promise.reject(new DOMException('aborted', 'AbortError'))
+  }
+  return new Promise((resolve, reject) => {
+    const timer = window.setTimeout(() => {
+      signal.removeEventListener('abort', onAbort)
+      resolve()
+    }, ms)
+
+    const onAbort = () => {
+      window.clearTimeout(timer)
+      signal.removeEventListener('abort', onAbort)
+      reject(new DOMException('aborted', 'AbortError'))
+    }
+
+    signal.addEventListener('abort', onAbort, { once: true })
+  })
 }
 
 export function UploadPage() {
@@ -83,6 +119,24 @@ export function UploadPage() {
     setItems((prev) => prev.map((item) => (item.id === itemID ? { ...item, ...next } : item)))
   }, [])
 
+  const pollFinalizeUntilTerminal = useCallback(
+    async (
+      albumId: string,
+      initial: FinalizeResponse,
+      signal: AbortSignal,
+      onUpdate: (status: FinalizeStatus) => void,
+    ): Promise<FinalizeResponse> => {
+      let state = initial
+      while (isPendingFinalize(state.status)) {
+        onUpdate(state.status)
+        await waitWithAbort(finalizePollIntervalMs, signal)
+        state = await fetchFinalizeStatus(albumId, { signal })
+      }
+      return state
+    },
+    [],
+  )
+
   const runItemUpload = useCallback(
     async (item: UploadItem) => {
       const controller = new AbortController()
@@ -95,25 +149,42 @@ export function UploadPage() {
         updateItem(item.id, { albumId: albumID, status: 'uploading' })
 
         await uploadAlbumObject(created.uploadUrl, item.file, created.uploadHeaders, controller.signal)
-        updateItem(item.id, { uploadedBytes: item.sizeBytes, status: 'finalizing' })
+        updateItem(item.id, { uploadedBytes: item.sizeBytes, status: 'finalizing', finalizeStatus: 'QUEUED' })
 
-        const finalized = await finalizeAlbum(albumID)
+        const accepted = await finalizeAlbum(albumID, { signal: controller.signal })
+        let finalized = accepted
+        if (isPendingFinalize(finalized.status)) {
+          finalized = await pollFinalizeUntilTerminal(albumID, finalized, controller.signal, (next) => {
+            updateItem(item.id, { status: 'finalizing', finalizeStatus: next })
+          })
+        }
+
+        if (finalized.status === 'SUCCEEDED') {
+          updateItem(item.id, {
+            status: 'ready',
+            finalizeStatus: undefined,
+            photoCount: finalized.photoCount,
+            error: undefined,
+          })
+          return
+        }
+
         updateItem(item.id, {
-          status: 'ready',
-          photoCount: finalized.photoCount,
-          error: undefined,
+          status: 'failed',
+          finalizeStatus: undefined,
+          error: finalized.error || 'finalize failed',
         })
       } catch (err) {
         if (isAbortError(err)) {
-          updateItem(item.id, { status: 'canceled', error: undefined })
+          updateItem(item.id, { status: 'canceled', finalizeStatus: undefined, error: undefined })
         } else {
-          updateItem(item.id, { status: 'failed', error: toErrorMessage(err) })
+          updateItem(item.id, { status: 'failed', finalizeStatus: undefined, error: toErrorMessage(err) })
         }
       } finally {
         controllersRef.current.delete(item.id)
       }
     },
-    [updateItem],
+    [pollFinalizeUntilTerminal, updateItem],
   )
 
   const enqueueUpload = useCallback(
@@ -183,6 +254,7 @@ export function UploadPage() {
           uploadedBytes: 0,
           albumId: undefined,
           photoCount: undefined,
+          finalizeStatus: undefined,
           error: undefined,
         }
       }),
@@ -194,6 +266,7 @@ export function UploadPage() {
         uploadedBytes: 0,
         albumId: undefined,
         photoCount: undefined,
+        finalizeStatus: undefined,
         error: undefined,
       })
     }
@@ -309,7 +382,7 @@ export function UploadPage() {
                     className={`upload-item-status upload-item-status-${item.status}`}
                     data-testid="upload-status"
                   >
-                    {statusLabel(item.status)}
+                    {statusLabel(item.status, item.finalizeStatus)}
                   </span>
                 </div>
                 <p className="upload-item-meta">
@@ -318,7 +391,7 @@ export function UploadPage() {
                 </p>
                 {item.error && <p className="upload-item-error">{item.error}</p>}
                 <div className="upload-item-actions">
-                  {item.status === 'uploading' && (
+                  {(item.status === 'uploading' || item.status === 'finalizing') && (
                     <button
                       type="button"
                       className="photo-nav-button"

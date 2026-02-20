@@ -3,6 +3,39 @@ import { expect, test, type APIRequestContext } from '@playwright/test'
 const zipBase64 =
   'UEsDBBQAAAAIAA+ETVzTNyprPwAAAEQAAAAHABwAMDAxLnBuZ1VUCQADHVKPaR1Sj2l1eAsAAQToAwAABOgDAADrDPBz5+WS4mJgYOD19HAJAtKMIMzBAiS3yvAwASluTxfHkIpbyX/+yzMwMzMxvLtafhIozODp6ueyzimhCQBQSwMEFAAAAAgAD4RNXKnVyORAAAAARAAAAAcAHAAwMDIucG5nVVQJAAMdUo9pHVKPaXV4CwABBOgDAAAE6AMAAOsM8HPn5ZLiYmBg4PX0cAkC0kxAzMjBAiT/1EzJAVLcni6OIRW3kv+cP8DAyszYsPJ9ciFQmMHT1c9lnVNCEwBQSwECHgMUAAAACAAPhE1c0zcqaz8AAABEAAAABwAYAAAAAAAAAAAApIEAAAAAMDAxLnBuZ1VUBQADHVKPaXV4CwABBOgDAAAE6AMAAFBLAQIeAxQAAAAIAA+ETVyp1cjkQAAAAEQAAAAHABgAAAAAAAAAAACkgYAAAAAwMDIucG5nVVQFAAMdUo9pdXgLAAEE6AMAAAToAwAAUEsFBgAAAAACAAIAmgAAAAEBAAAAAA=='
 
+type FinalizeStatus = 'QUEUED' | 'PROCESSING' | 'SUCCEEDED' | 'FAILED'
+
+type FinalizeResponse = {
+  albumId: string
+  status: FinalizeStatus
+  photoCount?: number
+  createdAt?: string
+  error?: string
+  updatedAt: string
+}
+
+async function waitForFinalizeSuccess(request: APIRequestContext, albumId: string): Promise<void> {
+  const deadline = Date.now() + 240_000
+  for (;;) {
+    const statusRes = await request.get(`/api/albums/${albumId}/finalize`)
+    expect(statusRes.ok()).toBeTruthy()
+    const state = (await statusRes.json()) as FinalizeResponse
+
+    if (state.status === 'SUCCEEDED') {
+      return
+    }
+    if (state.status === 'FAILED') {
+      throw new Error(state.error || 'finalize failed')
+    }
+    expect(state.status === 'QUEUED' || state.status === 'PROCESSING').toBeTruthy()
+
+    if (Date.now() >= deadline) {
+      throw new Error(`finalize timed out for album ${albumId}`)
+    }
+    await new Promise((resolve) => setTimeout(resolve, 1000))
+  }
+}
+
 async function createAndFinalizeAlbum(
   request: APIRequestContext,
   filename = 'album.zip',
@@ -35,7 +68,14 @@ async function createAndFinalizeAlbum(
   expect(uploadRes.ok()).toBeTruthy()
 
   const finalizeRes = await request.post(`/api/albums/${created.albumId}/finalize`)
-  expect(finalizeRes.ok()).toBeTruthy()
+  expect([200, 202]).toContain(finalizeRes.status())
+  const finalizeState = (await finalizeRes.json()) as FinalizeResponse
+  if (finalizeState.status === 'FAILED') {
+    throw new Error(finalizeState.error || 'finalize failed')
+  }
+  if (finalizeState.status === 'QUEUED' || finalizeState.status === 'PROCESSING') {
+    await waitForFinalizeSuccess(request, created.albumId)
+  }
   return created.albumId
 }
 

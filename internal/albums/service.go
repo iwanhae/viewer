@@ -2,6 +2,7 @@ package albums
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"path/filepath"
@@ -21,9 +22,13 @@ type Service struct {
 	store   albumStore
 	indexer *Indexer
 
-	mu          sync.RWMutex
-	albumCache  map[string]*models.AlbumIndex
-	uploadHints map[string]string
+	mu                sync.RWMutex
+	albumCache        map[string]*models.AlbumIndex
+	uploadHints       map[string]string
+	finalizeJobs      map[string]*FinalizeState
+	finalizeQueue     chan string
+	finalizeStartOnce sync.Once
+	onFinalizeSuccess func(models.AlbumIndex)
 }
 
 type RefreshSummary struct {
@@ -31,6 +36,26 @@ type RefreshSummary struct {
 	Loaded     int
 	Failed     int
 }
+
+type FinalizeStatus string
+
+const (
+	FinalizeStatusQueued     FinalizeStatus = "QUEUED"
+	FinalizeStatusProcessing FinalizeStatus = "PROCESSING"
+	FinalizeStatusSucceeded  FinalizeStatus = "SUCCEEDED"
+	FinalizeStatusFailed     FinalizeStatus = "FAILED"
+)
+
+type FinalizeState struct {
+	AlbumID    string         `json:"albumId"`
+	Status     FinalizeStatus `json:"status"`
+	PhotoCount int            `json:"photoCount,omitempty"`
+	CreatedAt  string         `json:"createdAt,omitempty"`
+	Error      string         `json:"error,omitempty"`
+	UpdatedAt  string         `json:"updatedAt"`
+}
+
+const defaultFinalizeQueueSize = 1024
 
 type albumStore interface {
 	PresignPut(ctx context.Context, key string, ttl time.Duration) (string, map[string]string, error)
@@ -43,11 +68,13 @@ type albumStore interface {
 
 func NewService(cfg cfgpkg.Config, store *storage.S3Store, indexer *Indexer) *Service {
 	return &Service{
-		cfg:         cfg,
-		store:       store,
-		indexer:     indexer,
-		albumCache:  make(map[string]*models.AlbumIndex),
-		uploadHints: make(map[string]string),
+		cfg:           cfg,
+		store:         store,
+		indexer:       indexer,
+		albumCache:    make(map[string]*models.AlbumIndex),
+		uploadHints:   make(map[string]string),
+		finalizeJobs:  make(map[string]*FinalizeState),
+		finalizeQueue: make(chan string, defaultFinalizeQueueSize),
 	}
 }
 
@@ -99,7 +126,239 @@ func (s *Service) CreateUpload(ctx context.Context, filename string, sizeBytes i
 	}, nil
 }
 
+func (s *Service) SetFinalizeSuccessHook(fn func(models.AlbumIndex)) {
+	s.mu.Lock()
+	s.onFinalizeSuccess = fn
+	s.mu.Unlock()
+}
+
+func (s *Service) StartFinalizeWorker(ctx context.Context) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	s.mu.Lock()
+	if s.finalizeJobs == nil {
+		s.finalizeJobs = make(map[string]*FinalizeState)
+	}
+	if s.finalizeQueue == nil {
+		s.finalizeQueue = make(chan string, defaultFinalizeQueueSize)
+	}
+	queue := s.finalizeQueue
+	s.mu.Unlock()
+
+	s.finalizeStartOnce.Do(func() {
+		go s.runFinalizeWorker(ctx, queue)
+	})
+}
+
+func (s *Service) runFinalizeWorker(ctx context.Context, queue <-chan string) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case albumID := <-queue:
+			s.processFinalize(ctx, albumID)
+		}
+	}
+}
+
+func (s *Service) processFinalize(ctx context.Context, albumID string) {
+	updatedAt := time.Now().UTC().Format(time.RFC3339Nano)
+
+	s.mu.Lock()
+	state, ok := s.finalizeJobs[albumID]
+	if !ok || state == nil {
+		state = &FinalizeState{
+			AlbumID:   albumID,
+			Status:    FinalizeStatusQueued,
+			UpdatedAt: updatedAt,
+		}
+		s.finalizeJobs[albumID] = state
+	}
+	if state.Status != FinalizeStatusQueued {
+		s.mu.Unlock()
+		return
+	}
+	state.Status = FinalizeStatusProcessing
+	state.Error = ""
+	state.UpdatedAt = updatedAt
+	s.mu.Unlock()
+
+	idx, err := s.finalizeNow(ctx, albumID)
+	if err != nil {
+		s.mu.Lock()
+		if failed, ok := s.finalizeJobs[albumID]; ok && failed != nil {
+			failed.Status = FinalizeStatusFailed
+			failed.PhotoCount = 0
+			failed.CreatedAt = ""
+			failed.Error = err.Error()
+			failed.UpdatedAt = time.Now().UTC().Format(time.RFC3339Nano)
+		}
+		s.mu.Unlock()
+		return
+	}
+
+	hookAlbum := cloneAlbumIndex(idx)
+	s.mu.Lock()
+	s.finalizeJobs[albumID] = &FinalizeState{
+		AlbumID:    albumID,
+		Status:     FinalizeStatusSucceeded,
+		PhotoCount: idx.PhotoCount,
+		CreatedAt:  idx.CreatedAt,
+		UpdatedAt:  time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	hook := s.onFinalizeSuccess
+	s.mu.Unlock()
+
+	if hook != nil && hookAlbum != nil {
+		hook(*hookAlbum)
+	}
+}
+
+func (s *Service) RequestFinalize(ctx context.Context, albumID string) (FinalizeState, error) {
+	albumID = strings.TrimSpace(albumID)
+	if albumID == "" {
+		return FinalizeState{}, fmt.Errorf("albumId is required")
+	}
+
+	s.StartFinalizeWorker(context.Background())
+
+	s.mu.RLock()
+	if current, ok := s.finalizeJobs[albumID]; ok && current != nil {
+		state := cloneFinalizeState(current)
+		s.mu.RUnlock()
+		switch state.Status {
+		case FinalizeStatusQueued, FinalizeStatusProcessing, FinalizeStatusSucceeded:
+			return state, nil
+		}
+	} else {
+		s.mu.RUnlock()
+	}
+
+	if idx, err := s.GetAlbum(ctx, albumID); err == nil {
+		state := FinalizeState{
+			AlbumID:    albumID,
+			Status:     FinalizeStatusSucceeded,
+			PhotoCount: idx.PhotoCount,
+			CreatedAt:  idx.CreatedAt,
+			UpdatedAt:  time.Now().UTC().Format(time.RFC3339Nano),
+		}
+		s.mu.Lock()
+		s.finalizeJobs[albumID] = cloneFinalizeStatePtr(state)
+		s.mu.Unlock()
+		return state, nil
+	} else if !errors.Is(err, ErrAlbumNotFound) {
+		return FinalizeState{}, err
+	}
+
+	exists, size, err := s.store.HeadObject(ctx, sourceKey(albumID))
+	if err != nil {
+		return FinalizeState{}, err
+	}
+	if !exists || size <= 0 {
+		return FinalizeState{}, fmt.Errorf("%w: %s", ErrAlbumSourceNotFound, albumID)
+	}
+
+	updatedAt := time.Now().UTC().Format(time.RFC3339Nano)
+	shouldEnqueue := false
+
+	s.mu.Lock()
+	state, ok := s.finalizeJobs[albumID]
+	if !ok || state == nil {
+		state = &FinalizeState{
+			AlbumID:   albumID,
+			Status:    FinalizeStatusQueued,
+			UpdatedAt: updatedAt,
+		}
+		s.finalizeJobs[albumID] = state
+		shouldEnqueue = true
+	} else {
+		switch state.Status {
+		case FinalizeStatusQueued, FinalizeStatusProcessing, FinalizeStatusSucceeded:
+		default:
+			state.Status = FinalizeStatusQueued
+			state.PhotoCount = 0
+			state.CreatedAt = ""
+			state.Error = ""
+			state.UpdatedAt = updatedAt
+			shouldEnqueue = true
+		}
+	}
+	response := cloneFinalizeState(state)
+	s.mu.Unlock()
+
+	if shouldEnqueue {
+		if err := s.enqueueFinalize(albumID); err != nil {
+			s.mu.Lock()
+			if failed, ok := s.finalizeJobs[albumID]; ok && failed != nil {
+				failed.Status = FinalizeStatusFailed
+				failed.PhotoCount = 0
+				failed.CreatedAt = ""
+				failed.Error = "finalize queue is full"
+				failed.UpdatedAt = time.Now().UTC().Format(time.RFC3339Nano)
+			}
+			s.mu.Unlock()
+			return FinalizeState{}, err
+		}
+	}
+
+	return response, nil
+}
+
+func (s *Service) GetFinalizeStatus(ctx context.Context, albumID string) (FinalizeState, error) {
+	albumID = strings.TrimSpace(albumID)
+	if albumID == "" {
+		return FinalizeState{}, fmt.Errorf("albumId is required")
+	}
+
+	s.mu.RLock()
+	if state, ok := s.finalizeJobs[albumID]; ok && state != nil {
+		out := cloneFinalizeState(state)
+		s.mu.RUnlock()
+		return out, nil
+	}
+	s.mu.RUnlock()
+
+	idx, err := s.GetAlbum(ctx, albumID)
+	if err != nil {
+		if errors.Is(err, ErrAlbumNotFound) {
+			return FinalizeState{}, fmt.Errorf("%w: %s", ErrAlbumNotFound, albumID)
+		}
+		return FinalizeState{}, err
+	}
+
+	state := FinalizeState{
+		AlbumID:    albumID,
+		Status:     FinalizeStatusSucceeded,
+		PhotoCount: idx.PhotoCount,
+		CreatedAt:  idx.CreatedAt,
+		UpdatedAt:  time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	s.mu.Lock()
+	if _, ok := s.finalizeJobs[albumID]; !ok {
+		s.finalizeJobs[albumID] = cloneFinalizeStatePtr(state)
+	}
+	s.mu.Unlock()
+	return state, nil
+}
+
+func (s *Service) enqueueFinalize(albumID string) error {
+	if s.finalizeQueue == nil {
+		return fmt.Errorf("finalize worker is not initialized")
+	}
+	select {
+	case s.finalizeQueue <- albumID:
+		return nil
+	default:
+		return fmt.Errorf("finalize queue is full")
+	}
+}
+
 func (s *Service) Finalize(ctx context.Context, albumID string) (*models.AlbumIndex, error) {
+	return s.finalizeNow(ctx, albumID)
+}
+
+func (s *Service) finalizeNow(ctx context.Context, albumID string) (*models.AlbumIndex, error) {
 	if strings.TrimSpace(albumID) == "" {
 		return nil, fmt.Errorf("albumId is required")
 	}
@@ -141,6 +400,13 @@ func (s *Service) Finalize(ctx context.Context, albumID string) (*models.AlbumIn
 	s.mu.Lock()
 	s.albumCache[albumID] = cloneAlbumIndex(idx)
 	delete(s.uploadHints, albumID)
+	if job, ok := s.finalizeJobs[albumID]; ok && job != nil && job.Status != FinalizeStatusSucceeded {
+		job.Status = FinalizeStatusSucceeded
+		job.PhotoCount = idx.PhotoCount
+		job.CreatedAt = idx.CreatedAt
+		job.Error = ""
+		job.UpdatedAt = time.Now().UTC().Format(time.RFC3339Nano)
+	}
 	s.mu.Unlock()
 
 	return cloneAlbumIndex(idx), nil
@@ -330,6 +596,18 @@ func cloneAlbumIndex(idx *models.AlbumIndex) *models.AlbumIndex {
 			dup.Embeddings[key] = embeddingCopy
 		}
 	}
+	return &dup
+}
+
+func cloneFinalizeState(state *FinalizeState) FinalizeState {
+	if state == nil {
+		return FinalizeState{}
+	}
+	return *state
+}
+
+func cloneFinalizeStatePtr(state FinalizeState) *FinalizeState {
+	dup := state
 	return &dup
 }
 
