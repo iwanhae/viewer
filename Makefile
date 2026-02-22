@@ -2,6 +2,7 @@ SHELL := /bin/bash
 .SHELLFLAGS := -eu -o pipefail -c
 
 BIN := bin/viewer
+ALBUM_DEDUPE_BIN := bin/album-dedupe-cleaner
 RECOMMENDER_BIN := bin/recommender
 CARGO_MANIFEST := workers/recommender/Cargo.toml
 FRONTEND_DIR := frontend
@@ -31,6 +32,7 @@ build:
 	npm --prefix $(FRONTEND_DIR) ci
 	npm --prefix $(FRONTEND_DIR) run build
 	go build -o $(BIN) ./cmd/viewer
+	go build -o $(ALBUM_DEDUPE_BIN) ./cmd/album-dedupe-cleaner
 
 test:
 	set -a; \

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 	"time"
 
@@ -23,6 +24,14 @@ type S3Store struct {
 	bucket    string
 	client    *s3.Client
 	presigner *s3.PresignClient
+}
+
+type AlbumSourceObject struct {
+	AlbumID      string
+	Key          string
+	LastModified time.Time
+	Size         int64
+	ETag         string
 }
 
 func NewS3Store(ctx context.Context, cfg cfgpkg.Config) (*S3Store, error) {
@@ -238,6 +247,107 @@ func (s *S3Store) ForEachAlbumObjectKey(ctx context.Context, fn func(key string)
 		token = out.NextContinuationToken
 	}
 	return nil
+}
+
+func (s *S3Store) ListAlbumSources(ctx context.Context) ([]AlbumSourceObject, error) {
+	sources := make([]AlbumSourceObject, 0)
+	var token *string
+	for {
+		out, err := s.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+			Bucket:            aws.String(s.bucket),
+			Prefix:            aws.String("albums/"),
+			ContinuationToken: token,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("list album sources: %w", err)
+		}
+		for _, obj := range out.Contents {
+			key := aws.ToString(obj.Key)
+			if key == "" {
+				continue
+			}
+			albumID, ok := parseAlbumSourceKey(key)
+			if !ok {
+				continue
+			}
+			sources = append(sources, AlbumSourceObject{
+				AlbumID:      albumID,
+				Key:          key,
+				LastModified: aws.ToTime(obj.LastModified).UTC(),
+				Size:         aws.ToInt64(obj.Size),
+				ETag:         aws.ToString(obj.ETag),
+			})
+		}
+		if out.IsTruncated == nil || !*out.IsTruncated {
+			break
+		}
+		token = out.NextContinuationToken
+	}
+
+	sort.Slice(sources, func(i, j int) bool {
+		return sources[i].Key < sources[j].Key
+	})
+	return sources, nil
+}
+
+func (s *S3Store) ListObjectsByPrefix(ctx context.Context, prefix string) ([]string, error) {
+	prefix = strings.TrimSpace(prefix)
+	if prefix == "" {
+		return nil, fmt.Errorf("prefix is required")
+	}
+
+	keys := make([]string, 0)
+	var token *string
+	for {
+		out, err := s.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+			Bucket:            aws.String(s.bucket),
+			Prefix:            aws.String(prefix),
+			ContinuationToken: token,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("list objects by prefix %s: %w", prefix, err)
+		}
+		for _, obj := range out.Contents {
+			key := aws.ToString(obj.Key)
+			if key == "" {
+				continue
+			}
+			keys = append(keys, key)
+		}
+		if out.IsTruncated == nil || !*out.IsTruncated {
+			break
+		}
+		token = out.NextContinuationToken
+	}
+
+	sort.Strings(keys)
+	return keys, nil
+}
+
+func (s *S3Store) DeleteObject(ctx context.Context, key string) error {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return fmt.Errorf("key is required")
+	}
+	_, err := s.client.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket: aws.String(s.bucket),
+		Key:    aws.String(key),
+	})
+	if err != nil {
+		return fmt.Errorf("delete object %s: %w", key, err)
+	}
+	return nil
+}
+
+func parseAlbumSourceKey(key string) (string, bool) {
+	parts := strings.Split(strings.TrimSpace(key), "/")
+	if len(parts) != 3 {
+		return "", false
+	}
+	if parts[0] != "albums" || strings.TrimSpace(parts[1]) == "" || parts[2] != "source.zip" {
+		return "", false
+	}
+	return parts[1], true
 }
 
 func wrapObjectError(action string, key string, err error) error {

@@ -92,6 +92,32 @@ func Load() (Config, error) {
 	return cfg, nil
 }
 
+func LoadS3Only() (Config, error) {
+	cfg := Config{
+		S3Endpoint:     os.Getenv("S3_ENDPOINT"),
+		S3Region:       getenv("S3_REGION", "us-east-1"),
+		S3Bucket:       os.Getenv("S3_BUCKET"),
+		S3AccessKey:    os.Getenv("S3_ACCESS_KEY"),
+		S3SecretKey:    os.Getenv("S3_SECRET_KEY"),
+		S3UsePathStyle: getenvBool("S3_USE_PATH_STYLE", true),
+	}
+
+	if cfg.S3Bucket == "" {
+		return Config{}, fmt.Errorf("S3_BUCKET is required")
+	}
+	if cfg.S3AccessKey == "" {
+		return Config{}, fmt.Errorf("S3_ACCESS_KEY is required")
+	}
+	if cfg.S3SecretKey == "" {
+		return Config{}, fmt.Errorf("S3_SECRET_KEY is required")
+	}
+	if cfg.S3Endpoint == "" {
+		return Config{}, fmt.Errorf("S3_ENDPOINT is required")
+	}
+
+	return cfg, nil
+}
+
 func getenv(key string, fallback string) string {
 	v := os.Getenv(key)
 	if v == "" {

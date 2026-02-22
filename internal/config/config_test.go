@@ -72,6 +72,23 @@ func TestLoadRecommenderEndpoint(t *testing.T) {
 	}
 }
 
+func TestLoadS3OnlyRequiresS3ValuesOnly(t *testing.T) {
+	t.Setenv("S3_ENDPOINT", "https://example.invalid")
+	t.Setenv("S3_BUCKET", "viewer")
+	t.Setenv("S3_ACCESS_KEY", "access")
+	t.Setenv("S3_SECRET_KEY", "secret")
+	t.Setenv("RECOMMENDER_REQUIRED", "true")
+	t.Setenv("RECOMMENDER_ENDPOINT", "")
+
+	cfg, err := LoadS3Only()
+	if err != nil {
+		t.Fatalf("LoadS3Only: %v", err)
+	}
+	if cfg.S3Bucket != "viewer" {
+		t.Fatalf("S3Bucket=%q want viewer", cfg.S3Bucket)
+	}
+}
+
 func setRequiredEnv(t *testing.T) {
 	t.Helper()
 	t.Setenv("S3_ENDPOINT", "https://example.invalid")
