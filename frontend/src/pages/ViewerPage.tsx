@@ -4,16 +4,39 @@ import { useAlbum } from '../hooks/useAlbum'
 import { readColumnPreference, writeColumnPreference } from '../utils/columnPreference'
 import { readLastWallSeed } from '../utils/wallSeed'
 import { MasonryWall } from '../components/MasonryWall'
+import { BottomIsland } from '../components/BottomIsland'
 
 const COLUMN_OPTIONS = [1, 2, 3, 4, 5, 6]
 const VIEWER_COLUMNS_KEY = 'viewer_columns'
 const DEFAULT_COLUMNS = 3
+const ALBUM_PAGE_SIZE = 50
+
+function parsePositiveInt(value: string | null, fallback: number): number {
+  const parsed = Number(value)
+  if (!Number.isInteger(parsed) || parsed < 1) return fallback
+  return parsed
+}
+
+function parseNonNegativeInt(value: string | null): number | null {
+  if (value === null) return null
+  const parsed = Number(value)
+  if (!Number.isInteger(parsed) || parsed < 0) return null
+  return parsed
+}
+
+function pageForPhotoIndex(index: number): number {
+  return Math.floor(index / ALBUM_PAGE_SIZE) + 1
+}
+
+function wallFocusKey(albumId: string, photoIndex: number): string {
+  return `${albumId}:${photoIndex}`
+}
 
 export function ViewerPage() {
   const { albumId = '' } = useParams()
-  const [params] = useSearchParams()
-  const initialIndexValue = Number(params.get('i') ?? '0')
-  const initialIndex = Number.isFinite(initialIndexValue) ? initialIndexValue : 0
+  const [params, setParams] = useSearchParams()
+  const requestedPage = parsePositiveInt(params.get('p'), 1)
+  const requestedIndex = parseNonNegativeInt(params.get('i'))
 
   const { album, loading, error } = useAlbum(albumId)
   const [columnCount, setColumnCount] = useState(() =>
@@ -26,16 +49,64 @@ export function ViewerPage() {
 
   useEffect(() => {
     anchoredRef.current = false
-  }, [albumId])
+  }, [albumId, requestedPage, requestedIndex])
+
+  const totalPages = useMemo(() => {
+    if (!album) return 1
+    return Math.max(1, Math.ceil(album.photoCount / ALBUM_PAGE_SIZE))
+  }, [album])
+
+  const normalizedPage = useMemo(
+    () => Math.min(Math.max(requestedPage, 1), totalPages),
+    [requestedPage, totalPages],
+  )
 
   const anchorIndex = useMemo(() => {
-    if (!album) return null
-    if (initialIndex < 0 || initialIndex >= album.photoCount) return 0
-    return initialIndex
-  }, [album, initialIndex])
+    if (!album || requestedIndex === null) return null
+    if (requestedIndex >= album.photoCount) return 0
+    return requestedIndex
+  }, [album, requestedIndex])
+
+  const anchorPage = useMemo(
+    () => (anchorIndex === null ? null : pageForPhotoIndex(anchorIndex)),
+    [anchorIndex],
+  )
 
   useEffect(() => {
-    if (!album || anchoredRef.current || anchorIndex === null) return
+    if (requestedPage === normalizedPage) return
+    setParams(
+      (prev) => {
+        const next = new URLSearchParams(prev)
+        next.set('p', String(normalizedPage))
+        return next
+      },
+      { replace: true },
+    )
+  }, [requestedPage, normalizedPage, setParams])
+
+  useEffect(() => {
+    if (!album || anchorPage === null) return
+    if (normalizedPage === anchorPage) return
+    setParams(
+      (prev) => {
+        const next = new URLSearchParams(prev)
+        next.set('p', String(anchorPage))
+        return next
+      },
+      { replace: true },
+    )
+  }, [album, anchorPage, normalizedPage, setParams])
+
+  const pageStart = useMemo(() => (normalizedPage - 1) * ALBUM_PAGE_SIZE, [normalizedPage])
+
+  const anchorVisibleIndex = useMemo(() => {
+    if (anchorIndex === null) return null
+    if (anchorIndex < pageStart || anchorIndex >= pageStart + ALBUM_PAGE_SIZE) return null
+    return anchorIndex
+  }, [anchorIndex, pageStart])
+
+  useEffect(() => {
+    if (!album || anchoredRef.current || anchorVisibleIndex === null) return
     const target = anchorRef.current
     if (!target) return
 
@@ -43,20 +114,40 @@ export function ViewerPage() {
       target.scrollIntoView({ block: 'nearest', inline: 'nearest' })
       anchoredRef.current = true
     })
-  }, [album, anchorIndex])
+  }, [album, anchorVisibleIndex])
 
-  const albumPhotos = useMemo(() => album?.photos ?? [], [album?.photos])
+  const albumPhotos = useMemo(() => {
+    if (!album) return []
+    return album.photos.slice(pageStart, pageStart + ALBUM_PAGE_SIZE)
+  }, [album, pageStart])
 
   const onBackToWall = () => {
     const seed = readLastWallSeed()
-    if (!seed) {
-      navigate('/')
-      return
-    }
+    const focusIndex = anchorIndex
 
     const query = new URLSearchParams()
-    query.set('seed', seed)
-    navigate(`/?${query.toString()}`)
+    if (seed) {
+      query.set('seed', seed)
+    }
+    if (focusIndex !== null) {
+      query.set('focus', wallFocusKey(album.albumId, focusIndex))
+    }
+    const queryString = query.toString()
+    navigate(queryString ? `/?${queryString}` : '/')
+  }
+
+  const onChangePage = (page: number) => {
+    const clamped = Math.min(Math.max(page, 1), totalPages)
+    setParams((prev) => {
+      const next = new URLSearchParams(prev)
+      next.set('p', String(clamped))
+      next.delete('i')
+      return next
+    })
+
+    if (typeof window !== 'undefined') {
+      window.scrollTo({ top: 0, behavior: 'auto' })
+    }
   }
 
   if (error) {
@@ -79,8 +170,13 @@ export function ViewerPage() {
           <button
             className="tile album-photo-tile"
             data-testid="album-tile"
-            ref={photo.i === anchorIndex ? anchorRef : null}
-            onClick={() => navigate(`/album/${album.albumId}/${photo.i}`, { state: { album } })}
+            ref={photo.i === anchorVisibleIndex ? anchorRef : null}
+            onClick={() => {
+              if (typeof window !== 'undefined') {
+                window.scrollTo({ top: 0, behavior: 'auto' })
+              }
+              navigate(`/album/${album.albumId}/${photo.i}`, { state: { album } })
+            }}
             aria-label={`Open details for image ${photo.i + 1}`}
           >
             <img
@@ -98,26 +194,66 @@ export function ViewerPage() {
         columnTestId="masonry-column"
       />
 
-      <div className="bottom-bar">
-        <div className="columns">
-          {COLUMN_OPTIONS.map((value) => (
-            <button
-              key={value}
-              className={value === columnCount ? 'active' : ''}
-              onClick={() => {
-                setColumnCount(value)
-                writeColumnPreference(VIEWER_COLUMNS_KEY, value)
-              }}
-              data-testid={`album-columns-${value}`}
-            >
-              {value}
-            </button>
-          ))}
+      {totalPages > 1 && (
+        <div className="album-pagination" data-testid="album-pagination">
+          <button
+            type="button"
+            className="album-pagination-button"
+            onClick={() => onChangePage(normalizedPage - 1)}
+            disabled={normalizedPage <= 1}
+            data-testid="album-page-prev"
+          >
+            Prev
+          </button>
+          <p className="album-pagination-status" data-testid="album-page-indicator">
+            Page {normalizedPage} / {totalPages}
+          </p>
+          <button
+            type="button"
+            className="album-pagination-button"
+            onClick={() => onChangePage(normalizedPage + 1)}
+            disabled={normalizedPage >= totalPages}
+            data-testid="album-page-next"
+          >
+            Next
+          </button>
         </div>
-        <button className="upload album-back" onClick={onBackToWall} data-testid="album-back">
-          Back
-        </button>
-      </div>
+      )}
+
+      <BottomIsland
+        actions={[
+          {
+            id: 'album-columns',
+            label: 'Columns',
+            testId: 'album-columns-toggle',
+            renderPopup: ({ close }) => (
+              <div className="bottom-island-popup-grid" data-testid="album-columns-popup">
+                {COLUMN_OPTIONS.map((value) => (
+                  <button
+                    type="button"
+                    key={value}
+                    className={`bottom-island-popup-option ${value === columnCount ? 'active' : ''}`.trim()}
+                    onClick={() => {
+                      setColumnCount(value)
+                      writeColumnPreference(VIEWER_COLUMNS_KEY, value)
+                      close()
+                    }}
+                    data-testid={`album-columns-${value}`}
+                  >
+                    {value}
+                  </button>
+                ))}
+              </div>
+            ),
+          },
+          {
+            id: 'album-back',
+            label: 'Back',
+            testId: 'album-back',
+            onClick: onBackToWall,
+          },
+        ]}
+      />
     </div>
   )
 }

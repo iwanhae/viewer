@@ -60,7 +60,7 @@ function wallOrderSrcs(items: FeedItem[], columns: number): string[] {
 }
 
 async function fetchFeedForSeed(page: Page, seed: string): Promise<FeedResponse> {
-  const response = await page.request.get(`/api/feed?limit=80&seed=${encodeURIComponent(seed)}`)
+  const response = await page.request.get(`/api/feed?limit=40&seed=${encodeURIComponent(seed)}`)
   expect(response.ok()).toBeTruthy()
   const payload = (await response.json()) as FeedResponse
   expect(Array.isArray(payload.items)).toBeTruthy()
@@ -129,6 +129,8 @@ async function uploadAndFinalizeFromUploadPage(page: Page, zipPath: string) {
   }
 
   await page.route('**/*', multipartRoute)
+  await page.getByTestId('wall-shortcut').click()
+  await expect(page.getByTestId('wall-shortcut-popup')).toBeVisible()
   await page.getByTestId('wall-upload').click()
   await expect.poll(() => new URL(page.url()).pathname).toBe('/upload')
   await expect(page.getByTestId('upload-page')).toBeVisible()
@@ -155,9 +157,9 @@ test('basic upload -> wall -> album flow', async ({ page }) => {
   await page.goto('/')
   await expect(page.getByTestId('wall-grid')).toBeVisible()
   await expect(page.getByTestId('masonry-column')).toHaveCount(3)
+  await expect(page.getByTestId('wall-columns')).toBeVisible()
   await expect(page.getByTestId('wall-refresh')).toBeVisible()
-  await expect(page.getByTestId('wall-find')).toBeVisible()
-  await expect(page.getByTestId('wall-upload')).toBeVisible()
+  await expect(page.getByTestId('wall-shortcut')).toBeVisible()
 
   await uploadAndFinalizeFromUploadPage(page, zip1)
 
@@ -172,6 +174,8 @@ test('basic upload -> wall -> album flow', async ({ page }) => {
   expect(wallResponse.headers()['content-type']).toBe(originalResponse.headers()['content-type'])
   expect(await wallResponse.body()).toEqual(await originalResponse.body())
 
+  await page.getByTestId('wall-shortcut').click()
+  await expect(page.getByTestId('wall-shortcut-popup')).toBeVisible()
   await page.getByTestId('wall-find').click()
   await expect.poll(() => new URL(page.url()).pathname).toBe('/albums/find')
   await expect(page.getByTestId('album-search-page')).toBeVisible()
@@ -233,11 +237,14 @@ test('basic upload -> wall -> album flow', async ({ page }) => {
   await expect(page.getByTestId('masonry-column')).toHaveCount(3)
   await expect(page.getByTestId('album-tile').first()).toBeVisible()
   const albumURL = new URL(page.url())
-  expect(albumURL.searchParams.get('i')).toBeNull()
+  expect(albumURL.searchParams.get('i')).toBeTruthy()
+  expect(albumURL.searchParams.get('p')).toBeTruthy()
   const albumPath = albumURL.pathname
   const albumId = albumPath.split('/').at(-1)
   expect(albumId).toBeTruthy()
 
+  await page.getByTestId('album-columns-toggle').click()
+  await expect(page.getByTestId('album-columns-popup')).toBeVisible()
   await expect(page.getByTestId('album-columns-4')).toBeVisible()
   await expect(page.getByTestId('album-columns-6')).toBeVisible()
   await page.getByTestId('album-columns-6').click()
@@ -249,7 +256,11 @@ test('basic upload -> wall -> album flow', async ({ page }) => {
   await expect
     .poll(() => new URL(page.url()).pathname)
     .toMatch(new RegExp(`^/album/${albumId}/\\d+$`))
-  const firstOriginalLink = page.getByTestId('photo-open-original')
+  await expect.poll(() => page.evaluate(() => window.scrollY)).toBe(0)
+  const photoURL = new URL(page.url())
+  const photoIndex = Number(photoURL.pathname.split('/').at(-1))
+  expect(Number.isInteger(photoIndex)).toBeTruthy()
+  const firstOriginalLink = page.getByTestId('photo-image-original-link')
   await expect(firstOriginalLink).toBeVisible()
   await expect(firstOriginalLink).toHaveAttribute('target', '_blank')
   await expect(firstOriginalLink).toHaveAttribute('rel', 'noopener noreferrer')
@@ -258,11 +269,13 @@ test('basic upload -> wall -> album flow', async ({ page }) => {
   await page.getByTestId('photo-back').click()
   await expect(page.getByTestId('album-grid')).toBeVisible()
   await expect.poll(() => new URL(page.url()).pathname).toBe(`/album/${albumId}`)
+  await expect.poll(() => new URL(page.url()).searchParams.get('i')).toBe(String(photoIndex))
 
   await page.getByTestId('album-back').click()
   await expect(page.getByTestId('wall-grid')).toBeVisible()
   await expect.poll(() => new URL(page.url()).pathname).toBe('/')
   await expect.poll(() => new URL(page.url()).searchParams.get('seed')).toBe(seedBeforeAlbumNavigation)
+  await page.getByTestId('wall-columns').click()
   await expect(page.getByTestId('columns-6')).toBeVisible()
   await page.screenshot({ path: path.join(samplesDir, '03-wall.png'), fullPage: true })
 

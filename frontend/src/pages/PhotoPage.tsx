@@ -1,11 +1,21 @@
-import { useMemo } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { useLocation, useNavigate, useParams } from 'react-router-dom'
 import { seedCachedAlbum, type AlbumIndex } from '../api/client'
 import { useAlbum } from '../hooks/useAlbum'
 import { useRecommendations } from '../hooks/useRecommendations'
 import { MasonryWall } from '../components/MasonryWall'
+import { readColumnPreference, writeColumnPreference } from '../utils/columnPreference'
+import { BottomIsland } from '../components/BottomIsland'
 
 const recommendationLimit = 24
+const recommendationColumnOptions = [1, 2, 3, 4, 5, 6]
+const PHOTO_RECOMMEND_COLUMNS_KEY = 'photo_recommend_columns'
+const DEFAULT_RECOMMEND_COLUMNS = 3
+const ALBUM_PAGE_SIZE = 50
+
+function pageForPhotoIndex(index: number): number {
+  return Math.floor(index / ALBUM_PAGE_SIZE) + 1
+}
 
 export function PhotoPage() {
   const { albumId = '', photoIndex: rawPhotoIndex = '' } = useParams<{
@@ -33,7 +43,13 @@ export function PhotoPage() {
   }, [location.state, albumId])
 
   const { album, loading, error } = useAlbum(albumId, locationAlbum)
-  const recommendationColumnCount = 3
+  const [recommendationColumnCount, setRecommendationColumnCount] = useState(() =>
+    readColumnPreference(
+      PHOTO_RECOMMEND_COLUMNS_KEY,
+      recommendationColumnOptions,
+      DEFAULT_RECOMMEND_COLUMNS,
+    ),
+  )
 
   const photo = useMemo(() => {
     if (!album || photoIndex === null) return null
@@ -54,6 +70,11 @@ export function PhotoPage() {
   } = useRecommendations(album?.albumId ?? '', photo?.i ?? null, recommendationLimit)
 
   const isRecommendationLoading = recommendationLoadStatus === 'loading'
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    window.scrollTo({ top: 0, behavior: 'auto' })
+  }, [albumId, photoIndex])
 
   if (!albumId) {
     return <div className="photo-error">Missing album ID</div>
@@ -77,11 +98,19 @@ export function PhotoPage() {
   return (
     <div className="photo-page" data-testid="photo-page">
       <div className="photo-shell">
-        <img
-          className="photo-view-image"
-          src={`/api/image/${album.albumId}/${photo.i}`}
-          alt={photo.name || `Photo ${photo.i + 1}`}
-        />
+        <a
+          className="photo-view-image-link"
+          href={`/api/image/${album.albumId}/${photo.i}`}
+          target="_blank"
+          rel="noopener noreferrer"
+          data-testid="photo-image-original-link"
+        >
+          <img
+            className="photo-view-image"
+            src={`/api/image/${album.albumId}/${photo.i}`}
+            alt={photo.name || `Photo ${photo.i + 1}`}
+          />
+        </a>
         <aside className="photo-panel">
           <p className="photo-context">
             Album {album.albumId} / Photo {photo.i + 1}
@@ -163,24 +192,41 @@ export function PhotoPage() {
           </section>
         </aside>
       </div>
-      <div className="photo-bottom-actions">
-        <button
-          className="photo-nav-button"
-          onClick={() => navigate(`/album/${album.albumId}`)}
-          data-testid="photo-back"
-        >
-          Back to album
-        </button>
-        <a
-          className="photo-primary-action"
-          href={`/api/image/${album.albumId}/${photo.i}`}
-          target="_blank"
-          rel="noopener noreferrer"
-          data-testid="photo-open-original"
-        >
-          Open original
-        </a>
-      </div>
+      <BottomIsland
+        className="photo-bottom-island"
+        actions={[
+          {
+            id: 'photo-back',
+            label: 'Back to album',
+            testId: 'photo-back',
+            onClick: () => navigate(`/album/${album.albumId}?i=${photo.i}&p=${pageForPhotoIndex(photo.i)}`),
+          },
+          {
+            id: 'photo-columns',
+            label: 'Similar columns',
+            testId: 'photo-columns-toggle',
+            renderPopup: ({ close }) => (
+              <div className="bottom-island-popup-grid" data-testid="photo-columns-popup">
+                {recommendationColumnOptions.map((option) => (
+                  <button
+                    type="button"
+                    key={option}
+                    className={`bottom-island-popup-option ${option === recommendationColumnCount ? 'active' : ''}`.trim()}
+                    data-testid={`photo-columns-${option}`}
+                    onClick={() => {
+                      setRecommendationColumnCount(option)
+                      writeColumnPreference(PHOTO_RECOMMEND_COLUMNS_KEY, option)
+                      close()
+                    }}
+                  >
+                    {option}
+                  </button>
+                ))}
+              </div>
+            ),
+          },
+        ]}
+      />
     </div>
   )
 }

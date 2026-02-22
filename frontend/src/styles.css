@@ -65,7 +65,7 @@ body,
   height: 1px;
 }
 
-.bottom-bar {
+.bottom-island {
   position: fixed;
   left: 50%;
   transform: translateX(-50%);
@@ -73,56 +73,82 @@ body,
   border-radius: 999px;
   padding: 10px;
   display: flex;
-  gap: 12px;
+  gap: 10px;
   align-items: center;
   backdrop-filter: blur(16px);
   background: rgba(255, 255, 255, 0.84);
   border: 1px solid rgba(31, 41, 51, 0.14);
+  z-index: 40;
 }
 
-.columns {
-  display: flex;
-  gap: 8px;
+.bottom-island-item {
+  position: relative;
 }
 
-.columns button,
-.upload {
+.bottom-island-action {
   border: 0;
   border-radius: 999px;
-  min-width: 32px;
-  min-height: 32px;
+  min-height: 34px;
+  padding: 0 14px;
   background: rgba(31, 41, 51, 0.1);
   color: #1f2933;
-  font-weight: 600;
+  font-weight: 650;
+  font-size: 13px;
   cursor: pointer;
 }
 
-.columns button.active {
+.bottom-island-action:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.bottom-island-action.is-open {
   background: #1f2933;
   color: #f8fbfd;
 }
 
-.upload {
-  font-size: 20px;
-  line-height: 1;
+.bottom-island-popup {
+  position: absolute;
+  left: 50%;
+  transform: translateX(-50%);
+  bottom: calc(100% + 10px);
+  border-radius: 14px;
+  border: 1px solid rgba(31, 41, 51, 0.14);
+  background: rgba(255, 255, 255, 0.96);
+  box-shadow: 0 16px 30px rgba(15, 23, 42, 0.12);
+  backdrop-filter: blur(14px);
+  padding: 8px;
 }
 
-.wall-refresh {
-  padding: 0 14px;
-  min-width: 84px;
-  font-size: 14px;
+.bottom-island-popup-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  min-width: 170px;
 }
 
-.wall-find {
-  padding: 0 14px;
-  min-width: 68px;
-  font-size: 14px;
+.bottom-island-popup-stack {
+  display: grid;
+  gap: 8px;
+  min-width: 142px;
 }
 
-.wall-upload {
-  padding: 0 14px;
-  min-width: 84px;
-  font-size: 14px;
+.bottom-island-popup-option {
+  border: 0;
+  border-radius: 999px;
+  min-width: 34px;
+  min-height: 32px;
+  padding: 0 10px;
+  background: rgba(31, 41, 51, 0.1);
+  color: #1f2933;
+  font-weight: 600;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.bottom-island-popup-option.active {
+  background: #1f2933;
+  color: #f8fbfd;
 }
 
 .status {
@@ -228,10 +254,47 @@ body,
   outline-offset: 2px;
 }
 
-.album-back {
-  padding: 0 14px;
-  min-width: 70px;
-  font-size: 14px;
+.album-pagination {
+  position: fixed;
+  left: 50%;
+  transform: translateX(-50%);
+  bottom: calc(72px + env(safe-area-inset-bottom));
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  border-radius: 999px;
+  padding: 7px;
+  border: 1px solid rgba(31, 41, 51, 0.12);
+  background: rgba(255, 255, 255, 0.9);
+  backdrop-filter: blur(12px);
+  z-index: 35;
+}
+
+.album-pagination-button {
+  border: 0;
+  border-radius: 999px;
+  min-height: 30px;
+  min-width: 58px;
+  padding: 0 12px;
+  background: rgba(31, 41, 51, 0.11);
+  color: #1f2933;
+  font-size: 12px;
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.album-pagination-button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.album-pagination-status {
+  margin: 0;
+  min-width: 92px;
+  text-align: center;
+  font-size: 12px;
+  color: #334155;
+  font-weight: 600;
 }
 
 .photo-page {
@@ -279,6 +342,17 @@ body,
   display: grid;
   gap: 14px;
   align-items: start;
+}
+
+.photo-view-image-link {
+  display: block;
+  border-radius: 20px;
+  overflow: hidden;
+}
+
+.photo-view-image-link:focus-visible {
+  outline: 2px solid #1f2933;
+  outline-offset: 3px;
 }
 
 @keyframes photo-enter {
@@ -405,21 +479,6 @@ body,
   width: 100%;
   display: block;
   object-fit: cover;
-}
-
-.photo-bottom-actions {
-  position: fixed;
-  left: 50%;
-  transform: translateX(-50%);
-  bottom: calc(12px + env(safe-area-inset-bottom));
-  border-radius: 999px;
-  padding: 10px;
-  display: flex;
-  gap: 10px;
-  align-items: center;
-  backdrop-filter: blur(16px);
-  background: rgba(255, 255, 255, 0.84);
-  border: 1px solid rgba(31, 41, 51, 0.14);
 }
 
 .photo-loading,
@@ -744,14 +803,20 @@ body,
 }
 
 @media (max-width: 700px) {
-  .photo-bottom-actions {
+  .bottom-island,
+  .album-pagination {
     width: calc(100vw - 20px);
     justify-content: space-between;
+  }
+
+  .album-pagination-status {
+    min-width: 0;
+    flex: 1 1 auto;
   }
 }
 
 @media (max-width: 640px) {
-  .bottom-bar {
+  .bottom-island {
     width: calc(100vw - 20px);
     justify-content: space-between;
   }

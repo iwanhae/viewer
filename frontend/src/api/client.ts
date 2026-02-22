@@ -39,7 +39,7 @@ export async function fetchFeed(params?: {
   seed?: string
   signal?: AbortSignal
 }): Promise<FeedResponse> {
-  const query = new URLSearchParams({ limit: '80' })
+  const query = new URLSearchParams({ limit: '40' })
   if (params?.seed) query.set('seed', params.seed)
   return await requestJSON<FeedResponse>(`/api/feed?${query.toString()}`, {
     signal: params?.signal,
