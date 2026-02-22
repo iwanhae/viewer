@@ -16,8 +16,10 @@ import (
 )
 
 const (
-	PlanVersion = 1
-	HashPolicy  = "etag_or_sha256"
+	PlanVersion = 2
+	HashPolicy  = "size_sampled_then_sha256_v1"
+
+	sampleWindowBytes int64 = 64 * 1024
 )
 
 type Store interface {
@@ -25,6 +27,7 @@ type Store interface {
 	ListObjectsByPrefix(ctx context.Context, prefix string) ([]string, error)
 	DeleteObject(ctx context.Context, key string) error
 	GetObject(ctx context.Context, key string) (io.ReadCloser, string, error)
+	GetObjectRange(ctx context.Context, key string, start int64, end int64) (io.ReadCloser, string, error)
 }
 
 type Planner struct {
@@ -48,7 +51,6 @@ type GroupMember struct {
 	AlbumID              string `json:"albumId"`
 	Key                  string `json:"key"`
 	Size                 int64  `json:"size"`
-	ETag                 string `json:"etag,omitempty"`
 	LastModifiedUnixNano int64  `json:"lastModifiedUnixNano"`
 }
 
@@ -60,11 +62,9 @@ type DuplicateGroup struct {
 }
 
 type SourceSnapshot struct {
-	AlbumID              string `json:"albumId"`
-	Key                  string `json:"key"`
-	Size                 int64  `json:"size"`
-	ETag                 string `json:"etag,omitempty"`
-	LastModifiedUnixNano int64  `json:"lastModifiedUnixNano"`
+	AlbumID string `json:"albumId"`
+	Key     string `json:"key"`
+	Size    int64  `json:"size"`
 }
 
 type Plan struct {
@@ -117,21 +117,69 @@ func (p *Planner) BuildPlan(ctx context.Context, opts PlanOptions) (Plan, PlanSu
 		sources = sources[:opts.Limit]
 	}
 
-	type sourceCandidate struct {
-		source      storage.AlbumSourceObject
-		contentHash string
+	groupsBySize := make(map[int64][]storage.AlbumSourceObject)
+	for _, source := range sources {
+		groupsBySize[source.Size] = append(groupsBySize[source.Size], source)
 	}
 
-	groupsByHash := make(map[string][]sourceCandidate)
-	for _, source := range sources {
-		contentHash, err := p.resolveContentHash(ctx, source)
-		if err != nil {
-			return Plan{}, PlanSummary{}, fmt.Errorf("hash source %s: %w", source.Key, err)
+	sizes := make([]int64, 0, len(groupsBySize))
+	for size := range groupsBySize {
+		sizes = append(sizes, size)
+	}
+	sort.Slice(sizes, func(i, j int) bool {
+		return sizes[i] < sizes[j]
+	})
+
+	groupsByHash := make(map[string][]storage.AlbumSourceObject)
+	for _, size := range sizes {
+		candidates := groupsBySize[size]
+		if len(candidates) < 2 {
+			continue
 		}
-		groupsByHash[contentHash] = append(groupsByHash[contentHash], sourceCandidate{
-			source:      source,
-			contentHash: contentHash,
-		})
+
+		sampleGroups := make(map[string][]storage.AlbumSourceObject)
+		sampleFailed := false
+		for _, source := range candidates {
+			sampleHash, err := p.resolveSampleHash(ctx, source)
+			if err != nil {
+				sampleFailed = true
+				break
+			}
+			sampleGroups[sampleHash] = append(sampleGroups[sampleHash], source)
+		}
+
+		if sampleFailed {
+			for _, source := range candidates {
+				fullHash, err := p.resolveFullSHA256(ctx, source)
+				if err != nil {
+					return Plan{}, PlanSummary{}, fmt.Errorf("hash source %s: %w", source.Key, err)
+				}
+				contentHash := "sha256:" + fullHash
+				groupsByHash[contentHash] = append(groupsByHash[contentHash], source)
+			}
+			continue
+		}
+
+		sampleHashes := make([]string, 0, len(sampleGroups))
+		for sampleHash := range sampleGroups {
+			sampleHashes = append(sampleHashes, sampleHash)
+		}
+		sort.Strings(sampleHashes)
+
+		for _, sampleHash := range sampleHashes {
+			sampleCandidates := sampleGroups[sampleHash]
+			if len(sampleCandidates) < 2 {
+				continue
+			}
+			for _, source := range sampleCandidates {
+				fullHash, err := p.resolveFullSHA256(ctx, source)
+				if err != nil {
+					return Plan{}, PlanSummary{}, fmt.Errorf("hash source %s: %w", source.Key, err)
+				}
+				contentHash := "sha256:" + fullHash
+				groupsByHash[contentHash] = append(groupsByHash[contentHash], source)
+			}
+		}
 	}
 
 	hashes := make([]string, 0, len(groupsByHash))
@@ -146,14 +194,14 @@ func (p *Planner) BuildPlan(ctx context.Context, opts PlanOptions) (Plan, PlanSu
 	snapshotByKey := make(map[string]SourceSnapshot)
 
 	for _, hash := range hashes {
-		candidates := groupsByHash[hash]
-		if len(candidates) < 2 {
+		sourcesWithHash := groupsByHash[hash]
+		if len(sourcesWithHash) < 2 {
 			continue
 		}
 
-		sort.Slice(candidates, func(i, j int) bool {
-			left := candidates[i].source
-			right := candidates[j].source
+		sort.Slice(sourcesWithHash, func(i, j int) bool {
+			left := sourcesWithHash[i]
+			right := sourcesWithHash[j]
 			if !left.LastModified.Equal(right.LastModified) {
 				return left.LastModified.After(right.LastModified)
 			}
@@ -163,24 +211,20 @@ func (p *Planner) BuildPlan(ctx context.Context, opts PlanOptions) (Plan, PlanSu
 			return left.Key < right.Key
 		})
 
-		members := make([]GroupMember, 0, len(candidates))
-		deleteIDs := make([]string, 0, len(candidates)-1)
-		for idx, candidate := range candidates {
-			source := candidate.source
+		members := make([]GroupMember, 0, len(sourcesWithHash))
+		deleteIDs := make([]string, 0, len(sourcesWithHash)-1)
+		for idx, source := range sourcesWithHash {
 			members = append(members, GroupMember{
 				AlbumID:              source.AlbumID,
 				Key:                  source.Key,
 				Size:                 source.Size,
-				ETag:                 NormalizeETag(source.ETag),
 				LastModifiedUnixNano: source.LastModified.UTC().UnixNano(),
 			})
 
 			snapshotByKey[source.Key] = SourceSnapshot{
-				AlbumID:              source.AlbumID,
-				Key:                  source.Key,
-				Size:                 source.Size,
-				ETag:                 NormalizeETag(source.ETag),
-				LastModifiedUnixNano: source.LastModified.UTC().UnixNano(),
+				AlbumID: source.AlbumID,
+				Key:     source.Key,
+				Size:    source.Size,
 			}
 
 			if idx == 0 {
@@ -194,7 +238,7 @@ func (p *Planner) BuildPlan(ctx context.Context, opts PlanOptions) (Plan, PlanSu
 
 		duplicateGroups = append(duplicateGroups, DuplicateGroup{
 			ContentHash:    hash,
-			KeepAlbumID:    candidates[0].source.AlbumID,
+			KeepAlbumID:    sourcesWithHash[0].AlbumID,
 			DeleteAlbumIDs: deleteIDs,
 			Members:        members,
 		})
@@ -255,11 +299,91 @@ func (p *Planner) BuildPlan(ctx context.Context, opts PlanOptions) (Plan, PlanSu
 	return plan, summary, nil
 }
 
-func (p *Planner) resolveContentHash(ctx context.Context, source storage.AlbumSourceObject) (string, error) {
-	if hash, ok := SimpleETagHash(source.ETag); ok {
-		return "etag:" + hash, nil
+type byteRange struct {
+	start int64
+	end   int64
+}
+
+func sampleRanges(size int64) []byteRange {
+	window := sampleWindowBytes
+	if size <= 0 {
+		return nil
+	}
+	if size < window {
+		window = size
+	}
+	maxStart := size - window
+	middleStart := (size / 2) - (window / 2)
+	if middleStart < 0 {
+		middleStart = 0
+	}
+	if middleStart > maxStart {
+		middleStart = maxStart
 	}
 
+	starts := []int64{0, middleStart, maxStart}
+	seenStarts := make(map[int64]struct{}, len(starts))
+	ranges := make([]byteRange, 0, len(starts))
+	for _, start := range starts {
+		if start < 0 {
+			start = 0
+		}
+		if start > maxStart {
+			start = maxStart
+		}
+		if _, exists := seenStarts[start]; exists {
+			continue
+		}
+		seenStarts[start] = struct{}{}
+		ranges = append(ranges, byteRange{
+			start: start,
+			end:   start + window - 1,
+		})
+	}
+	sort.Slice(ranges, func(i, j int) bool {
+		if ranges[i].start != ranges[j].start {
+			return ranges[i].start < ranges[j].start
+		}
+		return ranges[i].end < ranges[j].end
+	})
+	return ranges
+}
+
+func (p *Planner) resolveSampleHash(ctx context.Context, source storage.AlbumSourceObject) (string, error) {
+	ranges := sampleRanges(source.Size)
+	if len(ranges) == 0 {
+		return "", fmt.Errorf("invalid source size: %d", source.Size)
+	}
+
+	digest := sha256.New()
+	if _, err := fmt.Fprintf(digest, "size=%d;", source.Size); err != nil {
+		return "", fmt.Errorf("write sample hash header: %w", err)
+	}
+
+	for _, sample := range ranges {
+		body, _, err := p.store.GetObjectRange(ctx, source.Key, sample.start, sample.end)
+		if err != nil {
+			return "", fmt.Errorf("read sample range %d-%d: %w", sample.start, sample.end, err)
+		}
+		if _, err := fmt.Fprintf(digest, "range=%d-%d:", sample.start, sample.end); err != nil {
+			body.Close()
+			return "", fmt.Errorf("write sample range header: %w", err)
+		}
+		if _, err := io.Copy(digest, body); err != nil {
+			body.Close()
+			return "", fmt.Errorf("read sample bytes: %w", err)
+		}
+		if err := body.Close(); err != nil {
+			return "", fmt.Errorf("close sample reader: %w", err)
+		}
+		if _, err := io.WriteString(digest, ";"); err != nil {
+			return "", fmt.Errorf("write sample delimiter: %w", err)
+		}
+	}
+	return hex.EncodeToString(digest.Sum(nil)), nil
+}
+
+func (p *Planner) resolveFullSHA256(ctx context.Context, source storage.AlbumSourceObject) (string, error) {
 	body, _, err := p.store.GetObject(ctx, source.Key)
 	if err != nil {
 		return "", err
@@ -270,7 +394,7 @@ func (p *Planner) resolveContentHash(ctx context.Context, source storage.AlbumSo
 	if _, err := io.Copy(digest, body); err != nil {
 		return "", fmt.Errorf("read object for sha256: %w", err)
 	}
-	return "sha256:" + hex.EncodeToString(digest.Sum(nil)), nil
+	return hex.EncodeToString(digest.Sum(nil)), nil
 }
 
 func ApplyPlan(ctx context.Context, store Store, plan Plan) (ApplyResult, error) {
@@ -343,12 +467,6 @@ func validateSourceSnapshot(ctx context.Context, store Store, snapshots []Source
 		}
 		if source.Size != snapshot.Size {
 			return fmt.Errorf("snapshot mismatch: size changed for %s (have=%d want=%d)", snapshot.Key, source.Size, snapshot.Size)
-		}
-		if NormalizeETag(source.ETag) != NormalizeETag(snapshot.ETag) {
-			return fmt.Errorf("snapshot mismatch: etag changed for %s", snapshot.Key)
-		}
-		if source.LastModified.UTC().UnixNano() != snapshot.LastModifiedUnixNano {
-			return fmt.Errorf("snapshot mismatch: lastModified changed for %s", snapshot.Key)
 		}
 	}
 	return nil
@@ -432,29 +550,6 @@ func (p Plan) ValidateFingerprint() error {
 		return fmt.Errorf("plan fingerprint mismatch")
 	}
 	return nil
-}
-
-func NormalizeETag(etag string) string {
-	etag = strings.TrimSpace(strings.ToLower(etag))
-	etag = strings.Trim(etag, "\"")
-	return etag
-}
-
-func SimpleETagHash(etag string) (string, bool) {
-	etag = NormalizeETag(etag)
-	if etag == "" || strings.Contains(etag, "-") || len(etag) != 32 {
-		return "", false
-	}
-	for _, ch := range etag {
-		if !isLowerHex(ch) {
-			return "", false
-		}
-	}
-	return etag, true
-}
-
-func isLowerHex(ch rune) bool {
-	return (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f')
 }
 
 func sortedSetKeys[T any](set map[string]T) []string {
