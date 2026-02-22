@@ -4,6 +4,7 @@ import { ViewerPage } from './pages/ViewerPage'
 import { PhotoPage } from './pages/PhotoPage'
 import { AlbumSearchPage } from './pages/AlbumSearchPage'
 import { UploadPage } from './pages/UploadPage'
+import { ScrollToTopButton } from './components/ScrollToTopButton'
 
 export default function App() {
   return (
@@ -16,6 +17,7 @@ export default function App() {
         <Route path="/album/:albumId/:photoIndex" element={<PhotoPage />} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>
+      <ScrollToTopButton />
     </BrowserRouter>
   )
 }

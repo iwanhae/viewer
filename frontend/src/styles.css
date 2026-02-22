@@ -237,6 +237,56 @@ body,
   color: #a01f28;
 }
 
+.scroll-top-button {
+  position: fixed;
+  top: max(16px, env(safe-area-inset-top));
+  right: max(16px, env(safe-area-inset-right));
+  width: 42px;
+  height: 42px;
+  border: 1px solid rgba(255, 255, 255, 0.45);
+  border-radius: 999px;
+  color: #1f2933;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  backdrop-filter: blur(24px) saturate(155%);
+  -webkit-backdrop-filter: blur(24px) saturate(155%);
+  background: linear-gradient(
+    135deg,
+    rgba(255, 255, 255, 0.46),
+    rgba(255, 255, 255, 0.22)
+  );
+  box-shadow: 0 14px 32px rgba(15, 23, 42, 0.18),
+    inset 0 1px 0 rgba(255, 255, 255, 0.52);
+  z-index: 45;
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(-8px);
+  transition: opacity 160ms ease, transform 160ms ease;
+}
+
+.scroll-top-button.is-visible {
+  opacity: 1;
+  pointer-events: auto;
+  transform: translateY(0);
+}
+
+.scroll-top-button:focus-visible {
+  outline: 2px solid #1f2933;
+  outline-offset: 2px;
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .scroll-top-button:hover {
+    background: linear-gradient(
+      135deg,
+      rgba(255, 255, 255, 0.56),
+      rgba(255, 255, 255, 0.3)
+    );
+  }
+}
+
 .viewer {
   position: fixed;
   inset: 0;

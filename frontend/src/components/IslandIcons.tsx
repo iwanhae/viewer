@@ -118,3 +118,17 @@ export function NextIcon({ title }: IconProps) {
     </SvgIcon>
   )
 }
+
+export function UpIcon({ title }: IconProps) {
+  return (
+    <SvgIcon title={title}>
+      <path
+        d="m6 14 6-6 6 6"
+        stroke="currentColor"
+        strokeWidth="2"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </SvgIcon>
+  )
+}
