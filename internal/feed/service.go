@@ -21,15 +21,15 @@ type Service struct {
 	albums albumSource
 
 	mu             sync.RWMutex
-	refsSnapshot   []photoRef
-	refsSnapshotAt time.Time
+	albumsSnapshot []albumRef
+	albumsAt       time.Time
 	snapshotTTL    time.Duration
 	now            func() time.Time
 }
 
-type photoRef struct {
+type albumRef struct {
 	albumID string
-	photo   models.PhotoMeta
+	photos  []models.PhotoMeta
 }
 
 func NewService(albumsService *albums.Service) *Service {
@@ -49,8 +49,8 @@ func (s *Service) Build(ctx context.Context, limit int, seedParam string) (model
 		limit = 200
 	}
 
-	refs := s.snapshotPhotoRefs()
-	if len(refs) == 0 {
+	albumsList := s.snapshotAlbums()
+	if len(albumsList) == 0 {
 		return models.FeedResponse{Items: []models.FeedItem{}}, nil
 	}
 
@@ -59,20 +59,22 @@ func (s *Service) Build(ctx context.Context, limit int, seedParam string) (model
 	items := make([]models.FeedItem, 0, limit)
 	for i := 0; i < limit; i++ {
 		position := int64(i)
-		idx := deterministicIndex(seed, position, len(refs))
-		ref := refs[idx]
+		albumIdx := deterministicIndex(seed, position*2, len(albumsList))
+		album := albumsList[albumIdx]
+		photoIdx := deterministicIndex(seed, position*2+1, len(album.photos))
+		photo := album.photos[photoIdx]
 		items = append(items, models.FeedItem{
-			AlbumID: ref.albumID,
-			I:       ref.photo.I,
-			W:       ref.photo.W,
-			H:       ref.photo.H,
-			Ratio:   ref.photo.Ratio,
+			AlbumID: album.albumID,
+			I:       photo.I,
+			W:       photo.W,
+			H:       photo.H,
+			Ratio:   photo.Ratio,
 		})
 	}
 	return models.FeedResponse{Items: items}, nil
 }
 
-func (s *Service) snapshotPhotoRefs() []photoRef {
+func (s *Service) snapshotAlbums() []albumRef {
 	nowFn := s.now
 	if nowFn == nil {
 		nowFn = time.Now
@@ -84,29 +86,33 @@ func (s *Service) snapshotPhotoRefs() []photoRef {
 	now := nowFn()
 
 	s.mu.RLock()
-	if s.refsSnapshot != nil && now.Sub(s.refsSnapshotAt) < ttl {
-		refs := s.refsSnapshot
+	if s.albumsSnapshot != nil && now.Sub(s.albumsAt) < ttl {
+		albumsList := s.albumsSnapshot
 		s.mu.RUnlock()
-		return refs
+		return albumsList
 	}
 	s.mu.RUnlock()
 
 	if s.albums == nil {
 		return nil
 	}
-	albumsList := s.albums.AllAlbums()
-	refs := make([]photoRef, 0)
-	for _, album := range albumsList {
-		for _, photo := range album.Photos {
-			refs = append(refs, photoRef{albumID: album.AlbumID, photo: photo})
+	albumsIndex := s.albums.AllAlbums()
+	albumsList := make([]albumRef, 0, len(albumsIndex))
+	for _, album := range albumsIndex {
+		if album == nil || len(album.Photos) == 0 {
+			continue
 		}
+		albumsList = append(albumsList, albumRef{
+			albumID: album.AlbumID,
+			photos:  album.Photos,
+		})
 	}
 
 	s.mu.Lock()
-	s.refsSnapshot = refs
-	s.refsSnapshotAt = now
+	s.albumsSnapshot = albumsList
+	s.albumsAt = now
 	s.mu.Unlock()
-	return refs
+	return albumsList
 }
 
 func parseSeed(seed string) int64 {

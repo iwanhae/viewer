@@ -121,3 +121,90 @@ func TestBuildVariesForDifferentSeeds(t *testing.T) {
 		t.Fatalf("expected different seeds to produce different ordering, got same items=%+v", first.Items)
 	}
 }
+
+func TestBuildSkipsAlbumsWithoutPhotos(t *testing.T) {
+	source := &stubAlbumSource{
+		albums: []*models.AlbumIndex{
+			{
+				AlbumID: "empty-album",
+				Photos:  []models.PhotoMeta{},
+			},
+			{
+				AlbumID: "album-a",
+				Photos: []models.PhotoMeta{
+					{I: 0, W: 100, H: 80, Ratio: 1.25},
+					{I: 1, W: 101, H: 80, Ratio: 1.26},
+				},
+			},
+		},
+	}
+	svc := NewService(nil)
+	svc.albums = source
+	svc.snapshotTTL = 10 * time.Minute
+	svc.now = func() time.Time { return time.Unix(400, 0) }
+
+	resp, err := svc.Build(context.Background(), 20, "123")
+	if err != nil {
+		t.Fatalf("build failed: %v", err)
+	}
+	if len(resp.Items) != 20 {
+		t.Fatalf("items=%d want=20", len(resp.Items))
+	}
+	for _, item := range resp.Items {
+		if item.AlbumID != "album-a" {
+			t.Fatalf("unexpected album %q; expected only non-empty album", item.AlbumID)
+		}
+	}
+}
+
+func TestBuildSelectsAlbumBeforePhoto(t *testing.T) {
+	bigPhotos := make([]models.PhotoMeta, 0, 100)
+	for i := 0; i < 100; i++ {
+		bigPhotos = append(bigPhotos, models.PhotoMeta{
+			I:     i,
+			W:     1000 + i,
+			H:     500,
+			Ratio: float64(1000+i) / 500.0,
+		})
+	}
+	source := &stubAlbumSource{
+		albums: []*models.AlbumIndex{
+			{
+				AlbumID: "album-big",
+				Photos:  bigPhotos,
+			},
+			{
+				AlbumID: "album-small",
+				Photos: []models.PhotoMeta{
+					{I: 0, W: 33, H: 22, Ratio: 1.5},
+				},
+			},
+		},
+	}
+	svc := NewService(nil)
+	svc.albums = source
+	svc.snapshotTTL = 10 * time.Minute
+	svc.now = func() time.Time { return time.Unix(500, 0) }
+
+	resp, err := svc.Build(context.Background(), 200, "2026")
+	if err != nil {
+		t.Fatalf("build failed: %v", err)
+	}
+	if len(resp.Items) != 200 {
+		t.Fatalf("items=%d want=200", len(resp.Items))
+	}
+
+	countByAlbum := map[string]int{}
+	for _, item := range resp.Items {
+		countByAlbum[item.AlbumID]++
+		if item.AlbumID == "album-small" && item.I != 0 {
+			t.Fatalf("album-small returned unexpected photo index %d", item.I)
+		}
+	}
+	if countByAlbum["album-small"] < 50 {
+		t.Fatalf("album-small selected too rarely for album-first sampling: %d", countByAlbum["album-small"])
+	}
+	if countByAlbum["album-big"] < 50 {
+		t.Fatalf("album-big selected too rarely for album-first sampling: %d", countByAlbum["album-big"])
+	}
+}
