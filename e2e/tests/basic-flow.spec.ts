@@ -78,6 +78,21 @@ async function collectWallSrcs(page: Page, count: number): Promise<string[]> {
   return srcs
 }
 
+async function expectHorizontalOrder(page: Page, testIds: string[]): Promise<void> {
+  const centers: number[] = []
+  for (const testId of testIds) {
+    const locator = page.getByTestId(testId)
+    await expect(locator).toBeVisible()
+    const box = await locator.boundingBox()
+    expect(box).toBeTruthy()
+    centers.push(box!.x + box!.width / 2)
+  }
+
+  for (let i = 1; i < centers.length; i++) {
+    expect(centers[i]).toBeGreaterThan(centers[i - 1])
+  }
+}
+
 async function uploadAndFinalizeFromUploadPage(page: Page, zipPath: string) {
   const zipBytes = await fs.readFile(zipPath)
 
@@ -160,6 +175,7 @@ test('basic upload -> wall -> album flow', async ({ page }) => {
   await expect(page.getByTestId('wall-columns')).toBeVisible()
   await expect(page.getByTestId('wall-refresh')).toBeVisible()
   await expect(page.getByTestId('wall-shortcut')).toBeVisible()
+  await expectHorizontalOrder(page, ['wall-columns', 'wall-shortcut', 'wall-refresh'])
 
   await uploadAndFinalizeFromUploadPage(page, zip1)
 
@@ -242,6 +258,17 @@ test('basic upload -> wall -> album flow', async ({ page }) => {
   const albumPath = albumURL.pathname
   const albumId = albumPath.split('/').at(-1)
   expect(albumId).toBeTruthy()
+  await expect(page.locator('[data-testid="album-tile"][data-selected="true"]')).toHaveCount(1)
+  await expect(page.getByTestId('album-page-indicator')).toHaveText(/^\d+\s\/\s\d+$/)
+  await expect(page.getByTestId('album-page-prev')).toBeDisabled()
+  await expect(page.getByTestId('album-page-next')).toBeDisabled()
+  await expectHorizontalOrder(page, [
+    'album-page-prev',
+    'album-columns-toggle',
+    'album-page-indicator',
+    'album-back',
+    'album-page-next',
+  ])
 
   await page.getByTestId('album-columns-toggle').click()
   await expect(page.getByTestId('album-columns-popup')).toBeVisible()
@@ -266,15 +293,18 @@ test('basic upload -> wall -> album flow', async ({ page }) => {
   await expect(firstOriginalLink).toHaveAttribute('rel', 'noopener noreferrer')
   await expect(firstOriginalLink).toHaveAttribute('href', /^\/api\/image\/[^/]+\/\d+$/)
   expect(await firstOriginalLink.getAttribute('href')).toContain(`/api/image/${albumId}/`)
+  await expectHorizontalOrder(page, ['photo-columns-toggle', 'photo-back'])
   await page.getByTestId('photo-back').click()
   await expect(page.getByTestId('album-grid')).toBeVisible()
   await expect.poll(() => new URL(page.url()).pathname).toBe(`/album/${albumId}`)
   await expect.poll(() => new URL(page.url()).searchParams.get('i')).toBe(String(photoIndex))
+  await expect(page.locator('[data-testid="album-tile"][data-selected="true"]')).toHaveCount(1)
 
   await page.getByTestId('album-back').click()
   await expect(page.getByTestId('wall-grid')).toBeVisible()
   await expect.poll(() => new URL(page.url()).pathname).toBe('/')
   await expect.poll(() => new URL(page.url()).searchParams.get('seed')).toBe(seedBeforeAlbumNavigation)
+  await expectHorizontalOrder(page, ['wall-columns', 'wall-shortcut', 'wall-refresh'])
   await page.getByTestId('wall-columns').click()
   await expect(page.getByTestId('columns-6')).toBeVisible()
   await page.screenshot({ path: path.join(samplesDir, '03-wall.png'), fullPage: true })

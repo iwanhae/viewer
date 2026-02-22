@@ -6,6 +6,7 @@ import { useRecommendations } from '../hooks/useRecommendations'
 import { MasonryWall } from '../components/MasonryWall'
 import { readColumnPreference, writeColumnPreference } from '../utils/columnPreference'
 import { BottomIsland } from '../components/BottomIsland'
+import { BackToAlbumIcon, ColumnsIcon } from '../components/IslandIcons'
 
 const recommendationLimit = 24
 const recommendationColumnOptions = [1, 2, 3, 4, 5, 6]
@@ -196,14 +197,10 @@ export function PhotoPage() {
         className="photo-bottom-island"
         actions={[
           {
-            id: 'photo-back',
-            label: 'Back to album',
-            testId: 'photo-back',
-            onClick: () => navigate(`/album/${album.albumId}?i=${photo.i}&p=${pageForPhotoIndex(photo.i)}`),
-          },
-          {
             id: 'photo-columns',
-            label: 'Similar columns',
+            icon: <ColumnsIcon />,
+            ariaLabel: 'Change similar image columns',
+            tooltip: 'Columns',
             testId: 'photo-columns-toggle',
             renderPopup: ({ close }) => (
               <div className="bottom-island-popup-grid" data-testid="photo-columns-popup">
@@ -224,6 +221,14 @@ export function PhotoPage() {
                 ))}
               </div>
             ),
+          },
+          {
+            id: 'photo-back',
+            icon: <BackToAlbumIcon />,
+            ariaLabel: 'Back to album',
+            tooltip: 'Album',
+            testId: 'photo-back',
+            onClick: () => navigate(`/album/${album.albumId}?i=${photo.i}&p=${pageForPhotoIndex(photo.i)}`),
           },
         ]}
       />

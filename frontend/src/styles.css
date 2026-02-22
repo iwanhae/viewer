@@ -71,9 +71,9 @@ body,
   transform: translateX(-50%);
   bottom: calc(12px + env(safe-area-inset-bottom));
   border-radius: 999px;
-  padding: 10px;
+  padding: 8px;
   display: flex;
-  gap: 10px;
+  gap: 6px;
   align-items: center;
   backdrop-filter: blur(16px);
   background: rgba(255, 255, 255, 0.84);
@@ -83,17 +83,22 @@ body,
 
 .bottom-island-item {
   position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
 }
 
 .bottom-island-action {
   border: 0;
   border-radius: 999px;
-  min-height: 34px;
-  padding: 0 14px;
+  width: 38px;
+  height: 38px;
+  padding: 0;
   background: rgba(31, 41, 51, 0.1);
   color: #1f2933;
-  font-weight: 650;
-  font-size: 13px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   cursor: pointer;
 }
 
@@ -105,6 +110,62 @@ body,
 .bottom-island-action.is-open {
   background: #1f2933;
   color: #f8fbfd;
+}
+
+.bottom-island-icon {
+  width: 18px;
+  height: 18px;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.bottom-island-indicator {
+  min-height: 38px;
+  min-width: 94px;
+  padding: 0 12px;
+  border-radius: 999px;
+  background: rgba(31, 41, 51, 0.08);
+  color: #334155;
+  font-size: 12px;
+  font-weight: 650;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+}
+
+.bottom-island-tooltip {
+  position: absolute;
+  left: 50%;
+  transform: translate(-50%, 4px);
+  bottom: calc(100% + 8px);
+  border-radius: 999px;
+  padding: 4px 8px;
+  background: rgba(15, 23, 42, 0.9);
+  color: #f8fbfd;
+  font-size: 11px;
+  line-height: 1;
+  white-space: nowrap;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 130ms ease, transform 130ms ease;
+}
+
+.bottom-island-item:focus-within .bottom-island-tooltip {
+  opacity: 1;
+  transform: translate(-50%, 0);
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .bottom-island-item:hover .bottom-island-tooltip {
+    opacity: 1;
+    transform: translate(-50%, 0);
+  }
+}
+
+.bottom-island-action.is-open + .bottom-island-tooltip {
+  opacity: 0;
 }
 
 .bottom-island-popup {
@@ -243,58 +304,26 @@ body,
 .album-photo-tile {
   border-radius: 14px;
   overflow: hidden;
+  position: relative;
 }
 
 .album-photo-tile img {
   transition: none;
 }
 
+.album-photo-tile.is-selected::after {
+  content: "";
+  position: absolute;
+  inset: 3px;
+  border-radius: 11px;
+  border: 2px solid #1f2933;
+  box-shadow: 0 0 0 1px rgba(248, 251, 253, 0.95);
+  pointer-events: none;
+}
+
 .album-photo-tile:focus-visible {
   outline: 2px solid #1f2933;
   outline-offset: 2px;
-}
-
-.album-pagination {
-  position: fixed;
-  left: 50%;
-  transform: translateX(-50%);
-  bottom: calc(72px + env(safe-area-inset-bottom));
-  display: inline-flex;
-  align-items: center;
-  gap: 10px;
-  border-radius: 999px;
-  padding: 7px;
-  border: 1px solid rgba(31, 41, 51, 0.12);
-  background: rgba(255, 255, 255, 0.9);
-  backdrop-filter: blur(12px);
-  z-index: 35;
-}
-
-.album-pagination-button {
-  border: 0;
-  border-radius: 999px;
-  min-height: 30px;
-  min-width: 58px;
-  padding: 0 12px;
-  background: rgba(31, 41, 51, 0.11);
-  color: #1f2933;
-  font-size: 12px;
-  font-weight: 650;
-  cursor: pointer;
-}
-
-.album-pagination-button:disabled {
-  opacity: 0.5;
-  cursor: default;
-}
-
-.album-pagination-status {
-  margin: 0;
-  min-width: 92px;
-  text-align: center;
-  font-size: 12px;
-  color: #334155;
-  font-weight: 600;
 }
 
 .photo-page {
@@ -803,13 +832,12 @@ body,
 }
 
 @media (max-width: 700px) {
-  .bottom-island,
-  .album-pagination {
+  .bottom-island {
     width: calc(100vw - 20px);
     justify-content: space-between;
   }
 
-  .album-pagination-status {
+  .bottom-island-indicator {
     min-width: 0;
     flex: 1 1 auto;
   }

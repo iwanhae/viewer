@@ -5,6 +5,7 @@ import { readColumnPreference, writeColumnPreference } from '../utils/columnPref
 import { writeLastWallSeed } from '../utils/wallSeed'
 import { MasonryWall } from '../components/MasonryWall'
 import { BottomIsland } from '../components/BottomIsland'
+import { ColumnsIcon, RefreshIcon, ShortcutIcon } from '../components/IslandIcons'
 
 const columnOptions = [1, 2, 3, 4, 5, 6]
 const WALL_COLUMNS_KEY = 'wall_columns'
@@ -144,7 +145,9 @@ export function WallPage() {
         actions={[
           {
             id: 'wall-columns',
-            label: 'Columns',
+            icon: <ColumnsIcon />,
+            ariaLabel: 'Change columns',
+            tooltip: 'Columns',
             testId: 'wall-columns',
             renderPopup: ({ close }) => (
               <div className="bottom-island-popup-grid" data-testid="wall-columns-popup">
@@ -167,15 +170,10 @@ export function WallPage() {
             ),
           },
           {
-            id: 'wall-refresh',
-            label: 'Refresh',
-            testId: 'wall-refresh',
-            onClick: onRefresh,
-            disabled: loading,
-          },
-          {
             id: 'wall-shortcut',
-            label: 'Shortcut',
+            icon: <ShortcutIcon />,
+            ariaLabel: 'Open shortcuts',
+            tooltip: 'Shortcut',
             testId: 'wall-shortcut',
             renderPopup: ({ close }) => (
               <div className="bottom-island-popup-stack" data-testid="wall-shortcut-popup">
@@ -203,6 +201,15 @@ export function WallPage() {
                 </button>
               </div>
             ),
+          },
+          {
+            id: 'wall-refresh',
+            icon: <RefreshIcon />,
+            ariaLabel: 'Refresh wall',
+            tooltip: 'Refresh',
+            testId: 'wall-refresh',
+            onClick: onRefresh,
+            disabled: loading,
           },
         ]}
       />

@@ -5,6 +5,7 @@ import { readColumnPreference, writeColumnPreference } from '../utils/columnPref
 import { readLastWallSeed } from '../utils/wallSeed'
 import { MasonryWall } from '../components/MasonryWall'
 import { BottomIsland } from '../components/BottomIsland'
+import { BackToAlbumIcon, ColumnsIcon, NextIcon, PrevIcon } from '../components/IslandIcons'
 
 const COLUMN_OPTIONS = [1, 2, 3, 4, 5, 6]
 const VIEWER_COLUMNS_KEY = 'viewer_columns'
@@ -168,8 +169,9 @@ export function ViewerPage() {
         getItemWeight={(photo) => photo.h / Math.max(photo.w, 1)}
         renderItem={(photo) => (
           <button
-            className="tile album-photo-tile"
+            className={`tile album-photo-tile ${photo.i === anchorVisibleIndex ? 'is-selected' : ''}`.trim()}
             data-testid="album-tile"
+            data-selected={photo.i === anchorVisibleIndex ? 'true' : undefined}
             ref={photo.i === anchorVisibleIndex ? anchorRef : null}
             onClick={() => {
               if (typeof window !== 'undefined') {
@@ -178,6 +180,7 @@ export function ViewerPage() {
               navigate(`/album/${album.albumId}/${photo.i}`, { state: { album } })
             }}
             aria-label={`Open details for image ${photo.i + 1}`}
+            aria-current={photo.i === anchorVisibleIndex ? 'true' : undefined}
           >
             <img
               src={`/api/image/${album.albumId}/${photo.i}`}
@@ -194,37 +197,22 @@ export function ViewerPage() {
         columnTestId="masonry-column"
       />
 
-      {totalPages > 1 && (
-        <div className="album-pagination" data-testid="album-pagination">
-          <button
-            type="button"
-            className="album-pagination-button"
-            onClick={() => onChangePage(normalizedPage - 1)}
-            disabled={normalizedPage <= 1}
-            data-testid="album-page-prev"
-          >
-            Prev
-          </button>
-          <p className="album-pagination-status" data-testid="album-page-indicator">
-            Page {normalizedPage} / {totalPages}
-          </p>
-          <button
-            type="button"
-            className="album-pagination-button"
-            onClick={() => onChangePage(normalizedPage + 1)}
-            disabled={normalizedPage >= totalPages}
-            data-testid="album-page-next"
-          >
-            Next
-          </button>
-        </div>
-      )}
-
       <BottomIsland
         actions={[
           {
+            id: 'album-page-prev',
+            icon: <PrevIcon />,
+            ariaLabel: 'Previous page',
+            tooltip: 'Previous page',
+            testId: 'album-page-prev',
+            onClick: () => onChangePage(normalizedPage - 1),
+            disabled: normalizedPage <= 1,
+          },
+          {
             id: 'album-columns',
-            label: 'Columns',
+            icon: <ColumnsIcon />,
+            ariaLabel: 'Change columns',
+            tooltip: 'Columns',
             testId: 'album-columns-toggle',
             renderPopup: ({ close }) => (
               <div className="bottom-island-popup-grid" data-testid="album-columns-popup">
@@ -247,10 +235,32 @@ export function ViewerPage() {
             ),
           },
           {
+            kind: 'indicator',
+            id: 'album-page-indicator',
+            label: (
+              <span>
+                {normalizedPage} / {totalPages}
+              </span>
+            ),
+            testId: 'album-page-indicator',
+            ariaLabel: `Page ${normalizedPage} of ${totalPages}`,
+          },
+          {
             id: 'album-back',
-            label: 'Back',
+            icon: <BackToAlbumIcon />,
+            ariaLabel: 'Back to wall',
+            tooltip: 'Back',
             testId: 'album-back',
             onClick: onBackToWall,
+          },
+          {
+            id: 'album-page-next',
+            icon: <NextIcon />,
+            ariaLabel: 'Next page',
+            tooltip: 'Next page',
+            testId: 'album-page-next',
+            onClick: () => onChangePage(normalizedPage + 1),
+            disabled: normalizedPage >= totalPages,
           },
         ]}
       />

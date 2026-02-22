@@ -4,15 +4,29 @@ type PopupRenderContext = {
   close: () => void
 }
 
-type BottomIslandAction = {
+type BottomIslandButtonAction = {
+  kind?: 'button'
   id: string
-  label: ReactNode
+  icon: ReactNode
+  ariaLabel: string
+  tooltip?: string
   testId?: string
   disabled?: boolean
   className?: string
   onClick?: () => void
   renderPopup?: (context: PopupRenderContext) => ReactNode
 }
+
+type BottomIslandIndicator = {
+  kind: 'indicator'
+  id: string
+  label: ReactNode
+  testId?: string
+  className?: string
+  ariaLabel?: string
+}
+
+type BottomIslandAction = BottomIslandButtonAction | BottomIslandIndicator
 
 type BottomIslandProps = {
   actions: BottomIslandAction[]
@@ -48,8 +62,22 @@ export function BottomIsland({ actions, className }: BottomIslandProps): ReactNo
   return (
     <div className={`bottom-island ${className ?? ''}`.trim()} ref={rootRef}>
       {actions.map((action) => {
+        if (action.kind === 'indicator') {
+          return (
+            <div
+              className={`bottom-island-indicator ${action.className ?? ''}`.trim()}
+              data-testid={action.testId}
+              aria-label={action.ariaLabel}
+              key={action.id}
+            >
+              {action.label}
+            </div>
+          )
+        }
+
         const hasPopup = action.renderPopup !== undefined
         const isOpen = openActionId === action.id
+        const tooltipText = action.tooltip ?? action.ariaLabel
 
         return (
           <div className="bottom-island-item" key={action.id}>
@@ -58,6 +86,7 @@ export function BottomIsland({ actions, className }: BottomIslandProps): ReactNo
               className={`bottom-island-action ${action.className ?? ''} ${isOpen ? 'is-open' : ''}`.trim()}
               data-testid={action.testId}
               disabled={action.disabled}
+              aria-label={action.ariaLabel}
               aria-expanded={hasPopup ? isOpen : undefined}
               aria-haspopup={hasPopup ? 'dialog' : undefined}
               onClick={() => {
@@ -69,8 +98,9 @@ export function BottomIsland({ actions, className }: BottomIslandProps): ReactNo
                 action.onClick?.()
               }}
             >
-              {action.label}
+              {action.icon}
             </button>
+            <span className="bottom-island-tooltip">{tooltipText}</span>
             {hasPopup && isOpen && (
               <div className="bottom-island-popup" role="dialog">
                 {action.renderPopup?.({
