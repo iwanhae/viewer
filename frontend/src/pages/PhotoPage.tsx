@@ -8,7 +8,7 @@ import { readColumnPreference, writeColumnPreference } from '../utils/columnPref
 import { BottomIsland } from '../components/BottomIsland'
 import { BackToAlbumIcon, ColumnsIcon } from '../components/IslandIcons'
 
-const recommendationLimit = 24
+const recommendationLimit = 48
 const recommendationColumnOptions = [1, 2, 3, 4, 5, 6]
 const PHOTO_RECOMMEND_COLUMNS_KEY = 'photo_recommend_columns'
 const DEFAULT_RECOMMEND_COLUMNS = 3
