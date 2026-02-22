@@ -93,6 +93,23 @@ async function expectHorizontalOrder(page: Page, testIds: string[]): Promise<voi
   }
 }
 
+async function expectSelectedTileGlow(page: Page): Promise<void> {
+  const selectedTile = page.locator('[data-testid="album-tile"][data-selected="true"]').first()
+  await expect(selectedTile).toBeVisible()
+  const style = await selectedTile.evaluate((node) => {
+    const after = window.getComputedStyle(node, '::after')
+    return {
+      borderColor: after.borderColor,
+      boxShadow: after.boxShadow,
+      content: after.content,
+    }
+  })
+
+  expect(style.content).not.toBe('none')
+  expect(style.boxShadow).not.toBe('none')
+  expect(style.borderColor).toMatch(/245,\s*158,\s*11/)
+}
+
 async function uploadAndFinalizeFromUploadPage(page: Page, zipPath: string) {
   const zipBytes = await fs.readFile(zipPath)
 
@@ -259,6 +276,7 @@ test('basic upload -> wall -> album flow', async ({ page }) => {
   const albumId = albumPath.split('/').at(-1)
   expect(albumId).toBeTruthy()
   await expect(page.locator('[data-testid="album-tile"][data-selected="true"]')).toHaveCount(1)
+  await expectSelectedTileGlow(page)
   await expect(page.getByTestId('album-page-indicator')).toHaveText(/^\d+\s\/\s\d+$/)
   await expect(page.getByTestId('album-page-prev')).toBeDisabled()
   await expect(page.getByTestId('album-page-next')).toBeDisabled()
@@ -299,6 +317,7 @@ test('basic upload -> wall -> album flow', async ({ page }) => {
   await expect.poll(() => new URL(page.url()).pathname).toBe(`/album/${albumId}`)
   await expect.poll(() => new URL(page.url()).searchParams.get('i')).toBe(String(photoIndex))
   await expect(page.locator('[data-testid="album-tile"][data-selected="true"]')).toHaveCount(1)
+  await expectSelectedTileGlow(page)
 
   await page.getByTestId('album-back').click()
   await expect(page.getByTestId('wall-grid')).toBeVisible()
