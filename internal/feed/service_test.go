@@ -2,6 +2,7 @@ package feed
 
 import (
 	"context"
+	"fmt"
 	"reflect"
 	"testing"
 	"time"
@@ -207,4 +208,130 @@ func TestBuildSelectsAlbumBeforePhoto(t *testing.T) {
 	if countByAlbum["album-big"] < 50 {
 		t.Fatalf("album-big selected too rarely for album-first sampling: %d", countByAlbum["album-big"])
 	}
+}
+
+func TestBuildReservesRecentAlbumQuota(t *testing.T) {
+	albumsList, recentSet := buildAlbumsWithSequentialCreatedAt(120)
+	source := &stubAlbumSource{albums: albumsList}
+
+	svc := NewService(nil)
+	svc.albums = source
+	svc.snapshotTTL = 10 * time.Minute
+	svc.now = func() time.Time { return time.Unix(600, 0) }
+
+	const limit = 25
+	resp, err := svc.Build(context.Background(), limit, "777")
+	if err != nil {
+		t.Fatalf("build failed: %v", err)
+	}
+	if len(resp.Items) != limit {
+		t.Fatalf("items=%d want=%d", len(resp.Items), limit)
+	}
+
+	recentCount := 0
+	for _, item := range resp.Items {
+		if _, ok := recentSet[item.AlbumID]; ok {
+			recentCount++
+		}
+	}
+
+	if recentCount != 5 {
+		t.Fatalf("recentCount=%d want=5", recentCount)
+	}
+}
+
+func TestBuildSpreadsRecentAlbumsAcrossFeed(t *testing.T) {
+	albumsList, recentSet := buildAlbumsWithSequentialCreatedAt(120)
+	source := &stubAlbumSource{albums: albumsList}
+
+	svc := NewService(nil)
+	svc.albums = source
+	svc.snapshotTTL = 10 * time.Minute
+	svc.now = func() time.Time { return time.Unix(700, 0) }
+
+	const limit = 25
+	resp, err := svc.Build(context.Background(), limit, "999")
+	if err != nil {
+		t.Fatalf("build failed: %v", err)
+	}
+	if len(resp.Items) != limit {
+		t.Fatalf("items=%d want=%d", len(resp.Items), limit)
+	}
+
+	recentPositions := make([]int, 0, 5)
+	for i, item := range resp.Items {
+		if _, ok := recentSet[item.AlbumID]; ok {
+			recentPositions = append(recentPositions, i)
+		}
+	}
+
+	want := []int{4, 9, 14, 19, 24}
+	if !reflect.DeepEqual(recentPositions, want) {
+		t.Fatalf("recent positions mismatch, got=%v want=%v", recentPositions, want)
+	}
+}
+
+func TestBuildTreatsMalformedCreatedAtAsOldest(t *testing.T) {
+	validAlbums, _ := buildAlbumsWithSequentialCreatedAt(recentAlbumsWindow)
+	source := &stubAlbumSource{
+		albums: append(validAlbums, &models.AlbumIndex{
+			AlbumID:   "album-invalid",
+			CreatedAt: "not-a-timestamp",
+			Photos: []models.PhotoMeta{
+				{I: 0, W: 100, H: 80, Ratio: 1.25},
+			},
+		}),
+	}
+
+	svc := NewService(nil)
+	svc.albums = source
+	svc.snapshotTTL = 10 * time.Minute
+	svc.now = func() time.Time { return time.Unix(800, 0) }
+
+	const limit = 25
+	resp, err := svc.Build(context.Background(), limit, "12345")
+	if err != nil {
+		t.Fatalf("build failed: %v", err)
+	}
+	if len(resp.Items) != limit {
+		t.Fatalf("items=%d want=%d", len(resp.Items), limit)
+	}
+
+	invalidCount := 0
+	for _, item := range resp.Items {
+		if item.AlbumID == "album-invalid" {
+			invalidCount++
+		}
+	}
+
+	if invalidCount != 20 {
+		t.Fatalf("invalid album count=%d want=20", invalidCount)
+	}
+}
+
+func buildAlbumsWithSequentialCreatedAt(total int) ([]*models.AlbumIndex, map[string]struct{}) {
+	base := time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC)
+	albumsList := make([]*models.AlbumIndex, 0, total)
+
+	recentStart := total - recentAlbumsWindow
+	if recentStart < 0 {
+		recentStart = 0
+	}
+	recentSet := make(map[string]struct{}, total-recentStart)
+
+	for i := 0; i < total; i++ {
+		albumID := fmt.Sprintf("album-%03d", i)
+		albumsList = append(albumsList, &models.AlbumIndex{
+			AlbumID:   albumID,
+			CreatedAt: base.Add(time.Duration(i) * time.Minute).Format(time.RFC3339),
+			Photos: []models.PhotoMeta{
+				{I: 0, W: 100, H: 80, Ratio: 1.25},
+			},
+		})
+		if i >= recentStart {
+			recentSet[albumID] = struct{}{}
+		}
+	}
+
+	return albumsList, recentSet
 }

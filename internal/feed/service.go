@@ -3,7 +3,9 @@ package feed
 import (
 	"context"
 	"hash/fnv"
+	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -11,7 +13,13 @@ import (
 	"viewer/internal/models"
 )
 
-const photoRefsSnapshotTTL = 3 * time.Second
+const (
+	photoRefsSnapshotTTL       = 3 * time.Second
+	recentAlbumsWindow         = 100
+	recentAlbumSharePercent    = 20
+	recentStreamOffset         = int64(1_000_000)
+	recentFallbackStreamOffset = int64(2_000_000)
+)
 
 type albumSource interface {
 	AllAlbums() []*models.AlbumIndex
@@ -28,8 +36,9 @@ type Service struct {
 }
 
 type albumRef struct {
-	albumID string
-	photos  []models.PhotoMeta
+	albumID   string
+	photos    []models.PhotoMeta
+	createdAt string
 }
 
 func NewService(albumsService *albums.Service) *Service {
@@ -55,21 +64,26 @@ func (s *Service) Build(ctx context.Context, limit int, seedParam string) (model
 	}
 
 	seed := parseSeed(seedParam)
+	recentAlbums, nonRecentAlbums := splitRecentAlbums(albumsList, recentAlbumsWindow)
+	recentQuota := calculateRecentQuota(limit, len(recentAlbums))
 
 	items := make([]models.FeedItem, 0, limit)
 	for i := 0; i < limit; i++ {
 		position := int64(i)
-		albumIdx := deterministicIndex(seed, position*2, len(albumsList))
-		album := albumsList[albumIdx]
-		photoIdx := deterministicIndex(seed, position*2+1, len(album.photos))
-		photo := album.photos[photoIdx]
-		items = append(items, models.FeedItem{
-			AlbumID: album.albumID,
-			I:       photo.I,
-			W:       photo.W,
-			H:       photo.H,
-			Ratio:   photo.Ratio,
-		})
+		pool := nonRecentAlbums
+		streamOffset := int64(0)
+		if isRecentSlot(i, limit, recentQuota) {
+			pool = recentAlbums
+			streamOffset = recentStreamOffset
+		} else if len(pool) == 0 {
+			pool = recentAlbums
+			streamOffset = recentFallbackStreamOffset
+		}
+		if len(pool) == 0 {
+			continue
+		}
+
+		items = append(items, sampleFeedItem(seed, position, streamOffset, pool))
 	}
 	return models.FeedResponse{Items: items}, nil
 }
@@ -103,8 +117,9 @@ func (s *Service) snapshotAlbums() []albumRef {
 			continue
 		}
 		albumsList = append(albumsList, albumRef{
-			albumID: album.AlbumID,
-			photos:  album.Photos,
+			albumID:   album.AlbumID,
+			photos:    album.Photos,
+			createdAt: album.CreatedAt,
 		})
 	}
 
@@ -139,4 +154,100 @@ func deterministicIndex(seed int64, position int64, size int) int {
 	x *= 0x94d049bb133111eb
 	x ^= x >> 31
 	return int(x % uint64(size))
+}
+
+func sampleFeedItem(seed int64, position int64, streamOffset int64, pool []albumRef) models.FeedItem {
+	albumIdx := deterministicIndex(seed, streamOffset+position*2, len(pool))
+	album := pool[albumIdx]
+	photoIdx := deterministicIndex(seed, streamOffset+position*2+1, len(album.photos))
+	photo := album.photos[photoIdx]
+	return models.FeedItem{
+		AlbumID: album.albumID,
+		I:       photo.I,
+		W:       photo.W,
+		H:       photo.H,
+		Ratio:   photo.Ratio,
+	}
+}
+
+func splitRecentAlbums(albumsList []albumRef, recentLimit int) ([]albumRef, []albumRef) {
+	if len(albumsList) == 0 {
+		return nil, nil
+	}
+	if recentLimit <= 0 {
+		return nil, append([]albumRef(nil), albumsList...)
+	}
+
+	type rankedAlbum struct {
+		album     albumRef
+		createdAt time.Time
+	}
+
+	ranked := make([]rankedAlbum, 0, len(albumsList))
+	for _, album := range albumsList {
+		ranked = append(ranked, rankedAlbum{
+			album:     album,
+			createdAt: parseAlbumCreatedAt(album.createdAt),
+		})
+	}
+
+	sort.Slice(ranked, func(i, j int) bool {
+		if !ranked[i].createdAt.Equal(ranked[j].createdAt) {
+			return ranked[i].createdAt.After(ranked[j].createdAt)
+		}
+		return ranked[i].album.albumID < ranked[j].album.albumID
+	})
+
+	if recentLimit > len(ranked) {
+		recentLimit = len(ranked)
+	}
+
+	recent := make([]albumRef, 0, recentLimit)
+	recentSet := make(map[string]struct{}, recentLimit)
+	for i := 0; i < recentLimit; i++ {
+		recent = append(recent, ranked[i].album)
+		recentSet[ranked[i].album.albumID] = struct{}{}
+	}
+
+	nonRecent := make([]albumRef, 0, len(albumsList)-recentLimit)
+	for _, album := range albumsList {
+		if _, ok := recentSet[album.albumID]; ok {
+			continue
+		}
+		nonRecent = append(nonRecent, album)
+	}
+
+	return recent, nonRecent
+}
+
+func calculateRecentQuota(limit int, recentPoolSize int) int {
+	if limit <= 0 || recentPoolSize == 0 {
+		return 0
+	}
+	quota := (limit*recentAlbumSharePercent + 99) / 100
+	if quota > limit {
+		quota = limit
+	}
+	return quota
+}
+
+func isRecentSlot(position int, limit int, recentQuota int) bool {
+	if position < 0 || limit <= 0 || recentQuota <= 0 {
+		return false
+	}
+	return ((position+1)*recentQuota)/limit > (position*recentQuota)/limit
+}
+
+func parseAlbumCreatedAt(createdAt string) time.Time {
+	createdAt = strings.TrimSpace(createdAt)
+	if createdAt == "" {
+		return time.Time{}
+	}
+	if ts, err := time.Parse(time.RFC3339Nano, createdAt); err == nil {
+		return ts
+	}
+	if ts, err := time.Parse(time.RFC3339, createdAt); err == nil {
+		return ts
+	}
+	return time.Time{}
 }
