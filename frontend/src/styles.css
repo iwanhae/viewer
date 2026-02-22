@@ -321,15 +321,10 @@ body,
   transition: none;
 }
 
-.album-photo-tile.is-selected::after {
-  content: "";
-  position: absolute;
-  inset: 2px;
-  border-radius: 12px;
-  border: 2px solid rgba(245, 158, 11, 0.92);
-  box-shadow: 0 19px 38px rgba(217, 119, 6, 0.3),
-    0 15px 12px rgba(180, 83, 9, 0.22);
-  pointer-events: none;
+.album-photo-tile.is-selected {
+  box-shadow: 0 0 0 1px rgba(255, 251, 235, 0.9),
+    0 0 22px rgba(245, 158, 11, 0.42),
+    0 0 44px rgba(217, 119, 6, 0.26);
 }
 
 .album-photo-tile:focus-visible {
