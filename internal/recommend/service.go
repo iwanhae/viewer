@@ -32,6 +32,7 @@ type Service struct {
 	photoIDsByAlbum   map[string]map[string]struct{}
 	embeddingsByID    map[string]EmbeddingRecord
 	failedByID        map[string]string
+	processFailedByID map[string]string
 	missingByAlbum    map[string]map[int]struct{}
 	albumsWithMissing []string
 	albumMissingPos   map[string]int
@@ -55,6 +56,7 @@ func NewService(cfg cfgpkg.Config, imagesService *images.Service, s3Store *stora
 		photoIDsByAlbum:   make(map[string]map[string]struct{}),
 		embeddingsByID:    make(map[string]EmbeddingRecord),
 		failedByID:        make(map[string]string),
+		processFailedByID: make(map[string]string),
 		missingByAlbum:    make(map[string]map[int]struct{}),
 		albumsWithMissing: make([]string, 0),
 		albumMissingPos:   make(map[string]int),
@@ -130,8 +132,10 @@ func (s *Service) applyAlbumIndexLocked(idx models.AlbumIndex) {
 	if albumID == "" {
 		return
 	}
-	if previous, ok := s.photoIDsByAlbum[albumID]; ok {
-		for id := range previous {
+	var previous map[string]struct{}
+	if prev, ok := s.photoIDsByAlbum[albumID]; ok {
+		previous = prev
+		for id := range prev {
 			delete(s.photosByID, id)
 			delete(s.embeddingsByID, id)
 			delete(s.failedByID, id)
@@ -155,29 +159,57 @@ func (s *Service) applyAlbumIndexLocked(idx models.AlbumIndex) {
 		}
 		s.photosByID[id] = rec
 
+		processErr, processFailed := s.processFailedByID[id]
+
 		emb, ok := idx.Embeddings[embeddingIndexKey(photo.I)]
-		if !ok {
-			missing[photo.I] = struct{}{}
+		if ok {
+			switch emb.Status {
+			case embeddingStatusReady:
+				if len(emb.Vector) == 0 {
+					if processFailed {
+						s.failedByID[id] = processErr
+						continue
+					}
+					missing[photo.I] = struct{}{}
+					continue
+				}
+				normalized := normalizeVector(emb.Vector)
+				s.embeddingsByID[id] = EmbeddingRecord{
+					ImageID: id,
+					Vector:  normalized,
+				}
+				delete(s.failedByID, id)
+				delete(s.processFailedByID, id)
+			case embeddingStatusFailed:
+				if emb.Error != "" {
+					s.failedByID[id] = emb.Error
+				} else if processFailed {
+					s.failedByID[id] = processErr
+				} else {
+					s.failedByID[id] = "embed failed"
+				}
+			default:
+				if processFailed {
+					s.failedByID[id] = processErr
+					continue
+				}
+				missing[photo.I] = struct{}{}
+			}
 			continue
 		}
-		switch emb.Status {
-		case embeddingStatusReady:
-			if len(emb.Vector) == 0 {
-				missing[photo.I] = struct{}{}
-				continue
-			}
-			normalized := normalizeVector(emb.Vector)
-			s.embeddingsByID[id] = EmbeddingRecord{
-				ImageID: id,
-				Vector:  normalized,
-			}
-		case embeddingStatusFailed:
-			s.failedByID[id] = emb.Error
-		default:
-			missing[photo.I] = struct{}{}
+
+		if processFailed {
+			s.failedByID[id] = processErr
+			continue
 		}
+		missing[photo.I] = struct{}{}
 	}
 	s.photoIDsByAlbum[albumID] = albumPhotoIDs
+	for id := range previous {
+		if _, ok := albumPhotoIDs[id]; !ok {
+			delete(s.processFailedByID, id)
+		}
+	}
 	s.setMissingForAlbumLocked(albumID, missing)
 }
 
@@ -283,6 +315,10 @@ func (s *Service) embedAlbumAndPersist(ctx context.Context, albumID string, phot
 
 	targets := make([]PhotoRecord, 0, len(photos))
 	for _, photo := range photos {
+		if processErr, processFailed := s.getProcessFailed(photo.ImageID); processFailed {
+			s.markFailedLocal(photo.ImageID, processErr)
+			continue
+		}
 		current := idx.Embeddings[embeddingIndexKey(photo.PhotoIndex)]
 		if current.Status == embeddingStatusReady && len(current.Vector) > 0 {
 			continue
@@ -298,11 +334,16 @@ func (s *Service) embedAlbumAndPersist(ctx context.Context, albumID string, phot
 	}
 
 	updates := make(map[int]models.PhotoEmbedding, len(targets))
-	transientIndexes := make([]int, 0, len(targets))
 	readyCount := 0
 	failedCount := 0
 
 	for _, photo := range targets {
+		if processErr, processFailed := s.getProcessFailed(photo.ImageID); processFailed {
+			s.markFailedLocal(photo.ImageID, processErr)
+			failedCount++
+			continue
+		}
+
 		if err := s.acquireImageLoadSlot(ctx); err != nil {
 			s.requeueMissingPhotos(albumID, photoIndexesFromRecords(targets))
 			return fmt.Errorf("wait for image download slot: %w", err)
@@ -321,16 +362,8 @@ func (s *Service) embedAlbumAndPersist(ctx context.Context, albumID string, phot
 
 		vector, err := s.embedder.Embed(ctx, result.Bytes)
 		if err != nil {
-			if isTransientEmbedError(err) {
-				transientIndexes = append(transientIndexes, photo.PhotoIndex)
-				continue
-			}
 			failedCount++
-			updates[photo.PhotoIndex] = models.PhotoEmbedding{
-				Status:    embeddingStatusFailed,
-				Error:     fmt.Sprintf("embed image: %v", err),
-				UpdatedAt: time.Now().UTC().Format(time.RFC3339),
-			}
+			s.markFailedLocal(photo.ImageID, fmt.Sprintf("embed image: %v", err))
 			continue
 		}
 
@@ -347,16 +380,13 @@ func (s *Service) embedAlbumAndPersist(ctx context.Context, albumID string, phot
 		return fmt.Errorf("persist album embeddings: %w", err)
 	}
 
-	s.requeueMissingPhotos(albumID, transientIndexes)
-
 	log.Printf(
-		"recommend: album embed batch album=%s claimed=%d processed=%d ready=%d failed=%d retry=%d duration=%s",
+		"recommend: album embed batch album=%s claimed=%d processed=%d ready=%d failed=%d duration=%s",
 		albumID,
 		len(photos),
 		len(targets),
 		readyCount,
 		failedCount,
-		len(transientIndexes),
 		time.Since(startedAt).Round(time.Millisecond),
 	)
 
@@ -421,6 +451,10 @@ func (s *Service) requeueMissingPhotos(albumID string, photoIndexes []int) {
 		if _, ok := s.photosByID[imageIDValue]; !ok {
 			continue
 		}
+		if errText, processFailed := s.processFailedByID[imageIDValue]; processFailed {
+			s.failedByID[imageIDValue] = errText
+			continue
+		}
 		delete(s.failedByID, imageIDValue)
 		missing[photoIndex] = struct{}{}
 	}
@@ -435,6 +469,7 @@ func (s *Service) markFailedLocal(imageIDValue string, errText string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.ensureIndexesLocked()
+	s.processFailedByID[imageIDValue] = errText
 	s.failedByID[imageIDValue] = errText
 	albumID, photoIndex, err := parseImageID(imageIDValue)
 	if err == nil {
@@ -445,6 +480,16 @@ func (s *Service) markFailedLocal(imageIDValue string, errText string) {
 			}
 		}
 	}
+}
+
+func (s *Service) getProcessFailed(imageIDValue string) (string, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.processFailedByID == nil {
+		return "", false
+	}
+	errText, ok := s.processFailedByID[imageIDValue]
+	return errText, ok
 }
 
 func (s *Service) readAlbumIndex(ctx context.Context, albumID string) (*models.AlbumIndex, error) {
@@ -634,6 +679,9 @@ func (s *Service) ensureIndexesLocked() {
 	}
 	if s.failedByID == nil {
 		s.failedByID = make(map[string]string)
+	}
+	if s.processFailedByID == nil {
+		s.processFailedByID = make(map[string]string)
 	}
 	if s.missingByAlbum == nil {
 		s.missingByAlbum = make(map[string]map[int]struct{})

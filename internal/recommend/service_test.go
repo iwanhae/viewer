@@ -183,6 +183,121 @@ func TestRequeueMissingPhotosRestoresPendingSet(t *testing.T) {
 	}
 }
 
+func TestApplyAlbumIndexPreservesProcessFailedAsFailed(t *testing.T) {
+	id := imageID("album-a", 0)
+	s := &Service{
+		processFailedByID: map[string]string{
+			id: "embed image: timeout",
+		},
+	}
+
+	s.applyAlbumIndex(models.AlbumIndex{
+		AlbumID: "album-a",
+		Photos: []models.PhotoMeta{
+			{I: 0, Name: "one.jpg", W: 100, H: 100, Ratio: 1},
+		},
+	})
+
+	if got, ok := s.failedByID[id]; !ok || got != "embed image: timeout" {
+		t.Fatalf("expected process-local failed marker to remain visible, got=%q ok=%v", got, ok)
+	}
+	if _, ok := s.missingByAlbum["album-a"][0]; ok {
+		t.Fatalf("expected process-local failed photo to be excluded from missing set")
+	}
+	if _, ok := s.albumMissingPos["album-a"]; ok {
+		t.Fatalf("did not expect album with only process-local failures to stay in active missing index")
+	}
+}
+
+func TestApplyAlbumIndexReadyEmbeddingClearsProcessFailed(t *testing.T) {
+	id := imageID("album-a", 0)
+	s := &Service{
+		processFailedByID: map[string]string{
+			id: "embed image: timeout",
+		},
+		failedByID: map[string]string{
+			id: "embed image: timeout",
+		},
+	}
+
+	s.applyAlbumIndex(models.AlbumIndex{
+		AlbumID: "album-a",
+		Photos: []models.PhotoMeta{
+			{I: 0, Name: "one.jpg", W: 100, H: 100, Ratio: 1},
+		},
+		Embeddings: map[string]models.PhotoEmbedding{
+			"0": {
+				Status: embeddingStatusReady,
+				Vector: []float32{1, 2},
+			},
+		},
+	})
+
+	if _, ok := s.processFailedByID[id]; ok {
+		t.Fatalf("expected process-local failed marker to be cleared after ready embedding")
+	}
+	if _, ok := s.failedByID[id]; ok {
+		t.Fatalf("did not expect failed marker after ready embedding")
+	}
+	if _, ok := s.embeddingsByID[id]; !ok {
+		t.Fatalf("expected ready embedding to be tracked")
+	}
+}
+
+func TestRequeueMissingPhotosSkipsProcessFailed(t *testing.T) {
+	failedID := imageID("album-a", 0)
+	s := &Service{
+		photosByID: map[string]PhotoRecord{
+			failedID:              {ImageID: failedID, AlbumID: "album-a", PhotoIndex: 0},
+			imageID("album-a", 1): {ImageID: imageID("album-a", 1), AlbumID: "album-a", PhotoIndex: 1},
+		},
+		processFailedByID: map[string]string{
+			failedID: "embed image: timeout",
+		},
+		missingByAlbum: map[string]map[int]struct{}{
+			"album-a": {},
+		},
+	}
+
+	s.requeueMissingPhotos("album-a", []int{0, 1})
+
+	if _, ok := s.missingByAlbum["album-a"][0]; ok {
+		t.Fatalf("did not expect process-failed photo to be requeued")
+	}
+	if _, ok := s.missingByAlbum["album-a"][1]; !ok {
+		t.Fatalf("expected non-failed photo to be requeued")
+	}
+	if got, ok := s.failedByID[failedID]; !ok || got != "embed image: timeout" {
+		t.Fatalf("expected failed marker to remain for process-failed photo, got=%q ok=%v", got, ok)
+	}
+}
+
+func TestMarkFailedLocalTracksProcessFailure(t *testing.T) {
+	id := imageID("album-a", 0)
+	s := &Service{
+		missingByAlbum: map[string]map[int]struct{}{
+			"album-a": {
+				0: {},
+			},
+		},
+	}
+
+	s.markFailedLocal(id, "embed image: timeout")
+
+	if got, ok := s.processFailedByID[id]; !ok || got != "embed image: timeout" {
+		t.Fatalf("expected process-local failure marker, got=%q ok=%v", got, ok)
+	}
+	if got, ok := s.failedByID[id]; !ok || got != "embed image: timeout" {
+		t.Fatalf("expected failed marker, got=%q ok=%v", got, ok)
+	}
+	if _, ok := s.missingByAlbum["album-a"][0]; ok {
+		t.Fatalf("expected failed photo to be removed from missing set")
+	}
+	if _, ok := s.albumMissingPos["album-a"]; ok {
+		t.Fatalf("did not expect album with no missing photos to remain active")
+	}
+}
+
 func TestRecommendExcludesSameAlbum(t *testing.T) {
 	s := &Service{
 		photosByID: map[string]PhotoRecord{
