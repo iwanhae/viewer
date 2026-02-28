@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { useAlbum } from '../hooks/useAlbum'
 import { readColumnPreference, writeColumnPreference } from '../utils/columnPreference'
-import { readLastWallSeed } from '../utils/wallSeed'
+import { readLastWallSeed, readLastWallState } from '../utils/wallSeed'
 import { MasonryWall } from '../components/MasonryWall'
 import { BottomIsland } from '../components/BottomIsland'
 import { BackToAlbumIcon, ColumnsIcon, NextIcon, PrevIcon } from '../components/IslandIcons'
@@ -123,11 +123,20 @@ export function ViewerPage() {
   }, [album, pageStart])
 
   const onBackToWall = () => {
-    const seed = readLastWallSeed()
     const focusIndex = anchorIndex
+    const lastState = readLastWallState()
+    const seed = readLastWallSeed()
 
     const query = new URLSearchParams()
-    if (seed) {
+    if (lastState?.mode === 'latest') {
+      query.set('mode', 'latest')
+      if (typeof lastState.latestPage === 'number' && Number.isInteger(lastState.latestPage) && lastState.latestPage >= 1) {
+        query.set('lp', String(lastState.latestPage))
+      }
+      if (lastState.latestCursor) {
+        query.set('lc', lastState.latestCursor)
+      }
+    } else if (seed) {
       query.set('seed', seed)
     }
     if (focusIndex !== null) {

@@ -3,10 +3,10 @@ import { useNavigate, useSearchParams } from 'react-router-dom'
 import type { FeedMode } from '../api/client'
 import { useFeed } from '../hooks/useFeed'
 import { readColumnPreference, writeColumnPreference } from '../utils/columnPreference'
-import { writeLastWallSeed } from '../utils/wallSeed'
+import { writeLastWallSeed, writeLastWallState } from '../utils/wallSeed'
 import { MasonryWall } from '../components/MasonryWall'
 import { BottomIsland } from '../components/BottomIsland'
-import { ColumnsIcon, ModeIcon, RefreshIcon, ShortcutIcon } from '../components/IslandIcons'
+import { ColumnsIcon, ModeIcon, NextIcon, PrevIcon, RefreshIcon, ShortcutIcon } from '../components/IslandIcons'
 
 const columnOptions = [1, 2, 3, 4, 5, 6]
 const WALL_COLUMNS_KEY = 'wall_columns'
@@ -23,6 +23,12 @@ function nextTimestampSeed(currentSeed?: string): string {
     return String(parsedCurrent + 1)
   }
   return String(now)
+}
+
+function parsePositiveInt(value: string | null, fallback: number): number {
+  const parsed = Number(value)
+  if (!Number.isInteger(parsed) || parsed < 1) return fallback
+  return parsed
 }
 
 function pageForPhotoIndex(index: number): number {
@@ -48,8 +54,15 @@ export function WallPage() {
   const mode = parseWallMode(rawMode)
   const seed = searchParams.get('seed') ?? ''
   const focus = searchParams.get('focus')
+  const rawLatestPage = searchParams.get('lp')
+  const latestPage = parsePositiveInt(rawLatestPage, 1)
+  const latestCursor = searchParams.get('lc') ?? ''
 
-  const { items, loading, error, refetch } = useFeed(seed, mode)
+  const { items, loading, error, pageInfo, refetch } = useFeed(
+    seed,
+    mode,
+    mode === 'latest' ? latestCursor : '',
+  )
   const visibleItems = useMemo(() => items.slice(0, WALL_FEED_LIMIT), [items])
   const tileRefs = useRef(new Map<string, HTMLButtonElement>())
 
@@ -66,22 +79,103 @@ export function WallPage() {
   }, [mode, rawMode, setSearchParams])
 
   useEffect(() => {
-    if (mode !== 'random' || seed) return
-    const nextSeed = nextTimestampSeed()
+    if (mode !== 'random') return
+
+    const needsCleanup = rawLatestPage !== null || latestCursor !== ''
+    if (!seed) {
+      const nextSeed = nextTimestampSeed()
+      setSearchParams(
+        (prev) => {
+          const next = new URLSearchParams(prev)
+          next.set('seed', nextSeed)
+          next.delete('lp')
+          next.delete('lc')
+          return next
+        },
+        { replace: true },
+      )
+      return
+    }
+
+    if (!needsCleanup) return
     setSearchParams(
       (prev) => {
         const next = new URLSearchParams(prev)
-        next.set('seed', nextSeed)
+        next.delete('lp')
+        next.delete('lc')
         return next
       },
       { replace: true },
     )
-  }, [mode, seed, setSearchParams])
+  }, [latestCursor, mode, rawLatestPage, seed, setSearchParams])
 
   useEffect(() => {
-    if (mode !== 'random' || !seed) return
-    writeLastWallSeed(seed)
-  }, [mode, seed])
+    if (mode !== 'latest') return
+
+    const normalizedPage = String(latestPage)
+    const needsPageParam = rawLatestPage !== normalizedPage
+    const hasSeed = seed !== ''
+    if (!needsPageParam && !hasSeed) return
+
+    setSearchParams(
+      (prev) => {
+        const next = new URLSearchParams(prev)
+        next.set('lp', normalizedPage)
+        next.delete('seed')
+        return next
+      },
+      { replace: true },
+    )
+  }, [latestPage, mode, rawLatestPage, seed, setSearchParams])
+
+  useEffect(() => {
+    if (mode !== 'latest') return
+    if (latestPage <= 1 || latestCursor) return
+    setSearchParams(
+      (prev) => {
+        const next = new URLSearchParams(prev)
+        next.set('lp', '1')
+        return next
+      },
+      { replace: true },
+    )
+  }, [latestCursor, latestPage, mode, setSearchParams])
+
+  useEffect(() => {
+    if (mode === 'random' && seed) {
+      writeLastWallSeed(seed)
+      writeLastWallState({ mode: 'random', seed })
+      return
+    }
+
+    if (mode === 'latest') {
+      writeLastWallState({
+        mode: 'latest',
+        latestPage,
+        latestCursor,
+      })
+    }
+  }, [latestCursor, latestPage, mode, seed])
+
+  useEffect(() => {
+    if (mode !== 'latest' || loading || error) return
+    const normalizedCursor = pageInfo.cursor ?? ''
+    if (normalizedCursor === latestCursor) return
+
+    setSearchParams(
+      (prev) => {
+        const next = new URLSearchParams(prev)
+        next.set('lp', String(latestPage))
+        if (normalizedCursor) {
+          next.set('lc', normalizedCursor)
+        } else {
+          next.delete('lc')
+        }
+        return next
+      },
+      { replace: true },
+    )
+  }, [error, latestCursor, latestPage, loading, mode, pageInfo.cursor, setSearchParams])
 
   useEffect(() => {
     if (!focus || loading || visibleItems.length === 0) return
@@ -117,9 +211,39 @@ export function WallPage() {
       const next = new URLSearchParams(prev)
       next.set('mode', nextMode)
       next.delete('focus')
-      if (nextMode === 'random' && !next.get('seed')) {
+
+      if (nextMode === 'latest') {
+        next.set('lp', '1')
+        next.delete('lc')
+        next.delete('seed')
+        return next
+      }
+
+      next.delete('lp')
+      next.delete('lc')
+      if (!next.get('seed')) {
         next.set('seed', nextTimestampSeed())
       }
+      return next
+    })
+  }
+
+  const onChangeLatestPage = (nextPage: number, nextCursor: string | null) => {
+    if (typeof window !== 'undefined') {
+      window.scrollTo({ top: 0, behavior: 'auto' })
+    }
+
+    setSearchParams((prev) => {
+      const next = new URLSearchParams(prev)
+      next.set('mode', 'latest')
+      next.set('lp', String(Math.max(1, nextPage)))
+      if (nextCursor && nextCursor.trim()) {
+        next.set('lc', nextCursor)
+      } else {
+        next.delete('lc')
+      }
+      next.delete('seed')
+      next.delete('focus')
       return next
     })
   }
@@ -189,6 +313,19 @@ export function WallPage() {
 
       <BottomIsland
         actions={[
+          ...(mode === 'latest'
+            ? [
+                {
+                  id: 'wall-page-prev',
+                  icon: <PrevIcon />,
+                  ariaLabel: 'Previous latest page',
+                  tooltip: 'Previous page',
+                  testId: 'wall-page-prev',
+                  onClick: () => onChangeLatestPage(latestPage - 1, pageInfo.prevCursor),
+                  disabled: !pageInfo.hasPrev,
+                },
+              ]
+            : []),
           {
             id: 'wall-columns',
             icon: <ColumnsIcon />,
@@ -240,6 +377,17 @@ export function WallPage() {
               </div>
             ),
           },
+          ...(mode === 'latest'
+            ? [
+                {
+                  kind: 'indicator' as const,
+                  id: 'wall-page-indicator',
+                  label: <span>Page {latestPage}</span>,
+                  testId: 'wall-page-indicator',
+                  ariaLabel: `Latest page ${latestPage}`,
+                },
+              ]
+            : []),
           {
             id: 'wall-shortcut',
             icon: <ShortcutIcon />,
@@ -282,6 +430,19 @@ export function WallPage() {
             onClick: onRefresh,
             disabled: loading,
           },
+          ...(mode === 'latest'
+            ? [
+                {
+                  id: 'wall-page-next',
+                  icon: <NextIcon />,
+                  ariaLabel: 'Next latest page',
+                  tooltip: 'Next page',
+                  testId: 'wall-page-next',
+                  onClick: () => onChangeLatestPage(latestPage + 1, pageInfo.nextCursor),
+                  disabled: !pageInfo.hasNext,
+                },
+              ]
+            : []),
         ]}
       />
 

@@ -2,6 +2,8 @@ package feed
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"hash/fnv"
 	"sort"
@@ -68,7 +70,13 @@ func ParseMode(modeParam string) (Mode, error) {
 	}
 }
 
-func (s *Service) Build(ctx context.Context, limit int, seedParam string, mode Mode) (models.FeedResponse, error) {
+func (s *Service) Build(
+	ctx context.Context,
+	limit int,
+	seedParam string,
+	mode Mode,
+	afterCursor string,
+) (models.FeedResponse, error) {
 	_ = ctx
 	if limit <= 0 {
 		limit = 80
@@ -86,7 +94,7 @@ func (s *Service) Build(ctx context.Context, limit int, seedParam string, mode M
 		mode = ModeRandom
 	}
 	if mode == ModeLatest {
-		return models.FeedResponse{Items: buildLatestItems(limit, albumsList)}, nil
+		return buildLatestPage(limit, albumsList, afterCursor), nil
 	}
 	if mode != ModeRandom {
 		return models.FeedResponse{}, fmt.Errorf("invalid mode")
@@ -114,17 +122,96 @@ func (s *Service) Build(ctx context.Context, limit int, seedParam string, mode M
 
 		items = append(items, sampleFeedItem(seed, position, streamOffset, pool))
 	}
-	return models.FeedResponse{Items: items}, nil
+	return models.FeedResponse{
+		Items:   items,
+		HasNext: false,
+		HasPrev: false,
+	}, nil
 }
 
-func buildLatestItems(limit int, albumsList []albumRef) []models.FeedItem {
+type latestCursor struct {
+	CreatedAtUnixNano int64  `json:"t"`
+	AlbumID           string `json:"a"`
+}
+
+func decodeLatestCursor(raw string) (latestCursor, bool) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return latestCursor{}, false
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(trimmed)
+	if err != nil {
+		return latestCursor{}, false
+	}
+	var cursor latestCursor
+	if err := json.Unmarshal(decoded, &cursor); err != nil {
+		return latestCursor{}, false
+	}
+	if strings.TrimSpace(cursor.AlbumID) == "" {
+		return latestCursor{}, false
+	}
+	return cursor, true
+}
+
+func encodeLatestCursor(item rankedAlbum) string {
+	payload, err := json.Marshal(latestCursor{
+		CreatedAtUnixNano: item.createdAt.UnixNano(),
+		AlbumID:           item.album.albumID,
+	})
+	if err != nil {
+		return ""
+	}
+	return base64.RawURLEncoding.EncodeToString(payload)
+}
+
+func findRankedAlbumIndex(ranked []rankedAlbum, cursor latestCursor) int {
+	for idx, item := range ranked {
+		if item.album.albumID != cursor.AlbumID {
+			continue
+		}
+		if item.createdAt.UnixNano() != cursor.CreatedAtUnixNano {
+			continue
+		}
+		return idx
+	}
+	return -1
+}
+
+func buildLatestPage(limit int, albumsList []albumRef, afterCursor string) models.FeedResponse {
 	ranked := rankAlbumsByCreatedAt(albumsList)
+	if len(ranked) == 0 {
+		return models.FeedResponse{
+			Items:   []models.FeedItem{},
+			HasNext: false,
+			HasPrev: false,
+		}
+	}
 	if limit > len(ranked) {
 		limit = len(ranked)
 	}
+	if limit <= 0 {
+		limit = 1
+	}
 
-	items := make([]models.FeedItem, 0, limit)
-	for i := 0; i < limit; i++ {
+	start := 0
+	if decoded, ok := decodeLatestCursor(afterCursor); ok {
+		if idx := findRankedAlbumIndex(ranked, decoded); idx >= 0 {
+			start = idx + 1
+		}
+	}
+	if start < 0 {
+		start = 0
+	}
+	if start > len(ranked) {
+		start = len(ranked)
+	}
+	end := start + limit
+	if end > len(ranked) {
+		end = len(ranked)
+	}
+
+	items := make([]models.FeedItem, 0, end-start)
+	for i := start; i < end; i++ {
 		album := ranked[i].album
 		photo := album.photos[0]
 		items = append(items, models.FeedItem{
@@ -135,7 +222,39 @@ func buildLatestItems(limit int, albumsList []albumRef) []models.FeedItem {
 			Ratio:   photo.Ratio,
 		})
 	}
-	return items
+
+	hasPrev := start > 0
+	hasNext := end < len(ranked)
+
+	cursor := ""
+	if hasPrev {
+		cursor = encodeLatestCursor(ranked[start-1])
+	}
+
+	nextCursor := ""
+	if hasNext && end > 0 {
+		nextCursor = encodeLatestCursor(ranked[end-1])
+	}
+
+	prevCursor := ""
+	if hasPrev {
+		prevStart := start - limit
+		if prevStart < 0 {
+			prevStart = 0
+		}
+		if prevStart > 0 {
+			prevCursor = encodeLatestCursor(ranked[prevStart-1])
+		}
+	}
+
+	return models.FeedResponse{
+		Items:      items,
+		Cursor:     cursor,
+		NextCursor: nextCursor,
+		PrevCursor: prevCursor,
+		HasNext:    hasNext,
+		HasPrev:    hasPrev,
+	}
 }
 
 func (s *Service) snapshotAlbums() []albumRef {

@@ -213,15 +213,31 @@ test('basic upload -> wall -> album flow', async ({ page }) => {
   await expect(page.getByTestId('wall-mode-popup')).toBeVisible()
   await page.getByTestId('wall-mode-latest').click()
   await expect.poll(() => new URL(page.url()).searchParams.get('mode')).toBe('latest')
+  await expect.poll(() => new URL(page.url()).searchParams.get('lp')).toBe('1')
+  await expect(page.getByTestId('wall-page-prev')).toBeVisible()
+  await expect(page.getByTestId('wall-page-prev')).toBeDisabled()
+  await expect(page.getByTestId('wall-page-indicator')).toHaveText('Page 1')
+  await expect(page.getByTestId('wall-page-next')).toBeVisible()
+  await expectHorizontalOrder(page, [
+    'wall-page-prev',
+    'wall-columns',
+    'wall-mode',
+    'wall-page-indicator',
+    'wall-shortcut',
+    'wall-refresh',
+    'wall-page-next',
+  ])
   await expect(page.getByTestId('wall-tile').first()).toBeVisible({ timeout: 60_000 })
   await page.getByTestId('wall-refresh').click()
   await expect.poll(() => new URL(page.url()).searchParams.get('mode')).toBe('latest')
+  await expect.poll(() => new URL(page.url()).searchParams.get('lp')).toBe('1')
   await expect(page.getByTestId('wall-tile').first()).toBeVisible({ timeout: 60_000 })
 
   await page.getByTestId('wall-mode').click()
   await expect(page.getByTestId('wall-mode-popup')).toBeVisible()
   await page.getByTestId('wall-mode-random').click()
   await expect.poll(() => new URL(page.url()).searchParams.get('mode')).toBe('random')
+  await expect.poll(() => new URL(page.url()).searchParams.get('lp')).toBe(null)
 
   await page.getByTestId('wall-shortcut').click()
   await expect(page.getByTestId('wall-shortcut-popup')).toBeVisible()

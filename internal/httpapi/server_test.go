@@ -3,6 +3,7 @@ package httpapi
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"math"
 	"net/http"
@@ -108,6 +109,40 @@ func TestFeedEndpointSupportsLatestMode(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "\"items\"") {
 		t.Fatalf("expected items envelope in body, got: %s", rec.Body.String())
+	}
+}
+
+func TestFeedEndpointLatestSupportsAfterCursor(t *testing.T) {
+	router := New(nil, testFeedService(), nil, nil).Router()
+
+	firstReq := httptest.NewRequest(http.MethodGet, "/api/feed?limit=1&mode=latest", nil)
+	firstRec := httptest.NewRecorder()
+	router.ServeHTTP(firstRec, firstReq)
+	if firstRec.Code != http.StatusOK {
+		t.Fatalf("status=%d want=%d body=%s", firstRec.Code, http.StatusOK, firstRec.Body.String())
+	}
+
+	var first models.FeedResponse
+	if err := json.Unmarshal(firstRec.Body.Bytes(), &first); err != nil {
+		t.Fatalf("unmarshal first response: %v", err)
+	}
+	if len(first.Items) != 0 {
+		t.Fatalf("expected empty feed for empty album service, got items=%d", len(first.Items))
+	}
+
+	secondReq := httptest.NewRequest(http.MethodGet, "/api/feed?limit=1&mode=latest&after=not-a-real-cursor", nil)
+	secondRec := httptest.NewRecorder()
+	router.ServeHTTP(secondRec, secondReq)
+	if secondRec.Code != http.StatusOK {
+		t.Fatalf("status=%d want=%d body=%s", secondRec.Code, http.StatusOK, secondRec.Body.String())
+	}
+
+	var second models.FeedResponse
+	if err := json.Unmarshal(secondRec.Body.Bytes(), &second); err != nil {
+		t.Fatalf("unmarshal second response: %v", err)
+	}
+	if len(second.Items) != 0 {
+		t.Fatalf("expected empty feed for empty album service, got items=%d", len(second.Items))
 	}
 }
 

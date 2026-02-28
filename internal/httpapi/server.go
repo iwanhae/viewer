@@ -186,6 +186,7 @@ func (s *Server) getFeed(w http.ResponseWriter, r *http.Request) {
 		limit,
 		r.URL.Query().Get("seed"),
 		mode,
+		r.URL.Query().Get("after"),
 	)
 	if err != nil {
 		writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", err.Error())
