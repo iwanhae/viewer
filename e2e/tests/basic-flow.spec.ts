@@ -479,11 +479,55 @@ test('basic upload -> wall -> album flow', async ({ page }) => {
   await expect(firstOriginalLink).toHaveAttribute('rel', 'noopener noreferrer')
   await expect(firstOriginalLink).toHaveAttribute('href', /^\/api\/image\/[^/]+\/\d+$/)
   expect(await firstOriginalLink.getAttribute('href')).toContain(`/api/image/${albumId}/`)
-  await expectHorizontalOrder(page, ['photo-columns-toggle', 'photo-back'])
+
+  const photoPrevButton = page.getByTestId('photo-prev')
+  const photoNextButton = page.getByTestId('photo-next')
+  const photoIndexIndicator = page.getByTestId('photo-index-indicator')
+  await expect(photoIndexIndicator).toHaveText(/^\d+\s\/\s\d+$/)
+  await expectHorizontalOrder(page, [
+    'photo-prev',
+    'photo-columns-toggle',
+    'photo-index-indicator',
+    'photo-back',
+    'photo-next',
+  ])
+
+  const photoIndexText = (await photoIndexIndicator.textContent()) ?? ''
+  const photoIndexMatch = photoIndexText.match(/^(\d+)\s\/\s(\d+)$/)
+  expect(photoIndexMatch).toBeTruthy()
+  const currentPhotoNumber = Number(photoIndexMatch![1])
+  const totalPhotoCount = Number(photoIndexMatch![2])
+  expect(Number.isInteger(currentPhotoNumber) && currentPhotoNumber >= 1).toBeTruthy()
+  expect(Number.isInteger(totalPhotoCount) && totalPhotoCount >= 1).toBeTruthy()
+
+  if (currentPhotoNumber <= 1) {
+    await expect(photoPrevButton).toBeDisabled()
+  } else {
+    await expect(photoPrevButton).toBeEnabled()
+  }
+  if (currentPhotoNumber >= totalPhotoCount) {
+    await expect(photoNextButton).toBeDisabled()
+  } else {
+    await expect(photoNextButton).toBeEnabled()
+  }
+
+  let navigatedPhotoIndex = photoIndex
+  if (currentPhotoNumber < totalPhotoCount) {
+    await photoNextButton.click()
+    await expect(photoIndexIndicator).toHaveText(`${currentPhotoNumber + 1} / ${totalPhotoCount}`)
+    await expect.poll(() => new URL(page.url()).pathname).not.toBe(photoURL.pathname)
+    navigatedPhotoIndex = Number(new URL(page.url()).pathname.split('/').at(-1))
+  } else if (currentPhotoNumber > 1) {
+    await photoPrevButton.click()
+    await expect(photoIndexIndicator).toHaveText(`${currentPhotoNumber - 1} / ${totalPhotoCount}`)
+    await expect.poll(() => new URL(page.url()).pathname).not.toBe(photoURL.pathname)
+    navigatedPhotoIndex = Number(new URL(page.url()).pathname.split('/').at(-1))
+  }
+
   await page.getByTestId('photo-back').click()
   await expect(page.getByTestId('album-grid')).toBeVisible()
   await expect.poll(() => new URL(page.url()).pathname).toBe(`/album/${albumId}`)
-  await expect.poll(() => new URL(page.url()).searchParams.get('i')).toBe(String(photoIndex))
+  await expect.poll(() => new URL(page.url()).searchParams.get('i')).toBe(String(navigatedPhotoIndex))
   await expect(page.locator('[data-testid="album-tile"][data-selected="true"]')).toHaveCount(1)
   await expectSelectedTileGlow(page)
 

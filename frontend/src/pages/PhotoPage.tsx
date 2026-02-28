@@ -6,7 +6,7 @@ import { useRecommendations } from '../hooks/useRecommendations'
 import { MasonryWall } from '../components/MasonryWall'
 import { readColumnPreference, writeColumnPreference } from '../utils/columnPreference'
 import { BottomIsland } from '../components/BottomIsland'
-import { BackToAlbumIcon, ColumnsIcon } from '../components/IslandIcons'
+import { BackToAlbumIcon, ColumnsIcon, NextIcon, PrevIcon } from '../components/IslandIcons'
 
 const recommendationLimit = 48
 const recommendationColumnOptions = [1, 2, 3, 4, 5, 6]
@@ -94,6 +94,19 @@ export function PhotoPage() {
   }
   if (!photo) {
     return <div className="photo-error">Photo not found</div>
+  }
+
+  const photoPosition = album.photos.findIndex((item) => item.i === photo.i)
+  const totalPhotos = album.photos.length
+  const currentPhotoNumber = photoPosition >= 0 ? photoPosition + 1 : photo.i + 1
+  const prevPhotoIndex = photoPosition > 0 ? album.photos[photoPosition - 1]?.i : null
+  const nextPhotoIndex = photoPosition >= 0 && photoPosition < totalPhotos - 1 ? album.photos[photoPosition + 1]?.i : null
+
+  const onChangePhoto = (nextIndex: number) => {
+    if (typeof window !== 'undefined') {
+      window.scrollTo({ top: 0, behavior: 'auto' })
+    }
+    navigate(`/album/${album.albumId}/${nextIndex}`, { state: { album } })
   }
 
   return (
@@ -197,6 +210,18 @@ export function PhotoPage() {
         className="photo-bottom-island"
         actions={[
           {
+            id: 'photo-prev',
+            icon: <PrevIcon />,
+            ariaLabel: 'Previous photo',
+            tooltip: 'Previous photo',
+            testId: 'photo-prev',
+            onClick: () => {
+              if (prevPhotoIndex === null || prevPhotoIndex === undefined) return
+              onChangePhoto(prevPhotoIndex)
+            },
+            disabled: prevPhotoIndex === null || prevPhotoIndex === undefined,
+          },
+          {
             id: 'photo-columns',
             icon: <ColumnsIcon />,
             ariaLabel: 'Change similar image columns',
@@ -223,12 +248,35 @@ export function PhotoPage() {
             ),
           },
           {
+            kind: 'indicator',
+            id: 'photo-index-indicator',
+            label: (
+              <span>
+                {currentPhotoNumber} / {totalPhotos}
+              </span>
+            ),
+            testId: 'photo-index-indicator',
+            ariaLabel: `Photo ${currentPhotoNumber} of ${totalPhotos}`,
+          },
+          {
             id: 'photo-back',
             icon: <BackToAlbumIcon />,
             ariaLabel: 'Back to album',
             tooltip: 'Album',
             testId: 'photo-back',
             onClick: () => navigate(`/album/${album.albumId}?i=${photo.i}&p=${pageForPhotoIndex(photo.i)}`),
+          },
+          {
+            id: 'photo-next',
+            icon: <NextIcon />,
+            ariaLabel: 'Next photo',
+            tooltip: 'Next photo',
+            testId: 'photo-next',
+            onClick: () => {
+              if (nextPhotoIndex === null || nextPhotoIndex === undefined) return
+              onChangePhoto(nextPhotoIndex)
+            },
+            disabled: nextPhotoIndex === null || nextPhotoIndex === undefined,
           },
         ]}
       />
