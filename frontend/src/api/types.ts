@@ -1,3 +1,5 @@
+export type FeedMode = 'random' | 'latest'
+
 export type FeedItem = {
   albumId: string
   i: number

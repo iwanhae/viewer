@@ -190,9 +190,11 @@ test('basic upload -> wall -> album flow', async ({ page }) => {
   await expect(page.getByTestId('wall-grid')).toBeVisible()
   await expect(page.getByTestId('masonry-column')).toHaveCount(3)
   await expect(page.getByTestId('wall-columns')).toBeVisible()
+  await expect(page.getByTestId('wall-mode')).toBeVisible()
   await expect(page.getByTestId('wall-refresh')).toBeVisible()
   await expect(page.getByTestId('wall-shortcut')).toBeVisible()
-  await expectHorizontalOrder(page, ['wall-columns', 'wall-shortcut', 'wall-refresh'])
+  await expectHorizontalOrder(page, ['wall-columns', 'wall-mode', 'wall-shortcut', 'wall-refresh'])
+  await expect.poll(() => new URL(page.url()).searchParams.get('mode')).toBe('random')
 
   await uploadAndFinalizeFromUploadPage(page, zip1)
 
@@ -206,6 +208,20 @@ test('basic upload -> wall -> album flow', async ({ page }) => {
   expect(originalResponse.ok()).toBeTruthy()
   expect(wallResponse.headers()['content-type']).toBe(originalResponse.headers()['content-type'])
   expect(await wallResponse.body()).toEqual(await originalResponse.body())
+
+  await page.getByTestId('wall-mode').click()
+  await expect(page.getByTestId('wall-mode-popup')).toBeVisible()
+  await page.getByTestId('wall-mode-latest').click()
+  await expect.poll(() => new URL(page.url()).searchParams.get('mode')).toBe('latest')
+  await expect(page.getByTestId('wall-tile').first()).toBeVisible({ timeout: 60_000 })
+  await page.getByTestId('wall-refresh').click()
+  await expect.poll(() => new URL(page.url()).searchParams.get('mode')).toBe('latest')
+  await expect(page.getByTestId('wall-tile').first()).toBeVisible({ timeout: 60_000 })
+
+  await page.getByTestId('wall-mode').click()
+  await expect(page.getByTestId('wall-mode-popup')).toBeVisible()
+  await page.getByTestId('wall-mode-random').click()
+  await expect.poll(() => new URL(page.url()).searchParams.get('mode')).toBe('random')
 
   await page.getByTestId('wall-shortcut').click()
   await expect(page.getByTestId('wall-shortcut-popup')).toBeVisible()
@@ -323,7 +339,7 @@ test('basic upload -> wall -> album flow', async ({ page }) => {
   await expect(page.getByTestId('wall-grid')).toBeVisible()
   await expect.poll(() => new URL(page.url()).pathname).toBe('/')
   await expect.poll(() => new URL(page.url()).searchParams.get('seed')).toBe(seedBeforeAlbumNavigation)
-  await expectHorizontalOrder(page, ['wall-columns', 'wall-shortcut', 'wall-refresh'])
+  await expectHorizontalOrder(page, ['wall-columns', 'wall-mode', 'wall-shortcut', 'wall-refresh'])
   await page.getByTestId('wall-columns').click()
   await expect(page.getByTestId('columns-6')).toBeVisible()
   await page.screenshot({ path: path.join(samplesDir, '03-wall.png'), fullPage: true })

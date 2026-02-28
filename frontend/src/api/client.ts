@@ -3,6 +3,7 @@ import { ensureOK, requestJSON } from './http'
 import type {
   AlbumIndex,
   AlbumSearchResponse,
+  FeedMode,
   FeedResponse,
   FinalizeResponse,
   FinalizeStatus,
@@ -14,6 +15,7 @@ export type {
   AlbumIndex,
   AlbumSearchItem,
   AlbumSearchResponse,
+  FeedMode,
   FeedItem,
   FeedResponse,
   FinalizeResponse,
@@ -36,10 +38,12 @@ type RawRecommendationResponse = {
 }
 
 export async function fetchFeed(params?: {
+  mode?: FeedMode
   seed?: string
   signal?: AbortSignal
 }): Promise<FeedResponse> {
   const query = new URLSearchParams({ limit: '40' })
+  if (params?.mode) query.set('mode', params.mode)
   if (params?.seed) query.set('seed', params.seed)
   return await requestJSON<FeedResponse>(`/api/feed?${query.toString()}`, {
     signal: params?.signal,

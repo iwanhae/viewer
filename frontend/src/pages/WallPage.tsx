@@ -1,17 +1,20 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
+import type { FeedMode } from '../api/client'
 import { useFeed } from '../hooks/useFeed'
 import { readColumnPreference, writeColumnPreference } from '../utils/columnPreference'
 import { writeLastWallSeed } from '../utils/wallSeed'
 import { MasonryWall } from '../components/MasonryWall'
 import { BottomIsland } from '../components/BottomIsland'
-import { ColumnsIcon, RefreshIcon, ShortcutIcon } from '../components/IslandIcons'
+import { ColumnsIcon, ModeIcon, RefreshIcon, ShortcutIcon } from '../components/IslandIcons'
 
 const columnOptions = [1, 2, 3, 4, 5, 6]
 const WALL_COLUMNS_KEY = 'wall_columns'
 const DEFAULT_COLUMNS = 3
 const WALL_FEED_LIMIT = 40
 const ALBUM_PAGE_SIZE = 50
+const defaultMode: FeedMode = 'random'
+const wallModes: FeedMode[] = ['random', 'latest']
 
 function nextTimestampSeed(currentSeed?: string): string {
   const now = Date.now()
@@ -30,6 +33,10 @@ function wallFocusKey(albumId: string, photoIndex: number): string {
   return `${albumId}:${photoIndex}`
 }
 
+function parseWallMode(modeParam: string | null): FeedMode {
+  return modeParam === 'latest' ? 'latest' : defaultMode
+}
+
 export function WallPage() {
   const [columns, setColumns] = useState(() =>
     readColumnPreference(WALL_COLUMNS_KEY, columnOptions, DEFAULT_COLUMNS),
@@ -37,15 +44,29 @@ export function WallPage() {
 
   const navigate = useNavigate()
   const [searchParams, setSearchParams] = useSearchParams()
+  const rawMode = searchParams.get('mode')
+  const mode = parseWallMode(rawMode)
   const seed = searchParams.get('seed') ?? ''
   const focus = searchParams.get('focus')
 
-  const { items, loading, error } = useFeed(seed)
+  const { items, loading, error, refetch } = useFeed(seed, mode)
   const visibleItems = useMemo(() => items.slice(0, WALL_FEED_LIMIT), [items])
   const tileRefs = useRef(new Map<string, HTMLButtonElement>())
 
   useEffect(() => {
-    if (seed) return
+    if (rawMode === mode) return
+    setSearchParams(
+      (prev) => {
+        const next = new URLSearchParams(prev)
+        next.set('mode', mode)
+        return next
+      },
+      { replace: true },
+    )
+  }, [mode, rawMode, setSearchParams])
+
+  useEffect(() => {
+    if (mode !== 'random' || seed) return
     const nextSeed = nextTimestampSeed()
     setSearchParams(
       (prev) => {
@@ -55,12 +76,12 @@ export function WallPage() {
       },
       { replace: true },
     )
-  }, [seed, setSearchParams])
+  }, [mode, seed, setSearchParams])
 
   useEffect(() => {
-    if (!seed) return
+    if (mode !== 'random' || !seed) return
     writeLastWallSeed(seed)
-  }, [seed])
+  }, [mode, seed])
 
   useEffect(() => {
     if (!focus || loading || visibleItems.length === 0) return
@@ -91,10 +112,35 @@ export function WallPage() {
     )
   }, [focus, loading, visibleItems.length, setSearchParams])
 
+  const setWallMode = (nextMode: FeedMode) => {
+    setSearchParams((prev) => {
+      const next = new URLSearchParams(prev)
+      next.set('mode', nextMode)
+      next.delete('focus')
+      if (nextMode === 'random' && !next.get('seed')) {
+        next.set('seed', nextTimestampSeed())
+      }
+      return next
+    })
+  }
+
   const onRefresh = () => {
     if (typeof window !== 'undefined') {
       window.scrollTo({ top: 0, behavior: 'auto' })
     }
+    if (mode === 'latest') {
+      setSearchParams(
+        (prev) => {
+          const next = new URLSearchParams(prev)
+          next.delete('focus')
+          return next
+        },
+        { replace: true },
+      )
+      void refetch()
+      return
+    }
+
     const nextSeed = nextTimestampSeed(seed)
     setSearchParams((prev) => {
       const next = new URLSearchParams(prev)
@@ -164,6 +210,31 @@ export function WallPage() {
                     }}
                   >
                     {option}
+                  </button>
+                ))}
+              </div>
+            ),
+          },
+          {
+            id: 'wall-mode',
+            icon: <ModeIcon />,
+            ariaLabel: 'Change wall mode',
+            tooltip: 'Mode',
+            testId: 'wall-mode',
+            renderPopup: ({ close }) => (
+              <div className="bottom-island-popup-stack" data-testid="wall-mode-popup">
+                {wallModes.map((option) => (
+                  <button
+                    type="button"
+                    key={option}
+                    className={`bottom-island-popup-option ${option === mode ? 'active' : ''}`.trim()}
+                    data-testid={`wall-mode-${option}`}
+                    onClick={() => {
+                      setWallMode(option)
+                      close()
+                    }}
+                  >
+                    {option === 'random' ? 'Random' : 'Latest'}
                   </button>
                 ))}
               </div>

@@ -175,11 +175,17 @@ func (s *Server) getFeed(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", "invalid limit")
 		return
 	}
+	mode, err := feed.ParseMode(r.URL.Query().Get("mode"))
+	if err != nil {
+		writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", "invalid mode")
+		return
+	}
 
 	resp, err := s.feed.Build(
 		r.Context(),
 		limit,
 		r.URL.Query().Get("seed"),
+		mode,
 	)
 	if err != nil {
 		writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", err.Error())

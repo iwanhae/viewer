@@ -41,6 +41,16 @@ export function ColumnsIcon({ title }: IconProps) {
   )
 }
 
+export function ModeIcon({ title }: IconProps) {
+  return (
+    <SvgIcon title={title}>
+      <path d="M6 7h12M6 12h8M6 17h4" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+      <path d="m15 5 3 2-3 2" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+      <path d="m11 15 3 2-3 2" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+    </SvgIcon>
+  )
+}
+
 export function RefreshIcon({ title }: IconProps) {
   return (
     <SvgIcon title={title}>

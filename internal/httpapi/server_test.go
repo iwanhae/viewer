@@ -12,7 +12,9 @@ import (
 	"testing"
 
 	"github.com/go-chi/chi/v5"
+	"viewer/internal/albums"
 	cfgpkg "viewer/internal/config"
+	"viewer/internal/feed"
 	"viewer/internal/models"
 	"viewer/internal/recommend"
 )
@@ -79,6 +81,38 @@ func TestJSONBodyRejectsTrailingContent(t *testing.T) {
 	if err == nil {
 		t.Fatalf("expected trailing content to fail")
 	}
+}
+
+func TestFeedEndpointRejectsInvalidMode(t *testing.T) {
+	router := New(nil, testFeedService(), nil, nil).Router()
+	req := httptest.NewRequest(http.MethodGet, "/api/feed?mode=invalid", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d want=%d body=%s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "\"code\":\"INVALID_REQUEST\"") {
+		t.Fatalf("expected INVALID_REQUEST error code in body, got: %s", rec.Body.String())
+	}
+}
+
+func TestFeedEndpointSupportsLatestMode(t *testing.T) {
+	router := New(nil, testFeedService(), nil, nil).Router()
+	req := httptest.NewRequest(http.MethodGet, "/api/feed?limit=25&mode=latest", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d want=%d body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "\"items\"") {
+		t.Fatalf("expected items envelope in body, got: %s", rec.Body.String())
+	}
+}
+
+func testFeedService() *feed.Service {
+	return feed.NewService(albums.NewService(cfgpkg.Config{}, nil, nil))
 }
 
 func TestMetricsEndpointPrometheusPayload(t *testing.T) {

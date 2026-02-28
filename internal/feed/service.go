@@ -2,6 +2,7 @@ package feed
 
 import (
 	"context"
+	"fmt"
 	"hash/fnv"
 	"sort"
 	"strconv"
@@ -19,6 +20,13 @@ const (
 	recentAlbumSharePercent    = 20
 	recentStreamOffset         = int64(1_000_000)
 	recentFallbackStreamOffset = int64(2_000_000)
+)
+
+type Mode string
+
+const (
+	ModeRandom Mode = "random"
+	ModeLatest Mode = "latest"
 )
 
 type albumSource interface {
@@ -49,7 +57,18 @@ func NewService(albumsService *albums.Service) *Service {
 	}
 }
 
-func (s *Service) Build(ctx context.Context, limit int, seedParam string) (models.FeedResponse, error) {
+func ParseMode(modeParam string) (Mode, error) {
+	switch strings.ToLower(strings.TrimSpace(modeParam)) {
+	case "", string(ModeRandom):
+		return ModeRandom, nil
+	case string(ModeLatest):
+		return ModeLatest, nil
+	default:
+		return "", fmt.Errorf("invalid mode")
+	}
+}
+
+func (s *Service) Build(ctx context.Context, limit int, seedParam string, mode Mode) (models.FeedResponse, error) {
 	_ = ctx
 	if limit <= 0 {
 		limit = 80
@@ -61,6 +80,16 @@ func (s *Service) Build(ctx context.Context, limit int, seedParam string) (model
 	albumsList := s.snapshotAlbums()
 	if len(albumsList) == 0 {
 		return models.FeedResponse{Items: []models.FeedItem{}}, nil
+	}
+
+	if mode == "" {
+		mode = ModeRandom
+	}
+	if mode == ModeLatest {
+		return models.FeedResponse{Items: buildLatestItems(limit, albumsList)}, nil
+	}
+	if mode != ModeRandom {
+		return models.FeedResponse{}, fmt.Errorf("invalid mode")
 	}
 
 	seed := parseSeed(seedParam)
@@ -86,6 +115,27 @@ func (s *Service) Build(ctx context.Context, limit int, seedParam string) (model
 		items = append(items, sampleFeedItem(seed, position, streamOffset, pool))
 	}
 	return models.FeedResponse{Items: items}, nil
+}
+
+func buildLatestItems(limit int, albumsList []albumRef) []models.FeedItem {
+	ranked := rankAlbumsByCreatedAt(albumsList)
+	if limit > len(ranked) {
+		limit = len(ranked)
+	}
+
+	items := make([]models.FeedItem, 0, limit)
+	for i := 0; i < limit; i++ {
+		album := ranked[i].album
+		photo := album.photos[0]
+		items = append(items, models.FeedItem{
+			AlbumID: album.albumID,
+			I:       photo.I,
+			W:       photo.W,
+			H:       photo.H,
+			Ratio:   photo.Ratio,
+		})
+	}
+	return items
 }
 
 func (s *Service) snapshotAlbums() []albumRef {
@@ -170,19 +220,12 @@ func sampleFeedItem(seed int64, position int64, streamOffset int64, pool []album
 	}
 }
 
-func splitRecentAlbums(albumsList []albumRef, recentLimit int) ([]albumRef, []albumRef) {
-	if len(albumsList) == 0 {
-		return nil, nil
-	}
-	if recentLimit <= 0 {
-		return nil, append([]albumRef(nil), albumsList...)
-	}
+type rankedAlbum struct {
+	album     albumRef
+	createdAt time.Time
+}
 
-	type rankedAlbum struct {
-		album     albumRef
-		createdAt time.Time
-	}
-
+func rankAlbumsByCreatedAt(albumsList []albumRef) []rankedAlbum {
 	ranked := make([]rankedAlbum, 0, len(albumsList))
 	for _, album := range albumsList {
 		ranked = append(ranked, rankedAlbum{
@@ -197,6 +240,19 @@ func splitRecentAlbums(albumsList []albumRef, recentLimit int) ([]albumRef, []al
 		}
 		return ranked[i].album.albumID < ranked[j].album.albumID
 	})
+
+	return ranked
+}
+
+func splitRecentAlbums(albumsList []albumRef, recentLimit int) ([]albumRef, []albumRef) {
+	if len(albumsList) == 0 {
+		return nil, nil
+	}
+	if recentLimit <= 0 {
+		return nil, append([]albumRef(nil), albumsList...)
+	}
+
+	ranked := rankAlbumsByCreatedAt(albumsList)
 
 	if recentLimit > len(ranked) {
 		recentLimit = len(ranked)
