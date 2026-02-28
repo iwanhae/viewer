@@ -233,6 +233,57 @@ test('basic upload -> wall -> album flow', async ({ page }) => {
   await expect.poll(() => new URL(page.url()).searchParams.get('lp')).toBe('1')
   await expect(page.getByTestId('wall-tile').first()).toBeVisible({ timeout: 60_000 })
 
+  const restoredCursor = 'restored-cursor'
+  let restoredCursorRequestCount = 0
+  const restoredFeedRoute = async (route: Route) => {
+    const requestURL = new URL(route.request().url())
+    if (
+      requestURL.pathname === '/api/feed' &&
+      requestURL.searchParams.get('mode') === 'latest' &&
+      requestURL.searchParams.get('after') === restoredCursor
+    ) {
+      restoredCursorRequestCount += 1
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          items: [],
+          cursor: restoredCursor,
+          nextCursor: '',
+          prevCursor: '',
+          hasNext: false,
+          hasPrev: false,
+        }),
+      })
+      return
+    }
+
+    await route.continue()
+  }
+
+  await page.route('**/api/feed?*', restoredFeedRoute)
+  try {
+    await page.evaluate(({ latestPage, latestCursor }) => {
+      window.localStorage.setItem(
+        'wall_last_state',
+        JSON.stringify({
+          mode: 'latest',
+          latestPage,
+          latestCursor,
+        }),
+      )
+    }, { latestPage: 3, latestCursor: restoredCursor })
+
+    await page.goto('/')
+    await expect.poll(() => new URL(page.url()).searchParams.get('mode')).toBe('latest')
+    await expect.poll(() => new URL(page.url()).searchParams.get('lp')).toBe('3')
+    await expect.poll(() => new URL(page.url()).searchParams.get('lc')).toBe(restoredCursor)
+    await expect.poll(() => restoredCursorRequestCount).toBeGreaterThan(0)
+    await expect(page.getByTestId('wall-page-indicator')).toHaveText('Page 3')
+  } finally {
+    await page.unroute('**/api/feed?*', restoredFeedRoute)
+  }
+
   await page.getByTestId('wall-mode').click()
   await expect(page.getByTestId('wall-mode-popup')).toBeVisible()
   await page.getByTestId('wall-mode-random').click()

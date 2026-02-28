@@ -3,7 +3,7 @@ import { useNavigate, useSearchParams } from 'react-router-dom'
 import type { FeedMode } from '../api/client'
 import { useFeed } from '../hooks/useFeed'
 import { readColumnPreference, writeColumnPreference } from '../utils/columnPreference'
-import { writeLastWallSeed, writeLastWallState } from '../utils/wallSeed'
+import { readLastWallState, writeLastWallSeed, writeLastWallState } from '../utils/wallSeed'
 import { MasonryWall } from '../components/MasonryWall'
 import { BottomIsland } from '../components/BottomIsland'
 import { ColumnsIcon, ModeIcon, NextIcon, PrevIcon, RefreshIcon, ShortcutIcon } from '../components/IslandIcons'
@@ -39,8 +39,19 @@ function wallFocusKey(albumId: string, photoIndex: number): string {
   return `${albumId}:${photoIndex}`
 }
 
-function parseWallMode(modeParam: string | null): FeedMode {
-  return modeParam === 'latest' ? 'latest' : defaultMode
+function parseExplicitWallMode(modeParam: string | null): FeedMode | null {
+  if (modeParam === 'latest' || modeParam === 'random') return modeParam
+  return null
+}
+
+function normalizeStoredLatestPage(value: number | undefined): number {
+  if (typeof value === 'number' && Number.isInteger(value) && value >= 1) return value
+  return 1
+}
+
+function normalizeStoredLatestCursor(value: string | undefined): string {
+  if (typeof value !== 'string') return ''
+  return value.trim() ? value : ''
 }
 
 export function WallPage() {
@@ -50,13 +61,22 @@ export function WallPage() {
 
   const navigate = useNavigate()
   const [searchParams, setSearchParams] = useSearchParams()
+  const lastWallState = useMemo(() => readLastWallState(), [])
   const rawMode = searchParams.get('mode')
-  const mode = parseWallMode(rawMode)
+  const explicitMode = parseExplicitWallMode(rawMode)
+  const hasModeParam = rawMode !== null
+  const restoredMode: FeedMode = lastWallState?.mode === 'latest' ? 'latest' : defaultMode
+  const shouldRestoreFromState = !hasModeParam
+  const shouldRestoreLatestContext = shouldRestoreFromState && restoredMode === 'latest'
+  const mode: FeedMode = explicitMode ?? (shouldRestoreFromState ? restoredMode : defaultMode)
   const seed = searchParams.get('seed') ?? ''
   const focus = searchParams.get('focus')
   const rawLatestPage = searchParams.get('lp')
-  const latestPage = parsePositiveInt(rawLatestPage, 1)
-  const latestCursor = searchParams.get('lc') ?? ''
+  const rawLatestCursor = searchParams.get('lc')
+  const storedLatestPage = normalizeStoredLatestPage(lastWallState?.latestPage)
+  const storedLatestCursor = normalizeStoredLatestCursor(lastWallState?.latestCursor)
+  const latestPage = parsePositiveInt(rawLatestPage, shouldRestoreLatestContext ? storedLatestPage : 1)
+  const latestCursor = rawLatestCursor ?? (shouldRestoreLatestContext ? storedLatestCursor : '')
 
   const { items, loading, error, pageInfo, refetch } = useFeed(
     seed,
@@ -67,16 +87,25 @@ export function WallPage() {
   const tileRefs = useRef(new Map<string, HTMLButtonElement>())
 
   useEffect(() => {
-    if (rawMode === mode) return
+    if (explicitMode) return
     setSearchParams(
       (prev) => {
         const next = new URLSearchParams(prev)
         next.set('mode', mode)
+        if (shouldRestoreLatestContext) {
+          next.set('lp', String(latestPage))
+          if (latestCursor) {
+            next.set('lc', latestCursor)
+          } else {
+            next.delete('lc')
+          }
+          next.delete('seed')
+        }
         return next
       },
       { replace: true },
     )
-  }, [mode, rawMode, setSearchParams])
+  }, [explicitMode, latestCursor, latestPage, mode, setSearchParams, shouldRestoreLatestContext])
 
   useEffect(() => {
     if (mode !== 'random') return
