@@ -78,13 +78,15 @@ export function WallPage() {
   const latestPage = parsePositiveInt(rawLatestPage, shouldRestoreLatestContext ? storedLatestPage : 1)
   const latestCursor = rawLatestCursor ?? (shouldRestoreLatestContext ? storedLatestCursor : '')
 
-  const { items, loading, error, pageInfo, refetch } = useFeed(
+  const { items, loading, error, pageInfo } = useFeed(
     seed,
     mode,
     mode === 'latest' ? latestCursor : '',
   )
   const visibleItems = useMemo(() => items.slice(0, WALL_FEED_LIMIT), [items])
   const tileRefs = useRef(new Map<string, HTMLButtonElement>())
+  const normalizedPageCursor = pageInfo.cursor ?? ''
+  const latestNavigationLocked = mode === 'latest' && (loading || normalizedPageCursor !== latestCursor)
 
   useEffect(() => {
     if (explicitMode) return
@@ -258,6 +260,18 @@ export function WallPage() {
   }
 
   const onChangeLatestPage = (nextPage: number, nextCursor: string | null) => {
+    if (mode !== 'latest' || latestNavigationLocked) return
+
+    const targetPage = Math.max(1, nextPage)
+    const movingForward = targetPage > latestPage
+    const movingBackward = targetPage < latestPage
+    const normalizedTargetCursor = nextCursor?.trim() ?? ''
+
+    if (movingForward && (!pageInfo.hasNext || !normalizedTargetCursor)) return
+    if (movingBackward && !pageInfo.hasPrev) return
+    if (movingBackward && targetPage > 1 && !normalizedTargetCursor) return
+    if (targetPage === latestPage && normalizedTargetCursor === latestCursor) return
+
     if (typeof window !== 'undefined') {
       window.scrollTo({ top: 0, behavior: 'auto' })
     }
@@ -265,9 +279,9 @@ export function WallPage() {
     setSearchParams((prev) => {
       const next = new URLSearchParams(prev)
       next.set('mode', 'latest')
-      next.set('lp', String(Math.max(1, nextPage)))
-      if (nextCursor && nextCursor.trim()) {
-        next.set('lc', nextCursor)
+      next.set('lp', String(targetPage))
+      if (normalizedTargetCursor) {
+        next.set('lc', normalizedTargetCursor)
       } else {
         next.delete('lc')
       }
@@ -280,18 +294,6 @@ export function WallPage() {
   const onRefresh = () => {
     if (typeof window !== 'undefined') {
       window.scrollTo({ top: 0, behavior: 'auto' })
-    }
-    if (mode === 'latest') {
-      setSearchParams(
-        (prev) => {
-          const next = new URLSearchParams(prev)
-          next.delete('focus')
-          return next
-        },
-        { replace: true },
-      )
-      void refetch()
-      return
     }
 
     const nextSeed = nextTimestampSeed(seed)
@@ -351,7 +353,7 @@ export function WallPage() {
                   tooltip: 'Previous page',
                   testId: 'wall-page-prev',
                   onClick: () => onChangeLatestPage(latestPage - 1, pageInfo.prevCursor),
-                  disabled: !pageInfo.hasPrev,
+                  disabled: latestNavigationLocked || !pageInfo.hasPrev,
                 },
               ]
             : []),
@@ -450,15 +452,19 @@ export function WallPage() {
               </div>
             ),
           },
-          {
-            id: 'wall-refresh',
-            icon: <RefreshIcon />,
-            ariaLabel: 'Refresh wall',
-            tooltip: 'Refresh',
-            testId: 'wall-refresh',
-            onClick: onRefresh,
-            disabled: loading,
-          },
+          ...(mode === 'random'
+            ? [
+                {
+                  id: 'wall-refresh',
+                  icon: <RefreshIcon />,
+                  ariaLabel: 'Refresh wall',
+                  tooltip: 'Refresh',
+                  testId: 'wall-refresh',
+                  onClick: onRefresh,
+                  disabled: loading,
+                },
+              ]
+            : []),
           ...(mode === 'latest'
             ? [
                 {
@@ -468,7 +474,7 @@ export function WallPage() {
                   tooltip: 'Next page',
                   testId: 'wall-page-next',
                   onClick: () => onChangeLatestPage(latestPage + 1, pageInfo.nextCursor),
-                  disabled: !pageInfo.hasNext,
+                  disabled: latestNavigationLocked || !pageInfo.hasNext,
                 },
               ]
             : []),

@@ -218,20 +218,105 @@ test('basic upload -> wall -> album flow', async ({ page }) => {
   await expect(page.getByTestId('wall-page-prev')).toBeDisabled()
   await expect(page.getByTestId('wall-page-indicator')).toHaveText('Page 1')
   await expect(page.getByTestId('wall-page-next')).toBeVisible()
+  await expect(page.getByTestId('wall-refresh')).toHaveCount(0)
   await expectHorizontalOrder(page, [
     'wall-page-prev',
     'wall-columns',
     'wall-mode',
     'wall-page-indicator',
     'wall-shortcut',
-    'wall-refresh',
     'wall-page-next',
   ])
   await expect(page.getByTestId('wall-tile').first()).toBeVisible({ timeout: 60_000 })
-  await page.getByTestId('wall-refresh').click()
-  await expect.poll(() => new URL(page.url()).searchParams.get('mode')).toBe('latest')
-  await expect.poll(() => new URL(page.url()).searchParams.get('lp')).toBe('1')
-  await expect(page.getByTestId('wall-tile').first()).toBeVisible({ timeout: 60_000 })
+
+  const latestCursorPage2 = 'latest-cursor-page-2'
+  const latestCursorPage3 = 'latest-cursor-page-3'
+  const latestRequestAfters: string[] = []
+  const latestFeedRoute = async (route: Route) => {
+    const requestURL = new URL(route.request().url())
+    if (requestURL.pathname !== '/api/feed' || requestURL.searchParams.get('mode') !== 'latest') {
+      await route.continue()
+      return
+    }
+
+    const after = requestURL.searchParams.get('after') ?? ''
+    latestRequestAfters.push(after)
+
+    if (after === latestCursorPage2) {
+      await new Promise((resolve) => setTimeout(resolve, 300))
+    }
+
+    let body: object
+    if (after === '') {
+      body = {
+        items: [{ albumId: 'latest-page-1', i: 1, w: 100, h: 80 }],
+        cursor: '',
+        nextCursor: latestCursorPage2,
+        prevCursor: '',
+        hasNext: true,
+        hasPrev: false,
+      }
+    } else if (after === latestCursorPage2) {
+      body = {
+        items: [{ albumId: 'latest-page-2', i: 2, w: 100, h: 80 }],
+        cursor: latestCursorPage2,
+        nextCursor: latestCursorPage3,
+        prevCursor: '',
+        hasNext: true,
+        hasPrev: true,
+      }
+    } else if (after === latestCursorPage3) {
+      body = {
+        items: [{ albumId: 'latest-page-3', i: 3, w: 100, h: 80 }],
+        cursor: latestCursorPage3,
+        nextCursor: '',
+        prevCursor: latestCursorPage2,
+        hasNext: false,
+        hasPrev: true,
+      }
+    } else {
+      body = {
+        items: [],
+        cursor: '',
+        nextCursor: '',
+        prevCursor: '',
+        hasNext: false,
+        hasPrev: false,
+      }
+    }
+
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify(body),
+    })
+  }
+
+  await page.route('**/api/feed?*', latestFeedRoute)
+  try {
+    await page.goto('/?mode=latest&lp=1')
+    await expect.poll(() => new URL(page.url()).searchParams.get('mode')).toBe('latest')
+    await expect.poll(() => new URL(page.url()).searchParams.get('lp')).toBe('1')
+    await expect(page.getByTestId('wall-tile').first()).toBeVisible({ timeout: 60_000 })
+    await expect(page.getByTestId('wall-page-next')).toBeEnabled()
+
+    latestRequestAfters.length = 0
+
+    await page.getByTestId('wall-page-next').click()
+    await expect.poll(() => new URL(page.url()).searchParams.get('lp')).toBe('2')
+    await expect(page.getByTestId('wall-page-next')).toBeDisabled()
+    await expect.poll(() => latestRequestAfters.filter((value) => value === latestCursorPage2).length).toBe(1)
+    await expect(page.getByTestId('wall-page-indicator')).toHaveText('Page 2')
+    await expect.poll(() => new URL(page.url()).searchParams.get('lc')).toBe(latestCursorPage2)
+    await expect(page.getByTestId('wall-page-prev')).toBeEnabled()
+
+    await page.getByTestId('wall-page-prev').click()
+    await expect.poll(() => new URL(page.url()).searchParams.get('lp')).toBe('1')
+    await expect(page.getByTestId('wall-page-indicator')).toHaveText('Page 1')
+    await expect.poll(() => new URL(page.url()).searchParams.get('lc')).toBe(null)
+  } finally {
+    await page.unroute('**/api/feed?*', latestFeedRoute)
+  }
 
   const restoredCursor = 'restored-cursor'
   let restoredCursorRequestCount = 0
