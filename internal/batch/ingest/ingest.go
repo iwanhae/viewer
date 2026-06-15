@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"log"
 	"strings"
 
 	"viewer/internal/albums"
@@ -52,9 +53,11 @@ func Run(ctx context.Context, store Store, indexer *albums.Indexer, opts RunOpti
 
 	candidates := filterTopLevelZips(objects, prefix)
 	summary.Discovered = len(candidates)
+	log.Printf("batch ingest: prefix=%s listed=%d candidates=%d", prefix, len(objects), len(candidates))
 
 	for _, obj := range candidates {
 		if err := ctx.Err(); err != nil {
+			log.Printf("batch ingest: cancelled at key=%s", obj.Key)
 			return summary, err
 		}
 		processOne(ctx, store, indexer, obj, prefix, &summary)
@@ -89,37 +92,49 @@ func processOne(ctx context.Context, store Store, indexer *albums.Indexer, obj s
 	exists, _, err := store.HeadObject(ctx, dstKey)
 	if err != nil {
 		summary.Errors++
+		log.Printf("batch ingest: ERROR head key=%s album_id=%s size=%d err=%v", obj.Key, albumID, obj.Size, err)
 		return
 	}
 	if exists {
 		if err := store.DeleteObject(ctx, obj.Key); err != nil {
 			summary.Errors++
+			log.Printf("batch ingest: ERROR delete-dup key=%s album_id=%s size=%d err=%v", obj.Key, albumID, obj.Size, err)
 			return
 		}
 		summary.Deduped++
+		log.Printf("batch ingest: DEDUP key=%s album_id=%s size=%d (album already indexed)", obj.Key, albumID, obj.Size)
 		return
 	}
 
 	valid, validateErr := validateZip(ctx, store, indexer, obj, albumID, originalFilename)
 	if validateErr != nil {
 		summary.Errors++
+		log.Printf("batch ingest: ERROR validate key=%s album_id=%s size=%d err=%v", obj.Key, albumID, obj.Size, validateErr)
 		return
 	}
 	if !valid {
-		_ = store.DeleteObject(ctx, obj.Key)
+		if delErr := store.DeleteObject(ctx, obj.Key); delErr != nil {
+			summary.Errors++
+			log.Printf("batch ingest: ERROR delete-failed key=%s album_id=%s size=%d delete_err=%v", obj.Key, albumID, obj.Size, delErr)
+			return
+		}
 		summary.DeletedFailed++
+		log.Printf("batch ingest: DELETED_FAILED key=%s album_id=%s size=%d (corrupt zip or no valid images)", obj.Key, albumID, obj.Size)
 		return
 	}
 
 	if err := store.CopyObject(ctx, obj.Key, dstKey); err != nil {
 		summary.Errors++
+		log.Printf("batch ingest: ERROR copy key=%s dst=%s album_id=%s size=%d err=%v (original kept for retry)", obj.Key, dstKey, albumID, obj.Size, err)
 		return
 	}
 	if err := store.DeleteObject(ctx, obj.Key); err != nil {
 		summary.Errors++
+		log.Printf("batch ingest: ERROR delete-src key=%s dst=%s album_id=%s size=%d err=%v (copied but original left behind)", obj.Key, dstKey, albumID, obj.Size, err)
 		return
 	}
 	summary.Moved++
+	log.Printf("batch ingest: MOVED key=%s dst=%s album_id=%s size=%d original_filename=%s", obj.Key, dstKey, albumID, obj.Size, originalFilename)
 }
 
 func validateZip(ctx context.Context, store Store, indexer *albums.Indexer, obj storage.BatchObject, albumID, originalFilename string) (bool, error) {
