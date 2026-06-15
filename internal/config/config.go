@@ -27,6 +27,7 @@ type Config struct {
 	RecommenderRequired    bool
 	RecommenderConcurrency int
 	RecommenderTimeoutSec  int
+	BatchIngestEnabled     bool
 }
 
 func Load() (Config, error) {
@@ -56,6 +57,7 @@ func Load() (Config, error) {
 		RecommenderRequired:    getenvBool("RECOMMENDER_REQUIRED", true),
 		RecommenderConcurrency: getenvInt("RECOMMENDER_CONCURRENCY", defaultRecommenderConcurrency()),
 		RecommenderTimeoutSec:  getenvInt("RECOMMENDER_REQUEST_TIMEOUT_SECONDS", 120),
+		BatchIngestEnabled:     getenvBool("BATCH_INGEST_ENABLED", true),
 	}
 
 	if cfg.S3Bucket == "" {

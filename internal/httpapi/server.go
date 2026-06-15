@@ -16,10 +16,13 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"viewer/internal/albums"
+	batchingest "viewer/internal/batch/ingest"
+	cfgpkg "viewer/internal/config"
 	"viewer/internal/feed"
 	"viewer/internal/images"
 	"viewer/internal/models"
 	"viewer/internal/recommend"
+	"viewer/internal/storage"
 	"viewer/internal/web"
 )
 
@@ -353,7 +356,7 @@ func parseOptionalIntQuery(r *http.Request, key string, defaultValue int, min in
 	return value, nil
 }
 
-func Warmup(ctx context.Context, albumsService *albums.Service, recommendService *recommend.Service) {
+func Warmup(ctx context.Context, albumsService *albums.Service, recommendService *recommend.Service, store *storage.S3Store, indexer *albums.Indexer, cfg cfgpkg.Config) {
 	startedAt := time.Now()
 	log.Printf("album cache warmup started")
 
@@ -374,6 +377,27 @@ func Warmup(ctx context.Context, albumsService *albums.Service, recommendService
 		summary.Failed,
 		time.Since(startedAt).Round(time.Millisecond),
 	)
+
+	if cfg.BatchIngestEnabled {
+		batchStartedAt := time.Now()
+		log.Printf("batch ingest scan started")
+		ingestSummary, err := batchingest.Run(ctx, store, indexer, batchingest.RunOptions{})
+		if err != nil {
+			log.Printf("batch ingest scan skipped: %v", err)
+		} else {
+			log.Printf(
+				"batch ingest scan finished discovered=%d moved=%d deduped=%d deleted_failed=%d errors=%d duration=%s",
+				ingestSummary.Discovered,
+				ingestSummary.Moved,
+				ingestSummary.Deduped,
+				ingestSummary.DeletedFailed,
+				ingestSummary.Errors,
+				time.Since(batchStartedAt).Round(time.Millisecond),
+			)
+		}
+	} else {
+		log.Printf("batch ingest scan disabled (BATCH_INGEST_ENABLED=false)")
+	}
 
 	pendingStartedAt := time.Now()
 	log.Printf("pending upload finalize scan started")

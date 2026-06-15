@@ -29,7 +29,8 @@ func Run(ctx context.Context) error {
 		return err
 	}
 
-	albumService := albums.NewService(cfg, store, albums.NewIndexer())
+	indexer := albums.NewIndexer()
+	albumService := albums.NewService(cfg, store, indexer)
 	feedService := feed.NewService(albumService)
 	imageService, err := images.NewService(albumService, store, cfg.CacheDir, cfg.ZipCacheDir)
 	if err != nil {
@@ -78,7 +79,7 @@ func Run(ctx context.Context) error {
 	log.Printf("viewer: startup warmup running in background")
 	warmupDone := make(chan struct{})
 	go func() {
-		httpapi.Warmup(ctx, albumService, recommendService)
+		httpapi.Warmup(ctx, albumService, recommendService, store, indexer, cfg)
 		close(warmupDone)
 	}()
 	go func() {

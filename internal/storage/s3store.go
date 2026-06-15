@@ -34,6 +34,13 @@ type AlbumSourceObject struct {
 	ETag         string
 }
 
+type BatchObject struct {
+	Key          string
+	LastModified time.Time
+	Size         int64
+	ETag         string
+}
+
 func NewS3Store(ctx context.Context, cfg cfgpkg.Config) (*S3Store, error) {
 	awsCfg, err := config.LoadDefaultConfig(
 		ctx,
@@ -337,6 +344,68 @@ func (s *S3Store) DeleteObject(ctx context.Context, key string) error {
 		return fmt.Errorf("delete object %s: %w", key, err)
 	}
 	return nil
+}
+
+func (s *S3Store) CopyObject(ctx context.Context, srcKey, dstKey string) error {
+	srcKey = strings.TrimSpace(srcKey)
+	dstKey = strings.TrimSpace(dstKey)
+	if srcKey == "" || dstKey == "" {
+		return fmt.Errorf("srcKey and dstKey are required")
+	}
+	if srcKey == dstKey {
+		return fmt.Errorf("srcKey and dstKey must differ")
+	}
+	copySource := fmt.Sprintf("%s/%s", s.bucket, srcKey)
+	_, err := s.client.CopyObject(ctx, &s3.CopyObjectInput{
+		Bucket:     aws.String(s.bucket),
+		CopySource: aws.String(copySource),
+		Key:        aws.String(dstKey),
+	})
+	if err != nil {
+		return fmt.Errorf("copy object %s -> %s: %w", srcKey, dstKey, err)
+	}
+	return nil
+}
+
+func (s *S3Store) ListBatchObjects(ctx context.Context, prefix string) ([]BatchObject, error) {
+	prefix = strings.TrimSpace(prefix)
+	if prefix == "" {
+		return nil, fmt.Errorf("prefix is required")
+	}
+
+	objects := make([]BatchObject, 0)
+	var token *string
+	for {
+		out, err := s.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+			Bucket:            aws.String(s.bucket),
+			Prefix:            aws.String(prefix),
+			ContinuationToken: token,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("list batch objects: %w", err)
+		}
+		for _, obj := range out.Contents {
+			key := aws.ToString(obj.Key)
+			if key == "" {
+				continue
+			}
+			objects = append(objects, BatchObject{
+				Key:          key,
+				LastModified: aws.ToTime(obj.LastModified).UTC(),
+				Size:         aws.ToInt64(obj.Size),
+				ETag:         aws.ToString(obj.ETag),
+			})
+		}
+		if out.IsTruncated == nil || !*out.IsTruncated {
+			break
+		}
+		token = out.NextContinuationToken
+	}
+
+	sort.Slice(objects, func(i, j int) bool {
+		return objects[i].Key < objects[j].Key
+	})
+	return objects, nil
 }
 
 func parseAlbumSourceKey(key string) (string, bool) {
