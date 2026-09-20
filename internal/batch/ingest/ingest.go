@@ -5,11 +5,10 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
-	"io"
 	"log"
 	"strings"
 
-	"viewer/internal/albums"
+	"viewer/internal/pipeline"
 	"viewer/internal/storage"
 )
 
@@ -18,27 +17,34 @@ const (
 	albumIDHashLen     = 16
 )
 
+// Store is the S3 surface the batch scanner needs.
 type Store interface {
 	ListBatchObjects(ctx context.Context, prefix string) ([]storage.BatchObject, error)
 	HeadObject(ctx context.Context, key string) (bool, int64, error)
-	GetObjectRange(ctx context.Context, key string, start int64, end int64) (io.ReadCloser, string, error)
 	CopyObject(ctx context.Context, srcKey, dstKey string) error
 	DeleteObject(ctx context.Context, key string) error
 }
 
+// Sink registers a staged zip so the ingest pipeline picks it up.
+type Sink interface {
+	RegisterStagedUpload(ctx context.Context, albumID string, filename string, sizeBytes int64, sourceKey string) error
+}
+
 type Summary struct {
-	Discovered    int
-	Moved         int
-	Deduped       int
-	DeletedFailed int
-	Errors        int
+	Discovered int
+	Moved      int
+	Deduped    int
+	Errors     int
 }
 
 type RunOptions struct {
 	BatchPrefix string
 }
 
-func Run(ctx context.Context, store Store, indexer *albums.Indexer, opts RunOptions) (Summary, error) {
+// Run moves top-level "batch/*.zip" objects into the staged-upload location and
+// queues them for extraction. Album ids are derived from the zip content so the
+// same zip uploaded twice maps to the same album.
+func Run(ctx context.Context, store Store, sink Sink, opts RunOptions) (Summary, error) {
 	summary := Summary{}
 
 	prefix := strings.TrimSpace(opts.BatchPrefix)
@@ -60,7 +66,7 @@ func Run(ctx context.Context, store Store, indexer *albums.Indexer, opts RunOpti
 			log.Printf("batch ingest: cancelled at key=%s", obj.Key)
 			return summary, err
 		}
-		processOne(ctx, store, indexer, obj, prefix, &summary)
+		processOne(ctx, store, sink, obj, prefix, &summary)
 	}
 
 	return summary, nil
@@ -84,9 +90,9 @@ func filterTopLevelZips(objects []storage.BatchObject, prefix string) []storage.
 	return out
 }
 
-func processOne(ctx context.Context, store Store, indexer *albums.Indexer, obj storage.BatchObject, prefix string, summary *Summary) {
+func processOne(ctx context.Context, store Store, sink Sink, obj storage.BatchObject, prefix string, summary *Summary) {
 	albumID := albumIDFromContent(obj.ETag, obj.Size)
-	dstKey := fmt.Sprintf("albums/%s/source.zip", albumID)
+	dstKey := pipeline.SourceKey(albumID)
 	originalFilename := strings.TrimPrefix(obj.Key, prefix)
 
 	exists, _, err := store.HeadObject(ctx, dstKey)
@@ -95,68 +101,33 @@ func processOne(ctx context.Context, store Store, indexer *albums.Indexer, obj s
 		log.Printf("batch ingest: ERROR head key=%s album_id=%s size=%d err=%v", obj.Key, albumID, obj.Size, err)
 		return
 	}
-	if exists {
-		if err := store.DeleteObject(ctx, obj.Key); err != nil {
+
+	if !exists {
+		if err := store.CopyObject(ctx, obj.Key, dstKey); err != nil {
 			summary.Errors++
-			log.Printf("batch ingest: ERROR delete-dup key=%s album_id=%s size=%d err=%v", obj.Key, albumID, obj.Size, err)
+			log.Printf("batch ingest: ERROR copy key=%s dst=%s album_id=%s size=%d err=%v (original kept for retry)", obj.Key, dstKey, albumID, obj.Size, err)
 			return
 		}
+		summary.Moved++
+	} else {
 		summary.Deduped++
-		log.Printf("batch ingest: DEDUP key=%s album_id=%s size=%d (album already indexed)", obj.Key, albumID, obj.Size)
-		return
 	}
 
-	valid, validateErr := validateZip(ctx, store, indexer, obj, albumID, originalFilename)
-	if validateErr != nil {
-		summary.Errors++
-		log.Printf("batch ingest: ERROR validate key=%s album_id=%s size=%d err=%v", obj.Key, albumID, obj.Size, validateErr)
-		return
-	}
-	if !valid {
-		if delErr := store.DeleteObject(ctx, obj.Key); delErr != nil {
+	if sink != nil {
+		if err := sink.RegisterStagedUpload(ctx, albumID, originalFilename, obj.Size, dstKey); err != nil {
 			summary.Errors++
-			log.Printf("batch ingest: ERROR delete-failed key=%s album_id=%s size=%d delete_err=%v", obj.Key, albumID, obj.Size, delErr)
+			log.Printf("batch ingest: ERROR register key=%s dst=%s album_id=%s size=%d err=%v (staged zip kept)", obj.Key, dstKey, albumID, obj.Size, err)
 			return
 		}
-		summary.DeletedFailed++
-		log.Printf("batch ingest: DELETED_FAILED key=%s album_id=%s size=%d (corrupt zip or no valid images)", obj.Key, albumID, obj.Size)
-		return
 	}
 
-	if err := store.CopyObject(ctx, obj.Key, dstKey); err != nil {
-		summary.Errors++
-		log.Printf("batch ingest: ERROR copy key=%s dst=%s album_id=%s size=%d err=%v (original kept for retry)", obj.Key, dstKey, albumID, obj.Size, err)
-		return
-	}
 	if err := store.DeleteObject(ctx, obj.Key); err != nil {
 		summary.Errors++
 		log.Printf("batch ingest: ERROR delete-src key=%s dst=%s album_id=%s size=%d err=%v (copied but original left behind)", obj.Key, dstKey, albumID, obj.Size, err)
 		return
 	}
-	summary.Moved++
-	log.Printf("batch ingest: MOVED key=%s dst=%s album_id=%s size=%d original_filename=%s", obj.Key, dstKey, albumID, obj.Size, originalFilename)
-}
 
-func validateZip(ctx context.Context, store Store, indexer *albums.Indexer, obj storage.BatchObject, albumID, originalFilename string) (bool, error) {
-	readerAt := &storeReaderAt{ctx: ctx, store: store, key: obj.Key, size: obj.Size}
-	if _, err := indexer.BuildFromZipReaderAt(readerAt, obj.Size, albumID, originalFilename); err != nil {
-		if err == albums.ErrNoValidImages {
-			return false, nil
-		}
-		if isZipOpenErr(err) {
-			return false, nil
-		}
-		return false, err
-	}
-	return true, nil
-}
-
-func isZipOpenErr(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := err.Error()
-	return strings.Contains(msg, "open zip:") || strings.Contains(msg, "zip:")
+	log.Printf("batch ingest: STAGED key=%s dst=%s album_id=%s size=%d original_filename=%s", obj.Key, dstKey, albumID, obj.Size, originalFilename)
 }
 
 func albumIDFromContent(etag string, size int64) string {
@@ -168,44 +139,4 @@ func albumIDFromContent(etag string, size int64) string {
 		hexStr = hexStr[:albumIDHashLen]
 	}
 	return hexStr
-}
-
-type storeReaderAt struct {
-	ctx   context.Context
-	store Store
-	key   string
-	size  int64
-}
-
-func (r *storeReaderAt) ReadAt(p []byte, off int64) (int, error) {
-	if len(p) == 0 {
-		return 0, nil
-	}
-	if off < 0 {
-		return 0, fmt.Errorf("negative offset: %d", off)
-	}
-	if off >= r.size {
-		return 0, io.EOF
-	}
-
-	toRead := int64(len(p))
-	if max := r.size - off; toRead > max {
-		toRead = max
-	}
-	start := off
-	end := off + toRead - 1
-	body, _, err := r.store.GetObjectRange(r.ctx, r.key, start, end)
-	if err != nil {
-		return 0, err
-	}
-	defer body.Close()
-
-	n, readErr := io.ReadFull(body, p[:int(toRead)])
-	if readErr != nil {
-		return n, fmt.Errorf("read object range %s %d-%d: %w", r.key, start, end, readErr)
-	}
-	if int64(n) < int64(len(p)) {
-		return n, io.EOF
-	}
-	return n, nil
 }

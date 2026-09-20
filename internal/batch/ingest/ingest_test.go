@@ -1,380 +1,562 @@
 package ingest
 
 import (
-	"archive/zip"
-	"bytes"
 	"context"
+	"encoding/hex"
 	"errors"
-	"fmt"
-	"image"
-	"image/color"
-	"image/png"
-	"io"
 	"reflect"
 	"strings"
 	"testing"
 
-	"viewer/internal/albums"
+	"viewer/internal/pipeline"
 	"viewer/internal/storage"
 )
 
+// fakeStore is a hand-rolled Store whose behavior is injected per test through
+// function fields. Every call is recorded so tests can assert on the interact-
+// ions with the S3 surface without touching a network or filesystem.
 type fakeStore struct {
-	batchObjects []storage.BatchObject
-	existingKeys map[string]bool
-	objectBytes  map[string][]byte
-	copyErr      map[string]error
-	deleteErr    map[string]error
-	rangeErr     map[string]error
+	listFn   func(ctx context.Context, prefix string) ([]storage.BatchObject, error)
+	headFn   func(ctx context.Context, key string) (bool, int64, error)
+	copyFn   func(ctx context.Context, srcKey, dstKey string) error
+	deleteFn func(ctx context.Context, key string) error
 
-	copied   []srcDst
-	deleted  []string
-	headHits map[string]int
+	listedPrefixes []string
+	headCalls      []string
+	copied         []srcDst
+	deleted        []string
 }
 
-type srcDst struct{ src, dst string }
+type srcDst struct {
+	src string
+	dst string
+}
 
 func (f *fakeStore) ListBatchObjects(ctx context.Context, prefix string) ([]storage.BatchObject, error) {
-	out := make([]storage.BatchObject, len(f.batchObjects))
-	copy(out, f.batchObjects)
-	return out, nil
+	f.listedPrefixes = append(f.listedPrefixes, prefix)
+	if f.listFn == nil {
+		return nil, nil
+	}
+	return f.listFn(ctx, prefix)
 }
 
 func (f *fakeStore) HeadObject(ctx context.Context, key string) (bool, int64, error) {
-	if f.headHits == nil {
-		f.headHits = make(map[string]int)
+	f.headCalls = append(f.headCalls, key)
+	if f.headFn == nil {
+		return false, 0, nil
 	}
-	f.headHits[key]++
-	if f.existingKeys == nil {
-		f.existingKeys = make(map[string]bool)
-	}
-	exists := f.existingKeys[key]
-	var size int64
-	if exists {
-		if b, ok := f.objectBytes[key]; ok {
-			size = int64(len(b))
-		} else {
-			size = 1
-		}
-	}
-	return exists, size, nil
-}
-
-func (f *fakeStore) GetObjectRange(ctx context.Context, key string, start int64, end int64) (io.ReadCloser, string, error) {
-	if err, ok := f.rangeErr[key]; ok {
-		return nil, "", err
-	}
-	body, ok := f.objectBytes[key]
-	if !ok {
-		return nil, "", errors.New("missing object body")
-	}
-	if start < 0 || end < start || end >= int64(len(body)) {
-		return nil, "", fmt.Errorf("invalid range %d-%d for %s", start, end, key)
-	}
-	return io.NopCloser(bytes.NewReader(body[start : end+1])), "application/octet-stream", nil
+	return f.headFn(ctx, key)
 }
 
 func (f *fakeStore) CopyObject(ctx context.Context, srcKey, dstKey string) error {
-	if err, ok := f.copyErr[srcKey]; ok {
-		return err
-	}
 	f.copied = append(f.copied, srcDst{src: srcKey, dst: dstKey})
-	if f.existingKeys == nil {
-		f.existingKeys = make(map[string]bool)
+	if f.copyFn == nil {
+		return nil
 	}
-	f.existingKeys[dstKey] = true
-	if b, ok := f.objectBytes[srcKey]; ok {
-		if f.objectBytes == nil {
-			f.objectBytes = make(map[string][]byte)
-		}
-		f.objectBytes[dstKey] = append([]byte(nil), b...)
-	}
-	return nil
+	return f.copyFn(ctx, srcKey, dstKey)
 }
 
 func (f *fakeStore) DeleteObject(ctx context.Context, key string) error {
 	f.deleted = append(f.deleted, key)
-	if err, ok := f.deleteErr[key]; ok {
-		return err
+	if f.deleteFn == nil {
+		return nil
 	}
-	if f.existingKeys != nil {
-		delete(f.existingKeys, key)
-	}
-	if f.objectBytes != nil {
-		delete(f.objectBytes, key)
-	}
-	return nil
+	return f.deleteFn(ctx, key)
 }
 
-func validPNGBytes(t *testing.T) []byte {
-	t.Helper()
-	img := image.NewRGBA(image.Rect(0, 0, 2, 3))
-	img.Set(0, 0, color.RGBA{R: 255, G: 0, B: 0, A: 255})
-	var buf bytes.Buffer
-	if err := png.Encode(&buf, img); err != nil {
-		t.Fatalf("encode png: %v", err)
-	}
-	return buf.Bytes()
+// fakeSink records every staged-upload registration.
+type fakeSink struct {
+	fn    func(ctx context.Context, albumID, filename string, sizeBytes int64, sourceKey string) error
+	calls []registerCall
 }
 
-func zipWithFile(t *testing.T, name string, content []byte) []byte {
-	t.Helper()
-	var buf bytes.Buffer
-	w := zip.NewWriter(&buf)
-	fw, err := w.Create(name)
-	if err != nil {
-		t.Fatalf("create zip entry: %v", err)
-	}
-	if _, err := fw.Write(content); err != nil {
-		t.Fatalf("write zip entry: %v", err)
-	}
-	if err := w.Close(); err != nil {
-		t.Fatalf("close zip: %v", err)
-	}
-	return buf.Bytes()
+type registerCall struct {
+	albumID   string
+	filename  string
+	sizeBytes int64
+	sourceKey string
 }
 
-func TestAlbumIDFromContentStable(t *testing.T) {
-	a := albumIDFromContent("\"abc\"", 100)
-	b := albumIDFromContent("abc", 100)
-	if a != b {
-		t.Fatalf("etag quotes should be stripped: %q vs %q", a, b)
+func (s *fakeSink) RegisterStagedUpload(ctx context.Context, albumID, filename string, sizeBytes int64, sourceKey string) error {
+	s.calls = append(s.calls, registerCall{
+		albumID:   albumID,
+		filename:  filename,
+		sizeBytes: sizeBytes,
+		sourceKey: sourceKey,
+	})
+	if s.fn == nil {
+		return nil
 	}
-	if len(a) != albumIDHashLen {
-		t.Fatalf("album id length = %d, want %d", len(a), albumIDHashLen)
-	}
-	c := albumIDFromContent("abc", 101)
-	if a == c {
-		t.Fatalf("different size must yield different album id")
-	}
-	d := albumIDFromContent("abc-5", 100)
-	if a == d {
-		t.Fatalf("multipart-style etag must not collide with simple etag when derived differently")
-	}
+	return s.fn(ctx, albumID, filename, sizeBytes, sourceKey)
 }
 
-func TestFilterTopLevelZipsSkipsNestedAndNonZip(t *testing.T) {
-	objs := []storage.BatchObject{
-		{Key: "batch/a.zip", Size: 10},
-		{Key: "batch/b.ZIP", Size: 10},
-		{Key: "batch/sub/c.zip", Size: 10},
-		{Key: "batch/notazip.txt", Size: 10},
-		{Key: "batch/empty.zip", Size: 0},
+func TestAlbumIDFromContentDeterministicAndFormatted(t *testing.T) {
+	base := albumIDFromContent(`"etag-1"`, 123)
+
+	if got := albumIDFromContent(`"etag-1"`, 123); got != base {
+		t.Fatalf("album id is not deterministic: %q vs %q", base, got)
 	}
-	got := filterTopLevelZips(objs, "batch/")
-	if len(got) != 2 {
-		t.Fatalf("expected 2 candidates, got %d (%+v)", len(got), got)
+	if got := albumIDFromContent("etag-1", 123); got != base {
+		t.Fatalf("surrounding etag quotes must be stripped: %q vs %q", got, base)
 	}
-	for _, o := range got {
-		if o.Key == "batch/sub/c.zip" {
-			t.Fatalf("nested zip should be filtered out")
-		}
+	if len(base) != albumIDHashLen {
+		t.Fatalf("album id length = %d, want %d", len(base), albumIDHashLen)
+	}
+	if _, err := hex.DecodeString(base); err != nil {
+		t.Fatalf("album id %q is not valid hex: %v", base, err)
+	}
+	if base != strings.ToLower(base) {
+		t.Fatalf("album id %q should be lowercase hex", base)
+	}
+	if got := albumIDFromContent(`"etag-1"`, 124); got == base {
+		t.Fatalf("different size must yield a different album id (both %q)", got)
+	}
+	if got := albumIDFromContent(`"etag-2"`, 123); got == base {
+		t.Fatalf("different etag must yield a different album id (both %q)", got)
 	}
 }
 
-func TestRunMovesNewValidZip(t *testing.T) {
-	zipBytes := zipWithFile(t, "photo.png", validPNGBytes(t))
-	store := &fakeStore{
-		batchObjects: []storage.BatchObject{
-			{Key: "batch/Holiday.zip", Size: int64(len(zipBytes)), ETag: "\"etag-holiday\""},
+func TestFilterTopLevelZips(t *testing.T) {
+	tests := []struct {
+		name    string
+		prefix  string
+		objects []storage.BatchObject
+		want    []string
+	}{
+		{
+			name:   "keeps only top-level zips with case-insensitive extension",
+			prefix: "batch/",
+			objects: []storage.BatchObject{
+				{Key: "batch/a.zip", Size: 10},
+				{Key: "batch/b.ZIP", Size: 10},
+				{Key: "batch/c.Zip", Size: 10},
+				{Key: "batch/sub/d.zip", Size: 10},
+				{Key: "batch/deep/nested/e.zip", Size: 10},
+				{Key: "batch/notazip.txt", Size: 10},
+				{Key: "batch/noext", Size: 10},
+				{Key: "batch/empty.zip", Size: 0},
+				{Key: "batch/negative.zip", Size: -5},
+			},
+			want: []string{"batch/a.zip", "batch/b.ZIP", "batch/c.Zip"},
 		},
-		existingKeys: map[string]bool{},
-		objectBytes:  map[string][]byte{"batch/Holiday.zip": zipBytes},
+		{
+			name:   "custom prefix bounds the top level",
+			prefix: "inbox/",
+			objects: []storage.BatchObject{
+				{Key: "inbox/x.zip", Size: 1},
+				{Key: "inbox/x.zip.bak", Size: 1},
+				{Key: "inbox/sub/y.zip", Size: 1},
+				{Key: "batch/z.zip", Size: 1},
+			},
+			want: []string{"inbox/x.zip"},
+		},
+		{
+			name:   "bare prefix key is not a candidate",
+			prefix: "batch/",
+			objects: []storage.BatchObject{
+				{Key: "batch/", Size: 5},
+			},
+			want: []string{},
+		},
+		{
+			name:    "empty input yields no candidates",
+			prefix:  "batch/",
+			objects: nil,
+			want:    []string{},
+		},
 	}
 
-	summary, err := Run(context.Background(), store, albums.NewIndexer(), RunOptions{})
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := filterTopLevelZips(tc.objects, tc.prefix)
+			keys := make([]string, 0, len(got))
+			for _, obj := range got {
+				keys = append(keys, obj.Key)
+			}
+			if !reflect.DeepEqual(keys, tc.want) {
+				t.Fatalf("filterTopLevelZips keys = %v, want %v", keys, tc.want)
+			}
+		})
+	}
+}
+
+func TestRunStagesNewZip(t *testing.T) {
+	obj := storage.BatchObject{Key: "batch/Holiday.zip", Size: 4096, ETag: `"etag-holiday"`}
+	albumID := albumIDFromContent(obj.ETag, obj.Size)
+	dstKey := pipeline.SourceKey(albumID)
+
+	store := &fakeStore{
+		listFn: func(context.Context, string) ([]storage.BatchObject, error) {
+			return []storage.BatchObject{obj}, nil
+		},
+	}
+	sink := &fakeSink{}
+
+	summary, err := Run(context.Background(), store, sink, RunOptions{})
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 
-	expectedAlbumID := albumIDFromContent("\"etag-holiday\"", int64(len(zipBytes)))
-	expectedDst := "albums/" + expectedAlbumID + "/source.zip"
-
-	if summary.Discovered != 1 {
-		t.Fatalf("Discovered = %d, want 1", summary.Discovered)
+	if want := (Summary{Discovered: 1, Moved: 1}); summary != want {
+		t.Fatalf("summary = %+v, want %+v", summary, want)
 	}
-	if summary.Moved != 1 {
-		t.Fatalf("Moved = %d, want 1", summary.Moved)
+	if want := []string{"batch/"}; !reflect.DeepEqual(store.listedPrefixes, want) {
+		t.Fatalf("listed prefixes = %v, want %v", store.listedPrefixes, want)
 	}
-	if summary.Deduped != 0 || summary.DeletedFailed != 0 || summary.Errors != 0 {
-		t.Fatalf("unexpected summary: %+v", summary)
+	if want := []string{dstKey}; !reflect.DeepEqual(store.headCalls, want) {
+		t.Fatalf("head calls = %v, want %v", store.headCalls, want)
 	}
-
-	wantCopy := []srcDst{{src: "batch/Holiday.zip", dst: expectedDst}}
-	if !reflect.DeepEqual(store.copied, wantCopy) {
-		t.Fatalf("copied = %+v, want %+v", store.copied, wantCopy)
+	if want := []srcDst{{src: obj.Key, dst: dstKey}}; !reflect.DeepEqual(store.copied, want) {
+		t.Fatalf("copied = %+v, want %+v", store.copied, want)
 	}
-	if !reflect.DeepEqual(store.deleted, []string{"batch/Holiday.zip"}) {
-		t.Fatalf("deleted = %v, want [batch/Holiday.zip]", store.deleted)
+	if want := []string{obj.Key}; !reflect.DeepEqual(store.deleted, want) {
+		t.Fatalf("deleted = %v, want %v (source should be removed after staging)", store.deleted, want)
 	}
-	if !store.existingKeys[expectedDst] {
-		t.Fatalf("expected destination %s to exist after move", expectedDst)
+	if want := []registerCall{{
+		albumID:   albumID,
+		filename:  "Holiday.zip",
+		sizeBytes: obj.Size,
+		sourceKey: dstKey,
+	}}; !reflect.DeepEqual(sink.calls, want) {
+		t.Fatalf("sink calls = %+v, want %+v", sink.calls, want)
 	}
 }
 
-func TestRunDedupesWhenAlbumAlreadyExists(t *testing.T) {
-	zipBytes := zipWithFile(t, "photo.png", validPNGBytes(t))
-	albumID := albumIDFromContent("\"etag-dup\"", int64(len(zipBytes)))
-	dstKey := "albums/" + albumID + "/source.zip"
+func TestRunDedupesWhenDestinationExists(t *testing.T) {
+	obj := storage.BatchObject{Key: "batch/dup.zip", Size: 2048, ETag: `"etag-dup"`}
+	albumID := albumIDFromContent(obj.ETag, obj.Size)
+	dstKey := pipeline.SourceKey(albumID)
 
 	store := &fakeStore{
-		batchObjects: []storage.BatchObject{
-			{Key: "batch/dup.zip", Size: int64(len(zipBytes)), ETag: "\"etag-dup\""},
+		listFn: func(context.Context, string) ([]storage.BatchObject, error) {
+			return []storage.BatchObject{obj}, nil
 		},
-		existingKeys: map[string]bool{dstKey: true},
-		objectBytes:  map[string][]byte{"batch/dup.zip": zipBytes},
+		headFn: func(_ context.Context, key string) (bool, int64, error) {
+			if key != dstKey {
+				t.Fatalf("HeadObject key = %q, want %q", key, dstKey)
+			}
+			return true, obj.Size, nil
+		},
 	}
+	sink := &fakeSink{}
 
-	summary, err := Run(context.Background(), store, albums.NewIndexer(), RunOptions{})
+	summary, err := Run(context.Background(), store, sink, RunOptions{})
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 
-	if summary.Deduped != 1 {
-		t.Fatalf("Deduped = %d, want 1", summary.Deduped)
-	}
-	if summary.Moved != 0 {
-		t.Fatalf("Moved should be 0 on dedup, got %d", summary.Moved)
+	if want := (Summary{Discovered: 1, Deduped: 1}); summary != want {
+		t.Fatalf("summary = %+v, want %+v", summary, want)
 	}
 	if len(store.copied) != 0 {
-		t.Fatalf("no copy expected on dedup, got %+v", store.copied)
+		t.Fatalf("no copy expected on dedupe, got %+v", store.copied)
 	}
-	if !reflect.DeepEqual(store.deleted, []string{"batch/dup.zip"}) {
-		t.Fatalf("deleted = %v, want [batch/dup.zip]", store.deleted)
+	if want := []string{obj.Key}; !reflect.DeepEqual(store.deleted, want) {
+		t.Fatalf("deleted = %v, want %v (duplicate source should still be removed)", store.deleted, want)
+	}
+	if want := []registerCall{{
+		albumID:   albumID,
+		filename:  "dup.zip",
+		sizeBytes: obj.Size,
+		sourceKey: dstKey,
+	}}; !reflect.DeepEqual(sink.calls, want) {
+		t.Fatalf("sink calls = %+v, want %+v (sink must still be invoked on dedupe)", sink.calls, want)
 	}
 }
 
-func TestRunDeletesCorruptZip(t *testing.T) {
-	garbage := []byte("this is not a zip file")
-	store := &fakeStore{
-		batchObjects: []storage.BatchObject{
-			{Key: "batch/broken.zip", Size: int64(len(garbage)), ETag: "\"etag-broken\""},
-		},
-		existingKeys: map[string]bool{},
-		objectBytes:  map[string][]byte{"batch/broken.zip": garbage},
-	}
+func TestRunHeadObjectError(t *testing.T) {
+	obj := storage.BatchObject{Key: "batch/head.zip", Size: 128, ETag: `"etag-head"`}
+	headErr := errors.New("head boom")
 
-	summary, err := Run(context.Background(), store, albums.NewIndexer(), RunOptions{})
+	store := &fakeStore{
+		listFn: func(context.Context, string) ([]storage.BatchObject, error) {
+			return []storage.BatchObject{obj}, nil
+		},
+		headFn: func(context.Context, string) (bool, int64, error) {
+			return false, 0, headErr
+		},
+	}
+	sink := &fakeSink{}
+
+	summary, err := Run(context.Background(), store, sink, RunOptions{})
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 
-	if summary.DeletedFailed != 1 {
-		t.Fatalf("DeletedFailed = %d, want 1", summary.DeletedFailed)
-	}
-	if summary.Moved != 0 || summary.Errors != 0 {
-		t.Fatalf("unexpected summary: %+v", summary)
-	}
-	if !reflect.DeepEqual(store.deleted, []string{"batch/broken.zip"}) {
-		t.Fatalf("deleted = %v, want [batch/broken.zip]", store.deleted)
+	if want := (Summary{Discovered: 1, Errors: 1}); summary != want {
+		t.Fatalf("summary = %+v, want %+v", summary, want)
 	}
 	if len(store.copied) != 0 {
-		t.Fatalf("no copy expected for corrupt zip, got %+v", store.copied)
-	}
-}
-
-func TestRunDeletesZipWithNoValidImages(t *testing.T) {
-	zipBytes := zipWithFile(t, "notes.txt", []byte("hello"))
-	store := &fakeStore{
-		batchObjects: []storage.BatchObject{
-			{Key: "batch/noimgs.zip", Size: int64(len(zipBytes)), ETag: "\"etag-noimgs\""},
-		},
-		existingKeys: map[string]bool{},
-		objectBytes:  map[string][]byte{"batch/noimgs.zip": zipBytes},
-	}
-
-	summary, err := Run(context.Background(), store, albums.NewIndexer(), RunOptions{})
-	if err != nil {
-		t.Fatalf("Run: %v", err)
-	}
-
-	if summary.DeletedFailed != 1 {
-		t.Fatalf("DeletedFailed = %d, want 1", summary.DeletedFailed)
-	}
-	if summary.Moved != 0 {
-		t.Fatalf("Moved should be 0, got %d", summary.Moved)
-	}
-	if !reflect.DeepEqual(store.deleted, []string{"batch/noimgs.zip"}) {
-		t.Fatalf("deleted = %v, want [batch/noimgs.zip]", store.deleted)
-	}
-}
-
-func TestRunCopyFailureKeepsOriginalAndCountsError(t *testing.T) {
-	zipBytes := zipWithFile(t, "photo.png", validPNGBytes(t))
-	store := &fakeStore{
-		batchObjects: []storage.BatchObject{
-			{Key: "batch/fail.zip", Size: int64(len(zipBytes)), ETag: "\"etag-fail\""},
-		},
-		existingKeys: map[string]bool{},
-		objectBytes:  map[string][]byte{"batch/fail.zip": zipBytes},
-		copyErr:      map[string]error{"batch/fail.zip": errors.New("s3 copy failed")},
-	}
-
-	summary, err := Run(context.Background(), store, albums.NewIndexer(), RunOptions{})
-	if err != nil {
-		t.Fatalf("Run returned unexpected error: %v", err)
-	}
-
-	if summary.Errors != 1 {
-		t.Fatalf("Errors = %d, want 1", summary.Errors)
-	}
-	if summary.Moved != 0 {
-		t.Fatalf("Moved should be 0 on copy failure, got %d", summary.Moved)
+		t.Fatalf("no copy expected when head fails, got %+v", store.copied)
 	}
 	if len(store.deleted) != 0 {
-		t.Fatalf("original should NOT be deleted on copy failure, got %v", store.deleted)
+		t.Fatalf("no delete expected when head fails, got %v", store.deleted)
 	}
-	if _, ok := store.objectBytes["batch/fail.zip"]; !ok {
-		t.Fatalf("original batch/fail.zip bytes should still be present after copy failure")
+	if len(sink.calls) != 0 {
+		t.Fatalf("sink should not be invoked when head fails, got %+v", sink.calls)
 	}
 }
 
-func TestRunIgnoresNestedZip(t *testing.T) {
-	zipBytes := zipWithFile(t, "photo.png", validPNGBytes(t))
+func TestRunCopyObjectErrorKeepsOriginal(t *testing.T) {
+	obj := storage.BatchObject{Key: "batch/copy.zip", Size: 256, ETag: `"etag-copy"`}
+	copyErr := errors.New("copy boom")
+
 	store := &fakeStore{
-		batchObjects: []storage.BatchObject{
-			{Key: "batch/sub/nested.zip", Size: int64(len(zipBytes)), ETag: "\"etag-nested\""},
-			{Key: "batch/top.zip", Size: int64(len(zipBytes)), ETag: "\"etag-top\""},
+		listFn: func(context.Context, string) ([]storage.BatchObject, error) {
+			return []storage.BatchObject{obj}, nil
 		},
-		existingKeys: map[string]bool{},
-		objectBytes: map[string][]byte{
-			"batch/sub/nested.zip": zipBytes,
-			"batch/top.zip":        zipBytes,
+		copyFn: func(context.Context, string, string) error {
+			return copyErr
 		},
 	}
+	sink := &fakeSink{}
 
-	summary, err := Run(context.Background(), store, albums.NewIndexer(), RunOptions{})
+	summary, err := Run(context.Background(), store, sink, RunOptions{})
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 
-	if summary.Discovered != 1 {
-		t.Fatalf("Discovered = %d, want 1 (nested should be ignored)", summary.Discovered)
+	if want := (Summary{Discovered: 1, Errors: 1}); summary != want {
+		t.Fatalf("summary = %+v, want %+v", summary, want)
 	}
-	if summary.Moved != 1 {
-		t.Fatalf("Moved = %d, want 1", summary.Moved)
+	if len(store.deleted) != 0 {
+		t.Fatalf("source must be kept for retry on copy failure, got deleted=%v", store.deleted)
 	}
-	for _, c := range store.copied {
-		if strings.HasPrefix(c.src, "batch/sub/") {
-			t.Fatalf("nested zip should not be copied: %+v", c)
-		}
+	if len(sink.calls) != 0 {
+		t.Fatalf("sink should not be invoked on copy failure, got %+v", sink.calls)
+	}
+}
+
+func TestRunSinkErrorKeepsSource(t *testing.T) {
+	obj := storage.BatchObject{Key: "batch/sink.zip", Size: 512, ETag: `"etag-sink"`}
+	albumID := albumIDFromContent(obj.ETag, obj.Size)
+	dstKey := pipeline.SourceKey(albumID)
+	sinkErr := errors.New("register boom")
+
+	store := &fakeStore{
+		listFn: func(context.Context, string) ([]storage.BatchObject, error) {
+			return []storage.BatchObject{obj}, nil
+		},
+	}
+	sink := &fakeSink{
+		fn: func(context.Context, string, string, int64, string) error {
+			return sinkErr
+		},
+	}
+
+	summary, err := Run(context.Background(), store, sink, RunOptions{})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	if want := (Summary{Discovered: 1, Moved: 1, Errors: 1}); summary != want {
+		t.Fatalf("summary = %+v, want %+v", summary, want)
+	}
+	if want := []srcDst{{src: obj.Key, dst: dstKey}}; !reflect.DeepEqual(store.copied, want) {
+		t.Fatalf("copied = %+v, want %+v", store.copied, want)
+	}
+	if len(store.deleted) != 0 {
+		t.Fatalf("source must NOT be deleted when sink registration fails, got %v", store.deleted)
+	}
+	if len(sink.calls) != 1 {
+		t.Fatalf("sink calls = %+v, want exactly 1", sink.calls)
+	}
+	if sink.calls[0].sourceKey != dstKey {
+		t.Fatalf("sink sourceKey = %q, want %q", sink.calls[0].sourceKey, dstKey)
+	}
+}
+
+func TestRunDeleteObjectError(t *testing.T) {
+	obj := storage.BatchObject{Key: "batch/del.zip", Size: 64, ETag: `"etag-del"`}
+	albumID := albumIDFromContent(obj.ETag, obj.Size)
+	dstKey := pipeline.SourceKey(albumID)
+	deleteErr := errors.New("delete boom")
+
+	store := &fakeStore{
+		listFn: func(context.Context, string) ([]storage.BatchObject, error) {
+			return []storage.BatchObject{obj}, nil
+		},
+		deleteFn: func(context.Context, string) error {
+			return deleteErr
+		},
+	}
+	sink := &fakeSink{}
+
+	summary, err := Run(context.Background(), store, sink, RunOptions{})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	if want := (Summary{Discovered: 1, Moved: 1, Errors: 1}); summary != want {
+		t.Fatalf("summary = %+v, want %+v", summary, want)
+	}
+	if want := []srcDst{{src: obj.Key, dst: dstKey}}; !reflect.DeepEqual(store.copied, want) {
+		t.Fatalf("copied = %+v, want %+v", store.copied, want)
+	}
+	if want := []string{obj.Key}; !reflect.DeepEqual(store.deleted, want) {
+		t.Fatalf("deleted = %v, want %v (delete attempt should be recorded)", store.deleted, want)
+	}
+	if len(sink.calls) != 1 {
+		t.Fatalf("sink calls = %+v, want exactly 1", sink.calls)
 	}
 }
 
 func TestRunCustomBatchPrefix(t *testing.T) {
-	zipBytes := zipWithFile(t, "photo.png", validPNGBytes(t))
-	store := &fakeStore{
-		batchObjects: []storage.BatchObject{
-			{Key: "inbox/x.zip", Size: int64(len(zipBytes)), ETag: "\"etag-x\""},
-		},
-		existingKeys: map[string]bool{},
-		objectBytes:  map[string][]byte{"inbox/x.zip": zipBytes},
-	}
+	obj := storage.BatchObject{Key: "inbox/trip.zip", Size: 1024, ETag: `"etag-trip"`}
+	albumID := albumIDFromContent(obj.ETag, obj.Size)
+	dstKey := pipeline.SourceKey(albumID)
 
-	summary, err := Run(context.Background(), store, albums.NewIndexer(), RunOptions{BatchPrefix: "inbox/"})
+	store := &fakeStore{
+		listFn: func(context.Context, string) ([]storage.BatchObject, error) {
+			return []storage.BatchObject{obj}, nil
+		},
+	}
+	sink := &fakeSink{}
+
+	summary, err := Run(context.Background(), store, sink, RunOptions{BatchPrefix: "  inbox/  "})
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if summary.Discovered != 1 || summary.Moved != 1 {
-		t.Fatalf("summary = %+v, want Discovered=1 Moved=1", summary)
+
+	if want := (Summary{Discovered: 1, Moved: 1}); summary != want {
+		t.Fatalf("summary = %+v, want %+v", summary, want)
+	}
+	if want := []string{"inbox/"}; !reflect.DeepEqual(store.listedPrefixes, want) {
+		t.Fatalf("listed prefixes = %v, want %v (prefix should be trimmed)", store.listedPrefixes, want)
+	}
+	if want := []registerCall{{
+		albumID:   albumID,
+		filename:  "trip.zip",
+		sizeBytes: obj.Size,
+		sourceKey: dstKey,
+	}}; !reflect.DeepEqual(sink.calls, want) {
+		t.Fatalf("sink calls = %+v, want %+v", sink.calls, want)
+	}
+	if want := []srcDst{{src: obj.Key, dst: dstKey}}; !reflect.DeepEqual(store.copied, want) {
+		t.Fatalf("copied = %+v, want %+v", store.copied, want)
+	}
+}
+
+func TestRunListObjectsError(t *testing.T) {
+	listErr := errors.New("list boom")
+	store := &fakeStore{
+		listFn: func(context.Context, string) ([]storage.BatchObject, error) {
+			return nil, listErr
+		},
+	}
+	sink := &fakeSink{}
+
+	summary, err := Run(context.Background(), store, sink, RunOptions{})
+	if err == nil {
+		t.Fatalf("Run returned nil error, want wrapped list error")
+	}
+	if !errors.Is(err, listErr) {
+		t.Fatalf("Run error = %v, want it to wrap %v", err, listErr)
+	}
+	if summary != (Summary{}) {
+		t.Fatalf("summary = %+v, want zero value", summary)
+	}
+	if len(store.headCalls) != 0 || len(store.copied) != 0 || len(store.deleted) != 0 {
+		t.Fatalf("no store mutations expected after list error: head=%v copy=%v delete=%v",
+			store.headCalls, store.copied, store.deleted)
+	}
+}
+
+func TestRunNilSinkStillStages(t *testing.T) {
+	obj := storage.BatchObject{Key: "batch/nosink.zip", Size: 32, ETag: `"etag-nosink"`}
+	albumID := albumIDFromContent(obj.ETag, obj.Size)
+	dstKey := pipeline.SourceKey(albumID)
+
+	store := &fakeStore{
+		listFn: func(context.Context, string) ([]storage.BatchObject, error) {
+			return []storage.BatchObject{obj}, nil
+		},
+	}
+
+	summary, err := Run(context.Background(), store, nil, RunOptions{})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	if want := (Summary{Discovered: 1, Moved: 1}); summary != want {
+		t.Fatalf("summary = %+v, want %+v", summary, want)
+	}
+	if want := []srcDst{{src: obj.Key, dst: dstKey}}; !reflect.DeepEqual(store.copied, want) {
+		t.Fatalf("copied = %+v, want %+v", store.copied, want)
+	}
+	if want := []string{obj.Key}; !reflect.DeepEqual(store.deleted, want) {
+		t.Fatalf("deleted = %v, want %v", store.deleted, want)
+	}
+}
+
+func TestRunMixedBatchSummary(t *testing.T) {
+	newObj := storage.BatchObject{Key: "batch/new.zip", Size: 100, ETag: `"etag-new"`}
+	dupObj := storage.BatchObject{Key: "batch/dup.zip", Size: 200, ETag: `"etag-dup"`}
+	dupDst := pipeline.SourceKey(albumIDFromContent(dupObj.ETag, dupObj.Size))
+
+	store := &fakeStore{
+		listFn: func(context.Context, string) ([]storage.BatchObject, error) {
+			return []storage.BatchObject{
+				newObj,
+				dupObj,
+				{Key: "batch/sub/nested.zip", Size: 300, ETag: `"etag-nested"`},
+				{Key: "batch/readme.txt", Size: 10},
+				{Key: "batch/empty.zip", Size: 0},
+			}, nil
+		},
+		headFn: func(_ context.Context, key string) (bool, int64, error) {
+			return key == dupDst, dupObj.Size, nil
+		},
+	}
+	sink := &fakeSink{}
+
+	summary, err := Run(context.Background(), store, sink, RunOptions{})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	if want := (Summary{Discovered: 2, Moved: 1, Deduped: 1}); summary != want {
+		t.Fatalf("summary = %+v, want %+v", summary, want)
+	}
+	if want := []string{newObj.Key, dupObj.Key}; !reflect.DeepEqual(store.deleted, want) {
+		t.Fatalf("deleted = %v, want %v", store.deleted, want)
+	}
+	if len(store.copied) != 1 || store.copied[0].src != newObj.Key {
+		t.Fatalf("copied = %+v, want only %s", store.copied, newObj.Key)
+	}
+	if len(sink.calls) != 2 {
+		t.Fatalf("sink calls = %+v, want 2", sink.calls)
+	}
+	for _, call := range sink.calls {
+		if call.sourceKey == "" || call.albumID == "" || call.filename == "" || call.sizeBytes <= 0 {
+			t.Fatalf("incomplete sink registration: %+v", call)
+		}
+	}
+}
+
+func TestRunStopsOnCancelledContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	store := &fakeStore{
+		listFn: func(context.Context, string) ([]storage.BatchObject, error) {
+			return []storage.BatchObject{{Key: "batch/a.zip", Size: 10, ETag: `"etag-a"`}}, nil
+		},
+	}
+	sink := &fakeSink{}
+
+	summary, err := Run(ctx, store, sink, RunOptions{})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run error = %v, want context.Canceled", err)
+	}
+	if want := (Summary{Discovered: 1}); summary != want {
+		t.Fatalf("summary = %+v, want %+v", summary, want)
+	}
+	if len(store.headCalls) != 0 || len(store.copied) != 0 || len(store.deleted) != 0 {
+		t.Fatalf("cancelled run must not touch objects: head=%v copy=%v delete=%v",
+			store.headCalls, store.copied, store.deleted)
+	}
+	if len(sink.calls) != 0 {
+		t.Fatalf("cancelled run must not register uploads, got %+v", sink.calls)
 	}
 }

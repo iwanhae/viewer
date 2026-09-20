@@ -6,12 +6,13 @@ import (
 	"slices"
 )
 
+// Neighbor is a content hash and its similarity to the query vector.
 type Neighbor struct {
-	ImageID string
-	Score   float64
+	Hash  string
+	Score float64
 }
 
-func findNeighbors(embeddings map[string]EmbeddingRecord, query []float32, limit int, excludeIDs map[string]struct{}) []Neighbor {
+func findNeighbors(embeddings map[string][]float32, query []float32, limit int, excludeHash string) []Neighbor {
 	if limit <= 0 {
 		return nil
 	}
@@ -20,20 +21,20 @@ func findNeighbors(embeddings map[string]EmbeddingRecord, query []float32, limit
 		return nil
 	}
 	neighbors := make([]Neighbor, 0, len(embeddings))
-	for id, emb := range embeddings {
-		if excludeIDs != nil {
-			if _, excluded := excludeIDs[id]; excluded {
-				continue
-			}
+	for hash, vector := range embeddings {
+		if hash == excludeHash {
+			continue
 		}
-		score := cosineNormalized(queryNormed, emb.Vector)
-		neighbors = append(neighbors, Neighbor{ImageID: id, Score: score})
+		neighbors = append(neighbors, Neighbor{
+			Hash:  hash,
+			Score: cosineNormalized(queryNormed, vector),
+		})
 	}
 	slices.SortFunc(neighbors, func(a, b Neighbor) int {
 		if diff := cmp.Compare(b.Score, a.Score); diff != 0 {
 			return diff
 		}
-		return cmp.Compare(a.ImageID, b.ImageID)
+		return cmp.Compare(a.Hash, b.Hash)
 	})
 	if len(neighbors) > limit {
 		neighbors = neighbors[:limit]

@@ -90,6 +90,8 @@ USER 65532:65532
 ENV PORT=8080 \
     CACHE_DIR=/tmp/viewer-cache/images \
     ZIP_CACHE_DIR=/tmp/viewer-cache/zips \
+    DB_PATH=/tmp/viewer-cache/viewer.db \
+    INGEST_DELETE_SOURCE=true \
     RECOMMENDER_REQUIRED=false
 
 EXPOSE 8080

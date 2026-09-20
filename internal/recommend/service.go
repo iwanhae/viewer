@@ -2,67 +2,54 @@ package recommend
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
-	"math/rand"
-	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"viewer/internal/catalog"
 	cfgpkg "viewer/internal/config"
 	"viewer/internal/images"
-	"viewer/internal/models"
-	"viewer/internal/storage"
 )
 
+// Service keeps an in-memory similarity index of blob embeddings and runs the
+// background workers that fill in embeddings the ingest pipeline could not
+// compute.
 type Service struct {
-	cfg    cfgpkg.Config
-	images *images.Service
-	s3     *storage.S3Store
+	cfg     cfgpkg.Config
+	catalog *catalog.Store
+	images  *images.Service
 
 	embedder EmbeddingProvider
 
 	startOnce sync.Once
 	startErr  error
 
-	mu                sync.RWMutex
-	photosByID        map[string]PhotoRecord
-	photoIDsByAlbum   map[string]map[string]struct{}
-	embeddingsByID    map[string]EmbeddingRecord
-	failedByID        map[string]string
-	processFailedByID map[string]string
-	missingByAlbum    map[string]map[int]struct{}
-	albumsWithMissing []string
-	albumMissingPos   map[string]int
+	mu               sync.RWMutex
+	photosByHash     map[string][]photoRef
+	hashesByAlbum    map[string]map[string]struct{}
+	embeddingsByHash map[string][]float32
+	failedByHash     map[string]string
 
-	rngMu sync.Mutex
-	rng   *rand.Rand
-
-	albumLockMu sync.Mutex
-	albumLocks  map[string]*sync.Mutex
-
-	imageLoadSem chan struct{}
+	claimMu  sync.Mutex
+	claimed  map[string]struct{}
+	imageSem chan struct{}
 }
 
-func NewService(cfg cfgpkg.Config, imagesService *images.Service, s3Store *storage.S3Store) (*Service, error) {
+func NewService(cfg cfgpkg.Config, cat *catalog.Store, imagesService *images.Service) (*Service, error) {
 	return &Service{
-		cfg:               cfg,
-		images:            imagesService,
-		s3:                s3Store,
-		embedder:          NewHTTPEmbedder(cfg.RecommenderEndpoint, time.Duration(cfg.RecommenderTimeoutSec)*time.Second),
-		photosByID:        make(map[string]PhotoRecord),
-		photoIDsByAlbum:   make(map[string]map[string]struct{}),
-		embeddingsByID:    make(map[string]EmbeddingRecord),
-		failedByID:        make(map[string]string),
-		processFailedByID: make(map[string]string),
-		missingByAlbum:    make(map[string]map[int]struct{}),
-		albumsWithMissing: make([]string, 0),
-		albumMissingPos:   make(map[string]int),
-		rng:               rand.New(rand.NewSource(time.Now().UnixNano())),
-		albumLocks:        make(map[string]*sync.Mutex),
-		imageLoadSem:      make(chan struct{}, 1),
+		cfg:              cfg,
+		catalog:          cat,
+		images:           imagesService,
+		embedder:         NewHTTPEmbedder(cfg.RecommenderEndpoint, time.Duration(cfg.RecommenderTimeoutSec)*time.Second),
+		photosByHash:     make(map[string][]photoRef),
+		hashesByAlbum:    make(map[string]map[string]struct{}),
+		embeddingsByHash: make(map[string][]float32),
+		failedByHash:     make(map[string]string),
+		claimed:          make(map[string]struct{}),
+		imageSem:         make(chan struct{}, 1),
 	}, nil
 }
 
@@ -80,6 +67,109 @@ func (s *Service) Enabled() bool {
 	return s != nil && strings.TrimSpace(s.cfg.RecommenderEndpoint) != ""
 }
 
+// Embed satisfies the pipeline's embedder interface.
+func (s *Service) Embed(ctx context.Context, imageBytes []byte) ([]float32, error) {
+	if s == nil || s.embedder == nil {
+		return nil, fmt.Errorf("recommendation embedder is not initialized")
+	}
+	return s.embedder.Embed(ctx, imageBytes)
+}
+
+// LoadAll rebuilds the in-memory index from the SQLite catalog.
+func (s *Service) LoadAll(ctx context.Context) error {
+	if s == nil || s.catalog == nil {
+		return nil
+	}
+	pairs, err := s.catalog.ListPhotoBlobPairs(ctx)
+	if err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.resetLocked()
+	for _, pair := range pairs {
+		s.addPairLocked(pair)
+	}
+	return nil
+}
+
+// ReloadAlbum refreshes one album's photos and blob states in memory.
+func (s *Service) ReloadAlbum(ctx context.Context, albumID string) error {
+	if s == nil || s.catalog == nil || strings.TrimSpace(albumID) == "" {
+		return nil
+	}
+	pairs, err := s.catalog.ListPhotoBlobPairsByAlbum(ctx, albumID)
+	if err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	previous := s.hashesByAlbum[albumID]
+	delete(s.hashesByAlbum, albumID)
+	for hash := range previous {
+		s.removeHashForAlbumLocked(hash, albumID)
+	}
+	for _, pair := range pairs {
+		s.addPairLocked(pair)
+	}
+	return nil
+}
+
+func (s *Service) resetLocked() {
+	s.photosByHash = make(map[string][]photoRef)
+	s.hashesByAlbum = make(map[string]map[string]struct{})
+	s.embeddingsByHash = make(map[string][]float32)
+	s.failedByHash = make(map[string]string)
+}
+
+func (s *Service) addPairLocked(pair catalog.PhotoWithBlob) {
+	hash := pair.Photo.Hash
+	if hash == "" {
+		return
+	}
+	s.photosByHash[hash] = append(s.photosByHash[hash], photoRef{
+		AlbumID: pair.Photo.AlbumID,
+		Index:   pair.Photo.Index,
+		Hash:    hash,
+		Width:   pair.Photo.Width,
+		Height:  pair.Photo.Height,
+		Ratio:   pair.Photo.Ratio,
+	})
+	if s.hashesByAlbum[pair.Photo.AlbumID] == nil {
+		s.hashesByAlbum[pair.Photo.AlbumID] = make(map[string]struct{})
+	}
+	s.hashesByAlbum[pair.Photo.AlbumID][hash] = struct{}{}
+
+	switch pair.Blob.EmbeddingStatus {
+	case catalog.EmbeddingStatusReady:
+		if len(pair.Blob.Embedding) > 0 {
+			s.embeddingsByHash[hash] = normalizeVector(pair.Blob.Embedding)
+			delete(s.failedByHash, hash)
+		}
+	case catalog.EmbeddingStatusFailed:
+		s.failedByHash[hash] = pair.Blob.EmbeddingError
+	}
+}
+
+func (s *Service) removeHashForAlbumLocked(hash string, albumID string) {
+	refs := s.photosByHash[hash]
+	kept := refs[:0]
+	for _, ref := range refs {
+		if ref.AlbumID == albumID {
+			continue
+		}
+		kept = append(kept, ref)
+	}
+	if len(kept) == 0 {
+		delete(s.photosByHash, hash)
+		return
+	}
+	s.photosByHash[hash] = kept
+}
+
+// Start launches the background embedding workers.
 func (s *Service) Start(ctx context.Context) error {
 	s.startOnce.Do(func() {
 		if !s.Enabled() {
@@ -104,150 +194,36 @@ func (s *Service) Start(ctx context.Context) error {
 	return s.startErr
 }
 
-func (s *Service) IngestAlbumIndex(idx models.AlbumIndex) {
-	if idx.AlbumID == "" {
-		return
-	}
-	s.applyAlbumIndex(idx)
-}
-
-func albumIndexKey(albumID string) string {
-	return fmt.Sprintf("albums/%s/index.json", albumID)
-}
-
-func embeddingIndexKey(photoIndex int) string {
-	return strconv.Itoa(photoIndex)
-}
-
-func (s *Service) applyAlbumIndex(idx models.AlbumIndex) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.applyAlbumIndexLocked(idx)
-}
-
-func (s *Service) applyAlbumIndexLocked(idx models.AlbumIndex) {
-	s.ensureIndexesLocked()
-
-	albumID := idx.AlbumID
-	if albumID == "" {
-		return
-	}
-	var previous map[string]struct{}
-	if prev, ok := s.photoIDsByAlbum[albumID]; ok {
-		previous = prev
-		for id := range prev {
-			delete(s.photosByID, id)
-			delete(s.embeddingsByID, id)
-			delete(s.failedByID, id)
-		}
-	}
-	delete(s.photoIDsByAlbum, albumID)
-
-	missing := make(map[int]struct{})
-	albumPhotoIDs := make(map[string]struct{}, len(idx.Photos))
-	for _, photo := range idx.Photos {
-		id := imageID(albumID, photo.I)
-		albumPhotoIDs[id] = struct{}{}
-		rec := PhotoRecord{
-			ImageID:    id,
-			AlbumID:    albumID,
-			PhotoIndex: photo.I,
-			EntryName:  photo.Name,
-			Width:      photo.W,
-			Height:     photo.H,
-			Ratio:      photo.Ratio,
-		}
-		s.photosByID[id] = rec
-
-		processErr, processFailed := s.processFailedByID[id]
-
-		emb, ok := idx.Embeddings[embeddingIndexKey(photo.I)]
-		if ok {
-			switch emb.Status {
-			case embeddingStatusReady:
-				if len(emb.Vector) == 0 {
-					if processFailed {
-						s.failedByID[id] = processErr
-						continue
-					}
-					missing[photo.I] = struct{}{}
-					continue
-				}
-				normalized := normalizeVector(emb.Vector)
-				s.embeddingsByID[id] = EmbeddingRecord{
-					ImageID: id,
-					Vector:  normalized,
-				}
-				delete(s.failedByID, id)
-				delete(s.processFailedByID, id)
-			case embeddingStatusFailed:
-				if emb.Error != "" {
-					s.failedByID[id] = emb.Error
-				} else if processFailed {
-					s.failedByID[id] = processErr
-				} else {
-					s.failedByID[id] = "embed failed"
-				}
-			default:
-				if processFailed {
-					s.failedByID[id] = processErr
-					continue
-				}
-				missing[photo.I] = struct{}{}
-			}
-			continue
-		}
-
-		if processFailed {
-			s.failedByID[id] = processErr
-			continue
-		}
-		missing[photo.I] = struct{}{}
-	}
-	s.photoIDsByAlbum[albumID] = albumPhotoIDs
-	for id := range previous {
-		if _, ok := albumPhotoIDs[id]; !ok {
-			delete(s.processFailedByID, id)
-		}
-	}
-	s.setMissingForAlbumLocked(albumID, missing)
-}
-
-func (s *Service) syncAlbum(ctx context.Context, albumID string) error {
-	var idx models.AlbumIndex
-	if err := s.s3.ReadJSON(ctx, albumIndexKey(albumID), &idx); err != nil {
-		return err
-	}
-	if idx.AlbumID == "" {
-		idx.AlbumID = albumID
-	}
-	s.applyAlbumIndex(idx)
-	return nil
-}
-
 func (s *Service) workerLoop(ctx context.Context) {
-	idleTicker := time.NewTicker(400 * time.Millisecond)
+	idleTicker := time.NewTicker(500 * time.Millisecond)
 	defer idleTicker.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		default:
+		case <-idleTicker.C:
 		}
 
-		albumID, photos, ok := s.claimRandomMissingAlbum()
-		if !ok {
-			select {
-			case <-ctx.Done():
-				return
-			case <-idleTicker.C:
-			}
+		if s.catalog == nil || s.images == nil || s.embedder == nil {
 			continue
 		}
-
-		if err := s.embedAlbumAndPersist(ctx, albumID, photos); err != nil {
-			log.Printf("recommend: album embed failed album=%s claimed=%d err=%v", albumID, len(photos), err)
-			if isTransientEmbedError(err) {
+		blobs, err := s.catalog.ListBlobsAwaitingEmbedding(ctx, defaultWorkerBatchSize)
+		if err != nil {
+			continue
+		}
+		for _, blob := range blobs {
+			if ctx.Err() != nil {
+				return
+			}
+			if !s.claimBlob(blob.Hash) {
+				continue
+			}
+			transient := s.embedBlob(ctx, blob.Hash)
+			if !transient {
+				s.releaseBlob(blob.Hash)
+			}
+			if transient {
 				select {
 				case <-ctx.Done():
 					return
@@ -258,341 +234,116 @@ func (s *Service) workerLoop(ctx context.Context) {
 	}
 }
 
-func (s *Service) claimRandomMissingAlbum() (string, []PhotoRecord, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.ensureIndexesLocked()
-
-	for len(s.albumsWithMissing) > 0 {
-		s.rngMu.Lock()
-		albumID := s.albumsWithMissing[s.rng.Intn(len(s.albumsWithMissing))]
-		s.rngMu.Unlock()
-
-		missing := s.missingByAlbum[albumID]
-		if len(missing) == 0 {
-			s.removeAlbumWithMissingLocked(albumID)
-			continue
-		}
-
-		indexes := make([]int, 0, len(missing))
-		for idx := range missing {
-			indexes = append(indexes, idx)
-		}
-		sort.Ints(indexes)
-
-		photos := make([]PhotoRecord, 0, len(indexes))
-		for _, photoIndex := range indexes {
-			delete(missing, photoIndex)
-			photo, ok := s.photosByID[imageID(albumID, photoIndex)]
-			if !ok {
-				continue
-			}
-			photos = append(photos, photo)
-		}
-		if len(missing) == 0 {
-			s.removeAlbumWithMissingLocked(albumID)
-		}
-		if len(photos) == 0 {
-			continue
-		}
-		return albumID, photos, true
+// embedBlob computes and stores one blob embedding. It reports whether the
+// failure was transient (the blob stays pending and is retried).
+func (s *Service) embedBlob(ctx context.Context, hash string) bool {
+	if err := s.acquireImageSlot(ctx); err != nil {
+		return true
 	}
-	return "", nil, false
-}
-
-func (s *Service) embedAlbumAndPersist(ctx context.Context, albumID string, photos []PhotoRecord) error {
-	if albumID == "" || len(photos) == 0 {
-		return nil
-	}
-
-	startedAt := time.Now()
-
-	idx, err := s.readAlbumIndex(ctx, albumID)
+	result, err := s.images.GetImageByHash(ctx, hash)
+	s.releaseImageSlot()
 	if err != nil {
-		s.requeueMissingPhotos(albumID, photoIndexesFromRecords(photos))
-		return fmt.Errorf("read album index: %w", err)
+		log.Printf("recommend: blob=%s image load failed: %v", hash, err)
+		s.markFailed(ctx, hash, fmt.Sprintf("load image bytes: %v", err))
+		return false
 	}
 
-	targets := make([]PhotoRecord, 0, len(photos))
-	for _, photo := range photos {
-		if processErr, processFailed := s.getProcessFailed(photo.ImageID); processFailed {
-			s.markFailedLocal(photo.ImageID, processErr)
-			continue
+	vector, err := s.embedder.Embed(ctx, result.Bytes)
+	if err != nil {
+		if isTransientEmbedError(err) {
+			log.Printf("recommend: blob=%s embed transient failure: %v", hash, err)
+			return true
 		}
-		current := idx.Embeddings[embeddingIndexKey(photo.PhotoIndex)]
-		if current.Status == embeddingStatusReady && len(current.Vector) > 0 {
-			continue
-		}
-		if current.Status == embeddingStatusFailed {
-			continue
-		}
-		targets = append(targets, photo)
-	}
-	if len(targets) == 0 {
-		s.applyAlbumIndex(*idx)
-		return nil
+		log.Printf("recommend: blob=%s embed failed: %v", hash, err)
+		s.markFailed(ctx, hash, fmt.Sprintf("embed image: %v", err))
+		return false
 	}
 
-	updates := make(map[int]models.PhotoEmbedding, len(targets))
-	readyCount := 0
-	failedCount := 0
-
-	for _, photo := range targets {
-		if processErr, processFailed := s.getProcessFailed(photo.ImageID); processFailed {
-			s.markFailedLocal(photo.ImageID, processErr)
-			failedCount++
-			continue
-		}
-
-		if err := s.acquireImageLoadSlot(ctx); err != nil {
-			s.requeueMissingPhotos(albumID, photoIndexesFromRecords(targets))
-			return fmt.Errorf("wait for image download slot: %w", err)
-		}
-		result, err := s.images.GetImageByEntry(ctx, albumID, photo.EntryName)
-		s.releaseImageLoadSlot()
-		if err != nil {
-			failedCount++
-			updates[photo.PhotoIndex] = models.PhotoEmbedding{
-				Status:    embeddingStatusFailed,
-				Error:     fmt.Sprintf("load image bytes: %v", err),
-				UpdatedAt: time.Now().UTC().Format(time.RFC3339),
-			}
-			continue
-		}
-
-		vector, err := s.embedder.Embed(ctx, result.Bytes)
-		if err != nil {
-			failedCount++
-			s.markFailedLocal(photo.ImageID, fmt.Sprintf("embed image: %v", err))
-			continue
-		}
-
-		readyCount++
-		updates[photo.PhotoIndex] = models.PhotoEmbedding{
-			Status:    embeddingStatusReady,
-			Vector:    vector,
-			UpdatedAt: time.Now().UTC().Format(time.RFC3339),
-		}
+	if err := s.catalog.SetBlobEmbedding(ctx, hash, catalog.EmbeddingStatusReady, vector, ""); err != nil {
+		log.Printf("recommend: blob=%s persist embedding failed: %v", hash, err)
+		return true
 	}
-
-	if err := s.persistEmbeddingStatuses(ctx, albumID, updates); err != nil {
-		s.requeueMissingPhotos(albumID, photoIndexesFromRecords(targets))
-		return fmt.Errorf("persist album embeddings: %w", err)
-	}
-
-	log.Printf(
-		"recommend: album embed batch album=%s claimed=%d processed=%d ready=%d failed=%d duration=%s",
-		albumID,
-		len(photos),
-		len(targets),
-		readyCount,
-		failedCount,
-		time.Since(startedAt).Round(time.Millisecond),
-	)
-
-	total, ready, failed, missing := s.albumEmbeddingStats(albumID)
-	if missing == 0 {
-		if failed == 0 {
-			log.Printf("recommend: album embedded successfully album=%s total=%d ready=%d", albumID, total, ready)
-		} else {
-			log.Printf("recommend: album embedding complete album=%s total=%d ready=%d failed=%d", albumID, total, ready, failed)
-		}
-	}
-	return nil
+	s.mu.Lock()
+	s.embeddingsByHash[hash] = normalizeVector(vector)
+	delete(s.failedByHash, hash)
+	s.mu.Unlock()
+	return false
 }
 
-func (s *Service) acquireImageLoadSlot(ctx context.Context) error {
-	if s.imageLoadSem == nil {
+func (s *Service) markFailed(ctx context.Context, hash string, errText string) {
+	if s.catalog != nil {
+		_ = s.catalog.SetBlobEmbedding(context.Background(), hash, catalog.EmbeddingStatusFailed, nil, errText)
+	}
+	s.mu.Lock()
+	s.failedByHash[hash] = errText
+	s.mu.Unlock()
+}
+
+func (s *Service) claimBlob(hash string) bool {
+	s.claimMu.Lock()
+	defer s.claimMu.Unlock()
+	if _, exists := s.claimed[hash]; exists {
+		return false
+	}
+	s.claimed[hash] = struct{}{}
+	return true
+}
+
+func (s *Service) releaseBlob(hash string) {
+	s.claimMu.Lock()
+	delete(s.claimed, hash)
+	s.claimMu.Unlock()
+}
+
+func (s *Service) acquireImageSlot(ctx context.Context) error {
+	if s.imageSem == nil {
 		return nil
 	}
 	select {
-	case s.imageLoadSem <- struct{}{}:
+	case s.imageSem <- struct{}{}:
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
 	}
 }
 
-func (s *Service) releaseImageLoadSlot() {
-	if s.imageLoadSem == nil {
+func (s *Service) releaseImageSlot() {
+	if s.imageSem == nil {
 		return
 	}
 	select {
-	case <-s.imageLoadSem:
+	case <-s.imageSem:
 	default:
 	}
 }
 
-func photoIndexesFromRecords(photos []PhotoRecord) []int {
-	indexes := make([]int, 0, len(photos))
-	for _, photo := range photos {
-		indexes = append(indexes, photo.PhotoIndex)
-	}
-	return indexes
-}
-
-func (s *Service) requeueMissingPhotos(albumID string, photoIndexes []int) {
-	if albumID == "" || len(photoIndexes) == 0 {
-		return
-	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.ensureIndexesLocked()
-
-	missing, ok := s.missingByAlbum[albumID]
-	if !ok {
-		missing = make(map[int]struct{})
-		s.missingByAlbum[albumID] = missing
-	}
-
-	for _, photoIndex := range photoIndexes {
-		imageIDValue := imageID(albumID, photoIndex)
-		if _, ok := s.photosByID[imageIDValue]; !ok {
-			continue
-		}
-		if errText, processFailed := s.processFailedByID[imageIDValue]; processFailed {
-			s.failedByID[imageIDValue] = errText
-			continue
-		}
-		delete(s.failedByID, imageIDValue)
-		missing[photoIndex] = struct{}{}
-	}
-	if len(missing) > 0 {
-		s.addAlbumWithMissingLocked(albumID)
-	} else {
-		s.removeAlbumWithMissingLocked(albumID)
-	}
-}
-
-func (s *Service) markFailedLocal(imageIDValue string, errText string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.ensureIndexesLocked()
-	s.processFailedByID[imageIDValue] = errText
-	s.failedByID[imageIDValue] = errText
-	albumID, photoIndex, err := parseImageID(imageIDValue)
-	if err == nil {
-		if missing, ok := s.missingByAlbum[albumID]; ok {
-			delete(missing, photoIndex)
-			if len(missing) == 0 {
-				s.removeAlbumWithMissingLocked(albumID)
-			}
-		}
-	}
-}
-
-func (s *Service) getProcessFailed(imageIDValue string) (string, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if s.processFailedByID == nil {
-		return "", false
-	}
-	errText, ok := s.processFailedByID[imageIDValue]
-	return errText, ok
-}
-
-func (s *Service) readAlbumIndex(ctx context.Context, albumID string) (*models.AlbumIndex, error) {
-	var idx models.AlbumIndex
-	if err := s.s3.ReadJSON(ctx, albumIndexKey(albumID), &idx); err != nil {
-		return nil, err
-	}
-	if idx.AlbumID == "" {
-		idx.AlbumID = albumID
-	}
-	if idx.Embeddings == nil {
-		idx.Embeddings = make(map[string]models.PhotoEmbedding)
-	}
-	return &idx, nil
-}
-
-func (s *Service) persistEmbeddingStatuses(ctx context.Context, albumID string, embeddings map[int]models.PhotoEmbedding) error {
-	if len(embeddings) == 0 {
-		return nil
-	}
-
-	lock := s.albumLock(albumID)
-	lock.Lock()
-	defer lock.Unlock()
-
-	idx, err := s.readAlbumIndex(ctx, albumID)
-	if err != nil {
-		return err
-	}
-	for photoIndex, embedding := range embeddings {
-		idx.Embeddings[embeddingIndexKey(photoIndex)] = embedding
-	}
-	if err := s.s3.PutJSON(ctx, albumIndexKey(albumID), idx); err != nil {
-		return err
-	}
-	s.applyAlbumIndex(*idx)
-	return nil
-}
-
-func (s *Service) albumLock(albumID string) *sync.Mutex {
-	s.albumLockMu.Lock()
-	defer s.albumLockMu.Unlock()
-	lock, ok := s.albumLocks[albumID]
-	if !ok {
-		lock = &sync.Mutex{}
-		s.albumLocks[albumID] = lock
-	}
-	return lock
-}
-
-func (s *Service) albumEmbeddingStats(albumID string) (total int, ready int, failed int, missing int) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	for _, photo := range s.photosByID {
-		if photo.AlbumID != albumID {
-			continue
-		}
-		total++
-		if _, ok := s.embeddingsByID[photo.ImageID]; ok {
-			ready++
-		}
-		if _, ok := s.failedByID[photo.ImageID]; ok {
-			failed++
-		}
-	}
-	if m, ok := s.missingByAlbum[albumID]; ok {
-		missing = len(m)
-	}
-	return total, ready, failed, missing
-}
-
+// EmbeddingProgress reports embedding coverage across distinct blobs.
 func (s *Service) EmbeddingProgress() EmbeddingProgress {
-	if s == nil {
+	if s == nil || s.catalog == nil {
 		return EmbeddingProgress{}
 	}
-
-	s.mu.RLock()
-	total := len(s.photosByID)
-	ready := len(s.embeddingsByID)
-	failed := len(s.failedByID)
-	pending := 0
-	for _, missing := range s.missingByAlbum {
-		pending += len(missing)
+	counts, err := s.catalog.EmbeddingCounts(context.Background())
+	if err != nil {
+		log.Printf("recommend: embedding counts failed: %v", err)
+		return EmbeddingProgress{}
 	}
-	s.mu.RUnlock()
-
-	processed := ready + failed
+	processed := counts.Ready + counts.Failed
 	ratio := 0.0
-	if total > 0 {
-		ratio = float64(ready) / float64(total)
+	if counts.Total > 0 {
+		ratio = float64(counts.Ready) / float64(counts.Total)
 	}
-
 	return EmbeddingProgress{
-		Total:     total,
-		Ready:     ready,
-		Failed:    failed,
-		Pending:   pending,
+		Total:     counts.Total,
+		Ready:     counts.Ready,
+		Failed:    counts.Failed,
+		Pending:   counts.Pending,
 		Processed: processed,
 		Ratio:     ratio,
 		Percent:   ratio * 100,
 	}
 }
 
+// Recommend returns cross-album neighbors of a query photo.
 func (s *Service) Recommend(ctx context.Context, albumID string, photoIndex int, limit int) (RecommendationResponse, error) {
 	if limit <= 0 {
 		limit = s.cfg.RecoTopKDefault
@@ -604,60 +355,45 @@ func (s *Service) Recommend(ctx context.Context, albumID string, photoIndex int,
 		limit = s.cfg.RecoTopKMax
 	}
 
-	queryID := imageID(albumID, photoIndex)
-	s.mu.RLock()
-	_, hasPhoto := s.photosByID[queryID]
-	s.mu.RUnlock()
-	if !hasPhoto {
-		if err := s.syncAlbum(ctx, albumID); err != nil {
-			if storage.IsNotFound(err) {
-				return RecommendationResponse{}, fmt.Errorf("%w: %s:%d", ErrPhotoNotFound, albumID, photoIndex)
-			}
-			return RecommendationResponse{}, err
-		}
-		s.mu.RLock()
-		_, hasPhoto = s.photosByID[queryID]
-		s.mu.RUnlock()
-		if !hasPhoto {
+	if s.catalog == nil {
+		return RecommendationResponse{}, fmt.Errorf("catalog is not available")
+	}
+	photo, err := s.catalog.PhotoAt(ctx, albumID, photoIndex)
+	if err != nil {
+		if errors.Is(err, catalog.ErrPhotoNotFound) {
 			return RecommendationResponse{}, fmt.Errorf("%w: %s:%d", ErrPhotoNotFound, albumID, photoIndex)
 		}
+		return RecommendationResponse{}, err
+	}
+
+	query, failed := s.queryVector(ctx, photo.Hash)
+	if failed || len(query) == 0 {
+		return RecommendationResponse{Items: []RecommendationItem{}}, nil
 	}
 
 	s.mu.RLock()
-	if _, failed := s.failedByID[queryID]; failed {
-		s.mu.RUnlock()
-		return RecommendationResponse{Items: []RecommendationItem{}}, nil
-	}
-	queryEmbedding, ok := s.embeddingsByID[queryID]
-	if !ok || len(queryEmbedding.Vector) == 0 {
-		s.mu.RUnlock()
-		return RecommendationResponse{Items: []RecommendationItem{}}, nil
-	}
-
-	// Recommendations are cross-album only.
-	exclude := map[string]struct{}{queryID: {}}
-	neighbors := findNeighbors(s.embeddingsByID, queryEmbedding.Vector, len(s.embeddingsByID), exclude)
+	neighbors := findNeighbors(s.embeddingsByHash, query, len(s.embeddingsByHash), photo.Hash)
 	items := make([]RecommendationItem, 0, limit)
 	seenAlbumIDs := make(map[string]struct{}, limit)
-	for _, n := range neighbors {
-		photo, ok := s.photosByID[n.ImageID]
-		if !ok {
-			continue
+	for _, neighbor := range neighbors {
+		for _, ref := range s.photosByHash[neighbor.Hash] {
+			// Recommendations are cross-album only.
+			if ref.AlbumID == albumID {
+				continue
+			}
+			if _, seen := seenAlbumIDs[ref.AlbumID]; seen {
+				continue
+			}
+			seenAlbumIDs[ref.AlbumID] = struct{}{}
+			items = append(items, RecommendationItem{
+				AlbumID: ref.AlbumID,
+				I:       ref.Index,
+				W:       ref.Width,
+				H:       ref.Height,
+				Score:   neighbor.Score,
+			})
+			break
 		}
-		if photo.AlbumID == albumID {
-			continue
-		}
-		if _, seen := seenAlbumIDs[photo.AlbumID]; seen {
-			continue
-		}
-		seenAlbumIDs[photo.AlbumID] = struct{}{}
-		items = append(items, RecommendationItem{
-			AlbumID: photo.AlbumID,
-			I:       photo.PhotoIndex,
-			W:       photo.Width,
-			H:       photo.Height,
-			Score:   n.Score,
-		})
 		if len(items) >= limit {
 			break
 		}
@@ -667,82 +403,40 @@ func (s *Service) Recommend(ctx context.Context, albumID string, photoIndex int,
 	return RecommendationResponse{Items: items}, nil
 }
 
-func (s *Service) ensureIndexesLocked() {
-	if s.photosByID == nil {
-		s.photosByID = make(map[string]PhotoRecord)
+// queryVector returns a normalized embedding for a hash, falling back to the
+// catalog when the in-memory index has not seen it yet.
+func (s *Service) queryVector(ctx context.Context, hash string) ([]float32, bool) {
+	s.mu.RLock()
+	if _, failed := s.failedByHash[hash]; failed {
+		s.mu.RUnlock()
+		return nil, true
 	}
-	if s.photoIDsByAlbum == nil {
-		s.photoIDsByAlbum = make(map[string]map[string]struct{})
+	if vector, ok := s.embeddingsByHash[hash]; ok {
+		s.mu.RUnlock()
+		return vector, false
 	}
-	if s.embeddingsByID == nil {
-		s.embeddingsByID = make(map[string]EmbeddingRecord)
+	s.mu.RUnlock()
+
+	blob, err := s.catalog.GetBlob(ctx, hash)
+	if err != nil {
+		return nil, false
 	}
-	if s.failedByID == nil {
-		s.failedByID = make(map[string]string)
-	}
-	if s.processFailedByID == nil {
-		s.processFailedByID = make(map[string]string)
-	}
-	if s.missingByAlbum == nil {
-		s.missingByAlbum = make(map[string]map[int]struct{})
-	}
-	if s.albumsWithMissing == nil {
-		s.albumsWithMissing = make([]string, 0)
-	}
-	if s.albumMissingPos == nil {
-		s.albumMissingPos = make(map[string]int)
-		if len(s.albumsWithMissing) > 0 {
-			for idx, albumID := range s.albumsWithMissing {
-				s.albumMissingPos[albumID] = idx
-			}
+	switch blob.EmbeddingStatus {
+	case catalog.EmbeddingStatusFailed:
+		s.mu.Lock()
+		s.failedByHash[hash] = blob.EmbeddingError
+		s.mu.Unlock()
+		return nil, true
+	case catalog.EmbeddingStatusReady:
+		if len(blob.Embedding) == 0 {
+			return nil, false
 		}
+		normalized := normalizeVector(blob.Embedding)
+		s.mu.Lock()
+		s.embeddingsByHash[hash] = normalized
+		s.mu.Unlock()
+		return normalized, false
+	default:
+		return nil, false
 	}
-	if len(s.albumMissingPos) == 0 {
-		if len(s.albumsWithMissing) > 0 {
-			for idx, albumID := range s.albumsWithMissing {
-				s.albumMissingPos[albumID] = idx
-			}
-		} else {
-			for albumID, missing := range s.missingByAlbum {
-				if len(missing) == 0 {
-					continue
-				}
-				s.albumMissingPos[albumID] = len(s.albumsWithMissing)
-				s.albumsWithMissing = append(s.albumsWithMissing, albumID)
-			}
-		}
-	}
-}
-
-func (s *Service) setMissingForAlbumLocked(albumID string, missing map[int]struct{}) {
-	if missing == nil {
-		missing = make(map[int]struct{})
-	}
-	s.missingByAlbum[albumID] = missing
-	if len(missing) > 0 {
-		s.addAlbumWithMissingLocked(albumID)
-	} else {
-		s.removeAlbumWithMissingLocked(albumID)
-	}
-}
-
-func (s *Service) addAlbumWithMissingLocked(albumID string) {
-	if _, ok := s.albumMissingPos[albumID]; ok {
-		return
-	}
-	s.albumMissingPos[albumID] = len(s.albumsWithMissing)
-	s.albumsWithMissing = append(s.albumsWithMissing, albumID)
-}
-
-func (s *Service) removeAlbumWithMissingLocked(albumID string) {
-	pos, ok := s.albumMissingPos[albumID]
-	if !ok {
-		return
-	}
-	lastIdx := len(s.albumsWithMissing) - 1
-	lastAlbumID := s.albumsWithMissing[lastIdx]
-	s.albumsWithMissing[pos] = lastAlbumID
-	s.albumMissingPos[lastAlbumID] = pos
-	s.albumsWithMissing = s.albumsWithMissing[:lastIdx]
-	delete(s.albumMissingPos, albumID)
 }

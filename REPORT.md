@@ -1,5 +1,13 @@
 # Chunk Size Experiment Report for `/feed` Wall Flow
 
+> **Historical note.** This report documents the S3 *range-read* cache that was
+> used when images were served by seeking inside the per-album `source.zip`.
+> That design has been replaced: uploads are now unpacked into
+> content-addressed `blobs/<sha256>` objects and all metadata lives in the local
+> SQLite catalog (see `README.md` and `NOTES.md`). `internal/rangecache` and the
+> `RANGE_CHUNK_SIZE_BYTES` tuning knob no longer exist, so the findings below are
+> kept only as a record of the earlier approach.
+
 ## 1. Goal
 Find a better S3 range-cache chunk size for the wall experience driven by `/api/feed` and follow-up `/api/image/...` loads.  
 Current baseline was `1 MiB` (`1048576` bytes).
