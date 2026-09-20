@@ -104,6 +104,30 @@ are cross-album only: photos from the same album as the query are excluded from
 results. If no cross-album neighbors exist for an embedded query photo,
 recommendations return an empty `items` list.
 
+### Embedding progress
+
+Indexing and embedding are two stages, and the album status only covers the
+first: an album is `SUCCEEDED` while its embeddings may still be running. Both
+stages are reported:
+
+- `GET /api/albums/<albumId>/finalize` carries an `embedding` object covering
+  that album's distinct blobs, so the upload page can show an album that is
+  indexed but not yet fully embedded.
+- `GET /api/embedding` reports the same shape for the whole catalog; the wall
+  polls it and shows an `Embedding <ready>/<total>` indicator while work is
+  left.
+
+```json
+{"enabled":true,"active":true,"total":300,"ready":181,"failed":2,"pending":117,"ratio":0.603333}
+```
+
+`enabled` is false when no checkpoint is loaded. Nothing is embedding then and
+nothing ever will be, so a client stops waiting instead of showing a bar that
+cannot move; the blobs simply stay `pending` until a deployment with a model
+picks them up. `failed` images are terminal — the retry worker skips them — so
+`ratio` reaches 1 only when nothing is pending, and a failure is visible as
+`ready + failed == total` instead of a bar that never fills.
+
 Docker:
 - `runtime` (default `docker build .`) is self-contained: the Go viewer, frontend
   assets, and the prefetched SigLIP2 checkpoint at `/app/siglip2`.
@@ -147,6 +171,20 @@ difference below `1e-4`, cosine above `0.9995`). The test is skipped unless
 
 ## Observability
 - The server logs to stdout/stderr via Go's standard logger.
+- Embedding is reported as it happens. The background workers log
+  `recommend: embedding run started pending=<n> ready=<n> total=<n>`, one
+  `recommend: embedded blob=<sha256> bytes=<n> dim=768 elapsed=<d>` line per
+  image, a `recommend: embedding progress ready=<n>/<n> pending=<n> failed=<n>`
+  line every 25 images, and finally
+  `recommend: embedding run finished embedded=<n> ready=<n>/<n> pending=<n> failed=<n> duration=<d> avg=<d>`.
+  A drain that keeps finding work stays one run, so the summaries mark real
+  start and end points rather than one per batch.
+- Ingest-time embeddings, which the pipeline computes inline, log
+  `pipeline: album=<id> extracting entries=<n>`, then
+  `pipeline: album=<id> blob=<sha256> embedded bytes=<n> dim=768 elapsed=<d>`
+  per image, and end with
+  `pipeline: album=<id> ready photos=<n> embedded=<n> pending=<n> failed=<n>`, so
+  an album that could not be embedded says so on its own line.
 - Startup warmup loads the SQLite catalog into the recommendation index, scans the `batch/` prefix, and enqueues any album whose staged zip is still waiting; the embedding workers start once warmup finishes.
 - `/metrics` exposes `viewer_embedding_images_total`, `viewer_embedding_images_ready`, `viewer_embedding_images_failed`, `viewer_embedding_images_pending` and `viewer_embedding_progress_ratio`, computed from the blob embedding statuses in the SQLite catalog.
 - Requests that end in a 5xx are logged with the method, path, raw query, request ID (Chi request ID middleware), remote address and the internal error message; the JSON error body carries the code and message.

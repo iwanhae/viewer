@@ -1,9 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { createAlbum, fetchFinalizeStatus, finalizeAlbum, uploadAlbumObject } from '../api/client'
+import type { EmbeddingProgress } from '../api/types'
+import { useEmbeddingProgress } from '../hooks/useEmbeddingProgress'
 import { formatBytes } from '../utils/format'
 
-type UploadStatus = 'uploading' | 'submitted' | 'ready' | 'failed' | 'canceled'
+type UploadStatus = 'uploading' | 'submitted' | 'embedding' | 'ready' | 'failed' | 'canceled'
 const uploadWorkerCount = 3
 const finalizePollIntervalMs = 2000
 const finalizePollTimeoutMs = 30 * 60 * 1000
@@ -16,7 +18,20 @@ type UploadItem = {
   status: UploadStatus
   uploadedBytes: number
   albumId?: string
+  embedding?: EmbeddingProgress
   error?: string
+}
+
+// isEmbeddingPending reports whether the server still has images of this album
+// to embed. A disabled embedder means the counts will never move, so there is
+// nothing to wait for.
+function isEmbeddingPending(progress?: EmbeddingProgress): boolean {
+  return progress !== undefined && progress.enabled && progress.pending > 0
+}
+
+function embeddingPercent(progress?: EmbeddingProgress): number {
+  if (!progress || progress.total <= 0) return 0
+  return Math.min(100, Math.round((progress.ready / progress.total) * 100))
 }
 
 function nextItemID(): string {
@@ -79,6 +94,8 @@ function statusLabel(status: UploadStatus): string {
       return 'Uploading'
     case 'submitted':
       return 'Submitted'
+    case 'embedding':
+      return 'Embedding'
     case 'ready':
       return 'Ready'
     case 'failed':
@@ -100,6 +117,7 @@ export function UploadPage() {
 
   const [items, setItems] = useState<UploadItem[]>([])
   const [pageError, setPageError] = useState<string | null>(null)
+  const embedding = useEmbeddingProgress()
 
   const updateItem = useCallback((itemID: string, next: Partial<UploadItem>) => {
     setItems((prev) => {
@@ -140,18 +158,26 @@ export function UploadPage() {
         updateItem(item.id, { status: 'submitted', error: undefined })
 
         // Indexing runs in the background pipeline: keep polling until the
-        // album succeeds or fails. A deadline leaves the item submitted
-        // rather than falsely reporting a failure.
+        // album succeeds or fails. Embedding is a second, slower stage that
+        // continues after the album is indexed, so an indexed album stays
+        // "embedding" until the server reports nothing left pending. A deadline
+        // leaves the item submitted rather than falsely reporting a failure.
         const deadline = Date.now() + finalizePollTimeoutMs
         for (;;) {
           const state = await fetchFinalizeStatus(albumID, { signal: controller.signal })
-          if (state.status === 'SUCCEEDED') {
-            updateItem(item.id, { status: 'ready', error: undefined })
-            return
-          }
           if (state.status === 'FAILED') {
             updateItem(item.id, { status: 'failed', error: state.error })
             return
+          }
+          if (state.status === 'SUCCEEDED') {
+            if (isEmbeddingPending(state.embedding)) {
+              updateItem(item.id, { status: 'embedding', embedding: state.embedding, error: undefined })
+            } else {
+              updateItem(item.id, { status: 'ready', embedding: state.embedding, error: undefined })
+              return
+            }
+          } else if (state.embedding) {
+            updateItem(item.id, { embedding: state.embedding })
           }
           if (Date.now() >= deadline) {
             return
@@ -387,6 +413,12 @@ export function UploadPage() {
           <p>
             {formatBytes(summary.uploadedBytes)} / {formatBytes(summary.totalBytes)} ({summary.progressPct}%)
           </p>
+          {embedding && embedding.enabled && embedding.pending > 0 && (
+            <p data-testid="upload-embedding-summary">
+              Embedding {embedding.ready}/{embedding.total} images ({Math.round(embedding.ratio * 100)}%)
+              {embedding.failed > 0 ? `, ${embedding.failed} failed` : ''}
+            </p>
+          )}
           <p>Use Find albums to open albums once indexing is complete.</p>
         </section>
 
@@ -411,7 +443,28 @@ export function UploadPage() {
                 </div>
                 <p className="upload-item-meta">
                   {formatBytes(item.sizeBytes)} | {pct}% uploaded
+                  {item.embedding && item.embedding.enabled && item.embedding.total > 0
+                    ? ` | embedded ${item.embedding.ready}/${item.embedding.total}${
+                        item.embedding.failed > 0 ? `, ${item.embedding.failed} failed` : ''
+                      }`
+                    : ''}
+                  {item.embedding && !item.embedding.enabled && item.embedding.pending > 0
+                    ? ' | embeddings unavailable on this server'
+                    : ''}
                 </p>
+                {item.status === 'embedding' && (
+                  <div
+                    className="progress"
+                    data-testid="upload-embedding-progress"
+                    role="progressbar"
+                    aria-label="Embedding progress"
+                    aria-valuemin={0}
+                    aria-valuemax={item.embedding?.total ?? 0}
+                    aria-valuenow={item.embedding?.ready ?? 0}
+                  >
+                    <div className="progress-bar" style={{ width: `${embeddingPercent(item.embedding)}%` }} />
+                  </div>
+                )}
                 {item.error && <p className="upload-item-error">{item.error}</p>}
                 <div className="upload-item-actions">
                   {item.status === 'uploading' && (

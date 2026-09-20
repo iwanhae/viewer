@@ -23,6 +23,12 @@ const (
 	// embeddingTimeout bounds one image's preprocessing plus inference.
 	embeddingTimeout = 5 * time.Minute
 
+	// embeddingProgressEvery is how many images the background worker embeds
+	// between two progress lines. Every image logs its own completion; this
+	// only controls the extra "how far along are we" line, which costs one
+	// catalog count, so it stays coarse.
+	embeddingProgressEvery = 25
+
 	// defaultTopK and maxTopK bound recommendation result sizes.
 	defaultTopK = 12
 	maxTopK     = 48
@@ -47,6 +53,16 @@ type Service struct {
 	// marking them failed.
 	modelMu  sync.Mutex
 	modelErr error
+
+	// runMu guards the live state behind Progress: how many forward passes are
+	// in flight, and how the current background drain is going. The catalog
+	// stays the source of truth for the counts; these fields describe only what
+	// is happening right now.
+	runMu        sync.Mutex
+	activeEmbeds int
+	runActive    bool
+	runStartedAt time.Time
+	runEmbedded  int
 
 	mu               sync.RWMutex
 	photosByHash     map[string][]photoRef
@@ -119,7 +135,22 @@ func (s *Service) Embed(ctx context.Context, imageBytes []byte) ([]float32, erro
 	}
 	embedCtx, cancel := context.WithTimeout(ctx, embeddingTimeout)
 	defer cancel()
-	return s.embedder.Embed(embedCtx, imageBytes)
+	return s.computeEmbedding(embedCtx, imageBytes)
+}
+
+// computeEmbedding runs one forward pass and keeps the live "embedding is
+// happening now" state current for both the ingest pipeline and the background
+// worker.
+func (s *Service) computeEmbedding(ctx context.Context, imageBytes []byte) ([]float32, error) {
+	s.runMu.Lock()
+	s.activeEmbeds++
+	s.runMu.Unlock()
+	defer func() {
+		s.runMu.Lock()
+		s.activeEmbeds--
+		s.runMu.Unlock()
+	}()
+	return s.embedder.Embed(ctx, imageBytes)
 }
 
 // LoadAll rebuilds the in-memory index from the SQLite catalog.
@@ -245,6 +276,7 @@ func (s *Service) workerLoop(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
+			s.finishEmbeddingRun()
 			return
 		case <-idleTicker.C:
 		}
@@ -256,7 +288,12 @@ func (s *Service) workerLoop(ctx context.Context) {
 		if err != nil {
 			continue
 		}
-		for _, blob := range blobs {
+		if len(blobs) == 0 {
+			s.finishEmbeddingRun()
+			continue
+		}
+		s.beginEmbeddingRun(len(blobs))
+		for i, blob := range blobs {
 			if ctx.Err() != nil {
 				return
 			}
@@ -268,7 +305,118 @@ func (s *Service) workerLoop(ctx context.Context) {
 				case <-time.After(2 * time.Second):
 				}
 			}
+			if (i+1)%embeddingProgressEvery == 0 {
+				s.logEmbeddingProgress()
+			}
 		}
+	}
+}
+
+// beginEmbeddingRun opens the log record for one drain of the pending queue.
+// Repeated calls while a drain is already open are ignored, so a batch that is
+// followed by another batch stays one run.
+func (s *Service) beginEmbeddingRun(batch int) {
+	s.runMu.Lock()
+	if s.runActive {
+		s.runMu.Unlock()
+		return
+	}
+	s.runActive = true
+	s.runStartedAt = time.Now()
+	s.runEmbedded = 0
+	s.runMu.Unlock()
+
+	progress := s.EmbeddingProgress()
+	log.Printf(
+		"recommend: embedding run started pending=%d ready=%d total=%d batch=%d",
+		progress.Pending, progress.Ready, progress.Total, batch,
+	)
+}
+
+// finishEmbeddingRun closes the record opened by beginEmbeddingRun. It is
+// called on every idle tick and logs nothing unless a drain was in progress.
+func (s *Service) finishEmbeddingRun() {
+	s.runMu.Lock()
+	if !s.runActive {
+		s.runMu.Unlock()
+		return
+	}
+	embedded := s.runEmbedded
+	startedAt := s.runStartedAt
+	s.runActive = false
+	s.runMu.Unlock()
+
+	progress := s.EmbeddingProgress()
+	duration := time.Since(startedAt)
+	average := time.Duration(0)
+	if embedded > 0 {
+		average = duration / time.Duration(embedded)
+	}
+	log.Printf(
+		"recommend: embedding run finished embedded=%d ready=%d/%d pending=%d failed=%d duration=%s avg=%s",
+		embedded, progress.Ready, progress.Total, progress.Pending, progress.Failed,
+		duration.Round(time.Millisecond), average.Round(time.Millisecond),
+	)
+}
+
+// logEmbeddingProgress reports how far a long drain has come. The counts come
+// from the catalog, so the line stays correct while the ingest pipeline is
+// embedding images of its own at the same time.
+func (s *Service) logEmbeddingProgress() {
+	progress := s.EmbeddingProgress()
+	log.Printf(
+		"recommend: embedding progress ready=%d/%d pending=%d failed=%d",
+		progress.Ready, progress.Total, progress.Pending, progress.Failed,
+	)
+}
+
+// EmbeddingProgress reports embedding coverage across the whole catalog
+// together with whether anything is being embedded right now.
+func (s *Service) EmbeddingProgress() EmbeddingProgress {
+	if s == nil || s.catalog == nil {
+		return EmbeddingProgress{}
+	}
+	counts, err := s.catalog.EmbeddingCounts(context.Background())
+	if err != nil {
+		log.Printf("recommend: embedding counts failed: %v", err)
+		return EmbeddingProgress{}
+	}
+	return s.progressFrom(counts)
+}
+
+// AlbumEmbeddingProgress reports coverage for the distinct blobs one album
+// references, which is the progress a client uploading that album cares about.
+func (s *Service) AlbumEmbeddingProgress(ctx context.Context, albumID string) (EmbeddingProgress, error) {
+	if s == nil || s.catalog == nil || strings.TrimSpace(albumID) == "" {
+		return EmbeddingProgress{}, nil
+	}
+	counts, err := s.catalog.EmbeddingCountsByAlbum(ctx, albumID)
+	if err != nil {
+		return EmbeddingProgress{}, err
+	}
+	progress := s.progressFrom(counts)
+	progress.Active = false
+	return progress, nil
+}
+
+func (s *Service) progressFrom(counts catalog.EmbeddingCounts) EmbeddingProgress {
+	ratio := 0.0
+	if counts.Total > 0 {
+		ratio = float64(counts.Ready) / float64(counts.Total)
+	}
+
+	s.runMu.Lock()
+	active := s.activeEmbeds > 0
+	s.runMu.Unlock()
+
+	return EmbeddingProgress{
+		Enabled: s.Enabled(),
+		Active:  active,
+		Total:   counts.Total,
+		Ready:   counts.Ready,
+		Failed:  counts.Failed,
+		Pending: counts.Pending,
+		Ratio:   ratio,
 	}
 }
 
@@ -282,7 +430,8 @@ func (s *Service) embedBlob(ctx context.Context, hash string) bool {
 		return false
 	}
 
-	vector, err := s.embedder.Embed(ctx, result.Bytes)
+	startedAt := time.Now()
+	vector, err := s.computeEmbedding(ctx, result.Bytes)
 	if err != nil {
 		if isTransientEmbedError(err) {
 			log.Printf("recommend: blob=%s embed transient failure: %v", hash, err)
@@ -301,6 +450,17 @@ func (s *Service) embedBlob(ctx context.Context, hash string) bool {
 	s.embeddingsByHash[hash] = normalizeVector(vector)
 	delete(s.failedByHash, hash)
 	s.mu.Unlock()
+
+	s.runMu.Lock()
+	if s.runActive {
+		s.runEmbedded++
+	}
+	s.runMu.Unlock()
+
+	log.Printf(
+		"recommend: embedded blob=%s bytes=%d dim=%d elapsed=%s",
+		hash, len(result.Bytes), len(vector), time.Since(startedAt).Round(time.Millisecond),
+	)
 	return false
 }
 
@@ -311,29 +471,6 @@ func (s *Service) markFailed(ctx context.Context, hash string, errText string) {
 	s.mu.Lock()
 	s.failedByHash[hash] = errText
 	s.mu.Unlock()
-}
-
-// EmbeddingProgress reports embedding coverage across distinct blobs.
-func (s *Service) EmbeddingProgress() EmbeddingProgress {
-	if s == nil || s.catalog == nil {
-		return EmbeddingProgress{}
-	}
-	counts, err := s.catalog.EmbeddingCounts(context.Background())
-	if err != nil {
-		log.Printf("recommend: embedding counts failed: %v", err)
-		return EmbeddingProgress{}
-	}
-	ratio := 0.0
-	if counts.Total > 0 {
-		ratio = float64(counts.Ready) / float64(counts.Total)
-	}
-	return EmbeddingProgress{
-		Total:   counts.Total,
-		Ready:   counts.Ready,
-		Failed:  counts.Failed,
-		Pending: counts.Pending,
-		Ratio:   ratio,
-	}
 }
 
 // Recommend returns cross-album neighbors of a query photo.

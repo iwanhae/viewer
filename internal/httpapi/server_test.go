@@ -151,12 +151,11 @@ func testFeedService() *feed.Service {
 	return feed.NewService(albums.NewService(nil, nil, nil))
 }
 
-func TestMetricsEndpointPrometheusPayload(t *testing.T) {
-	cat, err := catalog.Open(filepath.Join(t.TempDir(), "test.db"))
-	if err != nil {
-		t.Fatalf("open catalog: %v", err)
-	}
-	defer cat.Close()
+// seedEmbeddingFixture creates one ready album with three distinct blobs: one
+// embedded, one failed and one still pending, so every count is non-zero and
+// distinguishable.
+func seedEmbeddingFixture(t *testing.T, cat *catalog.Store) {
+	t.Helper()
 
 	ctx := context.Background()
 	if err := cat.CreateAlbum(ctx, catalog.Album{
@@ -185,6 +184,60 @@ func TestMetricsEndpointPrometheusPayload(t *testing.T) {
 	if err := cat.SetBlobEmbedding(ctx, "hash-b", catalog.EmbeddingStatusFailed, nil, "embed failed"); err != nil {
 		t.Fatalf("set failed embedding: %v", err)
 	}
+}
+
+func TestEmbeddingEndpointReportsCatalogCoverage(t *testing.T) {
+	cat, err := catalog.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	defer cat.Close()
+	seedEmbeddingFixture(t, cat)
+
+	// The provider is nil, so the counts are real but nothing can ever move
+	// them: a client has to be told that instead of waiting forever.
+	router := New(nil, nil, nil, recommend.NewService(cat, nil, nil)).Router()
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/embedding", nil))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d want=%d body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var progress recommend.EmbeddingProgress
+	if err := json.Unmarshal(rec.Body.Bytes(), &progress); err != nil {
+		t.Fatalf("decode progress: %v body=%s", err, rec.Body.String())
+	}
+	if progress.Enabled || progress.Active {
+		t.Fatalf("expected Enabled=false and Active=false without a provider: %+v", progress)
+	}
+	if progress.Total != 3 || progress.Ready != 1 || progress.Failed != 1 || progress.Pending != 1 {
+		t.Fatalf("progress=%+v want total=3 ready=1 failed=1 pending=1", progress)
+	}
+	if math.Abs(progress.Ratio-1.0/3.0) > 1e-6 {
+		t.Fatalf("ratio=%v want %v", progress.Ratio, 1.0/3.0)
+	}
+}
+
+func TestEmbeddingEndpointWithoutRecommendService(t *testing.T) {
+	router := New(nil, nil, nil, nil).Router()
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/embedding", nil))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d want=%d body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"enabled":false`) {
+		t.Fatalf("expected a disabled progress payload, got: %s", rec.Body.String())
+	}
+}
+
+func TestMetricsEndpointPrometheusPayload(t *testing.T) {
+	cat, err := catalog.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	defer cat.Close()
+	seedEmbeddingFixture(t, cat)
 
 	recommendService := recommend.NewService(cat, nil, nil)
 

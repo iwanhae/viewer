@@ -579,6 +579,27 @@ func (s *Store) EmbeddingCounts(ctx context.Context) (EmbeddingCounts, error) {
 	return counts, nil
 }
 
+// EmbeddingCountsByAlbum reports embedding coverage across the distinct blobs
+// one album references. A blob shared by several albums counts once per album,
+// which is what makes the per-album progress the upload page shows meaningful.
+func (s *Store) EmbeddingCountsByAlbum(ctx context.Context, albumID string) (EmbeddingCounts, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT
+			COUNT(*),
+			COALESCE(SUM(CASE WHEN b.embedding_status = ? THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN b.embedding_status = ? THEN 1 ELSE 0 END), 0)
+		FROM (SELECT DISTINCT hash FROM photos WHERE album_id = ?) p
+		JOIN blobs b ON b.hash = p.hash`,
+		string(EmbeddingStatusReady), string(EmbeddingStatusFailed), albumID)
+
+	var counts EmbeddingCounts
+	if err := row.Scan(&counts.Total, &counts.Ready, &counts.Failed); err != nil {
+		return EmbeddingCounts{}, fmt.Errorf("album embedding counts: %w", err)
+	}
+	counts.Pending = counts.Total - counts.Ready - counts.Failed
+	return counts, nil
+}
+
 // ListPhotoBlobPairs returns every photo joined with its blob. It is used to
 // rebuild the in-memory recommendation index at startup.
 func (s *Store) ListPhotoBlobPairs(ctx context.Context) ([]PhotoWithBlob, error) {

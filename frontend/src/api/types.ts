@@ -59,6 +59,20 @@ export type RecommendationResponse = {
 
 export type FinalizeStatus = 'QUEUED' | 'PROCESSING' | 'SUCCEEDED' | 'FAILED'
 
+// EmbeddingProgress is the embedding coverage of a set of images: the whole
+// catalog for the status endpoint, one album for a finalize response. ready to
+// total is not the same as done when enabled is false: nothing is embedding
+// then, and nothing ever will be.
+export type EmbeddingProgress = {
+  enabled: boolean
+  active: boolean
+  total: number
+  ready: number
+  failed: number
+  pending: number
+  ratio: number
+}
+
 export type FinalizeResponse = {
   albumId: string
   status: FinalizeStatus
@@ -66,4 +80,5 @@ export type FinalizeResponse = {
   createdAt?: string
   error?: string
   updatedAt: string
+  embedding?: EmbeddingProgress
 }

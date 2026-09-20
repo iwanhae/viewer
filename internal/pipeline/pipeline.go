@@ -26,6 +26,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	_ "golang.org/x/image/webp"
 	"viewer/internal/catalog"
@@ -216,7 +217,17 @@ func (s *Service) ProcessAlbum(ctx context.Context, albumID string) error {
 		s.opts.OnAlbumReady(albumID)
 	}
 
-	log.Printf("pipeline: album=%s ready photos=%d", albumID, photoCount)
+	// Embedding is not part of "ready": the model may be missing, and the
+	// background workers may still have to finish what this album left pending.
+	// Report both so the log line says which of the two happened.
+	if embedder, err := s.catalog.EmbeddingCountsByAlbum(ctx, albumID); err == nil {
+		log.Printf(
+			"pipeline: album=%s ready photos=%d embedded=%d pending=%d failed=%d",
+			albumID, photoCount, embedder.Ready, embedder.Pending, embedder.Failed,
+		)
+	} else {
+		log.Printf("pipeline: album=%s ready photos=%d embedding count failed: %v", albumID, photoCount, err)
+	}
 	return nil
 }
 
@@ -247,6 +258,7 @@ func (s *Service) extract(ctx context.Context, albumID string, sourceKey string)
 	}
 
 	entries := imageEntries(reader.File)
+	log.Printf("pipeline: album=%s extracting entries=%d", albumID, len(entries))
 
 	if err := s.catalog.DeletePhotos(ctx, albumID); err != nil {
 		return 0, err
@@ -400,6 +412,7 @@ func (s *Service) embed(ctx context.Context, albumID string, hash string, data [
 	if s.embedder == nil {
 		return
 	}
+	startedAt := time.Now()
 	vector, err := s.embedder.Embed(ctx, data)
 	if err != nil {
 		_ = s.catalog.SetBlobEmbedding(context.Background(), hash, catalog.EmbeddingStatusFailed, nil, err.Error())
@@ -408,7 +421,12 @@ func (s *Service) embed(ctx context.Context, albumID string, hash string, data [
 	}
 	if err := s.catalog.SetBlobEmbedding(ctx, hash, catalog.EmbeddingStatusReady, vector, ""); err != nil {
 		log.Printf("pipeline: album=%s blob=%s persist embedding failed: %v", albumID, hash, err)
+		return
 	}
+	log.Printf(
+		"pipeline: album=%s blob=%s embedded bytes=%d dim=%d elapsed=%s",
+		albumID, hash, len(data), len(vector), time.Since(startedAt).Round(time.Millisecond),
+	)
 }
 
 // imageEntries returns decodable image entries sorted the same way the legacy

@@ -330,17 +330,22 @@ body,
   color: #1f2933;
 }
 
+/* Progress bars are shared by the upload page's per-album embedding bar and
+   anything else that reports a fraction; they sit on light surfaces, not on
+   the photo overlay. */
 .progress {
   width: 100%;
-  height: 4px;
-  background: rgba(255, 255, 255, 0.2);
+  height: 6px;
   border-radius: 999px;
+  background: rgba(37, 99, 235, 0.16);
+  overflow: hidden;
 }
 
 .progress-bar {
   height: 100%;
   border-radius: 999px;
-  background: #dce5d6;
+  background: #2563eb;
+  transition: width 240ms ease;
 }
 
 .viewer-loading,
@@ -855,6 +860,11 @@ body,
 .upload-item-status-submitted {
   background: rgba(5, 150, 105, 0.16);
   color: #065f46;
+}
+
+.upload-item-status-embedding {
+  background: rgba(37, 99, 235, 0.16);
+  color: #1d4ed8;
 }
 
 .upload-item-status-failed,

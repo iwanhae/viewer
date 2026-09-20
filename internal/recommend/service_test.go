@@ -703,3 +703,94 @@ func TestFindNeighborsOrdersAndTieBreaksByHash(t *testing.T) {
 		t.Fatalf("empty embeddings result=%+v want empty", got)
 	}
 }
+
+// gateEmbedder is a provider that stays inside Embed until the test releases
+// it, which is what lets a test observe the in-flight state.
+type gateEmbedder struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func (g *gateEmbedder) Load(context.Context) error { return nil }
+
+func (g *gateEmbedder) Embed(ctx context.Context, _ []byte) ([]float32, error) {
+	close(g.started)
+	select {
+	case <-g.release:
+		return []float32{1, 0}, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func (g *gateEmbedder) Close() error { return nil }
+
+func TestEmbeddingProgressCountsAndEnabled(t *testing.T) {
+	cat := newTestCatalog(t)
+	seedAlbum(t, cat, "album-a",
+		catalog.Photo{Index: 0, Name: "a.jpg", Hash: "hash-shared"},
+		catalog.Photo{Index: 1, Name: "b.jpg", Hash: "hash-only-a"},
+	)
+	seedAlbum(t, cat, "album-b", catalog.Photo{Index: 0, Name: "a.jpg", Hash: "hash-shared"})
+	seedBlob(t, cat, "hash-shared")
+	seedBlob(t, cat, "hash-only-a")
+
+	if err := cat.SetBlobEmbedding(context.Background(), "hash-shared", catalog.EmbeddingStatusReady, []float32{1, 0}, ""); err != nil {
+		t.Fatalf("set ready embedding: %v", err)
+	}
+
+	// A service without a provider reports the coverage but says plainly that
+	// it cannot embed anything, which is what stops a client from waiting.
+	disabled := newTestService(t, cat, nil)
+	progress := disabled.EmbeddingProgress()
+	if progress.Enabled {
+		t.Fatalf("expected Enabled=false without a provider: %+v", progress)
+	}
+	if progress.Total != 2 || progress.Ready != 1 || progress.Pending != 1 || progress.Failed != 0 {
+		t.Fatalf("global progress=%+v want total=2 ready=1 pending=1 failed=0", progress)
+	}
+	if !approxEqual(progress.Ratio, 0.5) {
+		t.Fatalf("ratio=%v want 0.5", progress.Ratio)
+	}
+
+	enabled := newTestService(t, cat, &gateEmbedder{started: make(chan struct{}), release: make(chan struct{})})
+	if progress := enabled.EmbeddingProgress(); !progress.Enabled || progress.Active {
+		t.Fatalf("expected Enabled=true and Active=false while idle: %+v", progress)
+	}
+
+	albumB, err := enabled.AlbumEmbeddingProgress(context.Background(), "album-b")
+	if err != nil {
+		t.Fatalf("album progress: %v", err)
+	}
+	if !albumB.Enabled || albumB.Total != 1 || albumB.Ready != 1 || albumB.Pending != 0 || !approxEqual(albumB.Ratio, 1) {
+		t.Fatalf("album-b progress=%+v want enabled total=1 ready=1 pending=0 ratio=1", albumB)
+	}
+	if albumB.Active {
+		t.Fatalf("a per-album view must not claim the worker's in-flight state: %+v", albumB)
+	}
+}
+
+func TestEmbeddingProgressReportsActiveWhileEmbedding(t *testing.T) {
+	cat := newTestCatalog(t)
+	gate := &gateEmbedder{started: make(chan struct{}), release: make(chan struct{})}
+	svc := newTestService(t, cat, gate)
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := svc.Embed(context.Background(), []byte("image"))
+		done <- err
+	}()
+
+	<-gate.started
+	if progress := svc.EmbeddingProgress(); !progress.Active {
+		t.Fatalf("expected Active while a forward pass is in flight: %+v", progress)
+	}
+
+	close(gate.release)
+	if err := <-done; err != nil {
+		t.Fatalf("embed: %v", err)
+	}
+	if progress := svc.EmbeddingProgress(); progress.Active {
+		t.Fatalf("expected Active=false once the pass finished: %+v", progress)
+	}
+}

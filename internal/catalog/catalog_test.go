@@ -434,3 +434,69 @@ func seedReadyAlbum(t *testing.T, store *Store, albumID string) {
 		t.Fatalf("create album %s: %v", albumID, err)
 	}
 }
+
+func TestEmbeddingCountsByAlbumCountsSharedBlobsPerAlbum(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	defer store.Close()
+
+	seedReadyAlbum(t, store, "album-a")
+	seedReadyAlbum(t, store, "album-b")
+
+	// The two albums share one blob, so the global count is smaller than the
+	// sum of the per-album counts. Per-album progress has to count the shared
+	// blob for both, because both albums are waiting for it.
+	photos := []Photo{
+		{AlbumID: "album-a", Index: 0, Name: "a.jpg", Hash: "hash-shared", Width: 4, Height: 2, Ratio: 2},
+		{AlbumID: "album-a", Index: 1, Name: "b.jpg", Hash: "hash-only-a", Width: 4, Height: 2, Ratio: 2},
+		{AlbumID: "album-b", Index: 0, Name: "a.jpg", Hash: "hash-shared", Width: 4, Height: 2, Ratio: 2},
+	}
+	for _, photo := range photos {
+		if err := store.InsertPhoto(ctx, photo); err != nil {
+			t.Fatalf("insert photo %s:%d: %v", photo.AlbumID, photo.Index, err)
+		}
+	}
+	for _, hash := range []string{"hash-shared", "hash-only-a"} {
+		if err := store.UpsertBlob(ctx, Blob{Hash: hash, SizeBytes: 1}); err != nil {
+			t.Fatalf("upsert blob %s: %v", hash, err)
+		}
+	}
+	if err := store.SetBlobEmbedding(ctx, "hash-shared", EmbeddingStatusReady, []float32{1, 0}, ""); err != nil {
+		t.Fatalf("set embedding: %v", err)
+	}
+
+	global, err := store.EmbeddingCounts(ctx)
+	if err != nil {
+		t.Fatalf("global counts: %v", err)
+	}
+	if global.Total != 2 || global.Ready != 1 || global.Pending != 1 {
+		t.Fatalf("global counts=%+v want total=2 ready=1 pending=1", global)
+	}
+
+	albumA, err := store.EmbeddingCountsByAlbum(ctx, "album-a")
+	if err != nil {
+		t.Fatalf("album-a counts: %v", err)
+	}
+	if albumA.Total != 2 || albumA.Ready != 1 || albumA.Pending != 1 || albumA.Failed != 0 {
+		t.Fatalf("album-a counts=%+v want total=2 ready=1 pending=1 failed=0", albumA)
+	}
+
+	albumB, err := store.EmbeddingCountsByAlbum(ctx, "album-b")
+	if err != nil {
+		t.Fatalf("album-b counts: %v", err)
+	}
+	if albumB.Total != 1 || albumB.Ready != 1 || albumB.Pending != 0 {
+		t.Fatalf("album-b counts=%+v want total=1 ready=1 pending=0", albumB)
+	}
+
+	empty, err := store.EmbeddingCountsByAlbum(ctx, "album-missing")
+	if err != nil {
+		t.Fatalf("missing album counts: %v", err)
+	}
+	if empty.Total != 0 || empty.Pending != 0 {
+		t.Fatalf("missing album counts=%+v want all zero", empty)
+	}
+}

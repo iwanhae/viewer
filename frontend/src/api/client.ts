@@ -3,6 +3,7 @@ import { ensureOK, requestJSON } from './http'
 import type {
   AlbumIndex,
   AlbumSearchResponse,
+  EmbeddingProgress,
   FeedMode,
   FeedResponse,
   FinalizeResponse,
@@ -15,6 +16,7 @@ export type {
   AlbumIndex,
   AlbumSearchItem,
   AlbumSearchResponse,
+  EmbeddingProgress,
   FeedMode,
   FeedItem,
   FeedResponse,
@@ -104,6 +106,12 @@ export async function fetchFinalizeStatus(
   return await requestJSON<FinalizeResponse>(`/api/albums/${albumId}/finalize`, {
     signal: options?.signal,
   })
+}
+
+// fetchEmbeddingStatus reports how many images have embeddings, across every
+// album. It is the global view behind the wall's embedding indicator.
+export async function fetchEmbeddingStatus(options?: { signal?: AbortSignal }): Promise<EmbeddingProgress> {
+  return await requestJSON<EmbeddingProgress>('/api/embedding', { signal: options?.signal })
 }
 
 export async function fetchAlbum(albumId: string, options?: { signal?: AbortSignal }): Promise<AlbumIndex> {

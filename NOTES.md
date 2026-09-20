@@ -62,6 +62,15 @@ Album status is persisted as `QUEUED` / `PROCESSING` / `SUCCEEDED` / `FAILED`
 `ready` / `failed`. Opening the catalog rewrites the pre-merge `PENDING` and
 `READY` album rows, so an existing database keeps working.
 
+The two statuses are independent and the API keeps them that way: an album is
+`SUCCEEDED` once its zip has been extracted, which says nothing about whether
+its blobs have embeddings. Embedding coverage is reported separately, by
+`catalog.EmbeddingCounts` (every blob) and `catalog.EmbeddingCountsByAlbum` (the
+distinct blobs of one album, so a blob shared by two albums counts for both).
+A blob that is `failed` is terminal — `ListBlobsAwaitingEmbedding` selects only
+`pending` rows — which is why the progress payload reports `failed` next to
+`ready` rather than folding it into a single percentage.
+
 ## Decisions and why
 
 - **Blobs are content-addressed by the raw bytes.** `blobs/<sha256>` means
