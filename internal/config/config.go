@@ -20,6 +20,8 @@ type Config struct {
 	MaxUploadBytes         int64
 	CacheDir               string
 	ZipCacheDir            string
+	DBPath                 string
+	IngestDeleteSource     bool
 	WarmupFetchConcurrency int
 	RecoTopKDefault        int
 	RecoTopKMax            int
@@ -36,6 +38,7 @@ func Load() (Config, error) {
 	maxUploadBytes := getenvInt64("MAX_UPLOAD_BYTES", 1024*1024*1024)
 	cacheDir := getenv("CACHE_DIR", ".cache/images")
 	zipCacheDir := getenv("ZIP_CACHE_DIR", ".cache/zips")
+	dbPath := getenv("DB_PATH", ".cache/viewer.db")
 	recommenderEndpoint := os.Getenv("RECOMMENDER_ENDPOINT")
 
 	cfg := Config{
@@ -50,6 +53,8 @@ func Load() (Config, error) {
 		MaxUploadBytes:         maxUploadBytes,
 		CacheDir:               cacheDir,
 		ZipCacheDir:            zipCacheDir,
+		DBPath:                 dbPath,
+		IngestDeleteSource:     getenvBool("INGEST_DELETE_SOURCE", true),
 		WarmupFetchConcurrency: getenvInt("WARMUP_FETCH_CONCURRENCY", 0),
 		RecoTopKDefault:        getenvInt("RECO_TOPK_DEFAULT", 12),
 		RecoTopKMax:            getenvInt("RECO_TOPK_MAX", 48),

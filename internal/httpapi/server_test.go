@@ -8,12 +8,14 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/go-chi/chi/v5"
 	"viewer/internal/albums"
+	"viewer/internal/catalog"
 	cfgpkg "viewer/internal/config"
 	"viewer/internal/feed"
 	"viewer/internal/models"
@@ -151,29 +153,51 @@ func testFeedService() *feed.Service {
 }
 
 func TestMetricsEndpointPrometheusPayload(t *testing.T) {
+	cat, err := catalog.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	defer cat.Close()
+
+	ctx := context.Background()
+	if err := cat.CreateAlbum(ctx, catalog.Album{
+		ID:               "album-a",
+		OriginalFilename: "album-a.zip",
+		Status:           catalog.AlbumStatusReady,
+	}); err != nil {
+		t.Fatalf("create album: %v", err)
+	}
+	photos := []catalog.Photo{
+		{AlbumID: "album-a", Index: 0, Name: "a.jpg", Hash: "hash-a", Width: 10, Height: 10, Ratio: 1},
+		{AlbumID: "album-a", Index: 1, Name: "b.jpg", Hash: "hash-b", Width: 10, Height: 10, Ratio: 1},
+		{AlbumID: "album-a", Index: 2, Name: "c.jpg", Hash: "hash-c", Width: 10, Height: 10, Ratio: 1},
+	}
+	for _, photo := range photos {
+		if err := cat.InsertPhoto(ctx, photo); err != nil {
+			t.Fatalf("insert photo: %v", err)
+		}
+		if err := cat.UpsertBlob(ctx, catalog.Blob{Hash: photo.Hash, SizeBytes: 1}); err != nil {
+			t.Fatalf("upsert blob: %v", err)
+		}
+	}
+	if err := cat.SetBlobEmbedding(ctx, "hash-a", catalog.EmbeddingStatusReady, []float32{1, 2, 3}, ""); err != nil {
+		t.Fatalf("set ready embedding: %v", err)
+	}
+	if err := cat.SetBlobEmbedding(ctx, "hash-b", catalog.EmbeddingStatusFailed, nil, "embed failed"); err != nil {
+		t.Fatalf("set failed embedding: %v", err)
+	}
+
 	recommendService, err := recommend.NewService(
 		cfgpkg.Config{
 			RecommenderEndpoint:   "http://127.0.0.1:18081",
 			RecommenderTimeoutSec: 1,
 		},
-		nil,
+		cat,
 		nil,
 	)
 	if err != nil {
 		t.Fatalf("new recommend service: %v", err)
 	}
-	recommendService.IngestAlbumIndex(models.AlbumIndex{
-		AlbumID: "album-a",
-		Photos: []models.PhotoMeta{
-			{I: 0, Name: "a.jpg"},
-			{I: 1, Name: "b.jpg"},
-			{I: 2, Name: "c.jpg"},
-		},
-		Embeddings: map[string]models.PhotoEmbedding{
-			"0": {Status: "ready", Vector: []float32{1, 2, 3}},
-			"1": {Status: "failed", Error: "embed failed"},
-		},
-	})
 
 	router := New(nil, nil, nil, recommendService).Router()
 	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)

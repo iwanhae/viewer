@@ -20,7 +20,6 @@ import (
 	cfgpkg "viewer/internal/config"
 	"viewer/internal/feed"
 	"viewer/internal/images"
-	"viewer/internal/models"
 	"viewer/internal/recommend"
 	"viewer/internal/storage"
 	"viewer/internal/web"
@@ -356,41 +355,33 @@ func parseOptionalIntQuery(r *http.Request, key string, defaultValue int, min in
 	return value, nil
 }
 
-func Warmup(ctx context.Context, albumsService *albums.Service, recommendService *recommend.Service, store *storage.S3Store, indexer *albums.Indexer, cfg cfgpkg.Config) {
+func Warmup(ctx context.Context, albumsService *albums.Service, recommendService *recommend.Service, store *storage.S3Store, cfg cfgpkg.Config) {
 	startedAt := time.Now()
-	log.Printf("album cache warmup started")
+	log.Printf("catalog warmup started")
 
-	summary, err := albumsService.RefreshFromStorage(ctx, func(idx models.AlbumIndex) {
-		if recommendService != nil {
-			recommendService.IngestAlbumIndex(idx)
+	if recommendService != nil {
+		if err := recommendService.LoadAll(ctx); err != nil {
+			log.Printf("recommendation index warmup failed: %v", err)
 		}
-	})
-	if err != nil {
-		log.Printf("album cache warmup skipped: %v", err)
-		return
 	}
 
 	log.Printf(
-		"album cache warmup finished discovered=%d loaded=%d failed=%d duration=%s",
-		summary.Discovered,
-		summary.Loaded,
-		summary.Failed,
+		"catalog warmup finished duration=%s",
 		time.Since(startedAt).Round(time.Millisecond),
 	)
 
 	if cfg.BatchIngestEnabled {
 		batchStartedAt := time.Now()
 		log.Printf("batch ingest scan started")
-		ingestSummary, err := batchingest.Run(ctx, store, indexer, batchingest.RunOptions{})
+		ingestSummary, err := batchingest.Run(ctx, store, albumsService, batchingest.RunOptions{})
 		if err != nil {
 			log.Printf("batch ingest scan skipped: %v", err)
 		} else {
 			log.Printf(
-				"batch ingest scan finished discovered=%d moved=%d deduped=%d deleted_failed=%d errors=%d duration=%s",
+				"batch ingest scan finished discovered=%d staged=%d deduped=%d errors=%d duration=%s",
 				ingestSummary.Discovered,
 				ingestSummary.Moved,
 				ingestSummary.Deduped,
-				ingestSummary.DeletedFailed,
 				ingestSummary.Errors,
 				time.Since(batchStartedAt).Round(time.Millisecond),
 			)
@@ -400,21 +391,15 @@ func Warmup(ctx context.Context, albumsService *albums.Service, recommendService
 	}
 
 	pendingStartedAt := time.Now()
-	log.Printf("pending upload finalize scan started")
-	pendingSummary, err := albumsService.QueuePendingFinalizations(ctx)
+	log.Printf("pending upload enqueue scan started")
+	enqueued, err := albumsService.EnqueuePending(ctx)
 	if err != nil {
-		log.Printf("pending upload finalize scan skipped: %v", err)
+		log.Printf("pending upload enqueue scan skipped: %v", err)
 		return
 	}
 	log.Printf(
-		"pending upload finalize scan finished objects=%d sources=%d indexes=%d pending=%d enqueued=%d tracked=%d enqueue_failed=%d duration=%s",
-		pendingSummary.ObjectsDiscovered,
-		pendingSummary.SourceObjects,
-		pendingSummary.IndexObjects,
-		pendingSummary.PendingCandidates,
-		pendingSummary.Enqueued,
-		pendingSummary.AlreadyTracked,
-		pendingSummary.EnqueueFailed,
+		"pending upload enqueue scan finished enqueued=%d duration=%s",
+		enqueued,
 		time.Since(pendingStartedAt).Round(time.Millisecond),
 	)
 }

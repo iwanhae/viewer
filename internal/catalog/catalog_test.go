@@ -1,0 +1,382 @@
+package catalog
+
+import (
+	"context"
+	"errors"
+	"path/filepath"
+	"testing"
+)
+
+func openTestStore(t *testing.T) *Store {
+	t.Helper()
+	store, err := Open(filepath.Join(t.TempDir(), "catalog.db"))
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	return store
+}
+
+func TestAlbumLifecycleAndStatusTransitions(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+
+	if err := store.CreateAlbum(ctx, Album{
+		ID:               "album-a",
+		OriginalFilename: "holiday.zip",
+		SizeBytes:        100,
+		Status:           AlbumStatusPending,
+		SourceKey:        "uploads/album-a/source.zip",
+	}); err != nil {
+		t.Fatalf("create album: %v", err)
+	}
+
+	album, err := store.GetAlbum(ctx, "album-a")
+	if err != nil {
+		t.Fatalf("get album: %v", err)
+	}
+	if album.Status != AlbumStatusPending || album.PhotoCount != 0 {
+		t.Fatalf("unexpected album: %+v", album)
+	}
+	if album.CreatedAt == "" || album.UpdatedAt == "" {
+		t.Fatalf("expected timestamps to be populated: %+v", album)
+	}
+
+	// CreateAlbum is idempotent and must not clobber progress.
+	if err := store.SetAlbumStatus(ctx, "album-a", AlbumStatusProcessing, ""); err != nil {
+		t.Fatalf("set status: %v", err)
+	}
+	if err := store.CreateAlbum(ctx, Album{ID: "album-a", OriginalFilename: "other.zip"}); err != nil {
+		t.Fatalf("create album again: %v", err)
+	}
+	album, err = store.GetAlbum(ctx, "album-a")
+	if err != nil {
+		t.Fatalf("get album: %v", err)
+	}
+	if album.OriginalFilename != "holiday.zip" || album.Status != AlbumStatusProcessing {
+		t.Fatalf("CreateAlbum clobbered existing row: %+v", album)
+	}
+
+	if err := store.MarkAlbumReady(ctx, "album-a", 2); err != nil {
+		t.Fatalf("mark ready: %v", err)
+	}
+	album, err = store.GetAlbum(ctx, "album-a")
+	if err != nil {
+		t.Fatalf("get album: %v", err)
+	}
+	if album.Status != AlbumStatusReady || album.PhotoCount != 2 || album.Error != "" {
+		t.Fatalf("unexpected ready album: %+v", album)
+	}
+
+	if _, err := store.GetAlbum(ctx, "missing"); !errors.Is(err, ErrAlbumNotFound) {
+		t.Fatalf("expected ErrAlbumNotFound, got %v", err)
+	}
+}
+
+func TestUpsertAlbumRefreshesUploadFieldsOnly(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+
+	if err := store.CreateAlbum(ctx, Album{
+		ID:               "album-a",
+		OriginalFilename: "first.zip",
+		SizeBytes:        10,
+		Status:           AlbumStatusReady,
+		SourceKey:        "uploads/album-a/source.zip",
+	}); err != nil {
+		t.Fatalf("create album: %v", err)
+	}
+	if err := store.MarkAlbumReady(ctx, "album-a", 7); err != nil {
+		t.Fatalf("mark ready: %v", err)
+	}
+
+	if err := store.UpsertAlbum(ctx, Album{
+		ID:               "album-a",
+		OriginalFilename: "second.zip",
+		SizeBytes:        20,
+		Status:           AlbumStatusQueued,
+		SourceKey:        "uploads/album-a/source.zip",
+	}); err != nil {
+		t.Fatalf("upsert album: %v", err)
+	}
+
+	album, err := store.GetAlbum(ctx, "album-a")
+	if err != nil {
+		t.Fatalf("get album: %v", err)
+	}
+	if album.OriginalFilename != "second.zip" || album.SizeBytes != 20 {
+		t.Fatalf("expected refreshed upload fields, got %+v", album)
+	}
+	if album.Status != AlbumStatusReady || album.PhotoCount != 7 {
+		t.Fatalf("expected progress to be preserved, got %+v", album)
+	}
+}
+
+func TestPhotoInsertAndLookup(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+	seedReadyAlbum(t, store, "album-a")
+
+	photos := []Photo{
+		{AlbumID: "album-a", Index: 0, Name: "b.png", Hash: "hash-b", Width: 4, Height: 2, Ratio: 2},
+		{AlbumID: "album-a", Index: 1, Name: "a.png", Hash: "hash-a", Width: 2, Height: 4, Ratio: 0.5},
+	}
+	for _, photo := range photos {
+		if err := store.InsertPhoto(ctx, photo); err != nil {
+			t.Fatalf("insert photo: %v", err)
+		}
+	}
+
+	got, err := store.PhotosByAlbum(ctx, "album-a")
+	if err != nil {
+		t.Fatalf("photos by album: %v", err)
+	}
+	if len(got) != 2 || got[0].Name != "b.png" || got[1].Name != "a.png" {
+		t.Fatalf("photos should be ordered by index, got %+v", got)
+	}
+
+	photo, err := store.PhotoAt(ctx, "album-a", 1)
+	if err != nil {
+		t.Fatalf("photo at: %v", err)
+	}
+	if photo.Hash != "hash-a" || photo.Width != 2 || photo.Height != 4 {
+		t.Fatalf("unexpected photo: %+v", photo)
+	}
+
+	if _, err := store.PhotoAt(ctx, "album-a", 9); !errors.Is(err, ErrPhotoNotFound) {
+		t.Fatalf("expected ErrPhotoNotFound, got %v", err)
+	}
+
+	if err := store.DeletePhotos(ctx, "album-a"); err != nil {
+		t.Fatalf("delete photos: %v", err)
+	}
+	got, err = store.PhotosByAlbum(ctx, "album-a")
+	if err != nil {
+		t.Fatalf("photos by album: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("expected photos to be deleted, got %d", len(got))
+	}
+}
+
+func TestBlobUpsertPreservesEmbedding(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+
+	if err := store.UpsertBlob(ctx, Blob{Hash: "hash-a", SizeBytes: 11, ContentType: "image/png"}); err != nil {
+		t.Fatalf("upsert blob: %v", err)
+	}
+	if err := store.SetBlobEmbedding(ctx, "hash-a", EmbeddingStatusReady, []float32{0.25, -1, 3}, ""); err != nil {
+		t.Fatalf("set embedding: %v", err)
+	}
+
+	// Re-extracting the same bytes must not reset an existing embedding.
+	if err := store.UpsertBlob(ctx, Blob{Hash: "hash-a", SizeBytes: 22, ContentType: "image/png"}); err != nil {
+		t.Fatalf("upsert blob again: %v", err)
+	}
+
+	blob, err := store.GetBlob(ctx, "hash-a")
+	if err != nil {
+		t.Fatalf("get blob: %v", err)
+	}
+	if blob.SizeBytes != 22 {
+		t.Fatalf("expected refreshed size, got %d", blob.SizeBytes)
+	}
+	if blob.EmbeddingStatus != EmbeddingStatusReady || len(blob.Embedding) != 3 {
+		t.Fatalf("expected embedding preserved, got %+v", blob)
+	}
+	if blob.Embedding[0] != 0.25 || blob.Embedding[1] != -1 || blob.Embedding[2] != 3 {
+		t.Fatalf("embedding roundtrip mismatch: %v", blob.Embedding)
+	}
+
+	if _, err := store.GetBlob(ctx, "missing"); !errors.Is(err, ErrBlobNotFound) {
+		t.Fatalf("expected ErrBlobNotFound, got %v", err)
+	}
+}
+
+func TestEmbeddingCountsAndPendingListing(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+
+	for _, hash := range []string{"ready", "failed", "pending"} {
+		if err := store.UpsertBlob(ctx, Blob{Hash: hash, SizeBytes: 1}); err != nil {
+			t.Fatalf("upsert blob %s: %v", hash, err)
+		}
+	}
+	if err := store.SetBlobEmbedding(ctx, "ready", EmbeddingStatusReady, []float32{1}, ""); err != nil {
+		t.Fatalf("set ready: %v", err)
+	}
+	if err := store.SetBlobEmbedding(ctx, "failed", EmbeddingStatusFailed, nil, "boom"); err != nil {
+		t.Fatalf("set failed: %v", err)
+	}
+
+	counts, err := store.EmbeddingCounts(ctx)
+	if err != nil {
+		t.Fatalf("embedding counts: %v", err)
+	}
+	if counts.Total != 3 || counts.Ready != 1 || counts.Failed != 1 || counts.Pending != 1 {
+		t.Fatalf("unexpected counts: %+v", counts)
+	}
+
+	awaiting, err := store.ListBlobsAwaitingEmbedding(ctx, 10)
+	if err != nil {
+		t.Fatalf("list awaiting: %v", err)
+	}
+	if len(awaiting) != 1 || awaiting[0].Hash != "pending" {
+		t.Fatalf("expected only pending blob, got %+v", awaiting)
+	}
+}
+
+func TestSearchAlbumsByPrefixOnlyMatchesReadyAlbums(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+
+	seed := []struct {
+		id     string
+		name   string
+		status AlbumStatus
+	}{
+		{id: "ready-new", name: "Holiday Trip.zip", status: AlbumStatusReady},
+		{id: "ready-old", name: "holiday family.zip", status: AlbumStatusReady},
+		{id: "pending", name: "Holiday Pending.zip", status: AlbumStatusPending},
+		{id: "other", name: "Weekend.zip", status: AlbumStatusReady},
+	}
+	for _, item := range seed {
+		if err := store.CreateAlbum(ctx, Album{ID: item.id, OriginalFilename: item.name, Status: item.status}); err != nil {
+			t.Fatalf("create album %s: %v", item.id, err)
+		}
+	}
+
+	got, err := store.SearchAlbumsByNamePrefix(ctx, "  HoLiDaY ", 10)
+	if err != nil {
+		t.Fatalf("search: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("expected 2 ready matches, got %d (%+v)", len(got), got)
+	}
+	for _, album := range got {
+		if album.ID == "pending" {
+			t.Fatalf("pending album should not be searchable")
+		}
+	}
+
+	limited, err := store.SearchAlbumsByNamePrefix(ctx, "", 1)
+	if err != nil {
+		t.Fatalf("search: %v", err)
+	}
+	if len(limited) != 1 {
+		t.Fatalf("expected limit to apply, got %d", len(limited))
+	}
+
+	// '%' must be treated literally, not as a LIKE wildcard.
+	if err := store.CreateAlbum(ctx, Album{ID: "wild", OriginalFilename: "100%.zip", Status: AlbumStatusReady}); err != nil {
+		t.Fatalf("create wildcard album: %v", err)
+	}
+	if err := store.CreateAlbum(ctx, Album{ID: "plain", OriginalFilename: "1000.zip", Status: AlbumStatusReady}); err != nil {
+		t.Fatalf("create plain album: %v", err)
+	}
+	wildcard, err := store.SearchAlbumsByNamePrefix(ctx, "100%", 10)
+	if err != nil {
+		t.Fatalf("search wildcard: %v", err)
+	}
+	if len(wildcard) != 1 || wildcard[0].ID != "wild" {
+		t.Fatalf("expected literal wildcard match, got %+v", wildcard)
+	}
+	// A wildcard in the middle must not act as "match anything".
+	noMatch, err := store.SearchAlbumsByNamePrefix(ctx, "1%0", 10)
+	if err != nil {
+		t.Fatalf("search wildcard: %v", err)
+	}
+	if len(noMatch) != 0 {
+		t.Fatalf("expected '%%' to be literal, got %+v", noMatch)
+	}
+}
+
+func TestListReadyAlbumPhotosAndPairs(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+	seedReadyAlbum(t, store, "album-a")
+	seedReadyAlbum(t, store, "album-b")
+	if err := store.CreateAlbum(ctx, Album{ID: "album-pending", OriginalFilename: "p.zip", Status: AlbumStatusPending}); err != nil {
+		t.Fatalf("create album: %v", err)
+	}
+
+	if err := store.UpsertBlob(ctx, Blob{Hash: "hash-shared", SizeBytes: 5}); err != nil {
+		t.Fatalf("upsert blob: %v", err)
+	}
+	if err := store.InsertPhoto(ctx, Photo{AlbumID: "album-a", Index: 0, Name: "a.png", Hash: "hash-shared", Width: 1, Height: 1, Ratio: 1}); err != nil {
+		t.Fatalf("insert photo: %v", err)
+	}
+	if err := store.InsertPhoto(ctx, Photo{AlbumID: "album-b", Index: 0, Name: "b.png", Hash: "hash-shared", Width: 1, Height: 1, Ratio: 1}); err != nil {
+		t.Fatalf("insert photo: %v", err)
+	}
+	if err := store.InsertPhoto(ctx, Photo{AlbumID: "album-pending", Index: 0, Name: "c.png", Hash: "hash-shared", Width: 1, Height: 1, Ratio: 1}); err != nil {
+		t.Fatalf("insert photo: %v", err)
+	}
+
+	photos, err := store.ListReadyAlbumPhotos(ctx)
+	if err != nil {
+		t.Fatalf("list ready album photos: %v", err)
+	}
+	if len(photos) != 2 {
+		t.Fatalf("expected only ready album photos, got %d", len(photos))
+	}
+
+	pairs, err := store.ListPhotoBlobPairs(ctx)
+	if err != nil {
+		t.Fatalf("list pairs: %v", err)
+	}
+	if len(pairs) != 3 {
+		t.Fatalf("expected all pairs, got %d", len(pairs))
+	}
+	for _, pair := range pairs {
+		if pair.Blob.Hash != "hash-shared" {
+			t.Fatalf("expected joined blob, got %+v", pair)
+		}
+	}
+
+	albumPairs, err := store.ListPhotoBlobPairsByAlbum(ctx, "album-a")
+	if err != nil {
+		t.Fatalf("list pairs by album: %v", err)
+	}
+	if len(albumPairs) != 1 || albumPairs[0].Photo.AlbumID != "album-a" {
+		t.Fatalf("unexpected album pairs: %+v", albumPairs)
+	}
+}
+
+func TestVectorEncodeDecodeRoundTrip(t *testing.T) {
+	if got := DecodeVector(EncodeVector(nil)); got != nil {
+		t.Fatalf("expected nil for empty vector, got %v", got)
+	}
+	if got := DecodeVector([]byte{1, 2, 3}); got != nil {
+		t.Fatalf("expected nil for truncated vector, got %v", got)
+	}
+
+	in := []float32{0, 1.5, -2.25, 1e-8}
+	out := DecodeVector(EncodeVector(in))
+	if len(out) != len(in) {
+		t.Fatalf("length mismatch: %d vs %d", len(out), len(in))
+	}
+	for i := range in {
+		if out[i] != in[i] {
+			t.Fatalf("value %d mismatch: %v vs %v", i, out[i], in[i])
+		}
+	}
+}
+
+func TestOpenRequiresPath(t *testing.T) {
+	if _, err := Open("   "); err == nil {
+		t.Fatalf("expected error for empty path")
+	}
+}
+
+func seedReadyAlbum(t *testing.T, store *Store, albumID string) {
+	t.Helper()
+	if err := store.CreateAlbum(context.Background(), Album{
+		ID:               albumID,
+		OriginalFilename: albumID + ".zip",
+		Status:           AlbumStatusReady,
+	}); err != nil {
+		t.Fatalf("create album %s: %v", albumID, err)
+	}
+}

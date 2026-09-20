@@ -89,6 +89,40 @@ func TestLoadS3OnlyRequiresS3ValuesOnly(t *testing.T) {
 	}
 }
 
+func TestLoadCatalogDefaults(t *testing.T) {
+	setRequiredEnv(t)
+	t.Setenv("DB_PATH", "")
+	t.Setenv("INGEST_DELETE_SOURCE", "")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got, want := cfg.DBPath, ".cache/viewer.db"; got != want {
+		t.Fatalf("DBPath=%q want=%q", got, want)
+	}
+	if !cfg.IngestDeleteSource {
+		t.Fatalf("IngestDeleteSource=false want=true")
+	}
+}
+
+func TestLoadCatalogOverrides(t *testing.T) {
+	setRequiredEnv(t)
+	t.Setenv("DB_PATH", "/var/lib/viewer/catalog.db")
+	t.Setenv("INGEST_DELETE_SOURCE", "false")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got, want := cfg.DBPath, "/var/lib/viewer/catalog.db"; got != want {
+		t.Fatalf("DBPath=%q want=%q", got, want)
+	}
+	if cfg.IngestDeleteSource {
+		t.Fatalf("IngestDeleteSource=true want=false")
+	}
+}
+
 func setRequiredEnv(t *testing.T) {
 	t.Helper()
 	t.Setenv("S3_ENDPOINT", "https://example.invalid")

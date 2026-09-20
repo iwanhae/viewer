@@ -7,7 +7,9 @@
 3. Provide a **photo-centric UI** with:
    - **Page 1:** Random “Pinterest-like” wall (edge-to-edge)
    - **Page 2:** Full-screen album viewer (edge-to-edge)
-4. Avoid a database. Use **S3 as source of truth** + **one metadata JSON per ZIP**.
+4. Keep metadata in a **local SQLite catalog** and store image bytes in S3 as
+   **content-addressed blobs**, so identical images are never stored twice.
+   (Superseded the original "no database, one index.json per ZIP" plan.)
 
 ## 2. Non-Goals (for MVP)
 
@@ -28,14 +30,16 @@
    - Page 2 full-screen viewer
 2. **API Server (Go)**
    - Album upload session + finalize
-   - Generate and store album metadata JSON
+   - Sequentially download each staged zip and extract every image entry
+   - Record album/photo/blob metadata in the local SQLite catalog
    - Random feed API
-   - Image serving API (extract from ZIP; optional resize/caching)
+   - Image serving API (read `blobs/<hash>`; local disk cache)
 3. **S3-Compatible Storage (Home Server)**
-   - Stores ZIP objects (large, few)
-   - Stores per-album `index.json` (small, few)
-4. **Optional Local Disk Cache (API Server)**
-   - Cache resized images and/or extracted bytes to reduce repeated ZIP work
+   - Stores the staged upload zip (deleted after a successful extract)
+   - Stores one object per distinct image content: `blobs/<sha256>`
+4. **Local SQLite Catalog + Disk Cache (API Server)**
+   - SQLite is the source of truth for albums, photos and embeddings
+   - Disk cache holds recently served image blobs
 
 ------
 
@@ -43,18 +47,20 @@
 
 Bucket: `photo-archive`
 
-For each album (`albumId` is a UUID or content-hash):
+Staging (deleted after a successful extract):
 
-- Source ZIP (1 object):
-  - `albums/{albumId}/source.zip`
-- Album metadata (1 object):
-  - `albums/{albumId}/index.json`
+- `uploads/{albumId}/source.zip`
 
-No per-photo thumbnail objects in S3.
+Durable image payloads (one object per distinct content hash, shared by every
+album that contains the same bytes):
+
+- `blobs/{sha256}`
+
+No per-album metadata objects and no per-photo thumbnail objects in S3.
 
 ------
 
-## 5. Album Metadata Format (`index.json`)
+## 5. Metadata (SQLite Catalog)
 
 Purpose:
 
@@ -62,31 +68,32 @@ Purpose:
   - list photos in order
   - compute masonry layout using aspect ratio
   - address a photo by `(albumId, photoIndex)`
+  - serve image bytes via the photo's content hash
 
-Example:
+Tables (see `internal/catalog`):
 
-```json
-{
-  "albumId": "a1b2c3...",
-  "originalFilename": "2021_trip.zip",
-  "createdAt": "2026-02-13T00:00:00Z",
-  "photoCount": 20,
-  "photos": [
-    {
-      "i": 0,
-      "name": "IMG_0001.JPG",
-      "w": 4032,
-      "h": 3024,
-      "ratio": 1.3333
-    }
-  ]
-}
+```sql
+albums(id, original_filename, size_bytes, status, source_key,
+       photo_count, error, created_at, updated_at)
+
+blobs(hash, size_bytes, content_type, embedding_status, embedding,
+      embedding_error, embedding_updated_at, created_at, updated_at)
+
+photos(album_id, idx, name, hash, width, height, ratio,
+       PRIMARY KEY (album_id, idx))
 ```
 
 Notes:
 
-- `i` is the stable ordering index (sort by filename or ZIP entry order; pick one and keep it consistent).
-- Width/height are extracted from image headers (or by decoding if needed).
+- `albums.status` moves through `PENDING -> QUEUED -> PROCESSING -> READY`
+  (`FAILED` on error) and drives the `/finalize` status API.
+- `photos.name` is the original zip entry name; `photos.idx` is the stable
+  ordering index (entries sorted by lower-cased filename).
+- `photos.hash` points at a `blobs` row, which is where embeddings are stored.
+  Identical image bytes therefore share one blob row, one S3 object and one
+  embedding regardless of how many albums contain them.
+- `AlbumIndex` is still the JSON shape returned by `GET /api/albums/{albumId}`;
+  it is now assembled from `albums` + `photos`.
 
 ------
 
@@ -136,9 +143,12 @@ Response:
 
 Behavior:
 
-- Server verifies ZIP exists in S3.
-- Server builds `albums/{albumId}/index.json`.
-- For MVP: do it synchronously (may take seconds). Optionally return early and allow polling.
+- Server verifies the staged ZIP exists in S3.
+- The album is marked `QUEUED` and handed to the in-process pipeline worker.
+- The worker downloads the ZIP, stores each image as a `blobs/<sha256>` object,
+  records metadata in SQLite and finally marks the album `READY`, then deletes
+  the staged ZIP (`INGEST_DELETE_SOURCE=true`).
+- Clients poll `GET /api/albums/{albumId}/finalize` until `SUCCEEDED`/`FAILED`.
 
 ### 6.3 Get Album Metadata
 
@@ -146,7 +156,7 @@ Behavior:
 GET /api/albums/{albumId}
 ```
 
-Response: the `index.json` content.
+Response: the album metadata assembled from the SQLite catalog.
 
 ### 6.4 List Albums (Lightweight)
 
@@ -166,7 +176,8 @@ Response:
 
 Implementation:
 
-- List `albums/*/index.json` objects (or list `albums/` prefixes and fetch index.json per album; cache results server-side).
+- Query the local SQLite catalog (`albums` where `status = 'READY'`), cached in
+  memory for the feed snapshot.
 
 ### 6.5 Random Feed (Page 1)
 
@@ -224,26 +235,23 @@ Caching (optional but recommended):
 
 When `/finalize` is called:
 
-1. Download ZIP to local temp **or** read via Range (optional optimization).
-2. Enumerate entries; keep only `.jpg/.jpeg/.png`.
-3. Determine ordering (e.g., filename sort).
-4. Extract width/height for each entry:
-   - Prefer header parsing or minimal decode.
-5. Write `index.json` to S3.
+1. Download the ZIP to local temp storage (one album at a time, sequentially).
+2. Enumerate entries; keep only `.jpg/.jpeg/.png/.webp`.
+3. Sort by lower-cased filename to assign stable photo indexes.
+4. For each entry:
+   - compute the SHA-256 of the raw bytes,
+   - extract width/height from the image header,
+   - upload the bytes to `blobs/<sha256>` (skipped when the object already
+     exists, so identical content is stored once),
+   - upsert the `blobs` row and insert the `photos` row in SQLite,
+   - request an embedding and store it on the blob row.
+5. Mark the album `READY` and delete the staged ZIP.
 
 ZIP format note:
 
-- Many implementations locate the “central directory” at the end of the ZIP to enumerate entries efficiently, which can enable Range-based partial reads. ([Rhardih](https://rhardih.io/tag/zip/?utm_source=chatgpt.com))
-
-### 7.2 Range-based ZIP Reading (Optional Optimization)
-
-If the home S3 server supports HTTP Range well:
-
-- Fetch the last chunk to find the End-of-Central-Directory
-- Fetch the central directory region
-- Fetch only the bytes for requested entries
-
-This can avoid full ZIP downloads, but is not required for MVP.
+- The worker downloads the whole object and uses `archive/zip` over the local
+  file, so no S3 range support is required. The previous range-based reader
+  (`internal/rangecache`) was removed with the index.json design.
 
 ------
 
@@ -295,15 +303,18 @@ Overlays (shown only when toggled on):
 
 ------
 
-## 9. Performance Strategy (No Small S3 Objects)
+## 9. Performance Strategy
 
 - Store only:
-  - **1 ZIP object per album**
-  - **1 JSON index per album**
-- Avoid storing thumbnails per photo in S3.
-- Optional server disk cache for resized images:
-  - Improves repeated viewing without adding S3 objects.
-- Server should cache `index.json` in memory to avoid repeated S3 reads.
+  - **the staged ZIP** (transient; deleted after extraction)
+  - **one object per distinct image content** (`blobs/<sha256>`)
+- Identical images across albums cost one object, one blob row and one
+  embedding.
+- Per-album metadata is a few SQLite rows instead of an S3 object.
+- Local disk cache (`CACHE_DIR`) serves repeated image views without touching
+  S3.
+- The recommendation index is held in memory and rebuilt from the catalog at
+  startup.
 
 ------
 
@@ -323,9 +334,9 @@ Overlays (shown only when toggled on):
 
 1. **Backend**
    - S3 client, presigned PUT, upload finalize
-   - ZIP indexing -> generate `index.json` -> put to S3
-   - `/feed` sampling using cached indices
-   - `/image/:albumId/:i` serving + optional resize + optional disk cache
+   - Sequential zip download -> content-addressed `blobs/<sha256>` -> SQLite catalog
+   - `/feed` sampling using the catalog
+   - `/image/:albumId/:i` serving from blobs + disk cache
 2. **Frontend**
    - Upload flow (select ZIP -> upload -> finalize -> ready)
    - Page 1 masonry wall (edge-to-edge) + infinite scroll + bottom bar

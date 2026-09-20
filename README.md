@@ -5,6 +5,36 @@ Photo viewer MVP with:
 - React frontend embedded into one Go binary
 - Playwright e2e test flow
 
+## Architecture
+
+Uploads are still sent straight to object storage with a presigned `PUT`, but the
+zip is only a transport container. A single in-process worker downloads each
+staged zip sequentially, unpacks it entry by entry, and turns every image into a
+content-addressed blob:
+
+1. `POST /api/albums` registers a `PENDING` album in SQLite and returns a
+   presigned `PUT` URL for `uploads/<albumId>/source.zip`.
+2. The browser uploads the zip directly to S3.
+3. `POST /api/albums/<albumId>/finalize` queues the album for the pipeline
+   worker.
+4. The worker downloads the zip to local disk and walks its image entries in
+   filename order. For each entry it:
+   - computes the SHA-256 of the raw image bytes,
+   - reads the entry name and image dimensions,
+   - stores the original bytes in S3 at `blobs/<sha256>` (uploaded only once per
+     distinct content hash, so identical images never occupy storage twice),
+   - computes an embedding and writes it to SQLite,
+   - records the zip entry name, hash, width, height and ratio in SQLite.
+5. After a successful extraction the staged zip is deleted from S3
+   (`INGEST_DELETE_SOURCE=true`, the default).
+
+All metadata lives in the local SQLite catalog at `DB_PATH`; S3 only holds the
+staged zip (briefly) and the deduplicated image blobs. The `albums/<id>/index.json`
+objects of previous versions are no longer written or read.
+
+Image requests are resolved as `(albumId, index)` -> photo row -> blob hash ->
+`blobs/<hash>`, with a local disk cache in `CACHE_DIR`.
+
 ## Required env
 Copy one of:
 - `.env.example` for local run
@@ -15,6 +45,15 @@ At minimum configure S3 values:
 - `S3_BUCKET`
 - `S3_ACCESS_KEY`
 - `S3_SECRET_KEY`
+
+Catalog/storage:
+- `DB_PATH` SQLite catalog path (default `.cache/viewer.db`).
+- `CACHE_DIR` local disk cache for image blobs (default `.cache/images`).
+- `ZIP_CACHE_DIR` temp dir for downloaded zips (default `.cache/zips`).
+- `INGEST_DELETE_SOURCE` delete the staged zip after a successful extract (default `true`).
+- `MAX_UPLOAD_BYTES` maximum accepted zip size (default `1073741824`).
+- `PRESIGN_TTL_SECONDS` presigned upload URL TTL (default `900`).
+- `BATCH_INGEST_ENABLED` scan the `batch/` prefix for out-of-band zips (default `true`).
 
 Optional tuning:
 - Recommendation feature:
@@ -35,10 +74,12 @@ Rust recommender service endpoints:
 
 Rust worker resolves model files through the Hugging Face cache (`HF_HOME`), downloading only if a required file is missing.
 
-Recommendation vectors are persisted in each album's `albums/<album-id>/index.json` under an `embeddings` section.
-Background embedding now runs album-by-album: workers pick a random album with missing vectors, embed all pending photos in that album, then persist metadata in one write.
-Recommendation responses are cross-album only: photos from the same album as the query are excluded from results.
-If no cross-album neighbors exist for an embedded query photo, recommendations return an empty `items` list.
+Embeddings are stored as `float32` blobs on each image blob row in SQLite. The
+ingest pipeline embeds images inline; the background workers pick up any blob
+left in the `pending` state (for example when the recommender was unreachable
+during ingest). Recommendation responses are cross-album only: photos from the
+same album as the query are excluded from results. If no cross-album neighbors
+exist for an embedded query photo, recommendations return an empty `items` list.
 
 Docker images are split by service:
 - `runtime-viewer` (default `docker build .`) contains only the Go viewer server and frontend assets.
@@ -58,13 +99,17 @@ To build an MKL-accelerated recommender for x86_64 images, pass `--build-arg REC
 - `make run` starts `bin/viewer` (loads `.env` if present, does not rebuild binaries).
 - `make clean` removes build outputs and dependency caches.
 
-Batch duplicate cleanup binary:
+Batch ingest:
+- Any `batch/*.zip` object is copied to `uploads/<albumId>/source.zip` (with `albumId` derived from the zip content) and queued for extraction; the batch object is then removed. Re-uploading identical bytes is deduplicated.
+
+Legacy batch duplicate cleanup binary (operates on pre-catalog `albums/<id>/source.zip` objects):
 - `bin/album-dedupe-cleaner plan --out ./dedupe-plan.json` creates a deletion plan (no deletes).
 - `bin/album-dedupe-cleaner apply --plan ./dedupe-plan.json` validates the plan snapshot and deletes duplicate album prefixes.
 
 ## Observability
 - The server logs to stdout/stderr via Go's standard logger.
-- Startup warmup now runs in background and streams each loaded album index once into both album cache and recommendation state.
+- Startup warmup loads the SQLite catalog into the recommendation index, scans the `batch/` prefix, and enqueues any album whose staged zip is still waiting.
+- Embedding progress metrics (`/metrics`) are computed from the SQLite catalog.
 - Request-scoped 500 errors now include request context including:
   - request method/path
   - request ID (Chi request ID middleware)

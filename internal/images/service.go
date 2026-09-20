@@ -1,143 +1,125 @@
 package images
 
 import (
-	"archive/zip"
 	"context"
+	"errors"
 	"fmt"
-	_ "image/jpeg"
-	_ "image/png"
 	"io"
-	"mime"
-	"path/filepath"
 	"strings"
 
-	_ "golang.org/x/image/webp"
 	"viewer/internal/albums"
 	"viewer/internal/cache"
-	"viewer/internal/rangecache"
+	"viewer/internal/catalog"
+	"viewer/internal/pipeline"
 	"viewer/internal/storage"
 )
 
-type Service struct {
-	albums     *albums.Service
-	store      *storage.S3Store
-	cache      *cache.DiskCache
-	rangeCache *rangecache.Manager
+// blobStore is the S3 surface needed to read image blobs.
+type blobStore interface {
+	GetObject(ctx context.Context, key string) (io.ReadCloser, string, error)
 }
 
+// Service resolves a (album, index) photo reference to the raw image bytes
+// stored in S3 under its content hash.
+type Service struct {
+	catalog *catalog.Store
+	store   blobStore
+	cache   *cache.DiskCache
+}
+
+// ImageResult is raw image bytes ready to be written to an HTTP response.
 type ImageResult struct {
 	Bytes       []byte
 	ContentType string
 }
 
-const (
-	defaultRangeChunkSize = int64(1 << 17) // 128 KiB
-	rangeMaxBytes         = int64(8 << 30) // 8 GiB
-)
-
-func NewService(albumsService *albums.Service, store *storage.S3Store, cacheDir string, zipCacheDir string) (*Service, error) {
+func NewService(cat *catalog.Store, store blobStore, cacheDir string) (*Service, error) {
 	dc, err := cache.NewDiskCache(cacheDir)
 	if err != nil {
 		return nil, err
 	}
-	rc, err := rangecache.NewManager(
-		filepath.Join(zipCacheDir, "range"),
-		rangecache.Config{
-			ChunkSize: defaultRangeChunkSize,
-			MaxBytes:  rangeMaxBytes,
-			Fetch: func(ctx context.Context, key string, start int64, end int64) (io.ReadCloser, error) {
-				body, _, err := store.GetObjectRange(ctx, key, start, end)
-				if err != nil {
-					return nil, err
-				}
-				return body, nil
-			},
-		},
-	)
-	if err != nil {
-		return nil, err
-	}
-
 	return &Service{
-		albums:     albumsService,
-		store:      store,
-		cache:      dc,
-		rangeCache: rc,
+		catalog: cat,
+		store:   store,
+		cache:   dc,
 	}, nil
 }
 
-func sourceKey(albumID string) string {
-	return fmt.Sprintf("albums/%s/source.zip", albumID)
-}
-
+// GetImage returns the image at the given index within an album.
 func (s *Service) GetImage(ctx context.Context, albumID string, idx int) (ImageResult, error) {
-	album, err := s.albums.GetAlbum(ctx, albumID)
-	if err != nil {
-		return ImageResult{}, err
-	}
-	if idx < 0 || idx >= len(album.Photos) {
-		return ImageResult{}, fmt.Errorf("%w: %d", ErrPhotoIndexOutOfRange, idx)
-	}
-
-	photo := album.Photos[idx]
-	return s.GetImageByEntry(ctx, albumID, photo.Name)
-}
-
-func (s *Service) GetImageByEntry(ctx context.Context, albumID string, entryName string) (ImageResult, error) {
 	if strings.TrimSpace(albumID) == "" {
 		return ImageResult{}, fmt.Errorf("album id is required")
 	}
-	cleanEntryName := strings.TrimSpace(entryName)
-	if cleanEntryName == "" {
-		return ImageResult{}, fmt.Errorf("entry name is required")
+	if idx < 0 {
+		return ImageResult{}, fmt.Errorf("%w: %d", ErrPhotoIndexOutOfRange, idx)
 	}
 
-	key := sourceKey(albumID)
-	exists, size, err := s.store.HeadObject(ctx, key)
-	if err != nil {
+	if _, err := s.catalog.GetAlbum(ctx, albumID); err != nil {
+		if errors.Is(err, catalog.ErrAlbumNotFound) {
+			return ImageResult{}, fmt.Errorf("%w: %s", albums.ErrAlbumNotFound, albumID)
+		}
 		return ImageResult{}, err
 	}
-	if !exists || size <= 0 {
-		return ImageResult{}, fmt.Errorf("%w: %s", albums.ErrAlbumSourceNotFound, albumID)
-	}
 
-	handle, err := s.rangeCache.Open(ctx, key, size)
+	photo, err := s.catalog.PhotoAt(ctx, albumID, idx)
 	if err != nil {
-		return ImageResult{}, fmt.Errorf("open range cache: %w", err)
-	}
-	defer handle.Close()
-
-	r, err := zip.NewReader(handle, size)
-	if err != nil {
-		return ImageResult{}, fmt.Errorf("open zip: %w", err)
-	}
-
-	for _, f := range r.File {
-		if f.Name != cleanEntryName {
-			continue
+		if errors.Is(err, catalog.ErrPhotoNotFound) {
+			return ImageResult{}, fmt.Errorf("%w: %d", ErrPhotoIndexOutOfRange, idx)
 		}
-		rc, err := f.Open()
-		if err != nil {
-			return ImageResult{}, fmt.Errorf("open zip entry: %w", err)
-		}
-		data, err := io.ReadAll(rc)
-		rc.Close()
-		if err != nil {
-			return ImageResult{}, fmt.Errorf("read zip entry: %w", err)
-		}
-		return ImageResult{
-			Bytes:       data,
-			ContentType: contentTypeForEntry(f.Name),
-		}, nil
+		return ImageResult{}, err
 	}
-
-	return ImageResult{}, fmt.Errorf("%w: %s", ErrImageEntryNotFound, cleanEntryName)
+	return s.GetImageByHash(ctx, photo.Hash)
 }
 
-func contentTypeForEntry(entryName string) string {
-	ct := mime.TypeByExtension(strings.ToLower(filepath.Ext(entryName)))
-	if ct == "" {
+// GetImageByHash returns the raw bytes of a content-addressed blob, preferring
+// the local disk cache.
+func (s *Service) GetImageByHash(ctx context.Context, hash string) (ImageResult, error) {
+	hash = strings.TrimSpace(hash)
+	if hash == "" {
+		return ImageResult{}, fmt.Errorf("blob hash is required")
+	}
+
+	blob, err := s.catalog.GetBlob(ctx, hash)
+	if err != nil {
+		if errors.Is(err, catalog.ErrBlobNotFound) {
+			return ImageResult{}, fmt.Errorf("%w: %s", ErrImageEntryNotFound, hash)
+		}
+		return ImageResult{}, err
+	}
+
+	if data, ok := s.cache.Get(hash); ok {
+		return ImageResult{Bytes: data, ContentType: contentTypeOrFallback(blob.ContentType)}, nil
+	}
+
+	body, remoteContentType, err := s.store.GetObject(ctx, pipeline.BlobKey(hash))
+	if err != nil {
+		if storage.IsNotFound(err) {
+			return ImageResult{}, fmt.Errorf("%w: %s", ErrImageEntryNotFound, hash)
+		}
+		return ImageResult{}, err
+	}
+	defer body.Close()
+
+	data, err := io.ReadAll(body)
+	if err != nil {
+		return ImageResult{}, fmt.Errorf("read blob %s: %w", hash, err)
+	}
+	if err := s.cache.Set(hash, data); err != nil {
+		// A cache write failure must not fail the request.
+		_ = err
+	}
+
+	contentType := contentTypeOrFallback(blob.ContentType)
+	if contentType == "application/octet-stream" {
+		contentType = contentTypeOrFallback(remoteContentType)
+	}
+	return ImageResult{Bytes: data, ContentType: contentType}, nil
+}
+
+func contentTypeOrFallback(contentType string) string {
+	trimmed := strings.TrimSpace(contentType)
+	if trimmed == "" {
 		return "application/octet-stream"
 	}
-	return ct
+	return trimmed
 }
