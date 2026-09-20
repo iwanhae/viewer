@@ -103,11 +103,12 @@ func TestPipelineStoresEveryObjectUnderKeyPrefix(t *testing.T) {
 
 	ctx := context.Background()
 	store, err := storage.NewS3Store(ctx, cfgpkg.Config{
-		S3Endpoint:  server.URL,
-		S3Bucket:    bucket,
-		S3AccessKey: "access",
-		S3SecretKey: "secret",
-		S3Prefix:    "photos/",
+		S3Endpoint:     server.URL,
+		S3Bucket:       bucket,
+		S3AccessKey:    "access",
+		S3SecretKey:    "secret",
+		S3Prefix:       "photos/",
+		S3UsePathStyle: true,
 	})
 	if err != nil {
 		t.Fatalf("NewS3Store: %v", err)

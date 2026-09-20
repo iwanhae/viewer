@@ -53,6 +53,9 @@ RUN apt-get update && \
     mkdir -p /app/siglip2 /tmp/viewer-cache/images /tmp/viewer-cache/zips && \
     chown -R 65532:65532 /app /tmp/viewer-cache
 
+# The line above pre-creates the default STATE_DIR. Another STATE_DIR works too,
+# since the viewer creates its subdirectories on demand, but a volume mounted
+# there must be writable by uid 65532.
 USER 65532:65532
 
 EXPOSE 8080

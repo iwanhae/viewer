@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	neturl "net/url"
 	"strings"
 	"testing"
 	"time"
@@ -45,13 +46,14 @@ const copyResultXML = `<?xml version="1.0" encoding="UTF-8"?>
 
 type recordedRequest struct {
 	method string
+	host   string
 	path   string
 	query  string
 	header http.Header
 }
 
 func (r recordedRequest) String() string {
-	return r.method + " " + r.path + "?" + r.query
+	return r.method + " " + r.host + r.path + "?" + r.query
 }
 
 // newRecordingStore builds a real S3 client pointed at a stub object store, so
@@ -59,11 +61,19 @@ func (r recordedRequest) String() string {
 // internal key helpers.
 func newRecordingStore(t *testing.T, keyPrefix string) (*S3Store, *[]recordedRequest) {
 	t.Helper()
+	return newRecordingStoreAt(t, "", keyPrefix)
+}
+
+// newRecordingStoreAt is newRecordingStore with a path prefix on the endpoint
+// itself, the shape a store behind a gateway exposes.
+func newRecordingStoreAt(t *testing.T, endpointPath string, keyPrefix string) (*S3Store, *[]recordedRequest) {
+	t.Helper()
 
 	requests := make([]recordedRequest, 0, 8)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requests = append(requests, recordedRequest{
 			method: r.Method,
+			host:   r.Host,
 			path:   r.URL.Path,
 			query:  r.URL.RawQuery,
 			header: r.Header.Clone(),
@@ -88,11 +98,12 @@ func newRecordingStore(t *testing.T, keyPrefix string) (*S3Store, *[]recordedReq
 	t.Cleanup(server.Close)
 
 	store, err := NewS3Store(context.Background(), cfgpkg.Config{
-		S3Endpoint:  server.URL,
-		S3Bucket:    "test-bucket",
-		S3AccessKey: "access",
-		S3SecretKey: "secret",
-		S3Prefix:    keyPrefix,
+		S3Endpoint:     server.URL + endpointPath,
+		S3Bucket:       "test-bucket",
+		S3AccessKey:    "access",
+		S3SecretKey:    "secret",
+		S3Prefix:       keyPrefix,
+		S3UsePathStyle: true,
 	})
 	if err != nil {
 		t.Fatalf("NewS3Store: %v", err)
@@ -235,5 +246,92 @@ func TestS3StorePresignsUnderKeyPrefix(t *testing.T) {
 	}
 	if len(headers) != 0 {
 		t.Errorf("headers=%v want none", headers)
+	}
+}
+
+// TestS3StoreAddressesRequestsPathStyle pins the addressing the self-hosted
+// stores need: the bucket is the first path segment of the request rather than
+// a subdomain of the endpoint, and an endpoint that already carries a path keeps
+// it in front of the bucket.
+func TestS3StoreAddressesRequestsPathStyle(t *testing.T) {
+	store, requests := newRecordingStoreAt(t, "/gateway", "")
+
+	if err := store.PutObject(context.Background(), "blobs/deadbeef", strings.NewReader("x"), "image/png"); err != nil {
+		t.Fatalf("PutObject: %v", err)
+	}
+
+	got := *requests
+	if len(got) != 1 {
+		t.Fatalf("recorded %d requests, want 1", len(got))
+	}
+	if want := "/gateway/test-bucket/blobs/deadbeef"; got[0].path != want {
+		t.Errorf("path=%q want=%q (bucket in the path, endpoint path preserved)", got[0].path, want)
+	}
+	if strings.HasPrefix(got[0].host, "test-bucket.") {
+		t.Errorf("host=%q puts the bucket in a subdomain; want path-style addressing", got[0].host)
+	}
+}
+
+// newVirtualHostedStore builds a store with the opt-in addressing mode and no
+// stub server: the assertions below read presigned URLs, which resolve the
+// endpoint without a request. A stub server is no use here because
+// "<bucket>.127.0.0.1" cannot be dialled.
+func newVirtualHostedStore(t *testing.T, endpoint string) *S3Store {
+	t.Helper()
+
+	store, err := NewS3Store(context.Background(), cfgpkg.Config{
+		S3Endpoint:     endpoint,
+		S3Bucket:       "test-bucket",
+		S3AccessKey:    "access",
+		S3SecretKey:    "secret",
+		S3UsePathStyle: false,
+	})
+	if err != nil {
+		t.Fatalf("NewS3Store: %v", err)
+	}
+	return store
+}
+
+// TestS3StoreVirtualHostedAddressing covers the opt-in mode for stores that
+// expect the bucket as a subdomain of the endpoint.
+func TestS3StoreVirtualHostedAddressing(t *testing.T) {
+	cases := []struct {
+		name     string
+		endpoint string
+		wantHost string
+		wantPath string
+	}{
+		{
+			name:     "plain endpoint",
+			endpoint: "https://s3.example.com",
+			wantHost: "test-bucket.s3.example.com",
+			wantPath: "/uploads/album-1/source.zip",
+		},
+		{
+			name:     "endpoint with a path prefix",
+			endpoint: "https://s3.example.com/gateway",
+			wantHost: "test-bucket.s3.example.com",
+			wantPath: "/gateway/uploads/album-1/source.zip",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newVirtualHostedStore(t, tc.endpoint)
+
+			url, _, err := store.PresignPut(context.Background(), "uploads/album-1/source.zip", time.Minute)
+			if err != nil {
+				t.Fatalf("PresignPut: %v", err)
+			}
+			parsed, err := neturl.Parse(url)
+			if err != nil {
+				t.Fatalf("parse presigned url %q: %v", url, err)
+			}
+			if parsed.Host != tc.wantHost {
+				t.Errorf("host=%q want=%q", parsed.Host, tc.wantHost)
+			}
+			if parsed.Path != tc.wantPath {
+				t.Errorf("path=%q want=%q (the bucket must not also appear in the path)", parsed.Path, tc.wantPath)
+			}
+		})
 	}
 }

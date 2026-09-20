@@ -47,17 +47,12 @@ func NewS3Store(ctx context.Context, cfg cfgpkg.Config) (*S3Store, error) {
 		return nil, fmt.Errorf("load aws config: %w", err)
 	}
 
-	awsCfg.EndpointResolverWithOptions = aws.EndpointResolverWithOptionsFunc(
-		func(service, region string, options ...interface{}) (aws.Endpoint, error) {
-			if service == s3.ServiceID {
-				return aws.Endpoint{URL: cfg.S3Endpoint, HostnameImmutable: true}, nil
-			}
-			return aws.Endpoint{}, &aws.EndpointNotFoundError{}
-		},
-	)
-
+	// BaseEndpoint keeps the operator's endpoint verbatim, including any path
+	// prefix it carries, and leaves UsePathStyle to place the bucket: the first
+	// path segment when true, a subdomain of the endpoint when false.
 	client := s3.NewFromConfig(awsCfg, func(o *s3.Options) {
-		o.UsePathStyle = cfgpkg.S3UsePathStyle
+		o.UsePathStyle = cfg.S3UsePathStyle
+		o.BaseEndpoint = aws.String(cfg.S3Endpoint)
 	})
 
 	return &S3Store{

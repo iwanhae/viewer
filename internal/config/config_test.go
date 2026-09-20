@@ -73,15 +73,110 @@ func TestLoadFallsBackOnUnusablePort(t *testing.T) {
 	}
 }
 
-// TestDeploymentConstants pins the values that used to be environment
-// variables. The Dockerfile bakes the checkpoint at ModelDir and pre-creates
-// the cache directories, so these two have to stay in step with it.
+// TestDeploymentConstants pins the value the Dockerfile bakes the checkpoint
+// at, which has to stay in step with it.
 func TestDeploymentConstants(t *testing.T) {
 	if ModelDir != "/app/siglip2" {
 		t.Errorf("ModelDir=%q want /app/siglip2 (the Dockerfile prefetch target)", ModelDir)
 	}
-	if DBPath != StateDir+"/viewer.db" || CacheDir != StateDir+"/images" || ZipCacheDir != StateDir+"/zips" {
-		t.Errorf("state paths must live under StateDir=%q", StateDir)
+}
+
+// TestStateDirAccessors pins the layout inside STATE_DIR. Every path lives
+// directly under it, so mounting one volume keeps the catalog and both caches.
+func TestStateDirAccessors(t *testing.T) {
+	cfg := Config{StateDir: "/data"}
+
+	if got := cfg.DBPath(); got != "/data/viewer.db" {
+		t.Errorf("DBPath=%q want /data/viewer.db", got)
+	}
+	if got := cfg.CacheDir(); got != "/data/images" {
+		t.Errorf("CacheDir=%q want /data/images", got)
+	}
+	if got := cfg.ZipCacheDir(); got != "/data/zips" {
+		t.Errorf("ZipCacheDir=%q want /data/zips", got)
+	}
+}
+
+// TestLoadStateDir covers the STATE_DIR default, its cleaning, and the
+// rejection of a relative path, which would put the catalog somewhere a volume
+// mount cannot preserve.
+func TestLoadStateDir(t *testing.T) {
+	cases := []struct {
+		name    string
+		raw     string
+		want    string
+		wantErr bool
+	}{
+		{name: "unset", raw: "", want: DefaultStateDir},
+		{name: "blank", raw: "   ", want: DefaultStateDir},
+		{name: "absolute", raw: "/data/viewer", want: "/data/viewer"},
+		{name: "trailing slash", raw: "/data/viewer/", want: "/data/viewer"},
+		{name: "surrounding spaces", raw: "  /data/viewer  ", want: "/data/viewer"},
+		{name: "redundant separators", raw: "/data//viewer", want: "/data/viewer"},
+		{name: "root", raw: "/", want: "/"},
+		{name: "relative", raw: "data/viewer", wantErr: true},
+		{name: "relative dot", raw: "./data", wantErr: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			setRequiredEnv(t)
+			t.Setenv("STATE_DIR", tc.raw)
+
+			cfg, err := Load()
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("Load(STATE_DIR=%q) expected an error", tc.raw)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if cfg.StateDir != tc.want {
+				t.Fatalf("StateDir=%q want=%q for STATE_DIR=%q", cfg.StateDir, tc.want, tc.raw)
+			}
+		})
+	}
+}
+
+// TestLoadS3UsePathStyle covers the addressing switch: path-style is the
+// default, and a value that cannot be parsed fails the start rather than
+// silently sending every request to a different host.
+func TestLoadS3UsePathStyle(t *testing.T) {
+	cases := []struct {
+		name    string
+		raw     string
+		want    bool
+		wantErr bool
+	}{
+		{name: "unset", raw: "", want: DefaultS3UsePathStyle},
+		{name: "blank", raw: "   ", want: DefaultS3UsePathStyle},
+		{name: "true", raw: "true", want: true},
+		{name: "false", raw: "false", want: false},
+		{name: "one", raw: "1", want: true},
+		{name: "zero", raw: "0", want: false},
+		{name: "surrounding spaces", raw: " false ", want: false},
+		{name: "unparseable", raw: "yes", wantErr: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			setRequiredEnv(t)
+			t.Setenv("S3_USE_PATH_STYLE", tc.raw)
+
+			cfg, err := Load()
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("Load(S3_USE_PATH_STYLE=%q) expected an error", tc.raw)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if cfg.S3UsePathStyle != tc.want {
+				t.Fatalf("S3UsePathStyle=%v want=%v for S3_USE_PATH_STYLE=%q", cfg.S3UsePathStyle, tc.want, tc.raw)
+			}
+		})
 	}
 }
 

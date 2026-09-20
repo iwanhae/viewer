@@ -32,8 +32,10 @@ read by key (image bytes) or by the `batch/` prefix.
 
 ## SQLite schema
 
-`/tmp/viewer-cache/viewer.db`, opened with WAL, `foreign_keys(1)`,
-`synchronous(NORMAL)`, a single connection and a 10 second busy timeout.
+`$STATE_DIR/viewer.db` (default `/tmp/viewer-cache`), opened with WAL,
+`foreign_keys(1)`, `synchronous(NORMAL)`, a single connection and a 10 second
+busy timeout. The decoded-image cache and the zip staging directory are siblings
+under the same `STATE_DIR`.
 
 ```sql
 albums(id, original_filename, size_bytes, status, source_key,
@@ -82,5 +84,5 @@ Album status is persisted as `QUEUED` / `PROCESSING` / `SUCCEEDED` / `FAILED`
   rank them by cosine similarity and return only cross-album hits, at most one
   photo per album.
 - **Images are served from a local disk cache.** `images.Service` materialises a
-  blob into `/tmp/viewer-cache/images` with an atomic temp-file rename and reuses
-  the cached file, so a repeated wall or viewer load never touches S3.
+  blob into `$STATE_DIR/images` with an atomic temp-file rename and reuses the
+  cached file, so a repeated wall or viewer load never touches S3.

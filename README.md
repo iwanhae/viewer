@@ -29,14 +29,14 @@ content-addressed blob:
    the zip is left in place and the album is marked `FAILED`, so
    `POST /api/albums/<albumId>/finalize` can retry it.
 
-All metadata lives in the local SQLite catalog at `/tmp/viewer-cache/viewer.db`;
+All metadata lives in the local SQLite catalog at `$STATE_DIR/viewer.db`;
 S3 only holds the staged zip (briefly) and the deduplicated image blobs. The
 `albums/<id>/index.json` objects of previous versions are no longer written or
 read. Object keys below are the logical ones: set `S3_PREFIX` to nest all of
 them under a single prefix in the bucket.
 
 Image requests are resolved as `(albumId, index)` -> photo row -> blob hash ->
-`blobs/<hash>`, with a local disk cache in `/tmp/viewer-cache/images`. The cached
+`blobs/<hash>`, with a local disk cache in `$STATE_DIR/images`. The cached
 file is served through `http.ServeContent`, so responses carry a
 `Content-Length`, support `Range`, and are revalidated with an `ETag` equal to
 the blob hash under `Cache-Control: public, max-age=86400, immutable`.
@@ -44,12 +44,30 @@ the blob hash under `Cache-Control: public, max-age=86400, immutable`.
 ## Configuration
 
 The viewer is always deployed as the Docker image, so the whole configuration is
-six environment variables:
+eight environment variables:
 
 - `S3_ENDPOINT`, `S3_BUCKET`, `S3_ACCESS_KEY`, `S3_SECRET_KEY` — required.
 - `S3_PREFIX` — optional key prefix, so several deployments can share one bucket
   (default empty: objects sit at the bucket root).
+- `S3_USE_PATH_STYLE` — how the bucket is addressed: `true` (the default) puts it
+  in the request path, `false` in a subdomain of the endpoint.
+- `STATE_DIR` — directory holding the SQLite catalog and the disk caches
+  (default `/tmp/viewer-cache`). It must be an absolute path.
 - `PORT` — the port the container listens on (default `8080`).
+
+By default the bucket is the first path segment of the request rather than a
+subdomain — `https://host/bucket/key` instead of `https://bucket.host/key` —
+which is what self-hosted stores like Garage and MinIO expect and needs no
+wildcard DNS. An endpoint that itself carries a path prefix keeps it:
+`https://host/gateway/bucket/key`. Set `S3_USE_PATH_STYLE=false` for a store that
+requires the subdomain form, which then needs wildcard DNS for the endpoint. The
+signing region is fixed at `us-east-1` because these stores ignore it.
+
+`STATE_DIR` holds three things: `viewer.db` (the SQLite catalog), `images/`
+(decoded blobs) and `zips/` (a staged upload while it is unpacked). The two
+caches are disposable; the catalog is not, so mount a volume at `STATE_DIR` to
+keep albums across container replacements. One volume covers all three because
+every path lives directly under it.
 
 `S3_PREFIX=photos` stores this deployment's objects under `photos/`
 (`photos/blobs/<sha256>`, `photos/uploads/<albumId>/source.zip`,
@@ -62,10 +80,9 @@ Setting the prefix is not a migration: a deployment that already has objects at
 the bucket root must move its `blobs/`, `uploads/` and `batch/` keys under the
 new prefix, or the viewer will not see them.
 
-Everything else is a constant in `internal/config`: the path-style S3 addressing
-and signing region, the 1 GiB upload limit, the 15 minute presign TTL, the
-`/tmp/viewer-cache` state directory, and the `/app/siglip2` checkpoint location.
-Copy `.env.example` to `.env` for a local run. The test suite uses no
+Everything else is a constant in `internal/config`: the signing region, the 1 GiB
+upload limit, the 15 minute presign TTL, and the `/app/siglip2` checkpoint
+location. Copy `.env.example` to `.env` for a local run. The test suite uses no
 credentials, so `make test` needs no environment file.
 
 There is no separate inference service to run: `viewer` loads the checkpoint
@@ -139,4 +156,4 @@ difference below `1e-4`, cosine above `0.9995`). The test is skipped unless
 - The wall serves original-resolution images. There is no thumbnail or resizing support, and `/api/image/{albumId}/{index}` ignores every query parameter and returns the original bytes. This is deliberate for now, but a wall of many large photos moves a lot of bytes.
 - There is no frontend typecheck gate: `vite build` (and therefore `make build` and the Docker build) does not run `tsc`. `npx tsc --noEmit` currently reports three pre-existing errors — two in `UploadPage.tsx` around `onRetryFailedUploads` (a widened `status: string`) and one in `ViewerPage.tsx` where `album` is possibly null.
 - The batch ingest scan runs once at startup, so a `batch/*.zip` object added while the server is already running is only picked up on the next start.
-- The SQLite catalog is container-local and the Dockerfile mounts no volume for it. Replacing the container without a host mount at `/tmp/viewer-cache` leaves the blobs in S3 but loses the album/photo mapping, and the staged zips are already deleted, so albums cannot be reconstructed from blobs alone.
+- The SQLite catalog defaults to `/tmp/viewer-cache`, and the Dockerfile declares no volume for it. Replacing the container without a host mount at `STATE_DIR` leaves the blobs in S3 but loses the album/photo mapping, and the staged zips are already deleted, so albums cannot be reconstructed from blobs alone.

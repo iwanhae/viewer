@@ -28,9 +28,9 @@ func Run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	log.Printf("viewer: config loaded on port=%d s3_prefix=%s", cfg.Port, cfg.DescribePrefix())
+	log.Printf("viewer: config loaded on port=%d state_dir=%s s3_prefix=%s", cfg.Port, cfg.StateDir, cfg.DescribePrefix())
 
-	cat, err := catalog.Open(cfgpkg.DBPath)
+	cat, err := catalog.Open(cfg.DBPath())
 	if err != nil {
 		return fmt.Errorf("open metadata catalog: %w", err)
 	}
@@ -41,7 +41,7 @@ func Run(ctx context.Context) error {
 		return err
 	}
 
-	imageService, err := images.NewService(cat, store, cfgpkg.CacheDir)
+	imageService, err := images.NewService(cat, store, cfg.CacheDir())
 	if err != nil {
 		return err
 	}
@@ -74,7 +74,7 @@ func Run(ctx context.Context) error {
 		pipelineEmbedder = recommendService
 	}
 	pipelineService := pipeline.NewService(cat, store, pipelineEmbedder, pipeline.Options{
-		TempDir: cfgpkg.ZipCacheDir,
+		TempDir: cfg.ZipCacheDir(),
 		OnAlbumReady: func(albumID string) {
 			if err := recommendService.ReloadAlbum(context.Background(), albumID); err != nil {
 				log.Printf("viewer: reload recommendation index for album=%s failed: %v", albumID, err)

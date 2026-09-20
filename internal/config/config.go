@@ -1,15 +1,17 @@
 // Package config holds the viewer's deployment settings.
 //
 // The viewer is always deployed as the Docker image, so the only values that
-// differ between deployments are the object-storage credentials, the port the
-// container listens on, and the optional key prefix that lets two deployments
-// share one bucket. Everything else - the cache paths, the upload limits, the
-// checkpoint location - is a constant here rather than an environment variable.
+// differ between deployments are the object-storage credentials and addressing,
+// the port the container listens on, the directory holding the SQLite catalog,
+// and the optional key prefix that lets two deployments share one bucket.
+// Everything else - the upload limits, the checkpoint location - is a constant
+// here rather than an environment variable.
 package config
 
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -19,30 +21,27 @@ const (
 	// DefaultPort is the port the HTTP server binds inside the container.
 	DefaultPort = 8080
 
-	// S3Region and S3UsePathStyle target the self-hosted, path-style object
-	// stores (Garage, MinIO) this deployment runs against. Those stores ignore
-	// the region, but the AWS SDK requires a non-empty value.
-	S3Region       = "us-east-1"
-	S3UsePathStyle = true
+	// DefaultStateDir holds the SQLite catalog and the disk caches unless
+	// STATE_DIR names another directory. The Docker image pre-creates it and
+	// owns it as the unprivileged user the container runs as.
+	DefaultStateDir = "/tmp/viewer-cache"
+
+	// S3Region targets the self-hosted object stores this deployment runs
+	// against. They ignore the region, but the AWS SDK requires a non-empty
+	// value.
+	S3Region = "us-east-1"
+
+	// DefaultS3UsePathStyle addresses the bucket as the first path segment of
+	// the request (https://host/bucket/key) instead of as a subdomain of the
+	// endpoint (https://bucket.host/key). Self-hosted stores expect the former,
+	// and it needs no wildcard DNS.
+	DefaultS3UsePathStyle = true
 
 	// MaxUploadBytes caps the staged zip size accepted by POST /api/albums.
 	MaxUploadBytes int64 = 1 << 30 // 1 GiB
 
 	// PresignTTL is how long a presigned zip upload URL stays valid.
 	PresignTTL = 15 * time.Minute
-
-	// StateDir is the container-local directory holding the SQLite catalog and
-	// the disk caches. The caches are disposable, but the catalog is not: the
-	// album-to-photo mapping exists nowhere else, and staged zips are deleted
-	// after extraction, so albums cannot be reconstructed from the blobs in S3.
-	// Mount a host directory here to keep them across container replacements.
-	StateDir = "/tmp/viewer-cache"
-
-	// DBPath is the SQLite catalog. CacheDir holds decoded image blobs and
-	// ZipCacheDir stages downloaded uploads while they are unpacked.
-	DBPath      = StateDir + "/viewer.db"
-	CacheDir    = StateDir + "/images"
-	ZipCacheDir = StateDir + "/zips"
 
 	// ModelDir is where the Docker image bakes the SigLIP2 vision checkpoint.
 	// It is a directory, not a Hugging Face repository id, so a container never
@@ -63,18 +62,47 @@ type Config struct {
 	// share one bucket. It is normalized to either "" or a slash-terminated
 	// path; an unset value keeps the flat "blobs/<hash>" layout.
 	S3Prefix string
+
+	// S3UsePathStyle selects how the bucket is addressed: the first path segment
+	// of the request when true, a subdomain of the endpoint when false. Load
+	// defaults it to DefaultS3UsePathStyle, so a Config built by hand must set
+	// it explicitly rather than relying on the false zero value.
+	S3UsePathStyle bool
+
+	// StateDir holds the SQLite catalog and the disk caches. Only the caches
+	// are disposable: the album-to-photo mapping exists nowhere else, and
+	// staged zips are deleted after extraction, so albums cannot be
+	// reconstructed from the blobs in S3. Mount a volume here to keep them
+	// across container replacements.
+	StateDir string
 }
+
+// DBPath is the SQLite catalog inside StateDir.
+func (c Config) DBPath() string { return filepath.Join(c.StateDir, "viewer.db") }
+
+// CacheDir holds decoded image blobs inside StateDir.
+func (c Config) CacheDir() string { return filepath.Join(c.StateDir, "images") }
+
+// ZipCacheDir stages downloaded uploads while they are unpacked.
+func (c Config) ZipCacheDir() string { return filepath.Join(c.StateDir, "zips") }
 
 // Load reads the deployment settings from the environment and validates that
 // the object store is fully configured.
 func Load() (Config, error) {
+	usePathStyle, err := getenvBool("S3_USE_PATH_STYLE", DefaultS3UsePathStyle)
+	if err != nil {
+		return Config{}, err
+	}
+
 	cfg := Config{
-		Port:        getenvInt("PORT", DefaultPort),
-		S3Endpoint:  os.Getenv("S3_ENDPOINT"),
-		S3Bucket:    os.Getenv("S3_BUCKET"),
-		S3AccessKey: os.Getenv("S3_ACCESS_KEY"),
-		S3SecretKey: os.Getenv("S3_SECRET_KEY"),
-		S3Prefix:    normalizePrefix(os.Getenv("S3_PREFIX")),
+		Port:           getenvInt("PORT", DefaultPort),
+		S3Endpoint:     os.Getenv("S3_ENDPOINT"),
+		S3Bucket:       os.Getenv("S3_BUCKET"),
+		S3AccessKey:    os.Getenv("S3_ACCESS_KEY"),
+		S3SecretKey:    os.Getenv("S3_SECRET_KEY"),
+		S3Prefix:       normalizePrefix(os.Getenv("S3_PREFIX")),
+		S3UsePathStyle: usePathStyle,
+		StateDir:       normalizeStateDir(os.Getenv("STATE_DIR")),
 	}
 
 	switch {
@@ -86,6 +114,10 @@ func Load() (Config, error) {
 		return Config{}, fmt.Errorf("S3_ACCESS_KEY is required")
 	case cfg.S3SecretKey == "":
 		return Config{}, fmt.Errorf("S3_SECRET_KEY is required")
+	case !filepath.IsAbs(cfg.StateDir):
+		// A relative path would silently land next to the binary instead of in
+		// a mounted volume, which loses the catalog on the next replacement.
+		return Config{}, fmt.Errorf("STATE_DIR must be an absolute path, got %q", cfg.StateDir)
 	}
 
 	return cfg, nil
@@ -101,6 +133,22 @@ func getenvInt(key string, fallback int) int {
 		return fallback
 	}
 	return n
+}
+
+// getenvBool reads a boolean setting. Unlike PORT, a value it cannot parse is an
+// error rather than a silent fallback: reading "yes" as true when the operator
+// meant the opposite would move every request to a different host, which is far
+// harder to notice than a failed start.
+func getenvBool(key string, fallback bool) (bool, error) {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return fallback, nil
+	}
+	v, err := strconv.ParseBool(raw)
+	if err != nil {
+		return false, fmt.Errorf("%s must be true or false, got %q", key, raw)
+	}
+	return v, nil
 }
 
 // normalizePrefix turns an operator-supplied key prefix into the exact string
@@ -122,4 +170,14 @@ func (c Config) DescribePrefix() string {
 		return "(bucket root)"
 	}
 	return c.S3Prefix
+}
+
+// normalizeStateDir falls back to DefaultStateDir when STATE_DIR is unset or
+// blank, and otherwise cleans the value so "/data/" and "/data" agree.
+func normalizeStateDir(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return DefaultStateDir
+	}
+	return filepath.Clean(trimmed)
 }
