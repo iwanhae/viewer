@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 
 	"viewer/internal/albums"
@@ -33,6 +34,27 @@ type ImageResult struct {
 	ContentType string
 }
 
+// ImageStream is an image body backed by a file in the disk cache. The reader
+// supports seeking so that http.ServeContent can answer range requests.
+type ImageStream struct {
+	Content     io.ReadSeeker
+	SizeBytes   int64
+	ContentType string
+	Hash        string
+
+	closer io.Closer
+}
+
+// Close releases the underlying cached file.
+func (s *ImageStream) Close() error {
+	if s == nil || s.closer == nil {
+		return nil
+	}
+	err := s.closer.Close()
+	s.closer = nil
+	return err
+}
+
 func NewService(cat *catalog.Store, store blobStore, cacheDir string) (*Service, error) {
 	dc, err := cache.NewDiskCache(cacheDir)
 	if err != nil {
@@ -45,75 +67,99 @@ func NewService(cat *catalog.Store, store blobStore, cacheDir string) (*Service,
 	}, nil
 }
 
-// GetImage returns the image at the given index within an album.
-func (s *Service) GetImage(ctx context.Context, albumID string, idx int) (ImageResult, error) {
+// OpenImage returns the image at the given index within an album as a
+// streamable result materialised in the disk cache.
+func (s *Service) OpenImage(ctx context.Context, albumID string, idx int) (*ImageStream, error) {
 	if strings.TrimSpace(albumID) == "" {
-		return ImageResult{}, fmt.Errorf("album id is required")
+		return nil, fmt.Errorf("album id is required")
 	}
 	if idx < 0 {
-		return ImageResult{}, fmt.Errorf("%w: %d", ErrPhotoIndexOutOfRange, idx)
+		return nil, fmt.Errorf("%w: %d", ErrPhotoIndexOutOfRange, idx)
 	}
 
 	if _, err := s.catalog.GetAlbum(ctx, albumID); err != nil {
 		if errors.Is(err, catalog.ErrAlbumNotFound) {
-			return ImageResult{}, fmt.Errorf("%w: %s", albums.ErrAlbumNotFound, albumID)
+			return nil, fmt.Errorf("%w: %s", albums.ErrAlbumNotFound, albumID)
 		}
-		return ImageResult{}, err
+		return nil, err
 	}
 
 	photo, err := s.catalog.PhotoAt(ctx, albumID, idx)
 	if err != nil {
 		if errors.Is(err, catalog.ErrPhotoNotFound) {
-			return ImageResult{}, fmt.Errorf("%w: %d", ErrPhotoIndexOutOfRange, idx)
+			return nil, fmt.Errorf("%w: %d", ErrPhotoIndexOutOfRange, idx)
 		}
-		return ImageResult{}, err
+		return nil, err
 	}
-	return s.GetImageByHash(ctx, photo.Hash)
+	return s.openImageByHash(ctx, photo.Hash)
 }
 
 // GetImageByHash returns the raw bytes of a content-addressed blob, preferring
-// the local disk cache.
+// the local disk cache. Recommendation workers still need the bytes in memory.
 func (s *Service) GetImageByHash(ctx context.Context, hash string) (ImageResult, error) {
+	stream, err := s.openImageByHash(ctx, hash)
+	if err != nil {
+		return ImageResult{}, err
+	}
+	defer stream.Close()
+
+	data, err := io.ReadAll(stream.Content)
+	if err != nil {
+		return ImageResult{}, fmt.Errorf("read blob %s: %w", stream.Hash, err)
+	}
+	return ImageResult{Bytes: data, ContentType: stream.ContentType}, nil
+}
+
+// openImageByHash materialises a content-addressed blob in the disk cache and
+// returns an open handle to the cached file.
+func (s *Service) openImageByHash(ctx context.Context, hash string) (*ImageStream, error) {
 	hash = strings.TrimSpace(hash)
 	if hash == "" {
-		return ImageResult{}, fmt.Errorf("blob hash is required")
+		return nil, fmt.Errorf("blob hash is required")
 	}
 
 	blob, err := s.catalog.GetBlob(ctx, hash)
 	if err != nil {
 		if errors.Is(err, catalog.ErrBlobNotFound) {
-			return ImageResult{}, fmt.Errorf("%w: %s", ErrImageEntryNotFound, hash)
+			return nil, fmt.Errorf("%w: %s", ErrImageEntryNotFound, hash)
 		}
-		return ImageResult{}, err
+		return nil, err
 	}
 
-	if data, ok := s.cache.Get(hash); ok {
-		return ImageResult{Bytes: data, ContentType: contentTypeOrFallback(blob.ContentType)}, nil
-	}
-
-	body, remoteContentType, err := s.store.GetObject(ctx, pipeline.BlobKey(hash))
-	if err != nil {
-		if storage.IsNotFound(err) {
-			return ImageResult{}, fmt.Errorf("%w: %s", ErrImageEntryNotFound, hash)
+	// The content type advertised by S3 is only consulted on a cache miss,
+	// which matches the previous cache-hit behaviour.
+	remoteContentType := ""
+	path, size, err := s.cache.Materialize(hash, func() (io.ReadCloser, error) {
+		body, contentType, err := s.store.GetObject(ctx, pipeline.BlobKey(hash))
+		if err != nil {
+			if storage.IsNotFound(err) {
+				return nil, fmt.Errorf("%w: %s", ErrImageEntryNotFound, hash)
+			}
+			return nil, err
 		}
-		return ImageResult{}, err
-	}
-	defer body.Close()
-
-	data, err := io.ReadAll(body)
+		remoteContentType = contentType
+		return body, nil
+	})
 	if err != nil {
-		return ImageResult{}, fmt.Errorf("read blob %s: %w", hash, err)
+		return nil, err
 	}
-	if err := s.cache.Set(hash, data); err != nil {
-		// A cache write failure must not fail the request.
-		_ = err
+
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("open cached blob %s: %w", hash, err)
 	}
 
 	contentType := contentTypeOrFallback(blob.ContentType)
 	if contentType == "application/octet-stream" {
 		contentType = contentTypeOrFallback(remoteContentType)
 	}
-	return ImageResult{Bytes: data, ContentType: contentType}, nil
+	return &ImageStream{
+		Content:     file,
+		SizeBytes:   size,
+		ContentType: contentType,
+		Hash:        hash,
+		closer:      file,
+	}, nil
 }
 
 func contentTypeOrFallback(contentType string) string {

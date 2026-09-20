@@ -284,6 +284,7 @@ func (s *Service) SearchAlbumsByNamePrefix(ctx context.Context, q string, limit 
 			OriginalFilename: album.OriginalFilename,
 			PhotoCount:       album.PhotoCount,
 			CreatedAt:        album.CreatedAt,
+			SizeBytes:        album.SizeBytes,
 		})
 	}
 	return items, nil

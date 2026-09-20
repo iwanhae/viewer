@@ -379,7 +379,7 @@ func TestSearchAlbumsByNamePrefixReturnsItems(t *testing.T) {
 	ctx := context.Background()
 	if err := cat.CreateAlbum(ctx, catalog.Album{
 		ID: "album-a", OriginalFilename: "Holiday Trip.zip", Status: catalog.AlbumStatusReady,
-		CreatedAt: "2026-02-17T10:00:00Z", PhotoCount: 2,
+		CreatedAt: "2026-02-17T10:00:00Z", PhotoCount: 2, SizeBytes: 2048,
 	}); err != nil {
 		t.Fatalf("create album: %v", err)
 	}
@@ -390,6 +390,9 @@ func TestSearchAlbumsByNamePrefixReturnsItems(t *testing.T) {
 	}
 	if len(got) != 1 || got[0].AlbumID != "album-a" || got[0].PhotoCount != 2 {
 		t.Fatalf("unexpected search results: %+v", got)
+	}
+	if got[0].SizeBytes != 2048 {
+		t.Fatalf("size bytes=%d want=2048", got[0].SizeBytes)
 	}
 }
 

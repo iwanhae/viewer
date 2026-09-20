@@ -15,6 +15,21 @@ type errorBody struct {
 	} `json:"error"`
 }
 
+// writeErrorRecorder captures the first write error for handlers that delegate
+// to http.ServeContent, which cannot report one itself.
+type writeErrorRecorder struct {
+	http.ResponseWriter
+	err error
+}
+
+func (w *writeErrorRecorder) Write(p []byte) (int, error) {
+	n, err := w.ResponseWriter.Write(p)
+	if err != nil && w.err == nil {
+		w.err = err
+	}
+	return n, err
+}
+
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)

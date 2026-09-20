@@ -38,6 +38,7 @@ export type AlbumSearchItem = {
   originalFilename: string
   photoCount: number
   createdAt: string
+  sizeBytes: number
 }
 
 export type AlbumSearchResponse = {
