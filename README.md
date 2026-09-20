@@ -3,7 +3,6 @@
 Photo viewer MVP with:
 - Go API server
 - React frontend embedded into one Go binary
-- Playwright e2e test flow
 
 ## Architecture
 
@@ -52,8 +51,8 @@ five environment variables:
 Everything else is a constant in `internal/config`: the path-style S3 addressing
 and signing region, the 1 GiB upload limit, the 15 minute presign TTL, the
 `/tmp/viewer-cache` state directory, and the `/app/siglip2` checkpoint location.
-Copy `.env.example` to `.env` for a local run, or `.env.test.example` to
-`.env.test` for `make test`.
+Copy `.env.example` to `.env` for a local run. The test suite uses no
+credentials, so `make test` needs no environment file.
 
 There is no separate inference service to run: `viewer` loads the checkpoint
 from `/app/siglip2` once at startup and runs the vision tower in-process. The
@@ -87,8 +86,7 @@ Docker, build with `--build-arg SIGLIP2_MODEL_ID=<repo-id>`.
 
 ## Commands
 - `make build` compiles `bin/viewer`, rebuilding frontend assets when their sources are newer than the committed `internal/web/static` bundle (`make build FORCE=1` forces a frontend rebuild).
-- `make test` runs fast Go unit/integration tests only (`go test ./cmd/... ./internal/...`) using values from `.env.test`.
-- `make test-full` runs the full regression pipeline: `make build`, `make test`, then Playwright e2e. The e2e step binds the app to `TEST_PORT` (default `18080`), sets `E2E_BASE_URL`, and saves screenshots to `samples/` by default.
+- `make test` runs the Go unit/integration tests (`go test ./cmd/... ./internal/...`). It needs no credentials or environment file.
 - `make run` starts `bin/viewer` (loads `.env` if present, does not rebuild binaries).
 - `make clean` removes build outputs, dependency caches, and the host-side `/tmp/viewer-cache` state directory.
 
