@@ -112,11 +112,13 @@ func newFlowHarness(t *testing.T) *flowHarness {
 
 	s3 := newMemoryS3()
 	cfg := cfgpkg.Config{
-		PresignTTL:            time.Minute,
-		MaxUploadBytes:        16 << 20,
-		CacheDir:              t.TempDir(),
-		ZipCacheDir:           t.TempDir(),
-		RecommenderTimeoutSec: 1,
+		PresignTTL:           time.Minute,
+		MaxUploadBytes:       16 << 20,
+		CacheDir:             t.TempDir(),
+		ZipCacheDir:          t.TempDir(),
+		EmbeddingEnabled:     true,
+		EmbeddingConcurrency: 1,
+		EmbeddingTimeoutSec:  1,
 	}
 
 	imageService, err := images.NewService(cat, s3, cfg.CacheDir)

@@ -3,18 +3,15 @@ SHELL := /bin/bash
 
 BIN := bin/viewer
 ALBUM_DEDUPE_BIN := bin/album-dedupe-cleaner
-RECOMMENDER_BIN := bin/recommender
-CARGO_MANIFEST := workers/recommender/Cargo.toml
 FRONTEND_DIR := frontend
 E2E_DIR := e2e
+FRONTEND_STATIC := internal/web/static
 CACHE_DIR := .cache
-RECOMMENDER_LOG := $(CACHE_DIR)/recommender-server.log
 VIEWER_LOG := $(CACHE_DIR)/e2e-server.log
 GO_CACHE_DIR := $(abspath $(CACHE_DIR)/go-build)
 NPM_CACHE_DIR := $(abspath $(CACHE_DIR)/npm)
 
 TEST_PORT ?= 18080
-RECOMMENDER_LISTEN_ADDR ?= 127.0.0.1:18081
 SCREENSHOT_DIR ?= ./samples
 
 GO_TEST_PKGS := ./cmd/... ./internal/...
@@ -23,14 +20,34 @@ ENV_TEST_HELP := missing .env.test (copy from .env.test.example and fill S3 cred
 export GOCACHE ?= $(GO_CACHE_DIR)
 export NPM_CONFIG_CACHE ?= $(NPM_CACHE_DIR)
 
-.PHONY: build test test-e2e test-full run clean
+.PHONY: build build-frontend build-backend test test-e2e test-full run clean
 
-build:
-	cargo build --release --manifest-path $(CARGO_MANIFEST)
+# build compiles the Go binaries. The frontend is rebuilt only when its sources
+# are present and newer than the committed bundle in internal/web/static, so a
+# checkout with committed assets still builds without touching npm.
+build: build-frontend build-backend
+
+build-frontend:
+	@if [ -n "$(FORCE)" ]; then \
+		echo "rebuilding frontend (FORCE=1)"; \
+		npm --prefix $(FRONTEND_DIR) ci; \
+		npm --prefix $(FRONTEND_DIR) run build; \
+	elif [ ! -d $(FRONTEND_DIR) ] || [ ! -f $(FRONTEND_DIR)/package.json ]; then \
+		echo "frontend sources are absent; using committed $(FRONTEND_STATIC)"; \
+	elif [ ! -f $(FRONTEND_STATIC)/index.html ]; then \
+		echo "no committed $(FRONTEND_STATIC); building frontend"; \
+		npm --prefix $(FRONTEND_DIR) ci; \
+		npm --prefix $(FRONTEND_DIR) run build; \
+	elif [ -n "$$(find $(FRONTEND_DIR)/src $(FRONTEND_DIR)/index.html -newer $(FRONTEND_STATIC)/index.html -print -quit 2>/dev/null)" ]; then \
+		echo "frontend sources are newer than $(FRONTEND_STATIC); rebuilding"; \
+		npm --prefix $(FRONTEND_DIR) ci; \
+		npm --prefix $(FRONTEND_DIR) run build; \
+	else \
+		echo "$(FRONTEND_STATIC) is up to date"; \
+	fi
+
+build-backend:
 	mkdir -p bin
-	cp workers/recommender/target/release/recommender $(RECOMMENDER_BIN)
-	npm --prefix $(FRONTEND_DIR) ci
-	npm --prefix $(FRONTEND_DIR) run build
 	go build -o $(BIN) ./cmd/viewer
 	go build -o $(ALBUM_DEDUPE_BIN) ./cmd/album-dedupe-cleaner
 
@@ -64,33 +81,14 @@ test-e2e:
 	: "$${S3_ACCESS_KEY:?S3_ACCESS_KEY is required in .env.test}"; \
 	: "$${S3_SECRET_KEY:?S3_SECRET_KEY is required in .env.test}"; \
 	: "$${TEST_PORT:=$(TEST_PORT)}"; \
-	: "$${RECOMMENDER_ENDPOINT:?RECOMMENDER_ENDPOINT is required in .env.test}"; \
-	: "$${RECOMMENDER_LISTEN_ADDR:=$(RECOMMENDER_LISTEN_ADDR)}"; \
 	PORT="$${TEST_PORT}"; \
 	E2E_BASE_URL="http://127.0.0.1:$${TEST_PORT}"; \
 	: "$${SCREENSHOT_DIR:=$(SCREENSHOT_DIR)}"; \
 	if [[ "$${SCREENSHOT_DIR}" != /* ]]; then SCREENSHOT_DIR="$$(pwd)/$${SCREENSHOT_DIR}"; fi; \
 	mkdir -p "$${SCREENSHOT_DIR}"; \
-	RECOMMENDER_LISTEN_ADDR="$${RECOMMENDER_LISTEN_ADDR}" ./$(RECOMMENDER_BIN) > $(RECOMMENDER_LOG) 2>&1 & \
-	RECOMMENDER_PID=$$!; \
-	SERVER_PID=""; \
-	trap 'kill "$${SERVER_PID:-}" "$${RECOMMENDER_PID:-}" >/dev/null 2>&1 || true' EXIT; \
-	for i in $$(seq 1 60); do \
-		if ! kill -0 $$RECOMMENDER_PID >/dev/null 2>&1; then \
-			echo "recommender worker exited before healthcheck"; \
-			sed -n '1,200p' $(RECOMMENDER_LOG); \
-			exit 1; \
-		fi; \
-		if curl -fsS "$${RECOMMENDER_ENDPOINT}/healthz" >/dev/null 2>&1; then break; fi; \
-		sleep 1; \
-	done; \
-	if ! curl -fsS "$${RECOMMENDER_ENDPOINT}/healthz" >/dev/null; then \
-		echo "recommender worker failed healthcheck"; \
-		sed -n '1,200p' $(RECOMMENDER_LOG); \
-		exit 1; \
-	fi; \
 	./$(BIN) > $(VIEWER_LOG) 2>&1 & \
 	SERVER_PID=$$!; \
+	trap 'kill "$${SERVER_PID:-}" >/dev/null 2>&1 || true' EXIT; \
 	for i in $$(seq 1 60); do \
 		if ! kill -0 $$SERVER_PID >/dev/null 2>&1; then \
 			echo "viewer server exited before healthcheck"; \
@@ -117,4 +115,4 @@ run:
 	./$(BIN)
 
 clean:
-	rm -rf bin .cache frontend/node_modules e2e/node_modules workers/recommender/target
+	rm -rf bin .cache frontend/node_modules e2e/node_modules

@@ -1,6 +1,6 @@
 module viewer
 
-go 1.25.0
+go 1.27
 
 require (
 	github.com/aws/aws-sdk-go-v2 v1.40.0
@@ -9,8 +9,12 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.88.3
 	github.com/aws/smithy-go v1.23.2
 	github.com/go-chi/chi/v5 v5.2.3
+	github.com/gomlx/compute v0.1.14
+	github.com/gomlx/go-huggingface v0.4.12
+	github.com/gomlx/gomlx v0.28.16
 	github.com/google/uuid v1.6.0
 	golang.org/x/image v0.30.0
+	modernc.org/sqlite v1.59.0
 )
 
 require (
@@ -29,12 +33,17 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/ssooidc v1.35.9 // indirect
 	github.com/aws/aws-sdk-go-v2/service/sts v1.41.1 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
+	github.com/edsrzf/mmap-go v1.2.0 // indirect
+	github.com/go-logr/logr v1.4.3 // indirect
+	github.com/gofrs/flock v0.13.0 // indirect
 	github.com/mattn/go-isatty v0.0.24 // indirect
 	github.com/ncruces/go-strftime v1.0.0 // indirect
+	github.com/pkg/errors v0.9.1 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
-	golang.org/x/sys v0.47.0 // indirect
+	golang.org/x/exp v0.0.0-20260908205506-85c1c2202aba // indirect
+	golang.org/x/sys v0.48.0 // indirect
+	k8s.io/klog/v2 v2.140.0 // indirect
 	modernc.org/libc v1.75.7 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.12.1 // indirect
-	modernc.org/sqlite v1.59.0 // indirect
 )

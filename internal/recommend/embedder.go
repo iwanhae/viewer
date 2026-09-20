@@ -1,262 +1,106 @@
 package recommend
 
 import (
-	"bytes"
 	"context"
-	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"net"
-	"net/http"
-	"net/url"
-	"strings"
-	"sync/atomic"
+	"sync"
 	"time"
+
+	"viewer/internal/vision"
 )
 
-var errRecommenderEndpointNotConfigured = errors.New("recommender endpoint is not configured")
-
+// EmbeddingProvider turns raw image bytes into an embedding vector.
 type EmbeddingProvider interface {
+	// Embed computes the embedding of one encoded image.
 	Embed(ctx context.Context, imageBytes []byte) ([]float32, error)
-	Healthcheck(ctx context.Context) error
+	// Close releases the resources held by the provider.
 	Close() error
 }
 
-type HTTPEmbedder struct {
-	endpoint       string
-	requestTimeout time.Duration
+// VisionEmbedder runs the SigLIP2 vision tower in-process through GoMLX. The
+// previous implementation shelled out to a Rust HTTP worker; keeping inference
+// in this binary removes that dependency and the extra hop per image.
+//
+// The checkpoint is large, so it is loaded lazily: NewVisionEmbedder never
+// touches the disk and Load performs the expensive work once, at startup.
+type VisionEmbedder struct {
+	config vision.Config
 
-	client        *http.Client
-	sequence      uint64
-	requestPrefix string
+	// loadMu serialises loadOnce so callers that race the startup load block
+	// until it finishes instead of piling up on sync.Once.
+	loadMu   sync.Mutex
+	loadOnce sync.Once
+	model    *vision.Model
+	loadErr  error
 }
 
-type embedRequest struct {
-	RequestID string `json:"request_id"`
-	ImageB64  string `json:"image_b64,omitempty"`
+// NewVisionEmbedder describes an embedder without loading the checkpoint.
+func NewVisionEmbedder(config vision.Config) *VisionEmbedder {
+	return &VisionEmbedder{config: config}
 }
 
-type embedResponse struct {
-	RequestID string    `json:"request_id"`
-	OK        bool      `json:"ok"`
-	Error     string    `json:"error,omitempty"`
-	Embedding []float32 `json:"embedding,omitempty"`
+// Load resolves the checkpoint and compiles the inference graph. It is safe to
+// call concurrently; the result of the first call is cached.
+func (v *VisionEmbedder) Load(ctx context.Context) error {
+	v.loadMu.Lock()
+	defer v.loadMu.Unlock()
+	v.loadOnce.Do(func() {
+		v.model, v.loadErr = vision.Load(ctx, v.config)
+	})
+	return v.loadErr
 }
 
-func NewHTTPEmbedder(endpoint string, requestTimeout time.Duration) *HTTPEmbedder {
-	if requestTimeout <= 0 {
-		requestTimeout = 120 * time.Second
-	}
-	return &HTTPEmbedder{
-		endpoint:       normalizeEndpoint(endpoint),
-		requestTimeout: requestTimeout,
-		client:         &http.Client{},
-		requestPrefix:  "request",
-	}
-}
-
-func (e *HTTPEmbedder) Healthcheck(ctx context.Context) error {
-	if strings.TrimSpace(e.endpoint) == "" {
-		return errRecommenderEndpointNotConfigured
-	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	requestCtx, cancel := contextWithTimeout(ctx, e.requestTimeout)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(requestCtx, http.MethodGet, e.endpoint+"/ping", nil)
-	if err != nil {
-		return fmt.Errorf("build ping request: %w", err)
-	}
-	res, err := e.client.Do(req)
-	if err != nil {
-		return fmt.Errorf("worker ping failed: %w", err)
-	}
-	defer res.Body.Close()
-
-	body, err := io.ReadAll(io.LimitReader(res.Body, 1024*1024))
-	if err != nil {
-		return fmt.Errorf("read ping response: %w", err)
-	}
-	if res.StatusCode != http.StatusOK {
-		if res.StatusCode >= 500 {
-			return workerStatusError{status: res.StatusCode, body: strings.TrimSpace(string(body)), op: "ping"}
-		}
-		return fmt.Errorf("worker ping failed: status=%d body=%s", res.StatusCode, strings.TrimSpace(string(body)))
-	}
-	if len(body) == 0 {
-		return nil
-	}
-	var ping embedResponse
-	if err := json.Unmarshal(body, &ping); err != nil {
-		return fmt.Errorf("decode ping response: %w", err)
-	}
-	if !ping.OK {
-		return fmt.Errorf("worker ping failed: %s", formatWorkerError(ping, string(body)))
-	}
-	return nil
-}
-
-func (e *HTTPEmbedder) Embed(ctx context.Context, imageBytes []byte) ([]float32, error) {
-	if strings.TrimSpace(e.endpoint) == "" {
-		return nil, errRecommenderEndpointNotConfigured
-	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	requestCtx, cancel := contextWithTimeout(ctx, e.requestTimeout)
-	defer cancel()
-
-	payload := embedRequest{
-		RequestID: e.nextRequestID(),
-		ImageB64:  base64.StdEncoding.EncodeToString(imageBytes),
-	}
-
-	out, body, err := e.sendRequest(requestCtx, "/embed", payload)
-	if err != nil {
+// Embed preprocesses the image and runs the vision tower.
+func (v *VisionEmbedder) Embed(ctx context.Context, imageBytes []byte) ([]float32, error) {
+	if err := v.Load(ctx); err != nil {
 		return nil, err
 	}
-	if !out.OK {
-		if out.Error == "" {
-			return nil, errors.New("embedding failed")
-		}
-		return nil, errors.New(formatWorkerError(out, body))
-	}
-	if len(out.Embedding) == 0 {
-		return nil, fmt.Errorf("worker returned empty embedding")
-	}
-	return out.Embedding, nil
-}
 
-func (e *HTTPEmbedder) sendRequest(ctx context.Context, path string, payload embedRequest) (embedResponse, string, error) {
-	bodyBytes, err := json.Marshal(payload)
+	image, err := vision.Preprocess(imageBytes, v.model.ImageSize())
 	if err != nil {
-		return embedResponse{}, "", fmt.Errorf("encode worker request: %w", err)
+		return nil, fmt.Errorf("preprocess image: %w", err)
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, e.endpoint+path, bytes.NewReader(bodyBytes))
+	vector, err := v.model.Embed(ctx, image)
 	if err != nil {
-		return embedResponse{}, string(bodyBytes), fmt.Errorf("build worker request: %w", err)
+		return nil, fmt.Errorf("embed image: %w", err)
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-
-	res, err := e.client.Do(req)
-	if err != nil {
-		return embedResponse{}, string(bodyBytes), fmt.Errorf("send worker request: %w", err)
-	}
-	defer res.Body.Close()
-
-	responseBody, err := io.ReadAll(io.LimitReader(res.Body, 16*1024*1024))
-	if err != nil {
-		return embedResponse{}, "", fmt.Errorf("read worker response: %w", err)
-	}
-	if res.StatusCode != http.StatusOK {
-		bodyText := strings.TrimSpace(string(responseBody))
-		if res.StatusCode >= 500 {
-			return embedResponse{}, bodyText, workerStatusError{status: res.StatusCode, body: bodyText, op: strings.TrimPrefix(path, "/")}
-		}
-		return embedResponse{}, string(responseBody), fmt.Errorf("worker request failed: status=%d body=%s", res.StatusCode, strings.TrimSpace(string(responseBody)))
-	}
-	var out embedResponse
-	if err := json.Unmarshal(responseBody, &out); err != nil {
-		return embedResponse{}, string(responseBody), fmt.Errorf("decode worker response: %w", err)
-	}
-	if out.RequestID != "" && out.RequestID != payload.RequestID {
-		return embedResponse{}, string(responseBody), fmt.Errorf("worker request id mismatch: got=%s want=%s", out.RequestID, payload.RequestID)
-	}
-	return out, string(responseBody), nil
+	return vector, nil
 }
 
-type workerStatusError struct {
-	status int
-	body   string
-	op     string
+// Close releases the compiled graph.
+func (v *VisionEmbedder) Close() error {
+	if v.model == nil {
+		return nil
+	}
+	return v.model.Close()
 }
 
-func (e workerStatusError) Error() string {
-	return fmt.Sprintf("worker %s failed: status=%d body=%s", e.op, e.status, e.body)
+// Describe returns a human readable summary of the loaded model, for logs.
+func (v *VisionEmbedder) Describe() string {
+	if v.model == nil {
+		return "siglip2 model=<unloaded>"
+	}
+	return v.model.Describe()
 }
 
-func (e workerStatusError) Status() int {
-	return e.status
-}
-
+// isTransientEmbedError reports whether a failed embedding is worth retrying.
+//
+// In-process inference has no network or remote-worker failure modes left: a
+// failure means the image could not be decoded or the model could not run, and
+// retrying it will not help. Context cancellation is still transient because
+// the worker exits and the blob is picked up by the next run.
 func isTransientEmbedError(err error) bool {
 	if err == nil {
 		return false
 	}
-
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return true
-	}
-
-	var netErr net.Error
-	if errors.As(err, &netErr) {
-		return true
-	}
-
-	var urlErr *url.Error
-	if errors.As(err, &urlErr) {
-		return true
-	}
-
-	var statusErr workerStatusError
-	if errors.As(err, &statusErr) && statusErr.Status() >= 500 {
-		return true
-	}
-
-	msg := strings.ToLower(err.Error())
-	if strings.Contains(msg, "connection refused") ||
-		strings.Contains(msg, "connection reset by peer") ||
-		strings.Contains(msg, "no such host") ||
-		strings.Contains(msg, "i/o timeout") ||
-		strings.Contains(msg, "timed out") ||
-		strings.Contains(msg, "broken pipe") ||
-		strings.Contains(msg, "eof") {
-		return true
-	}
-	return false
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
-func (e *HTTPEmbedder) nextRequestID() string {
-	next := atomic.AddUint64(&e.sequence, 1)
-	return e.requestPrefix + "-" + fmt.Sprintf("%d", next)
-}
-
-func (e *HTTPEmbedder) Close() error {
-	return nil
-}
-
-func contextWithTimeout(parent context.Context, d time.Duration) (context.Context, context.CancelFunc) {
-	if d <= 0 {
-		return parent, func() {}
+// embeddingTimeout bounds one image's preprocessing plus inference.
+func embeddingTimeout(configured time.Duration) time.Duration {
+	if configured <= 0 {
+		return 5 * time.Minute
 	}
-	return context.WithTimeout(parent, d)
-}
-
-func normalizeEndpoint(endpoint string) string {
-	clean := strings.TrimSpace(endpoint)
-	clean = strings.TrimRight(clean, "/")
-	return clean
-}
-
-func formatWorkerError(out embedResponse, body string) string {
-	parts := []string{}
-	if out.Error != "" {
-		parts = append(parts, out.Error)
-	}
-	if body != "" {
-		parts = append(parts, "body="+truncateText(body, 8<<10))
-	}
-	return strings.Join(parts, " ")
-}
-
-func truncateText(value string, max int) string {
-	if max <= 0 || len(value) <= max {
-		return value
-	}
-	return value[:max] + "...(truncated)"
+	return configured
 }

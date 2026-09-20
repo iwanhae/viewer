@@ -12,6 +12,7 @@ import (
 	"viewer/internal/catalog"
 	cfgpkg "viewer/internal/config"
 	"viewer/internal/images"
+	"viewer/internal/vision"
 )
 
 // Service keeps an in-memory similarity index of blob embeddings and runs the
@@ -26,6 +27,11 @@ type Service struct {
 
 	startOnce sync.Once
 	startErr  error
+
+	// modelMu guards model loading and modelErr. A failed load marks the
+	// service unavailable so the API layer stops advertising embeddings.
+	modelMu  sync.Mutex
+	modelErr error
 
 	mu               sync.RWMutex
 	photosByHash     map[string][]photoRef
@@ -43,36 +49,85 @@ func NewService(cfg cfgpkg.Config, cat *catalog.Store, imagesService *images.Ser
 		cfg:              cfg,
 		catalog:          cat,
 		images:           imagesService,
-		embedder:         NewHTTPEmbedder(cfg.RecommenderEndpoint, time.Duration(cfg.RecommenderTimeoutSec)*time.Second),
+		embedder:         newEmbedder(cfg),
 		photosByHash:     make(map[string][]photoRef),
 		hashesByAlbum:    make(map[string]map[string]struct{}),
 		embeddingsByHash: make(map[string][]float32),
 		failedByHash:     make(map[string]string),
 		claimed:          make(map[string]struct{}),
-		imageSem:         make(chan struct{}, 1),
+		imageSem:         make(chan struct{}, max(cfg.EmbeddingConcurrency, 1)),
 	}, nil
 }
 
-func (s *Service) Healthcheck(ctx context.Context) error {
-	if s == nil {
-		return fmt.Errorf("recommendation service is nil")
+// newEmbedder builds the in-process vision embedder, or returns nil when
+// embedding is switched off. A nil provider matters: the ingest pipeline treats
+// a missing embedder as "leave blobs pending", whereas a provider that
+// systematically errors would mark every blob as failed.
+func newEmbedder(cfg cfgpkg.Config) EmbeddingProvider {
+	if !cfg.EmbeddingEnabled {
+		return nil
 	}
-	if s.embedder == nil {
-		return fmt.Errorf("recommendation embedder is not initialized")
-	}
-	return s.embedder.Healthcheck(ctx)
+	return NewVisionEmbedder(vision.Config{
+		ModelID:  cfg.EmbeddingModelID,
+		Backend:  cfg.EmbeddingBackend,
+		CacheDir: cfg.EmbeddingCacheDir,
+	})
 }
 
+// ErrEmbeddingDisabled reports that embedding was switched off.
+var ErrEmbeddingDisabled = errors.New("image embedding is disabled")
+
+// LoadModel resolves the checkpoint and compiles the inference graph. Startup
+// calls it once so a broken embedding configuration fails fast instead of on
+// the first image. It is a no-op when embedding is disabled.
+//
+// A failed load is remembered: Enabled then reports false, so the rest of the
+// application degrades to running without embeddings.
+func (s *Service) LoadModel(ctx context.Context) error {
+	if s == nil || !s.cfg.EmbeddingEnabled {
+		return nil
+	}
+	embedder, ok := s.embedder.(*VisionEmbedder)
+	if !ok {
+		return nil
+	}
+
+	s.modelMu.Lock()
+	defer s.modelMu.Unlock()
+	if err := embedder.Load(ctx); err != nil {
+		s.modelErr = fmt.Errorf("load embedding model: %w", err)
+		return s.modelErr
+	}
+	log.Printf("recommend: %s", embedder.Describe())
+	return nil
+}
+
+// Enabled reports whether embeddings should be computed and served.
 func (s *Service) Enabled() bool {
-	return s != nil && strings.TrimSpace(s.cfg.RecommenderEndpoint) != ""
+	if s == nil || !s.cfg.EmbeddingEnabled {
+		return false
+	}
+	s.modelMu.Lock()
+	defer s.modelMu.Unlock()
+	return s.modelErr == nil
+}
+
+// Close releases the embedding model.
+func (s *Service) Close() error {
+	if s == nil || s.embedder == nil {
+		return nil
+	}
+	return s.embedder.Close()
 }
 
 // Embed satisfies the pipeline's embedder interface.
 func (s *Service) Embed(ctx context.Context, imageBytes []byte) ([]float32, error) {
 	if s == nil || s.embedder == nil {
-		return nil, fmt.Errorf("recommendation embedder is not initialized")
+		return nil, ErrEmbeddingDisabled
 	}
-	return s.embedder.Embed(ctx, imageBytes)
+	embedCtx, cancel := context.WithTimeout(ctx, embeddingTimeout(time.Duration(s.cfg.EmbeddingTimeoutSec)*time.Second))
+	defer cancel()
+	return s.embedder.Embed(embedCtx, imageBytes)
 }
 
 // LoadAll rebuilds the in-memory index from the SQLite catalog.
@@ -179,10 +234,10 @@ func (s *Service) Start(ctx context.Context) error {
 
 		go func() {
 			<-ctx.Done()
-			_ = s.embedder.Close()
+			_ = s.Close()
 		}()
 
-		concurrency := s.cfg.RecommenderConcurrency
+		concurrency := s.cfg.EmbeddingConcurrency
 		if concurrency <= 0 {
 			concurrency = 1
 		}

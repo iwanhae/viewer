@@ -18,6 +18,10 @@ import (
 	"viewer/internal/storage"
 )
 
+// embeddingLoadTimeout bounds resolving the checkpoint and compiling the
+// inference graph at startup. The checkpoint may need to be downloaded first.
+const embeddingLoadTimeout = 15 * time.Minute
+
 func Run(ctx context.Context) error {
 	cfg, err := cfgpkg.Load()
 	if err != nil {
@@ -48,8 +52,32 @@ func Run(ctx context.Context) error {
 
 	albumService := albums.NewService(cfg, cat, store)
 
+	// Load the vision tower before wiring the ingest pipeline: a failed load
+	// must keep the embedder out of the pipeline entirely, otherwise every
+	// image would be marked as a failed embedding instead of staying pending.
+	recommenderEnabled := recommendService.Enabled()
+	if recommenderEnabled {
+		loadCtx, cancel := context.WithTimeout(context.Background(), embeddingLoadTimeout)
+		loadErr := recommendService.LoadModel(loadCtx)
+		cancel()
+		if loadErr != nil {
+			if cfg.EmbeddingRequired {
+				return fmt.Errorf("recommendation service init failed: %w", loadErr)
+			}
+			log.Printf("viewer: embedding model unavailable, continuing without embeddings: %v", loadErr)
+		}
+		// Enabled reflects a failed load, so re-read it rather than trusting cfg.
+		recommenderEnabled = recommendService.Enabled()
+	}
+	if recommenderEnabled {
+		log.Printf("viewer: recommendation service enabled (model=%s backend=%s)",
+			cfg.EmbeddingModelID, cfg.EmbeddingBackend)
+	} else {
+		log.Printf("viewer: embeddings disabled (EMBEDDING_ENABLED=%t)", cfg.EmbeddingEnabled)
+	}
+
 	var pipelineEmbedder pipeline.Embedder
-	if recommendService.Enabled() {
+	if recommenderEnabled {
 		pipelineEmbedder = recommendService
 	}
 	pipelineService := pipeline.NewService(cat, store, pipelineEmbedder, pipeline.Options{
@@ -65,27 +93,6 @@ func Run(ctx context.Context) error {
 
 	feedService := feed.NewService(albumService)
 	pipelineService.Start(ctx)
-
-	recommenderEnabled := recommendService.Enabled()
-	if recommenderEnabled {
-		if cfg.RecommenderRequired {
-			healthcheckCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			if err := recommendService.Healthcheck(healthcheckCtx); err != nil {
-				cancel()
-				return fmt.Errorf("recommendation service init failed: %w", err)
-			}
-			cancel()
-		} else {
-			healthcheckCtx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
-			if err := recommendService.Healthcheck(healthcheckCtx); err != nil {
-				log.Printf("viewer: recommender unavailable at startup, continuing in degraded mode: %v", err)
-			}
-			cancel()
-		}
-		log.Printf("viewer: recommendation service enabled")
-	} else {
-		log.Printf("viewer: recommender disabled (RECOMMENDER_ENDPOINT is empty)")
-	}
 
 	h := httpapi.New(albumService, feedService, imageService, recommendService).Router()
 	srv := &http.Server{

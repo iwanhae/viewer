@@ -1,74 +1,122 @@
 package config
 
 import (
-	"strings"
 	"testing"
+
+	"viewer/internal/vision"
 )
 
-func TestLoadRequiresRecommenderEndpoint(t *testing.T) {
+func TestLoadEmbeddingDefaults(t *testing.T) {
 	setRequiredEnv(t)
-	t.Setenv("RECOMMENDER_REQUIRED", "true")
-	t.Setenv("RECOMMENDER_ENDPOINT", "")
-
-	_, err := Load()
-	if err == nil {
-		t.Fatalf("Load expected error for missing RECOMMENDER_ENDPOINT")
-	}
-	if got := err.Error(); !strings.Contains(got, "RECOMMENDER_ENDPOINT is required") {
-		t.Fatalf("unexpected error: %v", err)
-	}
-}
-
-func TestLoadAllowsMissingRecommenderEndpointWhenNotRequired(t *testing.T) {
-	setRequiredEnv(t)
-	t.Setenv("RECOMMENDER_REQUIRED", "false")
-	t.Setenv("RECOMMENDER_ENDPOINT", "")
+	// The test env sets this to false to keep tests hermetic; the default is on.
+	t.Setenv("EMBEDDING_ENABLED", "")
+	t.Setenv("EMBEDDING_MODEL_ID", "")
+	t.Setenv("EMBEDDING_BACKEND", "")
+	t.Setenv("EMBEDDING_CONCURRENCY", "")
+	t.Setenv("EMBEDDING_REQUEST_TIMEOUT_SECONDS", "")
 
 	cfg, err := Load()
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if got := cfg.RecommenderEndpoint; got != "" {
-		t.Fatalf("RecommenderEndpoint=%q want empty", got)
+	if !cfg.EmbeddingEnabled {
+		t.Fatalf("EmbeddingEnabled=false want=true")
+	}
+	if cfg.EmbeddingModelID != vision.DefaultModelID {
+		t.Fatalf("EmbeddingModelID=%q want=%q", cfg.EmbeddingModelID, vision.DefaultModelID)
+	}
+	if cfg.EmbeddingBackend != vision.DefaultBackend {
+		t.Fatalf("EmbeddingBackend=%q want=%q", cfg.EmbeddingBackend, vision.DefaultBackend)
+	}
+	if cfg.EmbeddingRequired {
+		t.Fatalf("EmbeddingRequired=true want=false so a missing model degrades gracefully")
+	}
+	if want := defaultEmbeddingConcurrency(); cfg.EmbeddingConcurrency != want {
+		t.Fatalf("EmbeddingConcurrency=%d want=%d", cfg.EmbeddingConcurrency, want)
+	}
+	if got, want := cfg.EmbeddingTimeoutSec, 300; got != want {
+		t.Fatalf("EmbeddingTimeoutSec=%d want=%d", got, want)
 	}
 }
 
-func TestLoadDefaultRecommenderRequired(t *testing.T) {
+// TestEmbeddingDefaultsMatchVision guards the intentional duplication of the
+// model id and backend defaults: config must not import the inference stack,
+// because album-dedupe-cleaner only needs configuration.
+func TestEmbeddingDefaultsMatchVision(t *testing.T) {
+	if defaultEmbeddingModelID != vision.DefaultModelID {
+		t.Errorf("defaultEmbeddingModelID=%q want %q", defaultEmbeddingModelID, vision.DefaultModelID)
+	}
+	if defaultEmbeddingBackend != vision.DefaultBackend {
+		t.Errorf("defaultEmbeddingBackend=%q want %q", defaultEmbeddingBackend, vision.DefaultBackend)
+	}
+}
+
+func TestLoadEmbeddingOverrides(t *testing.T) {
 	setRequiredEnv(t)
-	t.Setenv("RECOMMENDER_REQUIRED", "")
+	t.Setenv("EMBEDDING_ENABLED", "false")
+	t.Setenv("EMBEDDING_MODEL_ID", "/models/siglip2-local")
+	t.Setenv("EMBEDDING_BACKEND", "xla:cpu")
+	t.Setenv("EMBEDDING_CACHE_DIR", "/var/cache/hf")
+	t.Setenv("EMBEDDING_CONCURRENCY", "3")
+	t.Setenv("EMBEDDING_REQUEST_TIMEOUT_SECONDS", "45")
 
 	cfg, err := Load()
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if got, want := cfg.RecommenderRequired, true; got != want {
-		t.Fatalf("RecommenderRequired=%v want=%v", got, want)
+	if cfg.EmbeddingEnabled {
+		t.Fatalf("EmbeddingEnabled=true want=false")
+	}
+	if got, want := cfg.EmbeddingModelID, "/models/siglip2-local"; got != want {
+		t.Fatalf("EmbeddingModelID=%q want=%q", got, want)
+	}
+	if got, want := cfg.EmbeddingBackend, "xla:cpu"; got != want {
+		t.Fatalf("EmbeddingBackend=%q want=%q", got, want)
+	}
+	if got, want := cfg.EmbeddingCacheDir, "/var/cache/hf"; got != want {
+		t.Fatalf("EmbeddingCacheDir=%q want=%q", got, want)
+	}
+	if got, want := cfg.EmbeddingConcurrency, 3; got != want {
+		t.Fatalf("EmbeddingConcurrency=%d want=%d", got, want)
+	}
+	if got, want := cfg.EmbeddingTimeoutSec, 45; got != want {
+		t.Fatalf("EmbeddingTimeoutSec=%d want=%d", got, want)
 	}
 }
 
-func TestLoadRecommenderRequiredFalse(t *testing.T) {
+func TestLoadRejectsRequiredButDisabledEmbedding(t *testing.T) {
 	setRequiredEnv(t)
-	t.Setenv("RECOMMENDER_REQUIRED", "false")
+	t.Setenv("EMBEDDING_REQUIRED", "true")
+	t.Setenv("EMBEDDING_ENABLED", "false")
+
+	if _, err := Load(); err == nil {
+		t.Fatalf("Load expected an error for required-but-disabled embedding")
+	}
+}
+
+func TestLoadEmbeddingConcurrencyFallsBackToDefault(t *testing.T) {
+	setRequiredEnv(t)
+	t.Setenv("EMBEDDING_CONCURRENCY", "0")
+	t.Setenv("EMBEDDING_REQUEST_TIMEOUT_SECONDS", "0")
 
 	cfg, err := Load()
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if got, want := cfg.RecommenderRequired, false; got != want {
-		t.Fatalf("RecommenderRequired=%v want=%v", got, want)
+	if got, want := cfg.EmbeddingConcurrency, defaultEmbeddingConcurrency(); got != want {
+		t.Fatalf("EmbeddingConcurrency=%d want=%d", got, want)
+	}
+	if got, want := cfg.EmbeddingTimeoutSec, 300; got != want {
+		t.Fatalf("EmbeddingTimeoutSec=%d want=%d", got, want)
 	}
 }
 
-func TestLoadRecommenderEndpoint(t *testing.T) {
-	setRequiredEnv(t)
-	t.Setenv("RECOMMENDER_ENDPOINT", "http://127.0.0.1:8081")
-
-	cfg, err := Load()
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-	if got, want := cfg.RecommenderEndpoint, "http://127.0.0.1:8081"; got != want {
-		t.Fatalf("RecommenderEndpoint=%q want=%q", got, want)
+// TestDefaultEmbeddingConcurrencyIsSingle pins the measured default: the
+// backend already parallelises one forward pass across all cores, so more
+// workers only add queueing.
+func TestDefaultEmbeddingConcurrencyIsSingle(t *testing.T) {
+	if got := defaultEmbeddingConcurrency(); got != 1 {
+		t.Fatalf("defaultEmbeddingConcurrency()=%d want=1", got)
 	}
 }
 
@@ -77,8 +125,6 @@ func TestLoadS3OnlyRequiresS3ValuesOnly(t *testing.T) {
 	t.Setenv("S3_BUCKET", "viewer")
 	t.Setenv("S3_ACCESS_KEY", "access")
 	t.Setenv("S3_SECRET_KEY", "secret")
-	t.Setenv("RECOMMENDER_REQUIRED", "true")
-	t.Setenv("RECOMMENDER_ENDPOINT", "")
 
 	cfg, err := LoadS3Only()
 	if err != nil {
@@ -129,5 +175,4 @@ func setRequiredEnv(t *testing.T) {
 	t.Setenv("S3_BUCKET", "viewer")
 	t.Setenv("S3_ACCESS_KEY", "access")
 	t.Setenv("S3_SECRET_KEY", "secret")
-	t.Setenv("RECOMMENDER_ENDPOINT", "http://127.0.0.1:18081")
 }

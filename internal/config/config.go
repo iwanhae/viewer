@@ -3,9 +3,18 @@ package config
 import (
 	"fmt"
 	"os"
-	"runtime"
 	"strconv"
 	"time"
+)
+
+const (
+	// defaultEmbeddingModelID and defaultEmbeddingBackend mirror
+	// vision.DefaultModelID and vision.DefaultBackend. They are duplicated as
+	// literals so this package does not pull the inference stack into binaries
+	// such as album-dedupe-cleaner that only need configuration;
+	// TestEmbeddingDefaultsMatchVision keeps the two in step.
+	defaultEmbeddingModelID = "google/siglip2-base-patch16-224"
+	defaultEmbeddingBackend = "go"
 )
 
 type Config struct {
@@ -25,11 +34,16 @@ type Config struct {
 	WarmupFetchConcurrency int
 	RecoTopKDefault        int
 	RecoTopKMax            int
-	RecommenderEndpoint    string
-	RecommenderRequired    bool
-	RecommenderConcurrency int
-	RecommenderTimeoutSec  int
-	BatchIngestEnabled     bool
+
+	// Embedding runs the SigLIP2 vision tower in-process through GoMLX.
+	EmbeddingEnabled     bool
+	EmbeddingModelID     string
+	EmbeddingBackend     string
+	EmbeddingCacheDir    string
+	EmbeddingRequired    bool
+	EmbeddingConcurrency int
+	EmbeddingTimeoutSec  int
+	BatchIngestEnabled   bool
 }
 
 func Load() (Config, error) {
@@ -39,7 +53,6 @@ func Load() (Config, error) {
 	cacheDir := getenv("CACHE_DIR", ".cache/images")
 	zipCacheDir := getenv("ZIP_CACHE_DIR", ".cache/zips")
 	dbPath := getenv("DB_PATH", ".cache/viewer.db")
-	recommenderEndpoint := os.Getenv("RECOMMENDER_ENDPOINT")
 
 	cfg := Config{
 		Port:                   port,
@@ -58,11 +71,15 @@ func Load() (Config, error) {
 		WarmupFetchConcurrency: getenvInt("WARMUP_FETCH_CONCURRENCY", 0),
 		RecoTopKDefault:        getenvInt("RECO_TOPK_DEFAULT", 12),
 		RecoTopKMax:            getenvInt("RECO_TOPK_MAX", 48),
-		RecommenderEndpoint:    recommenderEndpoint,
-		RecommenderRequired:    getenvBool("RECOMMENDER_REQUIRED", true),
-		RecommenderConcurrency: getenvInt("RECOMMENDER_CONCURRENCY", defaultRecommenderConcurrency()),
-		RecommenderTimeoutSec:  getenvInt("RECOMMENDER_REQUEST_TIMEOUT_SECONDS", 120),
-		BatchIngestEnabled:     getenvBool("BATCH_INGEST_ENABLED", true),
+
+		EmbeddingEnabled:     getenvBool("EMBEDDING_ENABLED", true),
+		EmbeddingModelID:     getenv("EMBEDDING_MODEL_ID", defaultEmbeddingModelID),
+		EmbeddingBackend:     getenv("EMBEDDING_BACKEND", defaultEmbeddingBackend),
+		EmbeddingCacheDir:    os.Getenv("EMBEDDING_CACHE_DIR"),
+		EmbeddingRequired:    getenvBool("EMBEDDING_REQUIRED", false),
+		EmbeddingConcurrency: getenvInt("EMBEDDING_CONCURRENCY", defaultEmbeddingConcurrency()),
+		EmbeddingTimeoutSec:  getenvInt("EMBEDDING_REQUEST_TIMEOUT_SECONDS", 300),
+		BatchIngestEnabled:   getenvBool("BATCH_INGEST_ENABLED", true),
 	}
 
 	if cfg.S3Bucket == "" {
@@ -86,14 +103,14 @@ func Load() (Config, error) {
 	if cfg.RecoTopKMax <= 0 {
 		cfg.RecoTopKMax = 48
 	}
-	if cfg.RecommenderConcurrency <= 0 {
-		cfg.RecommenderConcurrency = defaultRecommenderConcurrency()
+	if cfg.EmbeddingConcurrency <= 0 {
+		cfg.EmbeddingConcurrency = defaultEmbeddingConcurrency()
 	}
-	if cfg.RecommenderTimeoutSec <= 0 {
-		cfg.RecommenderTimeoutSec = 120
+	if cfg.EmbeddingTimeoutSec <= 0 {
+		cfg.EmbeddingTimeoutSec = 300
 	}
-	if cfg.RecommenderRequired && cfg.RecommenderEndpoint == "" {
-		return Config{}, fmt.Errorf("RECOMMENDER_ENDPOINT is required")
+	if cfg.EmbeddingRequired && !cfg.EmbeddingEnabled {
+		return Config{}, fmt.Errorf("EMBEDDING_REQUIRED is set but EMBEDDING_ENABLED is false")
 	}
 
 	return cfg, nil
@@ -169,13 +186,9 @@ func getenvBool(key string, fallback bool) bool {
 	return b
 }
 
-func defaultRecommenderConcurrency() int {
-	workers := runtime.GOMAXPROCS(0) * 3
-	if workers < 8 {
-		return 8
-	}
-	if workers > 64 {
-		return 64
-	}
-	return workers
+func defaultEmbeddingConcurrency() int {
+	// One worker is the right default: the GoMLX backend already splits a single
+	// forward pass across every core, so extra workers only queue behind it.
+	// Measured per-image latency was flat from 1 to 4 concurrent images.
+	return 1
 }

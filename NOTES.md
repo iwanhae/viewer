@@ -244,7 +244,9 @@ When `/finalize` is called:
    - upload the bytes to `blobs/<sha256>` (skipped when the object already
      exists, so identical content is stored once),
    - upsert the `blobs` row and insert the `photos` row in SQLite,
-   - request an embedding and store it on the blob row.
+   - compute the SigLIP2 embedding in-process and store it on the blob row
+     (the vision tower runs inside the viewer through GoMLX; there is no
+     separate inference service).
 5. Mark the album `READY` and delete the staged ZIP.
 
 ZIP format note:
