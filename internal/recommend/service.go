@@ -90,7 +90,6 @@ func (s *Service) LoadModel(ctx context.Context) error {
 		s.modelErr = fmt.Errorf("load embedding model: %w", err)
 		return s.modelErr
 	}
-	log.Printf("recommend: embedding model loaded")
 	return nil
 }
 
