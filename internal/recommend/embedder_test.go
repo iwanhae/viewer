@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"viewer/internal/catalog"
-	cfgpkg "viewer/internal/config"
 	"viewer/internal/vision"
 )
 
@@ -35,25 +34,19 @@ func TestIsTransientEmbedError(t *testing.T) {
 	}
 }
 
-func TestEmbeddingTimeoutFallback(t *testing.T) {
-	if got, want := embeddingTimeout(0), 5*time.Minute; got != want {
-		t.Fatalf("embeddingTimeout(0)=%s want=%s", got, want)
-	}
-	if got, want := embeddingTimeout(-time.Second), 5*time.Minute; got != want {
-		t.Fatalf("embeddingTimeout(-1s)=%s want=%s", got, want)
-	}
-	if got, want := embeddingTimeout(30*time.Second), 30*time.Second; got != want {
-		t.Fatalf("embeddingTimeout(30s)=%s want=%s", got, want)
+func TestEmbeddingTimeoutIsFiveMinutes(t *testing.T) {
+	if got, want := embeddingTimeout, 5*time.Minute; got != want {
+		t.Fatalf("embeddingTimeout=%s want=%s", got, want)
 	}
 }
 
-func TestDisabledEmbedderReportsDisabled(t *testing.T) {
+// TestServiceWithoutEmbedderReportsDisabled covers the switched-off feature: a
+// nil provider means the API keeps serving and the pipeline leaves blobs
+// pending, while an always-erroring provider would mark every blob failed.
+func TestServiceWithoutEmbedderReportsDisabled(t *testing.T) {
 	cat := newTestCatalog(t)
-	svc := newTestService(t, cat, cfgpkg.Config{EmbeddingEnabled: false, EmbeddingConcurrency: 1})
+	svc := NewService(cat, nil, nil)
 
-	// A disabled service must expose no embedder at all: the pipeline treats a
-	// nil embedder as "leave blobs pending", while an always-erroring provider
-	// would mark every blob as failed.
 	if svc.embedder != nil {
 		t.Fatalf("embedder=%T want nil when embedding is off", svc.embedder)
 	}
@@ -121,17 +114,15 @@ func TestVisionEmbedderRejectsInvalidImage(t *testing.T) {
 }
 
 // TestServiceDisabledAfterModelLoadFailure checks the degraded path: a failed
-// load must be remembered so the API layer stops advertising embeddings.
+// load must be remembered so the ingest pipeline keeps blobs pending instead of
+// marking them failed.
 func TestServiceDisabledAfterModelLoadFailure(t *testing.T) {
 	cat := newTestCatalog(t)
-	cfg := cfgpkg.Config{
-		EmbeddingEnabled:     true,
-		EmbeddingModelID:     filepath.Join(t.TempDir(), "missing-model"),
-		EmbeddingBackend:     "go",
-		EmbeddingConcurrency: 1,
-		EmbeddingTimeoutSec:  1,
-	}
-	svc := newTestService(t, cat, cfg)
+	embedder := NewVisionEmbedder(vision.Config{
+		ModelID: filepath.Join(t.TempDir(), "missing-model"),
+		Backend: "go",
+	})
+	svc := NewService(cat, nil, embedder)
 
 	if err := svc.LoadModel(context.Background()); err == nil {
 		t.Fatalf("LoadModel expected an error for a missing model directory")
@@ -145,25 +136,6 @@ func TestServiceDisabledAfterModelLoadFailure(t *testing.T) {
 	// A second load reports the same failure rather than retrying or panicking.
 	if err := svc.LoadModel(context.Background()); err == nil {
 		t.Fatalf("second LoadModel expected an error")
-	}
-}
-
-// TestServiceDisabledWhenEmbeddingOff covers the config switch.
-func TestServiceDisabledWhenEmbeddingOff(t *testing.T) {
-	cat := newTestCatalog(t)
-	svc := newTestService(t, cat, cfgpkg.Config{EmbeddingEnabled: false, EmbeddingConcurrency: 1})
-
-	if svc.Enabled() {
-		t.Fatalf("Enabled()=true want=false")
-	}
-	if err := svc.LoadModel(context.Background()); err != nil {
-		t.Fatalf("LoadModel with embedding off: %v", err)
-	}
-	if _, err := svc.Embed(context.Background(), []byte("image")); !errors.Is(err, ErrEmbeddingDisabled) {
-		t.Fatalf("Embed err=%v want=%v", err, ErrEmbeddingDisabled)
-	}
-	if err := svc.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
 	}
 }
 
@@ -183,14 +155,7 @@ func TestServiceEmbedsAndPersistsWithRealModel(t *testing.T) {
 
 	cat := newTestCatalog(t)
 	ctx := context.Background()
-	cfg := cfgpkg.Config{
-		EmbeddingEnabled:     true,
-		EmbeddingModelID:     dir + "/model",
-		EmbeddingBackend:     "go",
-		EmbeddingConcurrency: 1,
-		EmbeddingTimeoutSec:  120,
-	}
-	svc := newTestService(t, cat, cfg)
+	svc := NewService(cat, nil, NewVisionEmbedder(vision.Config{ModelID: dir + "/model", Backend: "go"}))
 	if !svc.Enabled() {
 		t.Fatalf("Enabled()=false want=true")
 	}

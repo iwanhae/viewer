@@ -9,7 +9,6 @@ import (
 	"testing"
 
 	"viewer/internal/catalog"
-	cfgpkg "viewer/internal/config"
 )
 
 // ---------------------------------------------------------------------------
@@ -37,13 +36,11 @@ func newTestCatalog(t *testing.T) *catalog.Store {
 }
 
 // newTestService builds a recommendation service over the catalog. Tests that
-// only exercise the in-memory index pass a nil images service.
-func newTestService(t *testing.T, cat *catalog.Store, cfg cfgpkg.Config) *Service {
+// only exercise the in-memory index pass a nil images service and a nil
+// embedder, which switches embedding off.
+func newTestService(t *testing.T, cat *catalog.Store, embedder EmbeddingProvider) *Service {
 	t.Helper()
-	svc, err := NewService(cfg, cat, nil)
-	if err != nil {
-		t.Fatalf("new recommend service: %v", err)
-	}
+	svc := NewService(cat, nil, embedder)
 	if svc == nil {
 		t.Fatalf("new recommend service returned nil")
 	}
@@ -118,7 +115,7 @@ func TestLoadAllBuildsIndexFromCatalogRows(t *testing.T) {
 		catalog.Photo{Index: 0, Name: "b0.jpg", Hash: "hash-pending", Width: 30, Height: 40, Ratio: 0.75},
 	)
 
-	svc := newTestService(t, cat, cfgpkg.Config{})
+	svc := newTestService(t, cat, nil)
 	if err := svc.LoadAll(ctx); err != nil {
 		t.Fatalf("LoadAll: %v", err)
 	}
@@ -172,7 +169,7 @@ func TestLoadAllBuildsIndexFromCatalogRows(t *testing.T) {
 }
 
 func TestLoadAllAndReloadAlbumWithoutCatalog(t *testing.T) {
-	svc := newTestService(t, nil, cfgpkg.Config{})
+	svc := newTestService(t, nil, nil)
 	if err := svc.LoadAll(context.Background()); err != nil {
 		t.Fatalf("LoadAll without catalog: %v", err)
 	}
@@ -192,7 +189,7 @@ func TestReloadAlbumAddsAndRefreshes(t *testing.T) {
 	seedReadyEmbedding(t, cat, "hash-a0", []float32{1, 0})
 	seedAlbum(t, cat, "album-a", catalog.Photo{Index: 0, Name: "a0.jpg", Hash: "hash-a0", Width: 1, Height: 1, Ratio: 1})
 
-	svc := newTestService(t, cat, cfgpkg.Config{})
+	svc := newTestService(t, cat, nil)
 	if err := svc.LoadAll(ctx); err != nil {
 		t.Fatalf("LoadAll: %v", err)
 	}
@@ -273,7 +270,7 @@ func TestRecommendOrdersCrossAlbumNeighborsByScore(t *testing.T) {
 	seedAlbum(t, cat, "album-b", catalog.Photo{Index: 0, Name: "b0.jpg", Hash: "hash-b", Width: 10, Height: 20, Ratio: 0.5})
 	seedAlbum(t, cat, "album-c", catalog.Photo{Index: 0, Name: "c0.jpg", Hash: "hash-c", Width: 30, Height: 40, Ratio: 0.75})
 
-	svc := newTestService(t, cat, cfgpkg.Config{})
+	svc := newTestService(t, cat, nil)
 	if err := svc.LoadAll(ctx); err != nil {
 		t.Fatalf("LoadAll: %v", err)
 	}
@@ -317,7 +314,7 @@ func TestRecommendExcludesPhotosFromQueryAlbum(t *testing.T) {
 	)
 	seedAlbum(t, cat, "album-b", catalog.Photo{Index: 0, Name: "b0.jpg", Hash: "hash-other", Width: 1, Height: 1, Ratio: 1})
 
-	svc := newTestService(t, cat, cfgpkg.Config{})
+	svc := newTestService(t, cat, nil)
 	if err := svc.LoadAll(ctx); err != nil {
 		t.Fatalf("LoadAll: %v", err)
 	}
@@ -345,7 +342,7 @@ func TestRecommendReturnsEmptyItemsWhenNoCrossAlbumNeighbors(t *testing.T) {
 		catalog.Photo{Index: 1, Name: "a1.jpg", Hash: "hash-a1", Width: 1, Height: 1, Ratio: 1},
 	)
 
-	svc := newTestService(t, cat, cfgpkg.Config{})
+	svc := newTestService(t, cat, nil)
 	if err := svc.LoadAll(ctx); err != nil {
 		t.Fatalf("LoadAll: %v", err)
 	}
@@ -371,7 +368,7 @@ func TestRecommendReturnsEmptyItemsWhenQueryEmbeddingPending(t *testing.T) {
 	seedAlbum(t, cat, "album-a", catalog.Photo{Index: 0, Name: "a0.jpg", Hash: "hash-pending", Width: 1, Height: 1, Ratio: 1})
 	seedAlbum(t, cat, "album-b", catalog.Photo{Index: 0, Name: "b0.jpg", Hash: "hash-b", Width: 1, Height: 1, Ratio: 1})
 
-	svc := newTestService(t, cat, cfgpkg.Config{})
+	svc := newTestService(t, cat, nil)
 	if err := svc.LoadAll(ctx); err != nil {
 		t.Fatalf("LoadAll: %v", err)
 	}
@@ -394,7 +391,7 @@ func TestRecommendReturnsEmptyItemsWhenQueryEmbeddingFailed(t *testing.T) {
 	seedAlbum(t, cat, "album-a", catalog.Photo{Index: 0, Name: "a0.jpg", Hash: "hash-failed", Width: 1, Height: 1, Ratio: 1})
 	seedAlbum(t, cat, "album-b", catalog.Photo{Index: 0, Name: "b0.jpg", Hash: "hash-b", Width: 1, Height: 1, Ratio: 1})
 
-	svc := newTestService(t, cat, cfgpkg.Config{})
+	svc := newTestService(t, cat, nil)
 	if err := svc.LoadAll(ctx); err != nil {
 		t.Fatalf("LoadAll: %v", err)
 	}
@@ -418,7 +415,7 @@ func TestRecommendUnknownPhotoWrapsErrPhotoNotFound(t *testing.T) {
 	seedReadyEmbedding(t, cat, "hash-a", []float32{1, 0})
 	seedAlbum(t, cat, "album-a", catalog.Photo{Index: 0, Name: "a0.jpg", Hash: "hash-a", Width: 1, Height: 1, Ratio: 1})
 
-	svc := newTestService(t, cat, cfgpkg.Config{})
+	svc := newTestService(t, cat, nil)
 	if err := svc.LoadAll(ctx); err != nil {
 		t.Fatalf("LoadAll: %v", err)
 	}
@@ -468,7 +465,7 @@ func TestRecommendWithoutLoadedIndexReturnsEmptyNotPanic(t *testing.T) {
 	// No LoadAll: the in-memory index is empty even though the catalog has the
 	// photo. The query vector comes from the catalog fallback; there are no
 	// indexed neighbors, so the result is an empty list rather than a panic.
-	svc := newTestService(t, cat, cfgpkg.Config{})
+	svc := newTestService(t, cat, nil)
 	resp, err := svc.Recommend(ctx, "album-a", 0, 12)
 	if err != nil {
 		t.Fatalf("Recommend: %v", err)
@@ -489,40 +486,34 @@ func TestRecommendLimitClamping(t *testing.T) {
 	seedReadyEmbedding(t, cat, "hash-query", []float32{1, 0})
 	seedAlbum(t, cat, "album-query", catalog.Photo{Index: 0, Name: "q.jpg", Hash: "hash-query", Width: 1, Height: 1, Ratio: 1})
 
-	const targets = 13
+	// Enough distinct target albums to exercise the maxTopK clamp.
+	targets := maxTopK + 5
 	for i := 0; i < targets; i++ {
 		hash := fmt.Sprintf("hash-target-%02d", i)
 		// Strictly decreasing similarity to the [1, 0] query.
-		seedReadyEmbedding(t, cat, hash, []float32{1 - 0.05*float32(i), 0.05 * float32(i)})
+		seedReadyEmbedding(t, cat, hash, []float32{1 - 0.001*float32(i), 0.001 * float32(i)})
 		albumID := fmt.Sprintf("album-target-%02d", i)
 		seedAlbum(t, cat, albumID, catalog.Photo{Index: 0, Name: albumID + ".jpg", Hash: hash, Width: 1, Height: 1, Ratio: 1})
 	}
 
-	clamped := newTestService(t, cat, cfgpkg.Config{RecoTopKDefault: 2, RecoTopKMax: 3})
-	if err := clamped.LoadAll(ctx); err != nil {
-		t.Fatalf("LoadAll clamped: %v", err)
-	}
-	fallback := newTestService(t, cat, cfgpkg.Config{})
-	if err := fallback.LoadAll(ctx); err != nil {
-		t.Fatalf("LoadAll fallback: %v", err)
+	svc := newTestService(t, cat, nil)
+	if err := svc.LoadAll(ctx); err != nil {
+		t.Fatalf("LoadAll: %v", err)
 	}
 
 	cases := []struct {
 		name  string
-		svc   *Service
 		limit int
 		want  int
 	}{
-		{name: "default applied when limit zero", svc: clamped, limit: 0, want: 2},
-		{name: "default applied when limit negative", svc: clamped, limit: -3, want: 2},
-		{name: "requested limit honored", svc: clamped, limit: 1, want: 1},
-		{name: "max clamps oversized limit", svc: clamped, limit: 100, want: 3},
-		{name: "hard fallback default", svc: fallback, limit: 0, want: 12},
-		{name: "no max clamp when unset", svc: fallback, limit: 100, want: targets},
+		{name: "default applied when limit zero", limit: 0, want: defaultTopK},
+		{name: "default applied when limit negative", limit: -3, want: defaultTopK},
+		{name: "requested limit honored", limit: 1, want: 1},
+		{name: "max clamps oversized limit", limit: 1000, want: maxTopK},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			resp, err := tc.svc.Recommend(ctx, "album-query", 0, tc.limit)
+			resp, err := svc.Recommend(ctx, "album-query", 0, tc.limit)
 			if err != nil {
 				t.Fatalf("Recommend: %v", err)
 			}
@@ -533,7 +524,7 @@ func TestRecommendLimitClamping(t *testing.T) {
 	}
 
 	// Results stay ordered by descending score, one item per target album.
-	resp, err := clamped.Recommend(ctx, "album-query", 0, 3)
+	resp, err := svc.Recommend(ctx, "album-query", 0, maxTopK)
 	if err != nil {
 		t.Fatalf("Recommend: %v", err)
 	}
@@ -563,7 +554,7 @@ func TestEmbeddingProgressFromCatalogCounts(t *testing.T) {
 	seedFailedEmbedding(t, cat, "hash-failed", "embed image: boom")
 	seedBlob(t, cat, "hash-pending")
 
-	svc := newTestService(t, cat, cfgpkg.Config{})
+	svc := newTestService(t, cat, nil)
 	got := svc.EmbeddingProgress()
 
 	if got.Total != 4 || got.Ready != 2 || got.Failed != 1 || got.Pending != 1 || got.Processed != 3 {
@@ -579,7 +570,7 @@ func TestEmbeddingProgressFromCatalogCounts(t *testing.T) {
 
 func TestEmbeddingProgressEmptyCatalog(t *testing.T) {
 	cat := newTestCatalog(t)
-	svc := newTestService(t, cat, cfgpkg.Config{})
+	svc := newTestService(t, cat, nil)
 
 	got := svc.EmbeddingProgress()
 	if got.Total != 0 || got.Ready != 0 || got.Failed != 0 || got.Pending != 0 || got.Processed != 0 {
@@ -597,7 +588,7 @@ func TestEmbeddingProgressNilDependencies(t *testing.T) {
 		t.Fatalf("unexpected progress for nil service: %+v", got)
 	}
 
-	svc := newTestService(t, nil, cfgpkg.Config{})
+	svc := newTestService(t, nil, nil)
 	got = svc.EmbeddingProgress()
 	if got.Total != 0 || got.Ready != 0 || got.Failed != 0 || got.Pending != 0 || got.Processed != 0 || got.Ratio != 0 || got.Percent != 0 {
 		t.Fatalf("unexpected progress for nil catalog: %+v", got)

@@ -147,7 +147,7 @@ Behavior:
 - The album is marked `QUEUED` and handed to the in-process pipeline worker.
 - The worker downloads the ZIP, stores each image as a `blobs/<sha256>` object,
   records metadata in SQLite and finally marks the album `READY`, then deletes
-  the staged ZIP (`INGEST_DELETE_SOURCE=true`).
+  the staged ZIP.
 - Clients poll `GET /api/albums/{albumId}/finalize` until `SUCCEEDED`/`FAILED`.
 
 ### 6.3 Get Album Metadata
@@ -313,8 +313,8 @@ Overlays (shown only when toggled on):
 - Identical images across albums cost one object, one blob row and one
   embedding.
 - Per-album metadata is a few SQLite rows instead of an S3 object.
-- Local disk cache (`CACHE_DIR`) serves repeated image views without touching
-  S3.
+- Local disk cache (`/tmp/viewer-cache/images`) serves repeated image views
+  without touching S3.
 - The recommendation index is held in memory and rebuilt from the catalog at
   startup.
 

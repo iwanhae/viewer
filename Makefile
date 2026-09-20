@@ -116,3 +116,6 @@ run:
 
 clean:
 	rm -rf bin .cache frontend/node_modules e2e/node_modules
+	# The viewer writes its catalog and disk caches to a fixed container-local
+	# path (see config.StateDir), which on the host is /tmp/viewer-cache.
+	rm -rf /tmp/viewer-cache

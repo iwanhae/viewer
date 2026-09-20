@@ -64,11 +64,7 @@ func openTestCatalog(t *testing.T) *catalog.Store {
 func newTestService(t *testing.T, store *fakeStore, enqueuer Enqueuer) (*Service, *catalog.Store) {
 	t.Helper()
 	cat := openTestCatalog(t)
-	cfg := cfgpkg.Config{
-		PresignTTL:     15 * time.Minute,
-		MaxUploadBytes: 1024,
-	}
-	svc := NewService(cfg, cat, store)
+	svc := NewService(cat, store)
 	if enqueuer != nil {
 		svc.SetEnqueuer(enqueuer)
 	}
@@ -121,8 +117,8 @@ func TestCreateUploadValidation(t *testing.T) {
 	if _, err := svc.CreateUpload(context.Background(), "a.zip", 0); err == nil {
 		t.Fatalf("expected error for non-positive size")
 	}
-	if _, err := svc.CreateUpload(context.Background(), "a.zip", 2048); err == nil {
-		t.Fatalf("expected error for size over MAX_UPLOAD_BYTES")
+	if _, err := svc.CreateUpload(context.Background(), "a.zip", cfgpkg.MaxUploadBytes+1); err == nil {
+		t.Fatalf("expected error for size over the upload limit")
 	}
 	if len(store.presignCalls) != 0 {
 		t.Fatalf("no presign should happen on validation failure")
@@ -438,7 +434,7 @@ func TestRegisterStagedUploadQueuesAlbum(t *testing.T) {
 }
 
 func TestServiceWithNilCatalogDegradesGracefully(t *testing.T) {
-	svc := NewService(cfgpkg.Config{}, nil, newFakeStore())
+	svc := NewService(nil, newFakeStore())
 	if svc.AllAlbums() != nil {
 		t.Fatalf("expected nil albums for nil catalog")
 	}

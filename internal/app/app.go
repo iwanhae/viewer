@@ -16,6 +16,7 @@ import (
 	"viewer/internal/pipeline"
 	"viewer/internal/recommend"
 	"viewer/internal/storage"
+	"viewer/internal/vision"
 )
 
 // embeddingLoadTimeout bounds resolving the checkpoint and compiling the
@@ -27,9 +28,9 @@ func Run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	log.Printf("viewer: config loaded on port=%d cache_dir=%s zip_cache_dir=%s db_path=%s", cfg.Port, cfg.CacheDir, cfg.ZipCacheDir, cfg.DBPath)
+	log.Printf("viewer: config loaded on port=%d", cfg.Port)
 
-	cat, err := catalog.Open(cfg.DBPath)
+	cat, err := catalog.Open(cfgpkg.DBPath)
 	if err != nil {
 		return fmt.Errorf("open metadata catalog: %w", err)
 	}
@@ -40,40 +41,34 @@ func Run(ctx context.Context) error {
 		return err
 	}
 
-	imageService, err := images.NewService(cat, store, cfg.CacheDir)
+	imageService, err := images.NewService(cat, store, cfgpkg.CacheDir)
 	if err != nil {
 		return err
 	}
 
-	recommendService, err := recommend.NewService(cfg, cat, imageService)
-	if err != nil {
-		return fmt.Errorf("recommendation service init failed: %w", err)
-	}
+	// The vision tower runs in-process against the checkpoint the Docker image
+	// bakes in at config.ModelDir.
+	recommendService := recommend.NewService(cat, imageService, recommend.NewVisionEmbedder(vision.Config{
+		ModelID: cfgpkg.ModelDir,
+	}))
 
-	albumService := albums.NewService(cfg, cat, store)
+	albumService := albums.NewService(cat, store)
 
 	// Load the vision tower before wiring the ingest pipeline: a failed load
 	// must keep the embedder out of the pipeline entirely, otherwise every
 	// image would be marked as a failed embedding instead of staying pending.
+	loadCtx, cancel := context.WithTimeout(context.Background(), embeddingLoadTimeout)
+	loadErr := recommendService.LoadModel(loadCtx)
+	cancel()
+	if loadErr != nil {
+		log.Printf("viewer: embedding model unavailable, continuing without embeddings: %v", loadErr)
+	}
+	// Enabled reports a failed load, so ask the service rather than assuming.
 	recommenderEnabled := recommendService.Enabled()
 	if recommenderEnabled {
-		loadCtx, cancel := context.WithTimeout(context.Background(), embeddingLoadTimeout)
-		loadErr := recommendService.LoadModel(loadCtx)
-		cancel()
-		if loadErr != nil {
-			if cfg.EmbeddingRequired {
-				return fmt.Errorf("recommendation service init failed: %w", loadErr)
-			}
-			log.Printf("viewer: embedding model unavailable, continuing without embeddings: %v", loadErr)
-		}
-		// Enabled reflects a failed load, so re-read it rather than trusting cfg.
-		recommenderEnabled = recommendService.Enabled()
-	}
-	if recommenderEnabled {
-		log.Printf("viewer: recommendation service enabled (model=%s backend=%s)",
-			cfg.EmbeddingModelID, cfg.EmbeddingBackend)
+		log.Printf("viewer: recommendation service enabled (model=%s)", cfgpkg.ModelDir)
 	} else {
-		log.Printf("viewer: embeddings disabled (EMBEDDING_ENABLED=%t)", cfg.EmbeddingEnabled)
+		log.Printf("viewer: embedding model unavailable; serving recommendations from stored embeddings only")
 	}
 
 	var pipelineEmbedder pipeline.Embedder
@@ -81,8 +76,8 @@ func Run(ctx context.Context) error {
 		pipelineEmbedder = recommendService
 	}
 	pipelineService := pipeline.NewService(cat, store, pipelineEmbedder, pipeline.Options{
-		DeleteSource: cfg.IngestDeleteSource,
-		TempDir:      cfg.ZipCacheDir,
+		DeleteSource: true,
+		TempDir:      cfgpkg.ZipCacheDir,
 		OnAlbumReady: func(albumID string) {
 			if err := recommendService.ReloadAlbum(context.Background(), albumID); err != nil {
 				log.Printf("viewer: reload recommendation index for album=%s failed: %v", albumID, err)
@@ -104,7 +99,7 @@ func Run(ctx context.Context) error {
 	log.Printf("viewer: startup warmup running in background")
 	warmupDone := make(chan struct{})
 	go func() {
-		httpapi.Warmup(ctx, albumService, recommendService, store, cfg)
+		httpapi.Warmup(ctx, albumService, recommendService, store)
 		close(warmupDone)
 	}()
 	go func() {

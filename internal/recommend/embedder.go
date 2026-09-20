@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"sync"
-	"time"
 
 	"viewer/internal/vision"
 )
@@ -95,12 +94,4 @@ func isTransientEmbedError(err error) bool {
 		return false
 	}
 	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
-}
-
-// embeddingTimeout bounds one image's preprocessing plus inference.
-func embeddingTimeout(configured time.Duration) time.Duration {
-	if configured <= 0 {
-		return 5 * time.Minute
-	}
-	return configured
 }

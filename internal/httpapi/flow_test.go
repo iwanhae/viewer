@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"image"
 	"image/color"
 	"image/png"
@@ -18,7 +19,6 @@ import (
 
 	"viewer/internal/albums"
 	"viewer/internal/catalog"
-	cfgpkg "viewer/internal/config"
 	"viewer/internal/feed"
 	"viewer/internal/images"
 	"viewer/internal/pipeline"
@@ -93,6 +93,17 @@ func (m *memoryS3) putCountFor(prefix string) int {
 	return count
 }
 
+// stubEmbedder satisfies recommend.EmbeddingProvider without a checkpoint. The
+// flow tests never embed anything: the stub only keeps the service non-nil so
+// the recommendation endpoints stay reachable.
+type stubEmbedder struct{}
+
+func (stubEmbedder) Embed(context.Context, []byte) ([]float32, error) {
+	return nil, errors.New("stub embedder must not be called")
+}
+
+func (stubEmbedder) Close() error { return nil }
+
 type flowHarness struct {
 	router   http.Handler
 	albums   *albums.Service
@@ -111,28 +122,21 @@ func newFlowHarness(t *testing.T) *flowHarness {
 	t.Cleanup(func() { _ = cat.Close() })
 
 	s3 := newMemoryS3()
-	cfg := cfgpkg.Config{
-		PresignTTL:           time.Minute,
-		MaxUploadBytes:       16 << 20,
-		CacheDir:             t.TempDir(),
-		ZipCacheDir:          t.TempDir(),
-		EmbeddingEnabled:     true,
-		EmbeddingConcurrency: 1,
-		EmbeddingTimeoutSec:  1,
-	}
+	cacheDir := t.TempDir()
+	zipCacheDir := t.TempDir()
 
-	imageService, err := images.NewService(cat, s3, cfg.CacheDir)
+	imageService, err := images.NewService(cat, s3, cacheDir)
 	if err != nil {
 		t.Fatalf("new image service: %v", err)
 	}
-	recommendService, err := recommend.NewService(cfg, cat, imageService)
-	if err != nil {
-		t.Fatalf("new recommend service: %v", err)
-	}
-	albumService := albums.NewService(cfg, cat, s3)
+	// A stub embedder keeps the recommendation endpoints available without a
+	// checkpoint. It is never asked to embed anything: the pipeline gets a nil
+	// embedder, so blobs stay pending.
+	recommendService := recommend.NewService(cat, imageService, stubEmbedder{})
+	albumService := albums.NewService(cat, s3)
 	pipelineService := pipeline.NewService(cat, s3, nil, pipeline.Options{
 		DeleteSource: true,
-		TempDir:      cfg.ZipCacheDir,
+		TempDir:      zipCacheDir,
 		OnAlbumReady: func(albumID string) {
 			_ = recommendService.ReloadAlbum(context.Background(), albumID)
 		},
