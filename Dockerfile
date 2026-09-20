@@ -32,15 +32,28 @@ ENV SIGLIP2_MODEL_ID=${SIGLIP2_MODEL_ID}
 RUN pip install --no-cache-dir huggingface_hub==0.29.2
 RUN python - <<'PY'
 import os
+import shutil
+
 from huggingface_hub import hf_hub_download
 
 target = "/opt/siglip2"
 model_id = os.environ["SIGLIP2_MODEL_ID"]
 os.makedirs(target, exist_ok=True)
 for filename in ("config.json", "model.safetensors"):
+    # hf_hub_download returns a path inside the Hub cache, and that path is a
+    # symlink into the cache's blob directory. Renaming it would move the link
+    # and leave a dangling file inside the image, which the loader then reports
+    # as "file not found in local model directory". Copy the resolved contents
+    # instead, so what lands in the image is a real file.
     downloaded = hf_hub_download(repo_id=model_id, filename=filename)
-    os.replace(downloaded, os.path.join(target, filename))
+    destination = os.path.join(target, filename)
+    shutil.copyfile(os.path.realpath(downloaded), destination)
+    print(f"prefetched {filename}: {os.path.getsize(destination)} bytes")
 PY
+# Fail the build instead of shipping an incomplete checkpoint: at runtime a
+# missing file only degrades to "serving without embeddings", which is easy to
+# miss.
+RUN test -s /opt/siglip2/config.json && test -s /opt/siglip2/model.safetensors
 
 # Base runtime: the binary plus everything except the checkpoint.
 FROM debian:bookworm-slim AS runtime-base
@@ -70,3 +83,6 @@ FROM runtime-base AS runtime-slim
 FROM runtime-base AS runtime
 
 COPY --from=model-prefetch --chown=65532:65532 /opt/siglip2 /app/siglip2
+# A checkpoint that arrived as a broken symlink or an empty file builds a broken
+# image, so check the copied tree rather than trusting the prefetch stage.
+RUN test -s /app/siglip2/config.json && test -s /app/siglip2/model.safetensors
