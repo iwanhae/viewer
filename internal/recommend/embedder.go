@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"sync"
 
 	"viewer/internal/vision"
@@ -49,6 +50,9 @@ func (v *VisionEmbedder) Load(ctx context.Context) error {
 	defer v.loadMu.Unlock()
 	v.loadOnce.Do(func() {
 		v.model, v.loadErr = vision.Load(ctx, v.config)
+		if v.loadErr == nil {
+			log.Printf("recommend: %s", v.Describe())
+		}
 	})
 	return v.loadErr
 }
