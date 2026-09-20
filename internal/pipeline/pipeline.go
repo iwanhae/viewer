@@ -58,14 +58,10 @@ type Embedder interface {
 
 // Options configure a pipeline service.
 type Options struct {
-	// DeleteSource removes the staged zip from S3 after a successful extract.
-	DeleteSource bool
 	// TempDir holds the downloaded zip while it is being unpacked.
 	TempDir string
 	// OnAlbumReady is invoked after an album has been fully extracted.
 	OnAlbumReady func(albumID string)
-	// QueueSize bounds the pending-album queue.
-	QueueSize int
 }
 
 // Service downloads and unpacks staged uploads sequentially.
@@ -88,9 +84,6 @@ type Service struct {
 // NewService builds a pipeline service. embedder may be nil, in which case
 // images are stored without embeddings and left in the "pending" state.
 func NewService(cat *catalog.Store, store Store, embedder Embedder, opts Options) *Service {
-	if opts.QueueSize <= 0 {
-		opts.QueueSize = defaultQueueSize
-	}
 	if strings.TrimSpace(opts.TempDir) == "" {
 		opts.TempDir = os.TempDir()
 	}
@@ -99,7 +92,7 @@ func NewService(cat *catalog.Store, store Store, embedder Embedder, opts Options
 		store:     store,
 		embedder:  embedder,
 		opts:      opts,
-		queue:     make(chan string, opts.QueueSize),
+		queue:     make(chan string, defaultQueueSize),
 		inFlight:  make(map[string]struct{}),
 		blobCache: make(map[string]struct{}),
 	}
@@ -219,10 +212,8 @@ func (s *Service) ProcessAlbum(ctx context.Context, albumID string) error {
 		return err
 	}
 
-	if s.opts.DeleteSource {
-		if err := s.store.DeleteObject(ctx, sourceKey); err != nil {
-			log.Printf("pipeline: album=%s extracted but staged zip delete failed key=%s err=%v", albumID, sourceKey, err)
-		}
+	if err := s.store.DeleteObject(ctx, sourceKey); err != nil {
+		log.Printf("pipeline: album=%s extracted but staged zip delete failed key=%s err=%v", albumID, sourceKey, err)
 	}
 
 	if s.opts.OnAlbumReady != nil {

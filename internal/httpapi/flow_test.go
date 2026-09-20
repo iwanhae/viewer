@@ -135,8 +135,7 @@ func newFlowHarness(t *testing.T) *flowHarness {
 	recommendService := recommend.NewService(cat, imageService, stubEmbedder{})
 	albumService := albums.NewService(cat, s3)
 	pipelineService := pipeline.NewService(cat, s3, nil, pipeline.Options{
-		DeleteSource: true,
-		TempDir:      zipCacheDir,
+		TempDir: zipCacheDir,
 		OnAlbumReady: func(albumID string) {
 			_ = recommendService.ReloadAlbum(context.Background(), albumID)
 		},

@@ -207,9 +207,7 @@ func TestMetricsEndpointPrometheusPayload(t *testing.T) {
 		"viewer_embedding_images_ready",
 		"viewer_embedding_images_failed",
 		"viewer_embedding_images_pending",
-		"viewer_embedding_images_processed",
 		"viewer_embedding_progress_ratio",
-		"viewer_embedding_progress_percent",
 	}
 	for _, metricName := range required {
 		if !strings.Contains(body, metricName) {
@@ -221,9 +219,7 @@ func TestMetricsEndpointPrometheusPayload(t *testing.T) {
 	mustMetricIntValue(t, body, "viewer_embedding_images_ready", 1)
 	mustMetricIntValue(t, body, "viewer_embedding_images_failed", 1)
 	mustMetricIntValue(t, body, "viewer_embedding_images_pending", 1)
-	mustMetricIntValue(t, body, "viewer_embedding_images_processed", 2)
 	mustMetricFloatValue(t, body, "viewer_embedding_progress_ratio", 1.0/3.0, 1e-6)
-	mustMetricFloatValue(t, body, "viewer_embedding_progress_percent", (100.0 / 3.0), 1e-4)
 }
 
 func TestMetricsEndpointWithNilRecommendService(t *testing.T) {
@@ -241,9 +237,7 @@ func TestMetricsEndpointWithNilRecommendService(t *testing.T) {
 	mustMetricIntValue(t, body, "viewer_embedding_images_ready", 0)
 	mustMetricIntValue(t, body, "viewer_embedding_images_failed", 0)
 	mustMetricIntValue(t, body, "viewer_embedding_images_pending", 0)
-	mustMetricIntValue(t, body, "viewer_embedding_images_processed", 0)
 	mustMetricFloatValue(t, body, "viewer_embedding_progress_ratio", 0, 1e-9)
-	mustMetricFloatValue(t, body, "viewer_embedding_progress_percent", 0, 1e-9)
 }
 
 func TestRecommendationsEndpointWithNilRecommendService(t *testing.T) {

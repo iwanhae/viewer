@@ -73,15 +73,13 @@ type Photo struct {
 // "blobs/<hash>". Identical image bytes share a single blob row (and a single
 // S3 object) no matter how many albums contain them.
 type Blob struct {
-	Hash               string
-	SizeBytes          int64
-	ContentType        string
-	EmbeddingStatus    EmbeddingStatus
-	Embedding          []float32
-	EmbeddingError     string
-	EmbeddingUpdatedAt string
-	CreatedAt          string
-	UpdatedAt          string
+	Hash            string
+	SizeBytes       int64
+	ContentType     string
+	EmbeddingStatus EmbeddingStatus
+	Embedding       []float32
+	EmbeddingError  string
+	CreatedAt       string
 }
 
 // PhotoWithBlob is a photo joined with its blob row, used to rebuild the
@@ -125,9 +123,7 @@ CREATE TABLE IF NOT EXISTS blobs (
 	embedding_status     TEXT NOT NULL DEFAULT 'pending',
 	embedding            BLOB,
 	embedding_error      TEXT NOT NULL DEFAULT '',
-	embedding_updated_at TEXT NOT NULL DEFAULT '',
-	created_at           TEXT NOT NULL,
-	updated_at           TEXT NOT NULL
+	created_at           TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_blobs_embedding_status ON blobs(embedding_status);
 
@@ -271,11 +267,6 @@ func (s *Store) GetAlbum(ctx context.Context, albumID string) (*Album, error) {
 	}
 	album.Status = AlbumStatus(status)
 	return &album, nil
-}
-
-// ListAlbums returns every album ordered by id.
-func (s *Store) ListAlbums(ctx context.Context) ([]Album, error) {
-	return s.queryAlbums(ctx, `SELECT id, original_filename, size_bytes, status, source_key, photo_count, error, created_at, updated_at FROM albums ORDER BY id`)
 }
 
 // ListAlbumsByStatus returns albums in the given status ordered by id.
@@ -474,13 +465,12 @@ func (s *Store) UpsertBlob(ctx context.Context, blob Blob) error {
 	}
 	now := nowRFC3339()
 	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO blobs (hash, size_bytes, content_type, embedding_status, embedding, embedding_error, embedding_updated_at, created_at, updated_at)
-		VALUES (?, ?, ?, ?, NULL, '', '', ?, ?)
+		INSERT INTO blobs (hash, size_bytes, content_type, embedding_status, embedding, embedding_error, created_at)
+		VALUES (?, ?, ?, ?, NULL, '', ?)
 		ON CONFLICT(hash) DO UPDATE SET
 			size_bytes   = excluded.size_bytes,
-			content_type = excluded.content_type,
-			updated_at   = excluded.updated_at`,
-		blob.Hash, blob.SizeBytes, blob.ContentType, string(EmbeddingStatusPending), now, now,
+			content_type = excluded.content_type`,
+		blob.Hash, blob.SizeBytes, blob.ContentType, string(EmbeddingStatusPending), now,
 	)
 	if err != nil {
 		return fmt.Errorf("upsert blob %s: %w", blob.Hash, err)
@@ -490,14 +480,14 @@ func (s *Store) UpsertBlob(ctx context.Context, blob Blob) error {
 
 func (s *Store) GetBlob(ctx context.Context, hash string) (*Blob, error) {
 	row := s.db.QueryRowContext(ctx, `
-		SELECT hash, size_bytes, content_type, embedding_status, embedding, embedding_error, embedding_updated_at, created_at, updated_at
+		SELECT hash, size_bytes, content_type, embedding_status, embedding, embedding_error, created_at
 		FROM blobs WHERE hash = ?`, hash)
 	var blob Blob
 	var status string
 	var vector []byte
 	err := row.Scan(
 		&blob.Hash, &blob.SizeBytes, &blob.ContentType, &status, &vector,
-		&blob.EmbeddingError, &blob.EmbeddingUpdatedAt, &blob.CreatedAt, &blob.UpdatedAt,
+		&blob.EmbeddingError, &blob.CreatedAt,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, fmt.Errorf("%w: %s", ErrBlobNotFound, hash)
@@ -512,12 +502,11 @@ func (s *Store) GetBlob(ctx context.Context, hash string) (*Blob, error) {
 
 // SetBlobEmbedding stores the embedding outcome for a blob.
 func (s *Store) SetBlobEmbedding(ctx context.Context, hash string, status EmbeddingStatus, vector []float32, errorText string) error {
-	now := nowRFC3339()
 	_, err := s.db.ExecContext(ctx, `
 		UPDATE blobs
-		SET embedding_status = ?, embedding = ?, embedding_error = ?, embedding_updated_at = ?, updated_at = ?
+		SET embedding_status = ?, embedding = ?, embedding_error = ?
 		WHERE hash = ?`,
-		string(status), EncodeVector(vector), errorText, now, now, hash)
+		string(status), EncodeVector(vector), errorText, hash)
 	if err != nil {
 		return fmt.Errorf("set blob %s embedding: %w", hash, err)
 	}
@@ -532,7 +521,7 @@ func (s *Store) ListBlobsAwaitingEmbedding(ctx context.Context, limit int) ([]Bl
 		limit = 64
 	}
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT hash, size_bytes, content_type, embedding_status, embedding, embedding_error, embedding_updated_at, created_at, updated_at
+		SELECT hash, size_bytes, content_type, embedding_status, embedding, embedding_error, created_at
 		FROM blobs
 		WHERE embedding_status = ?
 		ORDER BY created_at ASC
@@ -549,7 +538,7 @@ func (s *Store) ListBlobsAwaitingEmbedding(ctx context.Context, limit int) ([]Bl
 		var vector []byte
 		if err := rows.Scan(
 			&blob.Hash, &blob.SizeBytes, &blob.ContentType, &status, &vector,
-			&blob.EmbeddingError, &blob.EmbeddingUpdatedAt, &blob.CreatedAt, &blob.UpdatedAt,
+			&blob.EmbeddingError, &blob.CreatedAt,
 		); err != nil {
 			return nil, fmt.Errorf("scan blob: %w", err)
 		}
@@ -586,7 +575,7 @@ func (s *Store) EmbeddingCounts(ctx context.Context) (EmbeddingCounts, error) {
 func (s *Store) ListPhotoBlobPairs(ctx context.Context) ([]PhotoWithBlob, error) {
 	return s.queryPhotoBlobPairs(ctx, `
 		SELECT p.album_id, p.idx, p.name, p.hash, p.width, p.height, p.ratio,
-		       b.hash, b.size_bytes, b.content_type, b.embedding_status, b.embedding, b.embedding_error, b.embedding_updated_at, b.created_at, b.updated_at
+		       b.hash, b.size_bytes, b.content_type, b.embedding_status, b.embedding, b.embedding_error, b.created_at
 		FROM photos p JOIN blobs b ON b.hash = p.hash
 		ORDER BY p.album_id ASC, p.idx ASC`)
 }
@@ -595,7 +584,7 @@ func (s *Store) ListPhotoBlobPairs(ctx context.Context) ([]PhotoWithBlob, error)
 func (s *Store) ListPhotoBlobPairsByAlbum(ctx context.Context, albumID string) ([]PhotoWithBlob, error) {
 	return s.queryPhotoBlobPairs(ctx, `
 		SELECT p.album_id, p.idx, p.name, p.hash, p.width, p.height, p.ratio,
-		       b.hash, b.size_bytes, b.content_type, b.embedding_status, b.embedding, b.embedding_error, b.embedding_updated_at, b.created_at, b.updated_at
+		       b.hash, b.size_bytes, b.content_type, b.embedding_status, b.embedding, b.embedding_error, b.created_at
 		FROM photos p JOIN blobs b ON b.hash = p.hash
 		WHERE p.album_id = ?
 		ORDER BY p.idx ASC`, albumID)
@@ -617,7 +606,7 @@ func (s *Store) queryPhotoBlobPairs(ctx context.Context, query string, args ...a
 			&pair.Photo.AlbumID, &pair.Photo.Index, &pair.Photo.Name, &pair.Photo.Hash,
 			&pair.Photo.Width, &pair.Photo.Height, &pair.Photo.Ratio,
 			&pair.Blob.Hash, &pair.Blob.SizeBytes, &pair.Blob.ContentType, &status, &vector,
-			&pair.Blob.EmbeddingError, &pair.Blob.EmbeddingUpdatedAt, &pair.Blob.CreatedAt, &pair.Blob.UpdatedAt,
+			&pair.Blob.EmbeddingError, &pair.Blob.CreatedAt,
 		); err != nil {
 			return nil, fmt.Errorf("scan photo blob: %w", err)
 		}

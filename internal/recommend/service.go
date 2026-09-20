@@ -382,19 +382,16 @@ func (s *Service) EmbeddingProgress() EmbeddingProgress {
 		log.Printf("recommend: embedding counts failed: %v", err)
 		return EmbeddingProgress{}
 	}
-	processed := counts.Ready + counts.Failed
 	ratio := 0.0
 	if counts.Total > 0 {
 		ratio = float64(counts.Ready) / float64(counts.Total)
 	}
 	return EmbeddingProgress{
-		Total:     counts.Total,
-		Ready:     counts.Ready,
-		Failed:    counts.Failed,
-		Pending:   counts.Pending,
-		Processed: processed,
-		Ratio:     ratio,
-		Percent:   ratio * 100,
+		Total:   counts.Total,
+		Ready:   counts.Ready,
+		Failed:  counts.Failed,
+		Pending: counts.Pending,
+		Ratio:   ratio,
 	}
 }
 

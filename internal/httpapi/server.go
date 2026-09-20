@@ -278,15 +278,9 @@ func (s *Server) getMetrics(w http.ResponseWriter, r *http.Request) {
 	_, _ = fmt.Fprintf(w, "# HELP viewer_embedding_images_pending Number of images pending embedding.\n")
 	_, _ = fmt.Fprintf(w, "# TYPE viewer_embedding_images_pending gauge\n")
 	_, _ = fmt.Fprintf(w, "viewer_embedding_images_pending %d\n", progress.Pending)
-	_, _ = fmt.Fprintf(w, "# HELP viewer_embedding_images_processed Number of images processed by embedding workers.\n")
-	_, _ = fmt.Fprintf(w, "# TYPE viewer_embedding_images_processed gauge\n")
-	_, _ = fmt.Fprintf(w, "viewer_embedding_images_processed %d\n", progress.Processed)
 	_, _ = fmt.Fprintf(w, "# HELP viewer_embedding_progress_ratio Ready embeddings divided by total images.\n")
 	_, _ = fmt.Fprintf(w, "# TYPE viewer_embedding_progress_ratio gauge\n")
 	_, _ = fmt.Fprintf(w, "viewer_embedding_progress_ratio %.6f\n", progress.Ratio)
-	_, _ = fmt.Fprintf(w, "# HELP viewer_embedding_progress_percent Ready embeddings as percentage of total images.\n")
-	_, _ = fmt.Fprintf(w, "# TYPE viewer_embedding_progress_percent gauge\n")
-	_, _ = fmt.Fprintf(w, "viewer_embedding_progress_percent %.6f\n", progress.Percent)
 }
 
 func recovererWithLog(next http.Handler) http.Handler {
@@ -318,17 +312,8 @@ func jsonBody(r *http.Request, out any) error {
 	return nil
 }
 
-func parsePathIntParam(r *http.Request, key string) (int, error) {
-	raw := chi.URLParam(r, key)
-	value, err := strconv.Atoi(raw)
-	if err != nil {
-		return 0, err
-	}
-	return value, nil
-}
-
 func parseNonNegativePathIntParam(r *http.Request, key string) (int, error) {
-	value, err := parsePathIntParam(r, key)
+	value, err := strconv.Atoi(chi.URLParam(r, key))
 	if err != nil {
 		return 0, err
 	}

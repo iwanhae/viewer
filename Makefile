@@ -2,7 +2,6 @@ SHELL := /bin/bash
 .SHELLFLAGS := -eu -o pipefail -c
 
 BIN := bin/viewer
-ALBUM_DEDUPE_BIN := bin/album-dedupe-cleaner
 FRONTEND_DIR := frontend
 E2E_DIR := e2e
 FRONTEND_STATIC := internal/web/static
@@ -49,7 +48,6 @@ build-frontend:
 build-backend:
 	mkdir -p bin
 	go build -o $(BIN) ./cmd/viewer
-	go build -o $(ALBUM_DEDUPE_BIN) ./cmd/album-dedupe-cleaner
 
 test:
 	set -a; \
