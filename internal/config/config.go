@@ -31,8 +31,10 @@ const (
 	PresignTTL = 15 * time.Minute
 
 	// StateDir is the container-local directory holding the SQLite catalog and
-	// the disk caches. Durable state lives in S3, so losing it only costs a
-	// rebuild of the local index.
+	// the disk caches. The caches are disposable, but the catalog is not: the
+	// album-to-photo mapping exists nowhere else, and staged zips are deleted
+	// after extraction, so albums cannot be reconstructed from the blobs in S3.
+	// Mount a host directory here to keep them across container replacements.
 	StateDir = "/tmp/viewer-cache"
 
 	// DBPath is the SQLite catalog. CacheDir holds decoded image blobs and
