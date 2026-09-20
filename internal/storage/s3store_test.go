@@ -1,0 +1,239 @@
+package storage
+
+import (
+	"context"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	cfgpkg "viewer/internal/config"
+)
+
+// listBatchXML is a canned ListObjectsV2 response whose keys already carry the
+// store's key prefix, exactly as a real bucket would return them.
+const listBatchXML = `<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Name>viewer</Name>
+  <Prefix>viewer/batch/</Prefix>
+  <KeyCount>2</KeyCount>
+  <MaxKeys>1000</MaxKeys>
+  <IsTruncated>false</IsTruncated>
+  <Contents>
+    <Key>viewer/batch/second.zip</Key>
+    <LastModified>2024-01-02T03:04:05.000Z</LastModified>
+    <ETag>&quot;etag-2&quot;</ETag>
+    <Size>20</Size>
+    <StorageClass>STANDARD</StorageClass>
+  </Contents>
+  <Contents>
+    <Key>viewer/batch/first.zip</Key>
+    <LastModified>2024-01-01T00:00:00.000Z</LastModified>
+    <ETag>&quot;etag-1&quot;</ETag>
+    <Size>10</Size>
+    <StorageClass>STANDARD</StorageClass>
+  </Contents>
+</ListBucketResult>`
+
+const copyResultXML = `<?xml version="1.0" encoding="UTF-8"?>
+<CopyObjectResult>
+  <ETag>&quot;etag-1&quot;</ETag>
+  <LastModified>2024-01-01T00:00:00.000Z</LastModified>
+</CopyObjectResult>`
+
+type recordedRequest struct {
+	method string
+	path   string
+	query  string
+	header http.Header
+}
+
+func (r recordedRequest) String() string {
+	return r.method + " " + r.path + "?" + r.query
+}
+
+// newRecordingStore builds a real S3 client pointed at a stub object store, so
+// the tests assert the requests that actually reach the wire rather than the
+// internal key helpers.
+func newRecordingStore(t *testing.T, keyPrefix string) (*S3Store, *[]recordedRequest) {
+	t.Helper()
+
+	requests := make([]recordedRequest, 0, 8)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests = append(requests, recordedRequest{
+			method: r.Method,
+			path:   r.URL.Path,
+			query:  r.URL.RawQuery,
+			header: r.Header.Clone(),
+		})
+		switch {
+		case r.URL.Query().Get("list-type") == "2":
+			w.Header().Set("Content-Type", "application/xml")
+			_, _ = io.WriteString(w, listBatchXML)
+		case r.Method == http.MethodPut && r.Header.Get("X-Amz-Copy-Source") != "":
+			w.Header().Set("Content-Type", "application/xml")
+			_, _ = io.WriteString(w, copyResultXML)
+		case r.Method == http.MethodHead:
+			w.Header().Set("Content-Length", "11")
+			w.Header().Set("ETag", `"etag-1"`)
+			w.Header().Set("Content-Type", "image/png")
+		default:
+			w.Header().Set("ETag", `"etag-1"`)
+			w.Header().Set("Content-Type", "image/png")
+			_, _ = io.WriteString(w, "image-bytes")
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	store, err := NewS3Store(context.Background(), cfgpkg.Config{
+		S3Endpoint:  server.URL,
+		S3Bucket:    "test-bucket",
+		S3AccessKey: "access",
+		S3SecretKey: "secret",
+		S3Prefix:    keyPrefix,
+	})
+	if err != nil {
+		t.Fatalf("NewS3Store: %v", err)
+	}
+	return store, &requests
+}
+
+// TestS3StoreKeyPrefixReachesEveryRequest is the whole point of S3_PREFIX: the
+// prefix has to be added on every path, including the copy source header, so
+// that a deployment's objects live entirely under its own namespace.
+func TestS3StoreKeyPrefixReachesEveryRequest(t *testing.T) {
+	store, requests := newRecordingStore(t, "viewer/")
+	ctx := context.Background()
+
+	if err := store.PutObject(ctx, "blobs/deadbeef", strings.NewReader("image-bytes"), "image/png"); err != nil {
+		t.Fatalf("PutObject: %v", err)
+	}
+
+	body, contentType, err := store.GetObject(ctx, "blobs/deadbeef")
+	if err != nil {
+		t.Fatalf("GetObject: %v", err)
+	}
+	payload, err := io.ReadAll(body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if err := body.Close(); err != nil {
+		t.Fatalf("close body: %v", err)
+	}
+	if string(payload) != "image-bytes" {
+		t.Errorf("body=%q want image-bytes", payload)
+	}
+	if contentType != "image/png" {
+		t.Errorf("contentType=%q want image/png", contentType)
+	}
+
+	exists, size, err := store.HeadObject(ctx, "blobs/deadbeef")
+	if err != nil {
+		t.Fatalf("HeadObject: %v", err)
+	}
+	if !exists || size != int64(len("image-bytes")) {
+		t.Errorf("exists=%v size=%d want true/%d", exists, size, len("image-bytes"))
+	}
+
+	if err := store.DeleteObject(ctx, "blobs/deadbeef"); err != nil {
+		t.Fatalf("DeleteObject: %v", err)
+	}
+
+	if err := store.CopyObject(ctx, "batch/first.zip", "uploads/album-1/source.zip"); err != nil {
+		t.Fatalf("CopyObject: %v", err)
+	}
+
+	want := []struct{ method, path string }{
+		{http.MethodPut, "/test-bucket/viewer/blobs/deadbeef"},
+		{http.MethodGet, "/test-bucket/viewer/blobs/deadbeef"},
+		{http.MethodHead, "/test-bucket/viewer/blobs/deadbeef"},
+		{http.MethodDelete, "/test-bucket/viewer/blobs/deadbeef"},
+		{http.MethodPut, "/test-bucket/viewer/uploads/album-1/source.zip"},
+	}
+	got := *requests
+	if len(got) != len(want) {
+		t.Fatalf("recorded %d requests (%v), want %d", len(got), got, len(want))
+	}
+	for i, w := range want {
+		if got[i].method != w.method || got[i].path != w.path {
+			t.Errorf("request %d = %s, want %s %s", i, got[i], w.method, w.path)
+		}
+	}
+	// CopySource is "<bucket>/<physical key>", matching the format this method
+	// already sent before the key prefix existed (it carries no leading slash).
+	if source := got[4].header.Get("X-Amz-Copy-Source"); source != "test-bucket/viewer/batch/first.zip" {
+		t.Errorf("copy source=%q want=test-bucket/viewer/batch/first.zip", source)
+	}
+}
+
+// TestS3StoreListBatchObjectsStripsKeyPrefix covers the one method that reads
+// keys back out of the bucket: the batch scanner feeds listed keys straight
+// into CopyObject and DeleteObject, so they must stay logical or the prefix
+// would be applied twice.
+func TestS3StoreListBatchObjectsStripsKeyPrefix(t *testing.T) {
+	store, requests := newRecordingStore(t, "viewer/")
+
+	objects, err := store.ListBatchObjects(context.Background(), "batch/")
+	if err != nil {
+		t.Fatalf("ListBatchObjects: %v", err)
+	}
+
+	got := *requests
+	if len(got) != 1 {
+		t.Fatalf("recorded %d requests, want 1", len(got))
+	}
+	if got[0].query == "" || !strings.Contains(got[0].query, "prefix=viewer%2Fbatch%2F") {
+		t.Errorf("list query=%q want a prefixed prefix=viewer%%2Fbatch%%2F", got[0].query)
+	}
+
+	if len(objects) != 2 {
+		t.Fatalf("ListBatchObjects returned %d objects, want 2", len(objects))
+	}
+	// Sorted by logical key: the canned response is deliberately out of order.
+	if objects[0].Key != "batch/first.zip" || objects[1].Key != "batch/second.zip" {
+		t.Errorf("keys=%q,%q want batch/first.zip,batch/second.zip", objects[0].Key, objects[1].Key)
+	}
+	if objects[0].ETag != `"etag-1"` || objects[0].Size != 10 {
+		t.Errorf("first object=%+v want etag-1 size 10", objects[0])
+	}
+
+	// A listed key must round-trip through the other methods unchanged.
+	if err := store.DeleteObject(context.Background(), objects[0].Key); err != nil {
+		t.Fatalf("DeleteObject: %v", err)
+	}
+	if path := (*requests)[1].path; path != "/test-bucket/viewer/batch/first.zip" {
+		t.Errorf("delete path=%q want /test-bucket/viewer/batch/first.zip", path)
+	}
+}
+
+// TestS3StoreWithoutPrefixKeepsFlatLayout pins the default: an unset S3_PREFIX
+// must not add a slash or otherwise move existing objects.
+func TestS3StoreWithoutPrefixKeepsFlatLayout(t *testing.T) {
+	store, requests := newRecordingStore(t, "")
+
+	if err := store.PutObject(context.Background(), "blobs/deadbeef", strings.NewReader("x"), "image/png"); err != nil {
+		t.Fatalf("PutObject: %v", err)
+	}
+	if path := (*requests)[0].path; path != "/test-bucket/blobs/deadbeef" {
+		t.Errorf("put path=%q want /test-bucket/blobs/deadbeef", path)
+	}
+}
+
+// TestS3StorePresignsUnderKeyPrefix checks the presigned upload URL the browser
+// PUTs to, which never goes through the store's own client.
+func TestS3StorePresignsUnderKeyPrefix(t *testing.T) {
+	store, _ := newRecordingStore(t, "team-a/")
+
+	url, headers, err := store.PresignPut(context.Background(), "uploads/album-1/source.zip", time.Minute)
+	if err != nil {
+		t.Fatalf("PresignPut: %v", err)
+	}
+	if !strings.Contains(url, "/test-bucket/team-a/uploads/album-1/source.zip") {
+		t.Errorf("presigned url=%q want the bucket and key prefix in the path", url)
+	}
+	if len(headers) != 0 {
+		t.Errorf("headers=%v want none", headers)
+	}
+}

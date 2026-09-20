@@ -85,6 +85,64 @@ func TestDeploymentConstants(t *testing.T) {
 	}
 }
 
+// TestLoadNormalizesS3Prefix pins the exact string that gets prepended to every
+// object key: an unset or slash-only value must stay empty (the historical flat
+// layout), and a real value always ends in exactly one slash.
+func TestLoadNormalizesS3Prefix(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{name: "unset", raw: "", want: ""},
+		{name: "blank", raw: "   ", want: ""},
+		{name: "slash only", raw: "/", want: ""},
+		{name: "slashes only", raw: "///", want: ""},
+		{name: "bare name", raw: "viewer", want: "viewer/"},
+		{name: "trailing slash", raw: "viewer/", want: "viewer/"},
+		{name: "surrounding slashes", raw: "/viewer/", want: "viewer/"},
+		{name: "surrounding spaces", raw: "  viewer  ", want: "viewer/"},
+		{name: "nested", raw: "team-a/viewer", want: "team-a/viewer/"},
+		{name: "nested with slashes", raw: "/team-a/viewer/", want: "team-a/viewer/"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			setRequiredEnv(t)
+			t.Setenv("S3_PREFIX", tc.raw)
+
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if cfg.S3Prefix != tc.want {
+				t.Fatalf("S3Prefix=%q want=%q for S3_PREFIX=%q", cfg.S3Prefix, tc.want, tc.raw)
+			}
+			wantDescribe := tc.want
+			if wantDescribe == "" {
+				wantDescribe = "(bucket root)"
+			}
+			if got := cfg.DescribePrefix(); got != wantDescribe {
+				t.Fatalf("DescribePrefix()=%q want=%q", got, wantDescribe)
+			}
+		})
+	}
+}
+
+// TestLoadDefaultsToNoS3Prefix keeps the prefix optional: an unset S3_PREFIX
+// must leave the deployment storing objects at the bucket root.
+func TestLoadDefaultsToNoS3Prefix(t *testing.T) {
+	setRequiredEnv(t)
+	t.Setenv("S3_PREFIX", "")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.S3Prefix != "" {
+		t.Fatalf("S3Prefix=%q want empty", cfg.S3Prefix)
+	}
+}
+
 func setRequiredEnv(t *testing.T) {
 	t.Helper()
 	t.Setenv("S3_ENDPOINT", "https://example.invalid")

@@ -1,16 +1,17 @@
 // Package config holds the viewer's deployment settings.
 //
 // The viewer is always deployed as the Docker image, so the only values that
-// differ between deployments are the object-storage credentials and the port
-// the container listens on. Everything else - the cache paths, the upload
-// limits, the checkpoint location - is a constant here rather than an
-// environment variable.
+// differ between deployments are the object-storage credentials, the port the
+// container listens on, and the optional key prefix that lets two deployments
+// share one bucket. Everything else - the cache paths, the upload limits, the
+// checkpoint location - is a constant here rather than an environment variable.
 package config
 
 import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -57,6 +58,11 @@ type Config struct {
 	S3Bucket    string
 	S3AccessKey string
 	S3SecretKey string
+
+	// S3Prefix is prepended to every object key, so several deployments can
+	// share one bucket. It is normalized to either "" or a slash-terminated
+	// path; an unset value keeps the flat "blobs/<hash>" layout.
+	S3Prefix string
 }
 
 // Load reads the deployment settings from the environment and validates that
@@ -68,6 +74,7 @@ func Load() (Config, error) {
 		S3Bucket:    os.Getenv("S3_BUCKET"),
 		S3AccessKey: os.Getenv("S3_ACCESS_KEY"),
 		S3SecretKey: os.Getenv("S3_SECRET_KEY"),
+		S3Prefix:    normalizePrefix(os.Getenv("S3_PREFIX")),
 	}
 
 	switch {
@@ -94,4 +101,25 @@ func getenvInt(key string, fallback int) int {
 		return fallback
 	}
 	return n
+}
+
+// normalizePrefix turns an operator-supplied key prefix into the exact string
+// prepended to every object key: "" for an unset or slash-only value, and a
+// slash-terminated path otherwise. Accepting "viewer", "viewer/" and
+// "/viewer/" alike keeps the setting forgiving about stray slashes.
+func normalizePrefix(raw string) string {
+	trimmed := strings.Trim(strings.TrimSpace(raw), "/")
+	if trimmed == "" {
+		return ""
+	}
+	return trimmed + "/"
+}
+
+// DescribePrefix renders the effective prefix for the startup log, so a
+// misconfigured value is visible before it looks like an empty bucket.
+func (c Config) DescribePrefix() string {
+	if c.S3Prefix == "" {
+		return "(bucket root)"
+	}
+	return c.S3Prefix
 }

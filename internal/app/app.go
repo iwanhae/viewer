@@ -28,7 +28,7 @@ func Run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	log.Printf("viewer: config loaded on port=%d", cfg.Port)
+	log.Printf("viewer: config loaded on port=%d s3_prefix=%s", cfg.Port, cfg.DescribePrefix())
 
 	cat, err := catalog.Open(cfgpkg.DBPath)
 	if err != nil {

@@ -19,6 +19,13 @@ The bucket holds binary payloads only; every piece of metadata is in SQLite.
 - `blobs/<sha256>` — the durable image payload, keyed by the SHA-256 of the raw
   image bytes.
 
+Every key above is logical. `S3_PREFIX` prepends one deployment-owned prefix to
+all of them (`photos/blobs/<sha256>` and so on); it is added and removed entirely
+inside `internal/storage`, so callers and the catalog only ever see the logical
+form. `ListBatchObjects` is the single method that reads keys back out of the
+bucket, so it strips the prefix again — the batch scanner feeds listed keys
+straight into `CopyObject`/`DeleteObject`, which would otherwise double it.
+
 There is no per-album manifest object. The album-to-photo mapping exists only in
 SQLite. Feed, viewer and search requests are answered from the catalog; S3 is
 read by key (image bytes) or by the `batch/` prefix.

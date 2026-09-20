@@ -32,7 +32,8 @@ content-addressed blob:
 All metadata lives in the local SQLite catalog at `/tmp/viewer-cache/viewer.db`;
 S3 only holds the staged zip (briefly) and the deduplicated image blobs. The
 `albums/<id>/index.json` objects of previous versions are no longer written or
-read.
+read. Object keys below are the logical ones: set `S3_PREFIX` to nest all of
+them under a single prefix in the bucket.
 
 Image requests are resolved as `(albumId, index)` -> photo row -> blob hash ->
 `blobs/<hash>`, with a local disk cache in `/tmp/viewer-cache/images`. The cached
@@ -43,10 +44,23 @@ the blob hash under `Cache-Control: public, max-age=86400, immutable`.
 ## Configuration
 
 The viewer is always deployed as the Docker image, so the whole configuration is
-five environment variables:
+six environment variables:
 
 - `S3_ENDPOINT`, `S3_BUCKET`, `S3_ACCESS_KEY`, `S3_SECRET_KEY` — required.
+- `S3_PREFIX` — optional key prefix, so several deployments can share one bucket
+  (default empty: objects sit at the bucket root).
 - `PORT` — the port the container listens on (default `8080`).
+
+`S3_PREFIX=photos` stores this deployment's objects under `photos/`
+(`photos/blobs/<sha256>`, `photos/uploads/<albumId>/source.zip`,
+`photos/batch/<name>.zip`). Surrounding slashes and whitespace are trimmed, so
+`photos`, `photos/` and `/photos/` are equivalent. The prefix is applied by the
+storage layer and never recorded in the catalog, so relocating a deployment's
+objects within the bucket does not invalidate the stored metadata.
+
+Setting the prefix is not a migration: a deployment that already has objects at
+the bucket root must move its `blobs/`, `uploads/` and `batch/` keys under the
+new prefix, or the viewer will not see them.
 
 Everything else is a constant in `internal/config`: the path-style S3 addressing
 and signing region, the 1 GiB upload limit, the 15 minute presign TTL, the

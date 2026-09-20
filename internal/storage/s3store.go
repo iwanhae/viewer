@@ -18,8 +18,14 @@ import (
 	cfgpkg "viewer/internal/config"
 )
 
+// S3Store is the object-storage boundary. Every key that crosses it is logical:
+// callers pass and receive keys like "blobs/<hash>" while the store itself adds
+// the configured key prefix. Keeping the prefix out of the catalog means moving
+// a deployment's objects within the bucket never invalidates stored metadata,
+// and it keeps the batch scanner's keys in the same namespace it lists.
 type S3Store struct {
 	bucket    string
+	prefix    string
 	client    *s3.Client
 	presigner *s3.PresignClient
 }
@@ -56,15 +62,30 @@ func NewS3Store(ctx context.Context, cfg cfgpkg.Config) (*S3Store, error) {
 
 	return &S3Store{
 		bucket:    cfg.S3Bucket,
+		prefix:    cfg.S3Prefix,
 		client:    client,
 		presigner: s3.NewPresignClient(client),
 	}, nil
 }
 
+// physicalKey maps a logical key to the key stored in the bucket.
+func (s *S3Store) physicalKey(key string) string {
+	if s.prefix == "" {
+		return key
+	}
+	return s.prefix + key
+}
+
+// logicalKey is the inverse of physicalKey. Callers only ever see logical keys,
+// so a listed object can be fed straight back into CopyObject or DeleteObject.
+func (s *S3Store) logicalKey(key string) string {
+	return strings.TrimPrefix(key, s.prefix)
+}
+
 func (s *S3Store) PresignPut(ctx context.Context, key string, ttl time.Duration) (string, map[string]string, error) {
 	out, err := s.presigner.PresignPutObject(ctx, &s3.PutObjectInput{
 		Bucket: aws.String(s.bucket),
-		Key:    aws.String(key),
+		Key:    aws.String(s.physicalKey(key)),
 	}, s3.WithPresignExpires(ttl))
 	if err != nil {
 		return "", nil, fmt.Errorf("presign put: %w", err)
@@ -75,7 +96,7 @@ func (s *S3Store) PresignPut(ctx context.Context, key string, ttl time.Duration)
 func (s *S3Store) PutObject(ctx context.Context, key string, body io.Reader, contentType string) error {
 	_, err := s.client.PutObject(ctx, &s3.PutObjectInput{
 		Bucket:      aws.String(s.bucket),
-		Key:         aws.String(key),
+		Key:         aws.String(s.physicalKey(key)),
 		Body:        body,
 		ContentType: aws.String(contentType),
 	})
@@ -88,7 +109,7 @@ func (s *S3Store) PutObject(ctx context.Context, key string, body io.Reader, con
 func (s *S3Store) GetObject(ctx context.Context, key string) (io.ReadCloser, string, error) {
 	out, err := s.client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(s.bucket),
-		Key:    aws.String(key),
+		Key:    aws.String(s.physicalKey(key)),
 	})
 	if err != nil {
 		return nil, "", wrapObjectError("get object", key, err)
@@ -103,7 +124,7 @@ func (s *S3Store) GetObject(ctx context.Context, key string) (io.ReadCloser, str
 func (s *S3Store) HeadObject(ctx context.Context, key string) (bool, int64, error) {
 	o, err := s.client.HeadObject(ctx, &s3.HeadObjectInput{
 		Bucket: aws.String(s.bucket),
-		Key:    aws.String(key),
+		Key:    aws.String(s.physicalKey(key)),
 	})
 	if err != nil {
 		if isS3NotFound(err) {
@@ -125,7 +146,7 @@ func (s *S3Store) DeleteObject(ctx context.Context, key string) error {
 	}
 	_, err := s.client.DeleteObject(ctx, &s3.DeleteObjectInput{
 		Bucket: aws.String(s.bucket),
-		Key:    aws.String(key),
+		Key:    aws.String(s.physicalKey(key)),
 	})
 	if err != nil {
 		return fmt.Errorf("delete object %s: %w", key, err)
@@ -142,11 +163,11 @@ func (s *S3Store) CopyObject(ctx context.Context, srcKey, dstKey string) error {
 	if srcKey == dstKey {
 		return fmt.Errorf("srcKey and dstKey must differ")
 	}
-	copySource := fmt.Sprintf("%s/%s", s.bucket, srcKey)
+	copySource := fmt.Sprintf("%s/%s", s.bucket, s.physicalKey(srcKey))
 	_, err := s.client.CopyObject(ctx, &s3.CopyObjectInput{
 		Bucket:     aws.String(s.bucket),
 		CopySource: aws.String(copySource),
-		Key:        aws.String(dstKey),
+		Key:        aws.String(s.physicalKey(dstKey)),
 	})
 	if err != nil {
 		return fmt.Errorf("copy object %s -> %s: %w", srcKey, dstKey, err)
@@ -154,25 +175,29 @@ func (s *S3Store) CopyObject(ctx context.Context, srcKey, dstKey string) error {
 	return nil
 }
 
+// ListBatchObjects lists the batch prefix. It is the one method that reads keys
+// out of the bucket, so it strips the store's key prefix again: callers get a
+// listing in the same logical namespace they pass to the other methods.
 func (s *S3Store) ListBatchObjects(ctx context.Context, prefix string) ([]BatchObject, error) {
 	prefix = strings.TrimSpace(prefix)
 	if prefix == "" {
 		return nil, fmt.Errorf("prefix is required")
 	}
+	listPrefix := s.physicalKey(prefix)
 
 	objects := make([]BatchObject, 0)
 	var token *string
 	for {
 		out, err := s.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
 			Bucket:            aws.String(s.bucket),
-			Prefix:            aws.String(prefix),
+			Prefix:            aws.String(listPrefix),
 			ContinuationToken: token,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("list batch objects: %w", err)
 		}
 		for _, obj := range out.Contents {
-			key := aws.ToString(obj.Key)
+			key := s.logicalKey(aws.ToString(obj.Key))
 			if key == "" {
 				continue
 			}
