@@ -260,11 +260,14 @@ export function UploadPage() {
       setPageError('Select at least one .zip file.')
     } else {
       setPageError(null)
-      setItems((prev) => {
-        const updated = [...prev, ...picked]
-        itemsRef.current = updated
-        return updated
-      })
+      // itemsRef is the upload queue's source of truth and pumpQueue runs
+      // synchronously in the loop below, so the ref must be updated before
+      // enqueueing. setItems' updater may be deferred by React's batching,
+      // and a stale ref makes pumpQueue drop the ids it cannot resolve - the
+      // upload then never starts and no request is sent.
+      const updated = [...itemsRef.current, ...picked]
+      itemsRef.current = updated
+      setItems(updated)
       for (const item of picked) {
         enqueueUpload(item.id)
       }
@@ -305,21 +308,21 @@ export function UploadPage() {
       return
     }
 
-    setItems((prev) => {
-      const updated = prev.map((item) => {
-        const isUploadFailure = item.status === 'canceled' || item.status === 'failed'
-        if (!isUploadFailure) return item
-        return {
-          ...item,
-          status: 'uploading',
-          uploadedBytes: 0,
-          albumId: undefined,
-          error: undefined,
-        }
-      })
-      itemsRef.current = updated
-      return updated
+    // Same invariant as onPickFiles: pumpQueue reads itemsRef.current
+    // synchronously right after this, so the ref leads and state follows.
+    const updated = itemsRef.current.map((item) => {
+      const isUploadFailure = item.status === 'canceled' || item.status === 'failed'
+      if (!isUploadFailure) return item
+      return {
+        ...item,
+        status: 'uploading' as const,
+        uploadedBytes: 0,
+        albumId: undefined,
+        error: undefined,
+      }
     })
+    itemsRef.current = updated
+    setItems(updated)
     for (const item of retryable) {
       removeQueuedItem(item.id)
       enqueueUpload(item.id)
