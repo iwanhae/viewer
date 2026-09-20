@@ -1,14 +1,12 @@
 export class ApiError extends Error {
   readonly status: number
   readonly code: string
-  readonly details?: unknown
 
-  constructor(status: number, code: string, message: string, details?: unknown) {
+  constructor(status: number, code: string, message: string) {
     super(message)
     this.name = 'ApiError'
     this.status = status
     this.code = code
-    this.details = details
   }
 }
 
@@ -16,7 +14,6 @@ type ErrorEnvelope = {
   error?: {
     code?: string
     message?: string
-    details?: unknown
   }
 }
 
@@ -32,7 +29,7 @@ function toApiError(res: Response, bodyText: string): ApiError {
   const parsed = bodyText ? (parseJson(bodyText) as ErrorEnvelope | null) : null
   const code = parsed?.error?.code || `HTTP_${res.status}`
   const message = parsed?.error?.message || `request failed: ${res.status}`
-  return new ApiError(res.status, code, message, parsed?.error?.details)
+  return new ApiError(res.status, code, message)
 }
 
 export async function requestJSON<T>(input: RequestInfo | URL, init?: RequestInit): Promise<T> {

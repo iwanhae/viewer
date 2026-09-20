@@ -1,9 +1,7 @@
 package storage
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -24,14 +22,6 @@ type S3Store struct {
 	bucket    string
 	client    *s3.Client
 	presigner *s3.PresignClient
-}
-
-type AlbumSourceObject struct {
-	AlbumID      string
-	Key          string
-	LastModified time.Time
-	Size         int64
-	ETag         string
 }
 
 type BatchObject struct {
@@ -95,24 +85,6 @@ func (s *S3Store) PutObject(ctx context.Context, key string, body io.Reader, con
 	return nil
 }
 
-func (s *S3Store) PutJSON(ctx context.Context, key string, v any) error {
-	b, err := json.Marshal(v)
-	if err != nil {
-		return fmt.Errorf("marshal json: %w", err)
-	}
-
-	_, err = s.client.PutObject(ctx, &s3.PutObjectInput{
-		Bucket:      aws.String(s.bucket),
-		Key:         aws.String(key),
-		Body:        bytes.NewReader(b),
-		ContentType: aws.String("application/json"),
-	})
-	if err != nil {
-		return fmt.Errorf("put json %s: %w", key, err)
-	}
-	return nil
-}
-
 func (s *S3Store) GetObject(ctx context.Context, key string) (io.ReadCloser, string, error) {
 	out, err := s.client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(s.bucket),
@@ -126,73 +98,6 @@ func (s *S3Store) GetObject(ctx context.Context, key string) (io.ReadCloser, str
 		ct = *out.ContentType
 	}
 	return out.Body, ct, nil
-}
-
-func (s *S3Store) GetObjectRange(ctx context.Context, key string, start int64, end int64) (io.ReadCloser, string, error) {
-	if start < 0 {
-		return nil, "", fmt.Errorf("invalid range start: %d", start)
-	}
-	if end < start {
-		return nil, "", fmt.Errorf("invalid range end: %d", end)
-	}
-
-	rangeValue := fmt.Sprintf("bytes=%d-%d", start, end)
-	out, err := s.client.GetObject(ctx, &s3.GetObjectInput{
-		Bucket: aws.String(s.bucket),
-		Key:    aws.String(key),
-		Range:  aws.String(rangeValue),
-	})
-	if err != nil {
-		return nil, "", wrapObjectError("get object range", key, err)
-	}
-
-	if out.ContentRange == nil || !strings.HasPrefix(*out.ContentRange, fmt.Sprintf("bytes %d-%d/", start, end)) {
-		out.Body.Close()
-		return nil, "", fmt.Errorf("range response mismatch for %s: expected bytes %d-%d, got %q", key, start, end, aws.ToString(out.ContentRange))
-	}
-	if out.ContentLength == nil || *out.ContentLength != (end-start+1) {
-		out.Body.Close()
-		return nil, "", fmt.Errorf("range response length mismatch for %s: expected %d, got %d", key, end-start+1, aws.ToInt64(out.ContentLength))
-	}
-	if out.AcceptRanges != nil {
-		accept := strings.ToLower(strings.TrimSpace(*out.AcceptRanges))
-		if accept != "" && accept != "bytes" {
-			out.Body.Close()
-			return nil, "", fmt.Errorf("range response does not advertise byte ranges for %s: %q", key, *out.AcceptRanges)
-		}
-	}
-	if out.ContentType == nil {
-		out.ContentType = aws.String("application/octet-stream")
-	}
-	if out.ContentLength != nil && *out.ContentLength <= 0 {
-		out.Body.Close()
-		return nil, "", fmt.Errorf("range response empty for %s", key)
-	}
-	if out.DeleteMarker != nil && *out.DeleteMarker {
-		out.Body.Close()
-		return nil, "", fmt.Errorf("range response points to delete marker for %s", key)
-	}
-	ct := "application/octet-stream"
-	if out.ContentType != nil {
-		ct = *out.ContentType
-	}
-	return out.Body, ct, nil
-}
-
-func (s *S3Store) ReadJSON(ctx context.Context, key string, out any) error {
-	getOut, err := s.client.GetObject(ctx, &s3.GetObjectInput{
-		Bucket: aws.String(s.bucket),
-		Key:    aws.String(key),
-	})
-	if err != nil {
-		return wrapObjectError("get object", key, err)
-	}
-	defer getOut.Body.Close()
-
-	if err := json.NewDecoder(getOut.Body).Decode(out); err != nil {
-		return fmt.Errorf("decode json %s: %w", key, err)
-	}
-	return nil
 }
 
 func (s *S3Store) HeadObject(ctx context.Context, key string) (bool, int64, error) {
@@ -211,124 +116,6 @@ func (s *S3Store) HeadObject(ctx context.Context, key string) (bool, int64, erro
 		size = *o.ContentLength
 	}
 	return true, size, nil
-}
-
-func (s *S3Store) ForEachAlbumIndexKey(ctx context.Context, fn func(key string) error) error {
-	if fn == nil {
-		return nil
-	}
-	return s.ForEachAlbumObjectKey(ctx, func(key string) error {
-		if !strings.HasSuffix(key, "/index.json") {
-			return nil
-		}
-		return fn(key)
-	})
-}
-
-func (s *S3Store) ForEachAlbumObjectKey(ctx context.Context, fn func(key string) error) error {
-	if fn == nil {
-		return nil
-	}
-	var token *string
-	for {
-		out, err := s.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
-			Bucket:            aws.String(s.bucket),
-			Prefix:            aws.String("albums/"),
-			ContinuationToken: token,
-		})
-		if err != nil {
-			return fmt.Errorf("list objects: %w", err)
-		}
-
-		for _, obj := range out.Contents {
-			if obj.Key == nil {
-				continue
-			}
-			if err := fn(*obj.Key); err != nil {
-				return err
-			}
-		}
-		if out.IsTruncated == nil || !*out.IsTruncated {
-			break
-		}
-		token = out.NextContinuationToken
-	}
-	return nil
-}
-
-func (s *S3Store) ListAlbumSources(ctx context.Context) ([]AlbumSourceObject, error) {
-	sources := make([]AlbumSourceObject, 0)
-	var token *string
-	for {
-		out, err := s.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
-			Bucket:            aws.String(s.bucket),
-			Prefix:            aws.String("albums/"),
-			ContinuationToken: token,
-		})
-		if err != nil {
-			return nil, fmt.Errorf("list album sources: %w", err)
-		}
-		for _, obj := range out.Contents {
-			key := aws.ToString(obj.Key)
-			if key == "" {
-				continue
-			}
-			albumID, ok := parseAlbumSourceKey(key)
-			if !ok {
-				continue
-			}
-			sources = append(sources, AlbumSourceObject{
-				AlbumID:      albumID,
-				Key:          key,
-				LastModified: aws.ToTime(obj.LastModified).UTC(),
-				Size:         aws.ToInt64(obj.Size),
-				ETag:         aws.ToString(obj.ETag),
-			})
-		}
-		if out.IsTruncated == nil || !*out.IsTruncated {
-			break
-		}
-		token = out.NextContinuationToken
-	}
-
-	sort.Slice(sources, func(i, j int) bool {
-		return sources[i].Key < sources[j].Key
-	})
-	return sources, nil
-}
-
-func (s *S3Store) ListObjectsByPrefix(ctx context.Context, prefix string) ([]string, error) {
-	prefix = strings.TrimSpace(prefix)
-	if prefix == "" {
-		return nil, fmt.Errorf("prefix is required")
-	}
-
-	keys := make([]string, 0)
-	var token *string
-	for {
-		out, err := s.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
-			Bucket:            aws.String(s.bucket),
-			Prefix:            aws.String(prefix),
-			ContinuationToken: token,
-		})
-		if err != nil {
-			return nil, fmt.Errorf("list objects by prefix %s: %w", prefix, err)
-		}
-		for _, obj := range out.Contents {
-			key := aws.ToString(obj.Key)
-			if key == "" {
-				continue
-			}
-			keys = append(keys, key)
-		}
-		if out.IsTruncated == nil || !*out.IsTruncated {
-			break
-		}
-		token = out.NextContinuationToken
-	}
-
-	sort.Strings(keys)
-	return keys, nil
 }
 
 func (s *S3Store) DeleteObject(ctx context.Context, key string) error {
@@ -406,17 +193,6 @@ func (s *S3Store) ListBatchObjects(ctx context.Context, prefix string) ([]BatchO
 		return objects[i].Key < objects[j].Key
 	})
 	return objects, nil
-}
-
-func parseAlbumSourceKey(key string) (string, bool) {
-	parts := strings.Split(strings.TrimSpace(key), "/")
-	if len(parts) != 3 {
-		return "", false
-	}
-	if parts[0] != "albums" || strings.TrimSpace(parts[1]) == "" || parts[2] != "source.zip" {
-		return "", false
-	}
-	return parts[1], true
 }
 
 func wrapObjectError(action string, key string, err error) error {

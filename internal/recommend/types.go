@@ -25,11 +25,9 @@ type RecommendationResponse struct {
 }
 
 type EmbeddingProgress struct {
-	Total     int
-	Ready     int
-	Failed    int
-	Pending   int
-	Processed int
-	Ratio     float64
-	Percent   float64
+	Total   int
+	Ready   int
+	Failed  int
+	Pending int
+	Ratio   float64
 }

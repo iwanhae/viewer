@@ -200,7 +200,7 @@ func TestProcessAlbumExtractsImagesAndDedupesBlobs(t *testing.T) {
 	)
 	seedAlbum(t, cat, store, "album-a", "holiday.zip", zipData)
 
-	svc := NewService(cat, store, embedder, Options{DeleteSource: true, TempDir: t.TempDir()})
+	svc := NewService(cat, store, embedder, Options{TempDir: t.TempDir()})
 	if err := svc.ProcessAlbum(context.Background(), "album-a"); err != nil {
 		t.Fatalf("process album: %v", err)
 	}
@@ -283,7 +283,7 @@ func TestProcessAlbumCrossAlbumDedupeStoresBlobOnce(t *testing.T) {
 	seedAlbum(t, cat, store, "album-a", "a.zip", zipA)
 	seedAlbum(t, cat, store, "album-b", "b.zip", zipB)
 
-	svc := NewService(cat, store, nil, Options{DeleteSource: true, TempDir: t.TempDir()})
+	svc := NewService(cat, store, nil, Options{TempDir: t.TempDir()})
 	if err := svc.ProcessAlbum(context.Background(), "album-a"); err != nil {
 		t.Fatalf("process album-a: %v", err)
 	}
@@ -310,7 +310,7 @@ func TestProcessAlbumNoValidImagesMarksFailedAndKeepsSource(t *testing.T) {
 	zipData := buildZip(t, zipEntry{name: "readme.txt", data: []byte("nothing here")}, zipEntry{name: "dir/", data: nil})
 	seedAlbum(t, cat, store, "album-a", "junk.zip", zipData)
 
-	svc := NewService(cat, store, nil, Options{DeleteSource: true, TempDir: t.TempDir()})
+	svc := NewService(cat, store, nil, Options{TempDir: t.TempDir()})
 	err := svc.ProcessAlbum(context.Background(), "album-a")
 	if !errors.Is(err, ErrNoValidImages) {
 		t.Fatalf("expected ErrNoValidImages, got %v", err)
@@ -339,7 +339,7 @@ func TestProcessAlbumMissingSourceMarksFailed(t *testing.T) {
 		t.Fatalf("create album: %v", err)
 	}
 
-	svc := NewService(cat, store, nil, Options{DeleteSource: true, TempDir: t.TempDir()})
+	svc := NewService(cat, store, nil, Options{TempDir: t.TempDir()})
 	if err := svc.ProcessAlbum(context.Background(), "album-a"); err == nil {
 		t.Fatalf("expected error for missing staged zip")
 	}
@@ -435,21 +435,6 @@ func TestProcessAlbumInvokesReadyHook(t *testing.T) {
 	}
 	if len(ready) != 1 || ready[0] != "album-a" {
 		t.Fatalf("ready hook calls=%v", ready)
-	}
-}
-
-func TestProcessAlbumKeepsSourceWhenDeleteDisabled(t *testing.T) {
-	cat := openTestCatalog(t)
-	store := newFakeStore()
-	zipData := buildZip(t, zipEntry{name: "a.png", data: pngBytes(t, 2, 2, 4)})
-	seedAlbum(t, cat, store, "album-a", "a.zip", zipData)
-
-	svc := NewService(cat, store, nil, Options{DeleteSource: false, TempDir: t.TempDir()})
-	if err := svc.ProcessAlbum(context.Background(), "album-a"); err != nil {
-		t.Fatalf("process album: %v", err)
-	}
-	if !store.has(SourceKey("album-a")) {
-		t.Fatalf("expected staged zip to be kept when DeleteSource is false")
 	}
 }
 

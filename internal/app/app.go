@@ -76,8 +76,7 @@ func Run(ctx context.Context) error {
 		pipelineEmbedder = recommendService
 	}
 	pipelineService := pipeline.NewService(cat, store, pipelineEmbedder, pipeline.Options{
-		DeleteSource: true,
-		TempDir:      cfgpkg.ZipCacheDir,
+		TempDir: cfgpkg.ZipCacheDir,
 		OnAlbumReady: func(albumID string) {
 			if err := recommendService.ReloadAlbum(context.Background(), albumID); err != nil {
 				log.Printf("viewer: reload recommendation index for album=%s failed: %v", albumID, err)

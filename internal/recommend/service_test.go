@@ -557,14 +557,11 @@ func TestEmbeddingProgressFromCatalogCounts(t *testing.T) {
 	svc := newTestService(t, cat, nil)
 	got := svc.EmbeddingProgress()
 
-	if got.Total != 4 || got.Ready != 2 || got.Failed != 1 || got.Pending != 1 || got.Processed != 3 {
+	if got.Total != 4 || got.Ready != 2 || got.Failed != 1 || got.Pending != 1 {
 		t.Fatalf("unexpected embedding progress counts: %+v", got)
 	}
 	if !approxEqual(got.Ratio, 0.5) {
 		t.Fatalf("ratio=%f want=0.5", got.Ratio)
-	}
-	if !approxEqual(got.Percent, 50) {
-		t.Fatalf("percent=%f want=50", got.Percent)
 	}
 }
 
@@ -573,10 +570,10 @@ func TestEmbeddingProgressEmptyCatalog(t *testing.T) {
 	svc := newTestService(t, cat, nil)
 
 	got := svc.EmbeddingProgress()
-	if got.Total != 0 || got.Ready != 0 || got.Failed != 0 || got.Pending != 0 || got.Processed != 0 {
+	if got.Total != 0 || got.Ready != 0 || got.Failed != 0 || got.Pending != 0 {
 		t.Fatalf("unexpected counts for empty catalog: %+v", got)
 	}
-	if got.Ratio != 0 || got.Percent != 0 {
+	if got.Ratio != 0 {
 		t.Fatalf("unexpected ratio for empty catalog: %+v", got)
 	}
 }
@@ -584,13 +581,13 @@ func TestEmbeddingProgressEmptyCatalog(t *testing.T) {
 func TestEmbeddingProgressNilDependencies(t *testing.T) {
 	var nilService *Service
 	got := nilService.EmbeddingProgress()
-	if got.Total != 0 || got.Ready != 0 || got.Failed != 0 || got.Pending != 0 || got.Processed != 0 || got.Ratio != 0 || got.Percent != 0 {
+	if got.Total != 0 || got.Ready != 0 || got.Failed != 0 || got.Pending != 0 || got.Ratio != 0 {
 		t.Fatalf("unexpected progress for nil service: %+v", got)
 	}
 
 	svc := newTestService(t, nil, nil)
 	got = svc.EmbeddingProgress()
-	if got.Total != 0 || got.Ready != 0 || got.Failed != 0 || got.Pending != 0 || got.Processed != 0 || got.Ratio != 0 || got.Percent != 0 {
+	if got.Total != 0 || got.Ready != 0 || got.Failed != 0 || got.Pending != 0 || got.Ratio != 0 {
 		t.Fatalf("unexpected progress for nil catalog: %+v", got)
 	}
 }

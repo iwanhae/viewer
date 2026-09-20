@@ -75,7 +75,7 @@ pod startup does not require Hugging Face egress. To use a different model in
 Docker, build with `--build-arg SIGLIP2_MODEL_ID=<repo-id>`.
 
 ## Commands
-- `make build` compiles `bin/viewer` plus `bin/album-dedupe-cleaner`, rebuilding frontend assets only when their sources are newer than `internal/web/static` (`make build FORCE=1` forces a frontend rebuild).
+- `make build` compiles `bin/viewer`, rebuilding frontend assets only when their sources are newer than `internal/web/static` (`make build FORCE=1` forces a frontend rebuild).
 - `make test` runs fast Go unit/integration tests only (`go test ./cmd/... ./internal/...`) using values from `.env.test`.
 - `make test-full` runs the full regression pipeline: `make build`, `make test`, then Playwright e2e (screenshots saved to `samples/` by default).
 - `make test-full` binds the app to `TEST_PORT` (default `18080`) and sets `E2E_BASE_URL` automatically.
@@ -84,10 +84,6 @@ Docker, build with `--build-arg SIGLIP2_MODEL_ID=<repo-id>`.
 
 Batch ingest:
 - Any `batch/*.zip` object is copied to `uploads/<albumId>/source.zip` (with `albumId` derived from the zip content) and queued for extraction; the batch object is then removed. Re-uploading identical bytes is deduplicated.
-
-Legacy batch duplicate cleanup binary (operates on pre-catalog `albums/<id>/source.zip` objects):
-- `bin/album-dedupe-cleaner plan --out ./dedupe-plan.json` creates a deletion plan (no deletes).
-- `bin/album-dedupe-cleaner apply --plan ./dedupe-plan.json` validates the plan snapshot and deletes duplicate album prefixes.
 
 ## Verifying the vision port
 
