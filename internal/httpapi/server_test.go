@@ -189,8 +189,9 @@ func TestMetricsEndpointPrometheusPayload(t *testing.T) {
 
 	recommendService, err := recommend.NewService(
 		cfgpkg.Config{
-			RecommenderEndpoint:   "http://127.0.0.1:18081",
-			RecommenderTimeoutSec: 1,
+			EmbeddingEnabled:     true,
+			EmbeddingConcurrency: 1,
+			EmbeddingTimeoutSec:  1,
 		},
 		cat,
 		nil,
