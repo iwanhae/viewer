@@ -152,7 +152,7 @@ func TestS3StoreKeyPrefixReachesEveryRequest(t *testing.T) {
 		t.Fatalf("DeleteObject: %v", err)
 	}
 
-	if err := store.CopyObject(ctx, "batch/first.zip", "uploads/album-1/source.zip"); err != nil {
+	if err := store.CopyObject(ctx, "batch/first.zip", "uploads/album-1.zip"); err != nil {
 		t.Fatalf("CopyObject: %v", err)
 	}
 
@@ -161,7 +161,7 @@ func TestS3StoreKeyPrefixReachesEveryRequest(t *testing.T) {
 		{http.MethodGet, "/test-bucket/viewer/blobs/deadbeef"},
 		{http.MethodHead, "/test-bucket/viewer/blobs/deadbeef"},
 		{http.MethodDelete, "/test-bucket/viewer/blobs/deadbeef"},
-		{http.MethodPut, "/test-bucket/viewer/uploads/album-1/source.zip"},
+		{http.MethodPut, "/test-bucket/viewer/uploads/album-1.zip"},
 	}
 	got := *requests
 	if len(got) != len(want) {
@@ -237,11 +237,11 @@ func TestS3StoreWithoutPrefixKeepsFlatLayout(t *testing.T) {
 func TestS3StorePresignsUnderKeyPrefix(t *testing.T) {
 	store, _ := newRecordingStore(t, "team-a/")
 
-	url, headers, err := store.PresignPut(context.Background(), "uploads/album-1/source.zip", time.Minute)
+	url, headers, err := store.PresignPut(context.Background(), "uploads/album-1.zip", time.Minute)
 	if err != nil {
 		t.Fatalf("PresignPut: %v", err)
 	}
-	if !strings.Contains(url, "/test-bucket/team-a/uploads/album-1/source.zip") {
+	if !strings.Contains(url, "/test-bucket/team-a/uploads/album-1.zip") {
 		t.Errorf("presigned url=%q want the bucket and key prefix in the path", url)
 	}
 	if len(headers) != 0 {
@@ -305,20 +305,20 @@ func TestS3StoreVirtualHostedAddressing(t *testing.T) {
 			name:     "plain endpoint",
 			endpoint: "https://s3.example.com",
 			wantHost: "test-bucket.s3.example.com",
-			wantPath: "/uploads/album-1/source.zip",
+			wantPath: "/uploads/album-1.zip",
 		},
 		{
 			name:     "endpoint with a path prefix",
 			endpoint: "https://s3.example.com/gateway",
 			wantHost: "test-bucket.s3.example.com",
-			wantPath: "/gateway/uploads/album-1/source.zip",
+			wantPath: "/gateway/uploads/album-1.zip",
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			store := newVirtualHostedStore(t, tc.endpoint)
 
-			url, _, err := store.PresignPut(context.Background(), "uploads/album-1/source.zip", time.Minute)
+			url, _, err := store.PresignPut(context.Background(), "uploads/album-1.zip", time.Minute)
 			if err != nil {
 				t.Fatalf("PresignPut: %v", err)
 			}

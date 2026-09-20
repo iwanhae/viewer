@@ -96,7 +96,7 @@ func NewService(cat *catalog.Store, store Store, embedder Embedder, opts Options
 
 // SourceKey is the staging object key a client uploads a zip to.
 func SourceKey(albumID string) string {
-	return fmt.Sprintf("uploads/%s/source.zip", albumID)
+	return fmt.Sprintf("uploads/%s.zip", albumID)
 }
 
 // BlobKey is the content-addressed S3 key for raw image bytes.

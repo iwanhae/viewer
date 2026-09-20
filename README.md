@@ -12,7 +12,7 @@ zip sequentially, unpacks it entry by entry, and turns every image into a
 content-addressed blob:
 
 1. `POST /api/albums` registers a `QUEUED` album in SQLite and returns a
-   presigned `PUT` URL for `uploads/<albumId>/source.zip`.
+   presigned `PUT` URL for `uploads/<albumId>.zip`.
 2. The browser uploads the zip directly to S3.
 3. `POST /api/albums/<albumId>/finalize` queues the album for the pipeline
    worker.
@@ -70,7 +70,7 @@ keep albums across container replacements. One volume covers all three because
 every path lives directly under it.
 
 `S3_PREFIX=photos` stores this deployment's objects under `photos/`
-(`photos/blobs/<sha256>`, `photos/uploads/<albumId>/source.zip`,
+(`photos/blobs/<sha256>`, `photos/uploads/<albumId>.zip`,
 `photos/batch/<name>.zip`). Surrounding slashes and whitespace are trimmed, so
 `photos`, `photos/` and `/photos/` are equivalent. The prefix is applied by the
 storage layer and never recorded in the catalog, so relocating a deployment's
@@ -122,7 +122,7 @@ Docker, build with `--build-arg SIGLIP2_MODEL_ID=<repo-id>`.
 - `make clean` removes build outputs, dependency caches, and the host-side `/tmp/viewer-cache` state directory.
 
 ## Batch ingest
-- Any top-level `batch/*.zip` object is copied to `uploads/<albumId>/source.zip` and queued for extraction; the batch object is then removed. The `albumId` is derived from the object's ETag and size, so re-uploading identical bytes is deduplicated.
+- Any top-level `batch/*.zip` object is copied to `uploads/<albumId>.zip` and queued for extraction; the batch object is then removed. The `albumId` is derived from the object's ETag and size, so re-uploading identical bytes is deduplicated.
 
 ## Verifying the vision port
 

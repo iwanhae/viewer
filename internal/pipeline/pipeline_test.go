@@ -484,7 +484,7 @@ func TestEnqueueDeduplicatesInFlightAlbums(t *testing.T) {
 }
 
 func TestSourceKeyAndBlobKeyLayout(t *testing.T) {
-	if got := SourceKey("abc"); got != "uploads/abc/source.zip" {
+	if got := SourceKey("abc"); got != "uploads/abc.zip" {
 		t.Fatalf("SourceKey=%q", got)
 	}
 	if got := BlobKey("deadbeef"); got != "blobs/deadbeef" {

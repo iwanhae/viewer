@@ -12,12 +12,17 @@ The bucket holds binary payloads only; every piece of metadata is in SQLite.
 
 - `batch/<name>.zip` — inbound drop prefix. Only top-level `.zip` objects are
   considered, and the prefix is scanned once at startup.
-- `uploads/<albumId>/source.zip` — the staged upload. `albumId` is a UUID for
+- `uploads/<albumId>.zip` — the staged upload. `albumId` is a UUID for
   `POST /api/albums`; for batch ingest it is the first 16 hex characters of
   `sha256("<etag>:<size>")`, so dropping identical bytes again resolves to the
   same album and the staged object is reused.
 - `blobs/<sha256>` — the durable image payload, keyed by the SHA-256 of the raw
   image bytes.
+
+The staging key is generated once and then stored on the album row
+(`albums.source_key`), and the pipeline reads it back from there rather than
+recomputing it. The generated name can therefore change between releases without
+stranding objects an older release already staged.
 
 Every key above is logical. `S3_PREFIX` prepends one deployment-owned prefix to
 all of them (`photos/blobs/<sha256>` and so on); it is added and removed entirely

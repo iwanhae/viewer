@@ -26,7 +26,7 @@ func TestAlbumLifecycleAndStatusTransitions(t *testing.T) {
 		OriginalFilename: "holiday.zip",
 		SizeBytes:        100,
 		Status:           AlbumStatusQueued,
-		SourceKey:        "uploads/album-a/source.zip",
+		SourceKey:        "uploads/album-a.zip",
 	}); err != nil {
 		t.Fatalf("create album: %v", err)
 	}
@@ -82,7 +82,7 @@ func TestUpsertAlbumRefreshesUploadFieldsOnly(t *testing.T) {
 		OriginalFilename: "first.zip",
 		SizeBytes:        10,
 		Status:           AlbumStatusReady,
-		SourceKey:        "uploads/album-a/source.zip",
+		SourceKey:        "uploads/album-a.zip",
 	}); err != nil {
 		t.Fatalf("create album: %v", err)
 	}
@@ -95,7 +95,7 @@ func TestUpsertAlbumRefreshesUploadFieldsOnly(t *testing.T) {
 		OriginalFilename: "second.zip",
 		SizeBytes:        20,
 		Status:           AlbumStatusQueued,
-		SourceKey:        "uploads/album-a/source.zip",
+		SourceKey:        "uploads/album-a.zip",
 	}); err != nil {
 		t.Fatalf("upsert album: %v", err)
 	}
