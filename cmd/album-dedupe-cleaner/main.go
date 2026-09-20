@@ -50,7 +50,7 @@ func runPlan(ctx context.Context, args []string) error {
 		return fmt.Errorf("--out is required")
 	}
 
-	cfg, err := cfgpkg.LoadS3Only()
+	cfg, err := cfgpkg.Load()
 	if err != nil {
 		return err
 	}
@@ -94,7 +94,7 @@ func runApply(ctx context.Context, args []string) error {
 		return err
 	}
 
-	cfg, err := cfgpkg.LoadS3Only()
+	cfg, err := cfgpkg.Load()
 	if err != nil {
 		return err
 	}

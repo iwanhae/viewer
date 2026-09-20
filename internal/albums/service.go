@@ -50,7 +50,6 @@ type albumStore interface {
 // work lives in the pipeline worker; album metadata lives in the SQLite
 // catalog.
 type Service struct {
-	cfg     cfgpkg.Config
 	catalog *catalog.Store
 	store   albumStore
 
@@ -66,9 +65,8 @@ type CreateUploadResult struct {
 	Headers   map[string]string
 }
 
-func NewService(cfg cfgpkg.Config, cat *catalog.Store, store albumStore) *Service {
+func NewService(cat *catalog.Store, store albumStore) *Service {
 	return &Service{
-		cfg:     cfg,
 		catalog: cat,
 		store:   store,
 	}
@@ -93,13 +91,13 @@ func (s *Service) CreateUpload(ctx context.Context, filename string, sizeBytes i
 	if sizeBytes <= 0 {
 		return CreateUploadResult{}, fmt.Errorf("sizeBytes must be > 0")
 	}
-	if sizeBytes > s.cfg.MaxUploadBytes {
-		return CreateUploadResult{}, fmt.Errorf("sizeBytes exceeds MAX_UPLOAD_BYTES")
+	if sizeBytes > cfgpkg.MaxUploadBytes {
+		return CreateUploadResult{}, fmt.Errorf("sizeBytes exceeds the %d byte upload limit", cfgpkg.MaxUploadBytes)
 	}
 
 	albumID := uuid.NewString()
 	key := pipeline.SourceKey(albumID)
-	url, headers, err := s.store.PresignPut(ctx, key, s.cfg.PresignTTL)
+	url, headers, err := s.store.PresignPut(ctx, key, cfgpkg.PresignTTL)
 	if err != nil {
 		return CreateUploadResult{}, err
 	}

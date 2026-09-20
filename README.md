@@ -25,57 +25,41 @@ content-addressed blob:
      distinct content hash, so identical images never occupy storage twice),
    - computes an embedding and writes it to SQLite,
    - records the zip entry name, hash, width, height and ratio in SQLite.
-5. After a successful extraction the staged zip is deleted from S3
-   (`INGEST_DELETE_SOURCE=true`, the default).
+5. After a successful extraction the staged zip is deleted from S3.
 
-All metadata lives in the local SQLite catalog at `DB_PATH`; S3 only holds the
-staged zip (briefly) and the deduplicated image blobs. The `albums/<id>/index.json`
-objects of previous versions are no longer written or read.
+All metadata lives in the local SQLite catalog at `/tmp/viewer-cache/viewer.db`;
+S3 only holds the staged zip (briefly) and the deduplicated image blobs. The
+`albums/<id>/index.json` objects of previous versions are no longer written or
+read.
 
 Image requests are resolved as `(albumId, index)` -> photo row -> blob hash ->
-`blobs/<hash>`, with a local disk cache in `CACHE_DIR`.
+`blobs/<hash>`, with a local disk cache in `/tmp/viewer-cache/images`.
 
-## Required env
-Copy one of:
-- `.env.example` for local run
-- `.env.test.example` for `make test`
+## Configuration
 
-At minimum configure S3 values:
-- `S3_ENDPOINT`
-- `S3_BUCKET`
-- `S3_ACCESS_KEY`
-- `S3_SECRET_KEY`
+The viewer is always deployed as the Docker image, so the whole configuration is
+five environment variables:
 
-Catalog/storage:
-- `DB_PATH` SQLite catalog path (default `.cache/viewer.db`).
-- `CACHE_DIR` local disk cache for image blobs (default `.cache/images`).
-- `ZIP_CACHE_DIR` temp dir for downloaded zips (default `.cache/zips`).
-- `INGEST_DELETE_SOURCE` delete the staged zip after a successful extract (default `true`).
-- `MAX_UPLOAD_BYTES` maximum accepted zip size (default `1073741824`).
-- `PRESIGN_TTL_SECONDS` presigned upload URL TTL (default `900`).
-- `BATCH_INGEST_ENABLED` scan the `batch/` prefix for out-of-band zips (default `true`).
+- `S3_ENDPOINT`, `S3_BUCKET`, `S3_ACCESS_KEY`, `S3_SECRET_KEY` — required.
+- `PORT` — the port the container listens on (default `8080`).
 
-Optional tuning:
-- Recommendation feature:
-  - `RECO_TOPK_DEFAULT` default recommendation count (default `12`).
-  - `RECO_TOPK_MAX` max recommendation count (default `48`).
-- Embedding (in-process SigLIP2 vision tower via GoMLX):
-  - `EMBEDDING_ENABLED` compute and serve embeddings (default `true`).
-  - `EMBEDDING_MODEL_ID` Hugging Face repository id, or a local directory holding `config.json` and `model.safetensors` (default `google/siglip2-base-patch16-224`).
-  - `EMBEDDING_BACKEND` GoMLX backend (default `go`, pure Go and no CGO; `xla:cpu` needs the XLA runtime and CGO but is roughly 8x faster).
-  - `EMBEDDING_CACHE_DIR` Hugging Face cache root used when downloading the checkpoint (default: the GoMLX/Hugging Face default).
-  - `EMBEDDING_REQUIRED` fail startup when the model cannot be loaded (default `false`; the server then runs without embeddings).
-  - `EMBEDDING_CONCURRENCY` background embedding workers (`0` means auto, default `1`: the backend already parallelises a single forward pass across all cores).
-  - `EMBEDDING_REQUEST_TIMEOUT_SECONDS` timeout per image, covering preprocessing plus inference (default `300`).
+Everything else is a constant in `internal/config`: the path-style S3 addressing
+and signing region, the 1 GiB upload limit, the 15 minute presign TTL, the
+`/tmp/viewer-cache` state directory, and the `/app/siglip2` checkpoint location.
+Copy `.env.example` for a local run or `.env.test.example` for `make test`.
 
-There is no separate inference service to run: `viewer` loads the checkpoint once
-at startup and runs the vision tower itself. A local model directory is read
-directly, so a pre-populated bundle works without network access.
+There is no separate inference service to run: `viewer` loads the checkpoint
+from `/app/siglip2` once at startup and runs the vision tower in-process. The
+tower needs no network access at startup, and a checkpoint that fails to load
+only degrades: the container logs the failure, keeps serving, and returns
+recommendations from whatever embeddings the catalog already holds. Mount a
+directory at `/app/siglip2` (holding `config.json` and `model.safetensors`) to
+supply a checkpoint to `runtime-slim`.
 
 Embeddings are stored as `float32` blobs on each image blob row in SQLite. The
 ingest pipeline embeds images inline; the background workers pick up any blob
-left in the `pending` state (for example when embedding was disabled during
-ingest). Recommendation responses are cross-album only: photos from the
+left in the `pending` state (for example when the checkpoint could not be
+loaded). Recommendation responses are cross-album only: photos from the
 same album as the query are excluded from results. If no cross-album neighbors
 exist for an embedded query photo, recommendations return an empty `items` list.
 
@@ -83,7 +67,7 @@ Docker:
 - `runtime` (default `docker build .`) is self-contained: the Go viewer, frontend
   assets, and the prefetched SigLIP2 checkpoint at `/app/siglip2`.
 - `runtime-slim` omits the checkpoint for deployments that mount one at
-  `/app/siglip2` or set `EMBEDDING_ENABLED=false`.
+  `/app/siglip2`.
 - CI publishes the viewer as `ghcr.io/<owner>/<repo>`.
 
 The checkpoint is fetched at build time through the `model-prefetch` stage, so
@@ -96,7 +80,7 @@ Docker, build with `--build-arg SIGLIP2_MODEL_ID=<repo-id>`.
 - `make test-full` runs the full regression pipeline: `make build`, `make test`, then Playwright e2e (screenshots saved to `samples/` by default).
 - `make test-full` binds the app to `TEST_PORT` (default `18080`) and sets `E2E_BASE_URL` automatically.
 - `make run` starts `bin/viewer` (loads `.env` if present, does not rebuild binaries).
-- `make clean` removes build outputs and dependency caches.
+- `make clean` removes build outputs, dependency caches, and the host-side `/tmp/viewer-cache` state directory.
 
 Batch ingest:
 - Any `batch/*.zip` object is copied to `uploads/<albumId>/source.zip` (with `albumId` derived from the zip content) and queued for extraction; the batch object is then removed. Re-uploading identical bytes is deduplicated.

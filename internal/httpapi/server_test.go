@@ -16,7 +16,6 @@ import (
 	"github.com/go-chi/chi/v5"
 	"viewer/internal/albums"
 	"viewer/internal/catalog"
-	cfgpkg "viewer/internal/config"
 	"viewer/internal/feed"
 	"viewer/internal/models"
 	"viewer/internal/recommend"
@@ -149,7 +148,7 @@ func TestFeedEndpointLatestSupportsAfterCursor(t *testing.T) {
 }
 
 func testFeedService() *feed.Service {
-	return feed.NewService(albums.NewService(cfgpkg.Config{}, nil, nil))
+	return feed.NewService(albums.NewService(nil, nil))
 }
 
 func TestMetricsEndpointPrometheusPayload(t *testing.T) {
@@ -187,18 +186,7 @@ func TestMetricsEndpointPrometheusPayload(t *testing.T) {
 		t.Fatalf("set failed embedding: %v", err)
 	}
 
-	recommendService, err := recommend.NewService(
-		cfgpkg.Config{
-			EmbeddingEnabled:     true,
-			EmbeddingConcurrency: 1,
-			EmbeddingTimeoutSec:  1,
-		},
-		cat,
-		nil,
-	)
-	if err != nil {
-		t.Fatalf("new recommend service: %v", err)
-	}
+	recommendService := recommend.NewService(cat, nil, nil)
 
 	router := New(nil, nil, nil, recommendService).Router()
 	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)

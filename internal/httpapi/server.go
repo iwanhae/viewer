@@ -17,7 +17,6 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 	"viewer/internal/albums"
 	batchingest "viewer/internal/batch/ingest"
-	cfgpkg "viewer/internal/config"
 	"viewer/internal/feed"
 	"viewer/internal/images"
 	"viewer/internal/recommend"
@@ -228,7 +227,9 @@ func (s *Server) getImage(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) getRecommendations(w http.ResponseWriter, r *http.Request) {
-	if s.recommend == nil || !s.recommend.Enabled() {
+	// The endpoint stays available even when the embedding model could not be
+	// loaded: the catalog simply has no embeddings to match against yet.
+	if s.recommend == nil {
 		writeError(w, r, http.StatusServiceUnavailable, "UNAVAILABLE", "recommendations are not available")
 		return
 	}
@@ -355,7 +356,7 @@ func parseOptionalIntQuery(r *http.Request, key string, defaultValue int, min in
 	return value, nil
 }
 
-func Warmup(ctx context.Context, albumsService *albums.Service, recommendService *recommend.Service, store *storage.S3Store, cfg cfgpkg.Config) {
+func Warmup(ctx context.Context, albumsService *albums.Service, recommendService *recommend.Service, store *storage.S3Store) {
 	startedAt := time.Now()
 	log.Printf("catalog warmup started")
 
@@ -370,24 +371,20 @@ func Warmup(ctx context.Context, albumsService *albums.Service, recommendService
 		time.Since(startedAt).Round(time.Millisecond),
 	)
 
-	if cfg.BatchIngestEnabled {
-		batchStartedAt := time.Now()
-		log.Printf("batch ingest scan started")
-		ingestSummary, err := batchingest.Run(ctx, store, albumsService, batchingest.RunOptions{})
-		if err != nil {
-			log.Printf("batch ingest scan skipped: %v", err)
-		} else {
-			log.Printf(
-				"batch ingest scan finished discovered=%d staged=%d deduped=%d errors=%d duration=%s",
-				ingestSummary.Discovered,
-				ingestSummary.Moved,
-				ingestSummary.Deduped,
-				ingestSummary.Errors,
-				time.Since(batchStartedAt).Round(time.Millisecond),
-			)
-		}
+	batchStartedAt := time.Now()
+	log.Printf("batch ingest scan started")
+	ingestSummary, err := batchingest.Run(ctx, store, albumsService, batchingest.RunOptions{})
+	if err != nil {
+		log.Printf("batch ingest scan skipped: %v", err)
 	} else {
-		log.Printf("batch ingest scan disabled (BATCH_INGEST_ENABLED=false)")
+		log.Printf(
+			"batch ingest scan finished discovered=%d staged=%d deduped=%d errors=%d duration=%s",
+			ingestSummary.Discovered,
+			ingestSummary.Moved,
+			ingestSummary.Deduped,
+			ingestSummary.Errors,
+			time.Since(batchStartedAt).Round(time.Millisecond),
+		)
 	}
 
 	pendingStartedAt := time.Now()

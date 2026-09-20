@@ -10,26 +10,41 @@ import (
 	"time"
 
 	"viewer/internal/catalog"
-	cfgpkg "viewer/internal/config"
 	"viewer/internal/images"
-	"viewer/internal/vision"
+)
+
+const (
+	// embeddingConcurrency is one worker by design: the GoMLX backend already
+	// splits a single forward pass across every core, so extra workers only
+	// queue behind it. Measured per-image latency was flat from one to four
+	// concurrent images.
+	embeddingConcurrency = 1
+
+	// embeddingTimeout bounds one image's preprocessing plus inference.
+	embeddingTimeout = 5 * time.Minute
+
+	// defaultTopK and maxTopK bound recommendation result sizes.
+	defaultTopK = 12
+	maxTopK     = 48
 )
 
 // Service keeps an in-memory similarity index of blob embeddings and runs the
 // background workers that fill in embeddings the ingest pipeline could not
 // compute.
 type Service struct {
-	cfg     cfgpkg.Config
 	catalog *catalog.Store
 	images  *images.Service
 
+	// embedder is nil when the recommendation feature is switched off, which is
+	// how tests run without a checkpoint.
 	embedder EmbeddingProvider
 
 	startOnce sync.Once
 	startErr  error
 
 	// modelMu guards model loading and modelErr. A failed load marks the
-	// service unavailable so the API layer stops advertising embeddings.
+	// embedder unusable so the ingest pipeline keeps blobs pending instead of
+	// marking them failed.
 	modelMu  sync.Mutex
 	modelErr error
 
@@ -44,47 +59,34 @@ type Service struct {
 	imageSem chan struct{}
 }
 
-func NewService(cfg cfgpkg.Config, cat *catalog.Store, imagesService *images.Service) (*Service, error) {
+// NewService builds a recommendation service. A nil embedder switches the
+// feature off: the API keeps serving empty recommendation lists and the ingest
+// pipeline leaves every blob pending.
+func NewService(cat *catalog.Store, imagesService *images.Service, embedder EmbeddingProvider) *Service {
 	return &Service{
-		cfg:              cfg,
 		catalog:          cat,
 		images:           imagesService,
-		embedder:         newEmbedder(cfg),
+		embedder:         embedder,
 		photosByHash:     make(map[string][]photoRef),
 		hashesByAlbum:    make(map[string]map[string]struct{}),
 		embeddingsByHash: make(map[string][]float32),
 		failedByHash:     make(map[string]string),
 		claimed:          make(map[string]struct{}),
-		imageSem:         make(chan struct{}, max(cfg.EmbeddingConcurrency, 1)),
-	}, nil
-}
-
-// newEmbedder builds the in-process vision embedder, or returns nil when
-// embedding is switched off. A nil provider matters: the ingest pipeline treats
-// a missing embedder as "leave blobs pending", whereas a provider that
-// systematically errors would mark every blob as failed.
-func newEmbedder(cfg cfgpkg.Config) EmbeddingProvider {
-	if !cfg.EmbeddingEnabled {
-		return nil
+		imageSem:         make(chan struct{}, embeddingConcurrency),
 	}
-	return NewVisionEmbedder(vision.Config{
-		ModelID:  cfg.EmbeddingModelID,
-		Backend:  cfg.EmbeddingBackend,
-		CacheDir: cfg.EmbeddingCacheDir,
-	})
 }
 
 // ErrEmbeddingDisabled reports that embedding was switched off.
 var ErrEmbeddingDisabled = errors.New("image embedding is disabled")
 
 // LoadModel resolves the checkpoint and compiles the inference graph. Startup
-// calls it once so a broken embedding configuration fails fast instead of on
-// the first image. It is a no-op when embedding is disabled.
+// calls it once so a broken checkpoint is reported at boot instead of on the
+// first image. It is a no-op when there is no embedder.
 //
-// A failed load is remembered: Enabled then reports false, so the rest of the
-// application degrades to running without embeddings.
+// A failed load is remembered: Enabled then reports false, so the application
+// degrades to running without embeddings.
 func (s *Service) LoadModel(ctx context.Context) error {
-	if s == nil || !s.cfg.EmbeddingEnabled {
+	if s == nil || s.embedder == nil {
 		return nil
 	}
 	embedder, ok := s.embedder.(*VisionEmbedder)
@@ -102,9 +104,10 @@ func (s *Service) LoadModel(ctx context.Context) error {
 	return nil
 }
 
-// Enabled reports whether embeddings should be computed and served.
+// Enabled reports whether embeddings can actually be computed, so the ingest
+// pipeline and the background workers stay out of the way after a failed load.
 func (s *Service) Enabled() bool {
-	if s == nil || !s.cfg.EmbeddingEnabled {
+	if s == nil || s.embedder == nil {
 		return false
 	}
 	s.modelMu.Lock()
@@ -125,7 +128,7 @@ func (s *Service) Embed(ctx context.Context, imageBytes []byte) ([]float32, erro
 	if s == nil || s.embedder == nil {
 		return nil, ErrEmbeddingDisabled
 	}
-	embedCtx, cancel := context.WithTimeout(ctx, embeddingTimeout(time.Duration(s.cfg.EmbeddingTimeoutSec)*time.Second))
+	embedCtx, cancel := context.WithTimeout(ctx, embeddingTimeout)
 	defer cancel()
 	return s.embedder.Embed(embedCtx, imageBytes)
 }
@@ -237,10 +240,7 @@ func (s *Service) Start(ctx context.Context) error {
 			_ = s.Close()
 		}()
 
-		concurrency := s.cfg.EmbeddingConcurrency
-		if concurrency <= 0 {
-			concurrency = 1
-		}
+		concurrency := embeddingConcurrency
 		for i := 0; i < concurrency; i++ {
 			go s.workerLoop(ctx)
 		}
@@ -401,13 +401,10 @@ func (s *Service) EmbeddingProgress() EmbeddingProgress {
 // Recommend returns cross-album neighbors of a query photo.
 func (s *Service) Recommend(ctx context.Context, albumID string, photoIndex int, limit int) (RecommendationResponse, error) {
 	if limit <= 0 {
-		limit = s.cfg.RecoTopKDefault
+		limit = defaultTopK
 	}
-	if limit <= 0 {
-		limit = 12
-	}
-	if s.cfg.RecoTopKMax > 0 && limit > s.cfg.RecoTopKMax {
-		limit = s.cfg.RecoTopKMax
+	if limit > maxTopK {
+		limit = maxTopK
 	}
 
 	if s.catalog == nil {

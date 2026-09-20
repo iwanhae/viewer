@@ -44,7 +44,7 @@ type BatchObject struct {
 func NewS3Store(ctx context.Context, cfg cfgpkg.Config) (*S3Store, error) {
 	awsCfg, err := config.LoadDefaultConfig(
 		ctx,
-		config.WithRegion(cfg.S3Region),
+		config.WithRegion(cfgpkg.S3Region),
 		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(cfg.S3AccessKey, cfg.S3SecretKey, "")),
 	)
 	if err != nil {
@@ -61,7 +61,7 @@ func NewS3Store(ctx context.Context, cfg cfgpkg.Config) (*S3Store, error) {
 	)
 
 	client := s3.NewFromConfig(awsCfg, func(o *s3.Options) {
-		o.UsePathStyle = cfg.S3UsePathStyle
+		o.UsePathStyle = cfgpkg.S3UsePathStyle
 	})
 
 	return &S3Store{

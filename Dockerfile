@@ -55,28 +55,15 @@ RUN apt-get update && \
 
 USER 65532:65532
 
-ENV PORT=8080 \
-    CACHE_DIR=/tmp/viewer-cache/images \
-    ZIP_CACHE_DIR=/tmp/viewer-cache/zips \
-    DB_PATH=/tmp/viewer-cache/viewer.db \
-    INGEST_DELETE_SOURCE=true \
-    EMBEDDING_BACKEND=go \
-    EMBEDDING_MODEL_ID=/app/siglip2
-
 EXPOSE 8080
 ENTRYPOINT ["/app/viewer"]
 
-# Slim image for deployments that mount the checkpoint at /app/siglip2 or set
-# EMBEDDING_ENABLED=false. A missing model only degrades, because
-# EMBEDDING_REQUIRED defaults to false.
+# Slim image for deployments that mount the checkpoint at /app/siglip2. Without
+# it the viewer logs the load failure at startup and serves recommendations from
+# whatever embeddings the catalog already holds.
 FROM runtime-base AS runtime-slim
-
-ENV EMBEDDING_ENABLED=true
 
 # Default image: self-contained, with the SigLIP2 checkpoint baked in.
 FROM runtime-base AS runtime
 
 COPY --from=model-prefetch --chown=65532:65532 /opt/siglip2 /app/siglip2
-
-ENV EMBEDDING_ENABLED=true \
-    EMBEDDING_REQUIRED=true
