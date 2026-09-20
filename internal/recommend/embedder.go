@@ -11,6 +11,9 @@ import (
 
 // EmbeddingProvider turns raw image bytes into an embedding vector.
 type EmbeddingProvider interface {
+	// Load resolves and prepares the provider's resources, such as downloading
+	// and compiling the model checkpoint. It is safe to call more than once.
+	Load(ctx context.Context) error
 	// Embed computes the embedding of one encoded image.
 	Embed(ctx context.Context, imageBytes []byte) ([]float32, error)
 	// Close releases the resources held by the provider.

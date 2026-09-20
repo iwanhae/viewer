@@ -1,36 +1,31 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { useAlbum } from '../hooks/useAlbum'
-import { readColumnPreference, writeColumnPreference } from '../utils/columnPreference'
-import { readLastWallSeed, readLastWallState } from '../utils/wallSeed'
+import {
+  ALBUM_PAGE_SIZE,
+  COLUMN_OPTIONS,
+  pageForPhotoIndex,
+  parsePositiveInt,
+  wallFocusKey,
+} from '../utils/albumPaging'
+import {
+  readLastWallSeed,
+  readLastWallState,
+  readNumberPreference,
+  writeNumberPreference,
+} from '../utils/storage'
 import { MasonryWall } from '../components/MasonryWall'
 import { BottomIsland } from '../components/BottomIsland'
 import { BackToAlbumIcon, ColumnsIcon, NextIcon, PrevIcon } from '../components/IslandIcons'
 
-const COLUMN_OPTIONS = [1, 2, 3, 4, 5, 6]
 const VIEWER_COLUMNS_KEY = 'viewer_columns'
 const DEFAULT_COLUMNS = 3
-const ALBUM_PAGE_SIZE = 50
-
-function parsePositiveInt(value: string | null, fallback: number): number {
-  const parsed = Number(value)
-  if (!Number.isInteger(parsed) || parsed < 1) return fallback
-  return parsed
-}
 
 function parseNonNegativeInt(value: string | null): number | null {
   if (value === null) return null
   const parsed = Number(value)
   if (!Number.isInteger(parsed) || parsed < 0) return null
   return parsed
-}
-
-function pageForPhotoIndex(index: number): number {
-  return Math.floor(index / ALBUM_PAGE_SIZE) + 1
-}
-
-function wallFocusKey(albumId: string, photoIndex: number): string {
-  return `${albumId}:${photoIndex}`
 }
 
 export function ViewerPage() {
@@ -41,7 +36,7 @@ export function ViewerPage() {
 
   const { album, loading, error } = useAlbum(albumId)
   const [columnCount, setColumnCount] = useState(() =>
-    readColumnPreference(VIEWER_COLUMNS_KEY, COLUMN_OPTIONS, DEFAULT_COLUMNS),
+    readNumberPreference(VIEWER_COLUMNS_KEY, COLUMN_OPTIONS, DEFAULT_COLUMNS),
   )
 
   const anchorRef = useRef<HTMLButtonElement | null>(null)
@@ -232,7 +227,7 @@ export function ViewerPage() {
                     className={`bottom-island-popup-option ${value === columnCount ? 'active' : ''}`.trim()}
                     onClick={() => {
                       setColumnCount(value)
-                      writeColumnPreference(VIEWER_COLUMNS_KEY, value)
+                      writeNumberPreference(VIEWER_COLUMNS_KEY, value)
                       close()
                     }}
                     data-testid={`album-columns-${value}`}

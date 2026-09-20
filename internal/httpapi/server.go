@@ -17,6 +17,7 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 	"viewer/internal/albums"
 	batchingest "viewer/internal/batch/ingest"
+	"viewer/internal/catalog"
 	"viewer/internal/feed"
 	"viewer/internal/images"
 	"viewer/internal/recommend"
@@ -119,7 +120,7 @@ func (s *Server) finalizeAlbum(w http.ResponseWriter, r *http.Request) {
 	}
 
 	status := http.StatusAccepted
-	if state.Status == albums.FinalizeStatusSucceeded {
+	if state.Status == catalog.AlbumStatusReady {
 		status = http.StatusOK
 	}
 	writeJSON(w, status, state)
@@ -183,7 +184,6 @@ func (s *Server) getFeed(w http.ResponseWriter, r *http.Request) {
 	}
 
 	resp, err := s.feed.Build(
-		r.Context(),
 		limit,
 		r.URL.Query().Get("seed"),
 		mode,

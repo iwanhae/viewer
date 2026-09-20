@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -16,24 +15,14 @@ import (
 	"viewer/internal/pipeline"
 )
 
-// FinalizeStatus mirrors the album pipeline state exposed over the HTTP API.
-type FinalizeStatus string
-
-const (
-	FinalizeStatusQueued     FinalizeStatus = "QUEUED"
-	FinalizeStatusProcessing FinalizeStatus = "PROCESSING"
-	FinalizeStatusSucceeded  FinalizeStatus = "SUCCEEDED"
-	FinalizeStatusFailed     FinalizeStatus = "FAILED"
-)
-
 // FinalizeState is the JSON payload returned by the finalize endpoints.
 type FinalizeState struct {
-	AlbumID    string         `json:"albumId"`
-	Status     FinalizeStatus `json:"status"`
-	PhotoCount int            `json:"photoCount,omitempty"`
-	CreatedAt  string         `json:"createdAt,omitempty"`
-	Error      string         `json:"error,omitempty"`
-	UpdatedAt  string         `json:"updatedAt"`
+	AlbumID    string              `json:"albumId"`
+	Status     catalog.AlbumStatus `json:"status"`
+	PhotoCount int                 `json:"photoCount,omitempty"`
+	CreatedAt  string              `json:"createdAt,omitempty"`
+	Error      string              `json:"error,omitempty"`
+	UpdatedAt  string              `json:"updatedAt"`
 }
 
 // Enqueuer schedules an album for background extraction.
@@ -50,10 +39,8 @@ type albumStore interface {
 // work lives in the pipeline worker; album metadata lives in the SQLite
 // catalog.
 type Service struct {
-	catalog *catalog.Store
-	store   albumStore
-
-	mu       sync.RWMutex
+	catalog  *catalog.Store
+	store    albumStore
 	enqueuer Enqueuer
 }
 
@@ -65,21 +52,15 @@ type CreateUploadResult struct {
 	Headers   map[string]string
 }
 
-func NewService(cat *catalog.Store, store albumStore) *Service {
+func NewService(cat *catalog.Store, store albumStore, enqueuer Enqueuer) *Service {
 	return &Service{
-		catalog: cat,
-		store:   store,
+		catalog:  cat,
+		store:    store,
+		enqueuer: enqueuer,
 	}
 }
 
-// SetEnqueuer wires the pipeline used to schedule extraction.
-func (s *Service) SetEnqueuer(enqueuer Enqueuer) {
-	s.mu.Lock()
-	s.enqueuer = enqueuer
-	s.mu.Unlock()
-}
-
-// CreateUpload registers a pending album and presigns its staging object.
+// CreateUpload registers a queued album and presigns its staging object.
 func (s *Service) CreateUpload(ctx context.Context, filename string, sizeBytes int64) (CreateUploadResult, error) {
 	if s == nil || s.catalog == nil {
 		return CreateUploadResult{}, fmt.Errorf("album catalog is not initialized")
@@ -109,7 +90,7 @@ func (s *Service) CreateUpload(ctx context.Context, filename string, sizeBytes i
 		ID:               albumID,
 		OriginalFilename: filename,
 		SizeBytes:        sizeBytes,
-		Status:           catalog.AlbumStatusPending,
+		Status:           catalog.AlbumStatusQueued,
 		SourceKey:        key,
 	}); err != nil {
 		return CreateUploadResult{}, err
@@ -142,7 +123,10 @@ func (s *Service) RegisterStagedUpload(ctx context.Context, albumID string, file
 	}); err != nil {
 		return err
 	}
-	return s.enqueue(albumID)
+	if s.enqueuer == nil {
+		return fmt.Errorf("finalize worker is not initialized")
+	}
+	return s.enqueuer.Enqueue(albumID)
 }
 
 // RequestFinalize schedules extraction for an uploaded zip.
@@ -160,10 +144,12 @@ func (s *Service) RequestFinalize(ctx context.Context, albumID string) (Finalize
 		return FinalizeState{}, err
 	}
 
+	// A succeeded album is done and a processing album is already scheduled.
+	// A queued album may be freshly registered (creation now records QUEUED) or
+	// waiting for a restart, so it falls through to the enqueue path below; the
+	// pipeline ignores a duplicate enqueue for an album it already holds.
 	switch album.Status {
-	case catalog.AlbumStatusReady:
-		return finalizeStateFromAlbum(album), nil
-	case catalog.AlbumStatusProcessing, catalog.AlbumStatusQueued:
+	case catalog.AlbumStatusReady, catalog.AlbumStatusProcessing:
 		return finalizeStateFromAlbum(album), nil
 	}
 
@@ -182,7 +168,12 @@ func (s *Service) RequestFinalize(ctx context.Context, albumID string) (Finalize
 	if err := s.catalog.SetAlbumStatus(ctx, albumID, catalog.AlbumStatusQueued, ""); err != nil {
 		return FinalizeState{}, err
 	}
-	if err := s.enqueue(albumID); err != nil {
+	if s.enqueuer == nil {
+		err := fmt.Errorf("finalize worker is not initialized")
+		_ = s.catalog.SetAlbumStatus(context.Background(), albumID, catalog.AlbumStatusFailed, err.Error())
+		return FinalizeState{}, err
+	}
+	if err := s.enqueuer.Enqueue(albumID); err != nil {
 		_ = s.catalog.SetAlbumStatus(context.Background(), albumID, catalog.AlbumStatusFailed, err.Error())
 		return FinalizeState{}, err
 	}
@@ -214,10 +205,7 @@ func (s *Service) GetFinalizeStatus(ctx context.Context, albumID string) (Finali
 
 // EnqueuePending schedules every album that still has a staged zip waiting.
 func (s *Service) EnqueuePending(ctx context.Context) (int, error) {
-	s.mu.RLock()
-	enqueuer := s.enqueuer
-	s.mu.RUnlock()
-	if enqueuer == nil {
+	if s.enqueuer == nil {
 		return 0, fmt.Errorf("finalize worker is not initialized")
 	}
 
@@ -225,7 +213,7 @@ func (s *Service) EnqueuePending(ctx context.Context) (int, error) {
 	// Collect first: processing an album mutates its status, so listing status
 	// by status while enqueueing would visit the same album twice.
 	byID := make(map[string]catalog.Album)
-	for _, status := range []catalog.AlbumStatus{catalog.AlbumStatusPending, catalog.AlbumStatusQueued, catalog.AlbumStatusProcessing} {
+	for _, status := range []catalog.AlbumStatus{catalog.AlbumStatusQueued, catalog.AlbumStatusProcessing} {
 		albums, err := s.catalog.ListAlbumsByStatus(ctx, status)
 		if err != nil {
 			return total, err
@@ -253,22 +241,12 @@ func (s *Service) EnqueuePending(ctx context.Context) (int, error) {
 		if err := s.catalog.SetAlbumStatus(ctx, album.ID, catalog.AlbumStatusQueued, ""); err != nil {
 			continue
 		}
-		if err := enqueuer.Enqueue(album.ID); err != nil {
+		if err := s.enqueuer.Enqueue(album.ID); err != nil {
 			continue
 		}
 		total++
 	}
 	return total, nil
-}
-
-func (s *Service) enqueue(albumID string) error {
-	s.mu.RLock()
-	enqueuer := s.enqueuer
-	s.mu.RUnlock()
-	if enqueuer == nil {
-		return fmt.Errorf("finalize worker is not initialized")
-	}
-	return enqueuer.Enqueue(albumID)
 }
 
 // GetAlbum returns an album and its photos in the legacy API shape.
@@ -385,23 +363,10 @@ func finalizeStateFromAlbum(album *catalog.Album) FinalizeState {
 	}
 	return FinalizeState{
 		AlbumID:    album.ID,
-		Status:     finalizeStatusFromCatalog(album.Status),
+		Status:     album.Status,
 		PhotoCount: album.PhotoCount,
 		CreatedAt:  album.CreatedAt,
 		Error:      album.Error,
 		UpdatedAt:  album.UpdatedAt,
-	}
-}
-
-func finalizeStatusFromCatalog(status catalog.AlbumStatus) FinalizeStatus {
-	switch status {
-	case catalog.AlbumStatusProcessing:
-		return FinalizeStatusProcessing
-	case catalog.AlbumStatusReady:
-		return FinalizeStatusSucceeded
-	case catalog.AlbumStatusFailed:
-		return FinalizeStatusFailed
-	default:
-		return FinalizeStatusQueued
 	}
 }

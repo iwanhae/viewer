@@ -148,7 +148,7 @@ func TestFeedEndpointLatestSupportsAfterCursor(t *testing.T) {
 }
 
 func testFeedService() *feed.Service {
-	return feed.NewService(albums.NewService(nil, nil))
+	return feed.NewService(albums.NewService(nil, nil, nil))
 }
 
 func TestMetricsEndpointPrometheusPayload(t *testing.T) {

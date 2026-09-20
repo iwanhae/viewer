@@ -52,8 +52,6 @@ func Run(ctx context.Context) error {
 		ModelID: cfgpkg.ModelDir,
 	}))
 
-	albumService := albums.NewService(cat, store)
-
 	// Load the vision tower before wiring the ingest pipeline: a failed load
 	// must keep the embedder out of the pipeline entirely, otherwise every
 	// image would be marked as a failed embedding instead of staying pending.
@@ -83,7 +81,7 @@ func Run(ctx context.Context) error {
 			}
 		},
 	})
-	albumService.SetEnqueuer(pipelineService)
+	albumService := albums.NewService(cat, store, pipelineService)
 
 	feedService := feed.NewService(albumService)
 	pipelineService.Start(ctx)

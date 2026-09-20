@@ -2,17 +2,26 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import type { FeedMode } from '../api/client'
 import { useFeed } from '../hooks/useFeed'
-import { readColumnPreference, writeColumnPreference } from '../utils/columnPreference'
-import { readLastWallState, writeLastWallSeed, writeLastWallState } from '../utils/wallSeed'
+import {
+  COLUMN_OPTIONS,
+  pageForPhotoIndex,
+  parsePositiveInt,
+  wallFocusKey,
+} from '../utils/albumPaging'
+import {
+  readLastWallState,
+  readNumberPreference,
+  writeLastWallSeed,
+  writeLastWallState,
+  writeNumberPreference,
+} from '../utils/storage'
 import { MasonryWall } from '../components/MasonryWall'
 import { BottomIsland } from '../components/BottomIsland'
 import { ColumnsIcon, ModeIcon, NextIcon, PrevIcon, RefreshIcon, ShortcutIcon } from '../components/IslandIcons'
 
-const columnOptions = [1, 2, 3, 4, 5, 6]
 const WALL_COLUMNS_KEY = 'wall_columns'
 const DEFAULT_COLUMNS = 3
 const WALL_FEED_LIMIT = 40
-const ALBUM_PAGE_SIZE = 50
 const defaultMode: FeedMode = 'random'
 const wallModes: FeedMode[] = ['random', 'latest']
 
@@ -23,20 +32,6 @@ function nextTimestampSeed(currentSeed?: string): string {
     return String(parsedCurrent + 1)
   }
   return String(now)
-}
-
-function parsePositiveInt(value: string | null, fallback: number): number {
-  const parsed = Number(value)
-  if (!Number.isInteger(parsed) || parsed < 1) return fallback
-  return parsed
-}
-
-function pageForPhotoIndex(index: number): number {
-  return Math.floor(index / ALBUM_PAGE_SIZE) + 1
-}
-
-function wallFocusKey(albumId: string, photoIndex: number): string {
-  return `${albumId}:${photoIndex}`
 }
 
 function parseExplicitWallMode(modeParam: string | null): FeedMode | null {
@@ -56,7 +51,7 @@ function normalizeStoredLatestCursor(value: string | undefined): string {
 
 export function WallPage() {
   const [columns, setColumns] = useState(() =>
-    readColumnPreference(WALL_COLUMNS_KEY, columnOptions, DEFAULT_COLUMNS),
+    readNumberPreference(WALL_COLUMNS_KEY, COLUMN_OPTIONS, DEFAULT_COLUMNS),
   )
 
   const navigate = useNavigate()
@@ -365,7 +360,7 @@ export function WallPage() {
             testId: 'wall-columns',
             renderPopup: ({ close }) => (
               <div className="bottom-island-popup-grid" data-testid="wall-columns-popup">
-                {columnOptions.map((option) => (
+                {COLUMN_OPTIONS.map((option) => (
                   <button
                     type="button"
                     key={option}
@@ -373,7 +368,7 @@ export function WallPage() {
                     data-testid={`columns-${option}`}
                     onClick={() => {
                       setColumns(option)
-                      writeColumnPreference(WALL_COLUMNS_KEY, option)
+                      writeNumberPreference(WALL_COLUMNS_KEY, option)
                       close()
                     }}
                   >

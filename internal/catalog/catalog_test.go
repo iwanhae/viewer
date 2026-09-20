@@ -25,7 +25,7 @@ func TestAlbumLifecycleAndStatusTransitions(t *testing.T) {
 		ID:               "album-a",
 		OriginalFilename: "holiday.zip",
 		SizeBytes:        100,
-		Status:           AlbumStatusPending,
+		Status:           AlbumStatusQueued,
 		SourceKey:        "uploads/album-a/source.zip",
 	}); err != nil {
 		t.Fatalf("create album: %v", err)
@@ -35,7 +35,7 @@ func TestAlbumLifecycleAndStatusTransitions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get album: %v", err)
 	}
-	if album.Status != AlbumStatusPending || album.PhotoCount != 0 {
+	if album.Status != AlbumStatusQueued || album.PhotoCount != 0 {
 		t.Fatalf("unexpected album: %+v", album)
 	}
 	if album.CreatedAt == "" || album.UpdatedAt == "" {
@@ -238,7 +238,7 @@ func TestSearchAlbumsByPrefixOnlyMatchesReadyAlbums(t *testing.T) {
 	}{
 		{id: "ready-new", name: "Holiday Trip.zip", status: AlbumStatusReady},
 		{id: "ready-old", name: "holiday family.zip", status: AlbumStatusReady},
-		{id: "pending", name: "Holiday Pending.zip", status: AlbumStatusPending},
+		{id: "pending", name: "Holiday Pending.zip", status: AlbumStatusQueued},
 		{id: "other", name: "Weekend.zip", status: AlbumStatusReady},
 	}
 	for _, item := range seed {
@@ -297,7 +297,7 @@ func TestListReadyAlbumPhotosAndPairs(t *testing.T) {
 	ctx := context.Background()
 	seedReadyAlbum(t, store, "album-a")
 	seedReadyAlbum(t, store, "album-b")
-	if err := store.CreateAlbum(ctx, Album{ID: "album-pending", OriginalFilename: "p.zip", Status: AlbumStatusPending}); err != nil {
+	if err := store.CreateAlbum(ctx, Album{ID: "album-pending", OriginalFilename: "p.zip", Status: AlbumStatusQueued}); err != nil {
 		t.Fatalf("create album: %v", err)
 	}
 
@@ -367,6 +367,60 @@ func TestVectorEncodeDecodeRoundTrip(t *testing.T) {
 func TestOpenRequiresPath(t *testing.T) {
 	if _, err := Open("   "); err == nil {
 		t.Fatalf("expected error for empty path")
+	}
+}
+
+// TestOpenMigratesLegacyAlbumStatuses covers a catalog written before album
+// statuses matched the wire format: READY must become SUCCEEDED and PENDING
+// must fold into QUEUED, and reopening the migrated file must be harmless.
+func TestOpenMigratesLegacyAlbumStatuses(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "catalog.db")
+	ctx := context.Background()
+
+	store, err := Open(path)
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	for _, album := range []Album{
+		{ID: "legacy-ready", OriginalFilename: "ready.zip", Status: AlbumStatusReady},
+		{ID: "legacy-pending", OriginalFilename: "pending.zip", Status: AlbumStatusQueued},
+	} {
+		if err := store.CreateAlbum(ctx, album); err != nil {
+			t.Fatalf("create album %s: %v", album.ID, err)
+		}
+	}
+	if _, err := store.db.Exec(`
+		UPDATE albums SET status = 'READY' WHERE id = 'legacy-ready';
+		UPDATE albums SET status = 'PENDING' WHERE id = 'legacy-pending';`); err != nil {
+		t.Fatalf("seed legacy statuses: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close catalog: %v", err)
+	}
+
+	// Opening rewrites the legacy rows, and a second open is a no-op.
+	for attempt := 0; attempt < 2; attempt++ {
+		reopened, err := Open(path)
+		if err != nil {
+			t.Fatalf("reopen catalog (attempt %d): %v", attempt, err)
+		}
+		ready, err := reopened.GetAlbum(ctx, "legacy-ready")
+		if err != nil {
+			t.Fatalf("get legacy-ready: %v", err)
+		}
+		if ready.Status != AlbumStatusReady {
+			t.Fatalf("legacy READY status=%s want=%s", ready.Status, AlbumStatusReady)
+		}
+		pending, err := reopened.GetAlbum(ctx, "legacy-pending")
+		if err != nil {
+			t.Fatalf("get legacy-pending: %v", err)
+		}
+		if pending.Status != AlbumStatusQueued {
+			t.Fatalf("legacy PENDING status=%s want=%s", pending.Status, AlbumStatusQueued)
+		}
+		if err := reopened.Close(); err != nil {
+			t.Fatalf("close reopened catalog: %v", err)
+		}
 	}
 }
 

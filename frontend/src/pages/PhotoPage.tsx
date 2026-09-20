@@ -4,19 +4,14 @@ import { seedCachedAlbum, type AlbumIndex } from '../api/client'
 import { useAlbum } from '../hooks/useAlbum'
 import { useRecommendations } from '../hooks/useRecommendations'
 import { MasonryWall } from '../components/MasonryWall'
-import { readColumnPreference, writeColumnPreference } from '../utils/columnPreference'
+import { COLUMN_OPTIONS, pageForPhotoIndex } from '../utils/albumPaging'
+import { readNumberPreference, writeNumberPreference } from '../utils/storage'
 import { BottomIsland } from '../components/BottomIsland'
 import { BackToAlbumIcon, ColumnsIcon, NextIcon, PrevIcon } from '../components/IslandIcons'
 
 const recommendationLimit = 48
-const recommendationColumnOptions = [1, 2, 3, 4, 5, 6]
 const PHOTO_RECOMMEND_COLUMNS_KEY = 'photo_recommend_columns'
 const DEFAULT_RECOMMEND_COLUMNS = 3
-const ALBUM_PAGE_SIZE = 50
-
-function pageForPhotoIndex(index: number): number {
-  return Math.floor(index / ALBUM_PAGE_SIZE) + 1
-}
 
 export function PhotoPage() {
   const { albumId = '', photoIndex: rawPhotoIndex = '' } = useParams<{
@@ -45,9 +40,9 @@ export function PhotoPage() {
 
   const { album, loading, error } = useAlbum(albumId, locationAlbum)
   const [recommendationColumnCount, setRecommendationColumnCount] = useState(() =>
-    readColumnPreference(
+    readNumberPreference(
       PHOTO_RECOMMEND_COLUMNS_KEY,
-      recommendationColumnOptions,
+      COLUMN_OPTIONS,
       DEFAULT_RECOMMEND_COLUMNS,
     ),
   )
@@ -229,7 +224,7 @@ export function PhotoPage() {
             testId: 'photo-columns-toggle',
             renderPopup: ({ close }) => (
               <div className="bottom-island-popup-grid" data-testid="photo-columns-popup">
-                {recommendationColumnOptions.map((option) => (
+                {COLUMN_OPTIONS.map((option) => (
                   <button
                     type="button"
                     key={option}
@@ -237,7 +232,7 @@ export function PhotoPage() {
                     data-testid={`photo-columns-${option}`}
                     onClick={() => {
                       setRecommendationColumnCount(option)
-                      writeColumnPreference(PHOTO_RECOMMEND_COLUMNS_KEY, option)
+                      writeNumberPreference(PHOTO_RECOMMEND_COLUMNS_KEY, option)
                       close()
                     }}
                   >

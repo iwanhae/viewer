@@ -76,9 +76,6 @@ type Service struct {
 
 	mu       sync.Mutex
 	inFlight map[string]struct{}
-
-	blobMu    sync.Mutex
-	blobCache map[string]struct{}
 }
 
 // NewService builds a pipeline service. embedder may be nil, in which case
@@ -88,13 +85,12 @@ func NewService(cat *catalog.Store, store Store, embedder Embedder, opts Options
 		opts.TempDir = os.TempDir()
 	}
 	return &Service{
-		catalog:   cat,
-		store:     store,
-		embedder:  embedder,
-		opts:      opts,
-		queue:     make(chan string, defaultQueueSize),
-		inFlight:  make(map[string]struct{}),
-		blobCache: make(map[string]struct{}),
+		catalog:  cat,
+		store:    store,
+		embedder: embedder,
+		opts:     opts,
+		queue:    make(chan string, defaultQueueSize),
+		inFlight: make(map[string]struct{}),
 	}
 }
 
@@ -386,24 +382,18 @@ func (s *Service) shouldEmbed(ctx context.Context, hash string, created bool) bo
 // ensureBlob uploads the raw image bytes to S3 exactly once per content hash.
 // It reports whether this call created the object.
 func (s *Service) ensureBlob(ctx context.Context, hash string, data []byte, contentType string) (bool, error) {
-	if s.blobKnown(hash) {
-		return false, nil
-	}
-
 	key := BlobKey(hash)
 	exists, size, err := s.store.HeadObject(ctx, key)
 	if err != nil {
 		return false, fmt.Errorf("head blob %s: %w", key, err)
 	}
-	created := false
 	if !exists || size <= 0 {
 		if err := s.store.PutObject(ctx, key, bytes.NewReader(data), contentType); err != nil {
 			return false, fmt.Errorf("put blob %s: %w", key, err)
 		}
-		created = true
+		return true, nil
 	}
-	s.rememberBlob(hash)
-	return created, nil
+	return false, nil
 }
 
 func (s *Service) embed(ctx context.Context, albumID string, hash string, data []byte) {
@@ -419,19 +409,6 @@ func (s *Service) embed(ctx context.Context, albumID string, hash string, data [
 	if err := s.catalog.SetBlobEmbedding(ctx, hash, catalog.EmbeddingStatusReady, vector, ""); err != nil {
 		log.Printf("pipeline: album=%s blob=%s persist embedding failed: %v", albumID, hash, err)
 	}
-}
-
-func (s *Service) blobKnown(hash string) bool {
-	s.blobMu.Lock()
-	defer s.blobMu.Unlock()
-	_, ok := s.blobCache[hash]
-	return ok
-}
-
-func (s *Service) rememberBlob(hash string) {
-	s.blobMu.Lock()
-	s.blobCache[hash] = struct{}{}
-	s.blobMu.Unlock()
 }
 
 // imageEntries returns decodable image entries sorted the same way the legacy
