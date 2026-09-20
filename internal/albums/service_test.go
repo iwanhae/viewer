@@ -64,14 +64,11 @@ func openTestCatalog(t *testing.T) *catalog.Store {
 func newTestService(t *testing.T, store *fakeStore, enqueuer Enqueuer) (*Service, *catalog.Store) {
 	t.Helper()
 	cat := openTestCatalog(t)
-	svc := NewService(cat, store)
-	if enqueuer != nil {
-		svc.SetEnqueuer(enqueuer)
-	}
+	svc := NewService(cat, store, enqueuer)
 	return svc, cat
 }
 
-func TestCreateUploadRegistersPendingAlbumAndPresigns(t *testing.T) {
+func TestCreateUploadRegistersQueuedAlbumAndPresigns(t *testing.T) {
 	store := newFakeStore()
 	svc, cat := newTestService(t, store, nil)
 
@@ -96,8 +93,8 @@ func TestCreateUploadRegistersPendingAlbumAndPresigns(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get album: %v", err)
 	}
-	if album.Status != catalog.AlbumStatusPending {
-		t.Fatalf("status=%s want=%s", album.Status, catalog.AlbumStatusPending)
+	if album.Status != catalog.AlbumStatusQueued {
+		t.Fatalf("status=%s want=%s", album.Status, catalog.AlbumStatusQueued)
 	}
 	if album.OriginalFilename != "holiday.zip" || album.SizeBytes != 512 {
 		t.Fatalf("unexpected album: %+v", album)
@@ -140,8 +137,8 @@ func TestRequestFinalizeQueuesUploadedAlbum(t *testing.T) {
 	if err != nil {
 		t.Fatalf("request finalize: %v", err)
 	}
-	if state.Status != FinalizeStatusQueued {
-		t.Fatalf("status=%s want=%s", state.Status, FinalizeStatusQueued)
+	if state.Status != catalog.AlbumStatusQueued {
+		t.Fatalf("status=%s want=%s", state.Status, catalog.AlbumStatusQueued)
 	}
 	if len(enqueuer.enqueued) != 1 || enqueuer.enqueued[0] != result.AlbumID {
 		t.Fatalf("enqueued=%v", enqueuer.enqueued)
@@ -173,12 +170,12 @@ func TestRequestFinalizeUnknownAlbum(t *testing.T) {
 	}
 }
 
-func TestRequestFinalizeIsNoopForQueuedAndReadyAlbums(t *testing.T) {
+func TestRequestFinalizeIsNoopForProcessingAndReadyAlbums(t *testing.T) {
 	store := newFakeStore()
 	enqueuer := &fakeEnqueuer{}
 	svc, cat := newTestService(t, store, enqueuer)
 
-	for _, status := range []catalog.AlbumStatus{catalog.AlbumStatusQueued, catalog.AlbumStatusProcessing, catalog.AlbumStatusReady} {
+	for _, status := range []catalog.AlbumStatus{catalog.AlbumStatusProcessing, catalog.AlbumStatusReady} {
 		albumID := "album-" + string(status)
 		if err := cat.CreateAlbum(context.Background(), catalog.Album{
 			ID:        albumID,
@@ -192,13 +189,42 @@ func TestRequestFinalizeIsNoopForQueuedAndReadyAlbums(t *testing.T) {
 		if err != nil {
 			t.Fatalf("request finalize %s: %v", status, err)
 		}
-		want := finalizeStatusFromCatalog(status)
+		want := status
 		if state.Status != want {
 			t.Fatalf("status=%s want=%s", state.Status, want)
 		}
 	}
 	if len(enqueuer.enqueued) != 0 {
 		t.Fatalf("no re-enqueue expected, got %v", enqueuer.enqueued)
+	}
+}
+
+// TestRequestFinalizeReenqueuesQueuedAlbumWithStagedZip covers the collapsed
+// QUEUED status: a freshly registered album is already QUEUED, so finalize must
+// still schedule it instead of treating it as already in flight.
+func TestRequestFinalizeReenqueuesQueuedAlbumWithStagedZip(t *testing.T) {
+	store := newFakeStore()
+	enqueuer := &fakeEnqueuer{}
+	svc, cat := newTestService(t, store, enqueuer)
+
+	if err := cat.CreateAlbum(context.Background(), catalog.Album{
+		ID:        "album-queued",
+		Status:    catalog.AlbumStatusQueued,
+		SourceKey: pipeline.SourceKey("album-queued"),
+	}); err != nil {
+		t.Fatalf("create album: %v", err)
+	}
+	store.objects[pipeline.SourceKey("album-queued")] = 10
+
+	state, err := svc.RequestFinalize(context.Background(), "album-queued")
+	if err != nil {
+		t.Fatalf("request finalize: %v", err)
+	}
+	if state.Status != catalog.AlbumStatusQueued {
+		t.Fatalf("status=%s want=%s", state.Status, catalog.AlbumStatusQueued)
+	}
+	if len(enqueuer.enqueued) != 1 || enqueuer.enqueued[0] != "album-queued" {
+		t.Fatalf("enqueued=%v", enqueuer.enqueued)
 	}
 }
 
@@ -221,8 +247,8 @@ func TestRequestFinalizeRetriesFailedAlbum(t *testing.T) {
 	if err != nil {
 		t.Fatalf("request finalize: %v", err)
 	}
-	if state.Status != FinalizeStatusQueued {
-		t.Fatalf("status=%s want=%s", state.Status, FinalizeStatusQueued)
+	if state.Status != catalog.AlbumStatusQueued {
+		t.Fatalf("status=%s want=%s", state.Status, catalog.AlbumStatusQueued)
 	}
 	if len(enqueuer.enqueued) != 1 {
 		t.Fatalf("expected re-enqueue, got %v", enqueuer.enqueued)
@@ -249,29 +275,25 @@ func TestRequestFinalizeMarksFailedWhenQueueRejects(t *testing.T) {
 	}
 }
 
-func TestGetFinalizeStatusMapsCatalogStatuses(t *testing.T) {
+func TestGetFinalizeStatusPassesCatalogStatusThrough(t *testing.T) {
 	svc, cat := newTestService(t, newFakeStore(), nil)
-	cases := []struct {
-		status catalog.AlbumStatus
-		want   FinalizeStatus
-	}{
-		{catalog.AlbumStatusPending, FinalizeStatusQueued},
-		{catalog.AlbumStatusQueued, FinalizeStatusQueued},
-		{catalog.AlbumStatusProcessing, FinalizeStatusProcessing},
-		{catalog.AlbumStatusReady, FinalizeStatusSucceeded},
-		{catalog.AlbumStatusFailed, FinalizeStatusFailed},
+	statuses := []catalog.AlbumStatus{
+		catalog.AlbumStatusQueued,
+		catalog.AlbumStatusProcessing,
+		catalog.AlbumStatusReady,
+		catalog.AlbumStatusFailed,
 	}
-	for _, tc := range cases {
-		albumID := "album-" + string(tc.status)
-		if err := cat.CreateAlbum(context.Background(), catalog.Album{ID: albumID, Status: tc.status}); err != nil {
+	for _, status := range statuses {
+		albumID := "album-" + string(status)
+		if err := cat.CreateAlbum(context.Background(), catalog.Album{ID: albumID, Status: status}); err != nil {
 			t.Fatalf("create album: %v", err)
 		}
 		state, err := svc.GetFinalizeStatus(context.Background(), albumID)
 		if err != nil {
 			t.Fatalf("get status: %v", err)
 		}
-		if state.Status != tc.want {
-			t.Fatalf("status=%s want=%s", state.Status, tc.want)
+		if state.Status != status {
+			t.Fatalf("status=%s want=%s", state.Status, status)
 		}
 	}
 
@@ -324,7 +346,7 @@ func TestAllAlbumsOnlyReturnsReadyAlbums(t *testing.T) {
 	}{
 		{id: "ready-b", status: catalog.AlbumStatusReady},
 		{id: "ready-a", status: catalog.AlbumStatusReady},
-		{id: "pending", status: catalog.AlbumStatusPending},
+		{id: "pending", status: catalog.AlbumStatusQueued},
 	}
 	for _, item := range seed {
 		if err := cat.CreateAlbum(ctx, catalog.Album{
@@ -378,12 +400,12 @@ func TestEnqueuePendingOnlyQueuesAlbumsWithStagedZip(t *testing.T) {
 	ctx := context.Background()
 
 	if err := cat.CreateAlbum(ctx, catalog.Album{
-		ID: "with-zip", Status: catalog.AlbumStatusPending, SourceKey: pipeline.SourceKey("with-zip"),
+		ID: "with-zip", Status: catalog.AlbumStatusQueued, SourceKey: pipeline.SourceKey("with-zip"),
 	}); err != nil {
 		t.Fatalf("create album: %v", err)
 	}
 	if err := cat.CreateAlbum(ctx, catalog.Album{
-		ID: "without-zip", Status: catalog.AlbumStatusPending, SourceKey: pipeline.SourceKey("without-zip"),
+		ID: "without-zip", Status: catalog.AlbumStatusQueued, SourceKey: pipeline.SourceKey("without-zip"),
 	}); err != nil {
 		t.Fatalf("create album: %v", err)
 	}
@@ -434,7 +456,7 @@ func TestRegisterStagedUploadQueuesAlbum(t *testing.T) {
 }
 
 func TestServiceWithNilCatalogDegradesGracefully(t *testing.T) {
-	svc := NewService(nil, newFakeStore())
+	svc := NewService(nil, newFakeStore(), nil)
 	if svc.AllAlbums() != nil {
 		t.Fatalf("expected nil albums for nil catalog")
 	}

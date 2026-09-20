@@ -28,10 +28,9 @@ var (
 type AlbumStatus string
 
 const (
-	AlbumStatusPending    AlbumStatus = "PENDING"
 	AlbumStatusQueued     AlbumStatus = "QUEUED"
 	AlbumStatusProcessing AlbumStatus = "PROCESSING"
-	AlbumStatusReady      AlbumStatus = "READY"
+	AlbumStatusReady      AlbumStatus = "SUCCEEDED"
 	AlbumStatusFailed     AlbumStatus = "FAILED"
 )
 
@@ -170,6 +169,16 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("apply catalog schema: %w", err)
 	}
+	// Catalogs written before album statuses matched the wire format stored
+	// READY for a finished album and PENDING for a freshly registered one.
+	// Rewrite those rows so an existing database keeps working. Both statements
+	// are idempotent, so this is harmless to run on every open.
+	if _, err := db.Exec(`
+		UPDATE albums SET status = 'SUCCEEDED' WHERE status = 'READY';
+		UPDATE albums SET status = 'QUEUED' WHERE status = 'PENDING';`); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate album statuses: %w", err)
+	}
 	return &Store{db: db}, nil
 }
 
@@ -191,7 +200,7 @@ func (s *Store) CreateAlbum(ctx context.Context, album Album) error {
 		return fmt.Errorf("album id is required")
 	}
 	if album.Status == "" {
-		album.Status = AlbumStatusPending
+		album.Status = AlbumStatusQueued
 	}
 	now := nowRFC3339()
 	if album.CreatedAt == "" {
@@ -221,7 +230,7 @@ func (s *Store) UpsertAlbum(ctx context.Context, album Album) error {
 		return fmt.Errorf("album id is required")
 	}
 	if album.Status == "" {
-		album.Status = AlbumStatusPending
+		album.Status = AlbumStatusQueued
 	}
 	now := nowRFC3339()
 	if album.CreatedAt == "" {

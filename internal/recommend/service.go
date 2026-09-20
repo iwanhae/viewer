@@ -53,10 +53,6 @@ type Service struct {
 	hashesByAlbum    map[string]map[string]struct{}
 	embeddingsByHash map[string][]float32
 	failedByHash     map[string]string
-
-	claimMu  sync.Mutex
-	claimed  map[string]struct{}
-	imageSem chan struct{}
 }
 
 // NewService builds a recommendation service. A nil embedder switches the
@@ -71,8 +67,6 @@ func NewService(cat *catalog.Store, imagesService *images.Service, embedder Embe
 		hashesByAlbum:    make(map[string]map[string]struct{}),
 		embeddingsByHash: make(map[string][]float32),
 		failedByHash:     make(map[string]string),
-		claimed:          make(map[string]struct{}),
-		imageSem:         make(chan struct{}, embeddingConcurrency),
 	}
 }
 
@@ -89,18 +83,14 @@ func (s *Service) LoadModel(ctx context.Context) error {
 	if s == nil || s.embedder == nil {
 		return nil
 	}
-	embedder, ok := s.embedder.(*VisionEmbedder)
-	if !ok {
-		return nil
-	}
 
 	s.modelMu.Lock()
 	defer s.modelMu.Unlock()
-	if err := embedder.Load(ctx); err != nil {
+	if err := s.embedder.Load(ctx); err != nil {
 		s.modelErr = fmt.Errorf("load embedding model: %w", err)
 		return s.modelErr
 	}
-	log.Printf("recommend: %s", embedder.Describe())
+	log.Printf("recommend: embedding model loaded")
 	return nil
 }
 
@@ -271,14 +261,8 @@ func (s *Service) workerLoop(ctx context.Context) {
 			if ctx.Err() != nil {
 				return
 			}
-			if !s.claimBlob(blob.Hash) {
-				continue
-			}
-			transient := s.embedBlob(ctx, blob.Hash)
-			if !transient {
-				s.releaseBlob(blob.Hash)
-			}
-			if transient {
+			// A transient failure leaves the blob pending for a later retry.
+			if s.embedBlob(ctx, blob.Hash) {
 				select {
 				case <-ctx.Done():
 					return
@@ -292,11 +276,7 @@ func (s *Service) workerLoop(ctx context.Context) {
 // embedBlob computes and stores one blob embedding. It reports whether the
 // failure was transient (the blob stays pending and is retried).
 func (s *Service) embedBlob(ctx context.Context, hash string) bool {
-	if err := s.acquireImageSlot(ctx); err != nil {
-		return true
-	}
 	result, err := s.images.GetImageByHash(ctx, hash)
-	s.releaseImageSlot()
 	if err != nil {
 		log.Printf("recommend: blob=%s image load failed: %v", hash, err)
 		s.markFailed(ctx, hash, fmt.Sprintf("load image bytes: %v", err))
@@ -332,44 +312,6 @@ func (s *Service) markFailed(ctx context.Context, hash string, errText string) {
 	s.mu.Lock()
 	s.failedByHash[hash] = errText
 	s.mu.Unlock()
-}
-
-func (s *Service) claimBlob(hash string) bool {
-	s.claimMu.Lock()
-	defer s.claimMu.Unlock()
-	if _, exists := s.claimed[hash]; exists {
-		return false
-	}
-	s.claimed[hash] = struct{}{}
-	return true
-}
-
-func (s *Service) releaseBlob(hash string) {
-	s.claimMu.Lock()
-	delete(s.claimed, hash)
-	s.claimMu.Unlock()
-}
-
-func (s *Service) acquireImageSlot(ctx context.Context) error {
-	if s.imageSem == nil {
-		return nil
-	}
-	select {
-	case s.imageSem <- struct{}{}:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-}
-
-func (s *Service) releaseImageSlot() {
-	if s.imageSem == nil {
-		return
-	}
-	select {
-	case <-s.imageSem:
-	default:
-	}
 }
 
 // EmbeddingProgress reports embedding coverage across distinct blobs.

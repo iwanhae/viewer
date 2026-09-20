@@ -98,6 +98,8 @@ func (m *memoryS3) putCountFor(prefix string) int {
 // the recommendation endpoints stay reachable.
 type stubEmbedder struct{}
 
+func (stubEmbedder) Load(context.Context) error { return nil }
+
 func (stubEmbedder) Embed(context.Context, []byte) ([]float32, error) {
 	return nil, errors.New("stub embedder must not be called")
 }
@@ -133,14 +135,13 @@ func newFlowHarness(t *testing.T) *flowHarness {
 	// checkpoint. It is never asked to embed anything: the pipeline gets a nil
 	// embedder, so blobs stay pending.
 	recommendService := recommend.NewService(cat, imageService, stubEmbedder{})
-	albumService := albums.NewService(cat, s3)
 	pipelineService := pipeline.NewService(cat, s3, nil, pipeline.Options{
 		TempDir: zipCacheDir,
 		OnAlbumReady: func(albumID string) {
 			_ = recommendService.ReloadAlbum(context.Background(), albumID)
 		},
 	})
-	albumService.SetEnqueuer(pipelineService)
+	albumService := albums.NewService(cat, s3, pipelineService)
 	pipelineService.Start(context.Background())
 
 	return &flowHarness{

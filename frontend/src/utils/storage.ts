@@ -1,3 +1,6 @@
+// Typed localStorage access. Every helper tolerates a missing window (server
+// rendering, tests) and ignores malformed stored values instead of throwing.
+
 const WALL_LAST_SEED_KEY = 'wall_last_seed'
 const WALL_LAST_STATE_KEY = 'wall_last_state'
 
@@ -6,6 +9,23 @@ export type LastWallState = {
   seed?: string
   latestPage?: number
   latestCursor?: string
+}
+
+export function readNumberPreference(key: string, allowed: number[], fallback: number): number {
+  if (typeof window === 'undefined') return fallback
+
+  const raw = window.localStorage.getItem(key)
+  if (!raw) return fallback
+
+  const parsed = Number(raw)
+  if (!Number.isInteger(parsed)) return fallback
+  if (!allowed.includes(parsed)) return fallback
+  return parsed
+}
+
+export function writeNumberPreference(key: string, value: number): void {
+  if (typeof window === 'undefined') return
+  window.localStorage.setItem(key, String(value))
 }
 
 export function readLastWallSeed(): string | null {
