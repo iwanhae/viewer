@@ -112,6 +112,33 @@ func TestUpsertAlbumRefreshesUploadFieldsOnly(t *testing.T) {
 	}
 }
 
+func TestGetAlbumBySourceKey(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+
+	if err := store.CreateAlbum(ctx, Album{
+		ID:               "album-a",
+		OriginalFilename: "trip.zip",
+		SizeBytes:        10,
+		Status:           AlbumStatusQueued,
+		SourceKey:        "uploads/2026/June/trip.zip",
+	}); err != nil {
+		t.Fatalf("create album: %v", err)
+	}
+
+	album, err := store.GetAlbumBySourceKey(ctx, "uploads/2026/June/trip.zip")
+	if err != nil {
+		t.Fatalf("get album by source key: %v", err)
+	}
+	if album.ID != "album-a" || album.Status != AlbumStatusQueued {
+		t.Fatalf("unexpected album: %+v", album)
+	}
+
+	if _, err := store.GetAlbumBySourceKey(ctx, "uploads/missing.zip"); !errors.Is(err, ErrAlbumNotFound) {
+		t.Fatalf("error = %v, want ErrAlbumNotFound", err)
+	}
+}
+
 func TestPhotoInsertAndLookup(t *testing.T) {
 	store := openTestStore(t)
 	ctx := context.Background()

@@ -16,12 +16,10 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"viewer/internal/albums"
-	batchingest "viewer/internal/batch/ingest"
 	"viewer/internal/catalog"
 	"viewer/internal/feed"
 	"viewer/internal/images"
 	"viewer/internal/recommend"
-	"viewer/internal/storage"
 	"viewer/internal/web"
 )
 
@@ -383,49 +381,4 @@ func parseOptionalIntQuery(r *http.Request, key string, defaultValue int, min in
 		return 0, fmt.Errorf("invalid %s: too large", key)
 	}
 	return value, nil
-}
-
-func Warmup(ctx context.Context, albumsService *albums.Service, recommendService *recommend.Service, store *storage.S3Store) {
-	startedAt := time.Now()
-	log.Printf("catalog warmup started")
-
-	if recommendService != nil {
-		if err := recommendService.LoadAll(ctx); err != nil {
-			log.Printf("recommendation index warmup failed: %v", err)
-		}
-	}
-
-	log.Printf(
-		"catalog warmup finished duration=%s",
-		time.Since(startedAt).Round(time.Millisecond),
-	)
-
-	batchStartedAt := time.Now()
-	log.Printf("batch ingest scan started")
-	ingestSummary, err := batchingest.Run(ctx, store, albumsService, batchingest.RunOptions{})
-	if err != nil {
-		log.Printf("batch ingest scan skipped: %v", err)
-	} else {
-		log.Printf(
-			"batch ingest scan finished discovered=%d staged=%d deduped=%d errors=%d duration=%s",
-			ingestSummary.Discovered,
-			ingestSummary.Moved,
-			ingestSummary.Deduped,
-			ingestSummary.Errors,
-			time.Since(batchStartedAt).Round(time.Millisecond),
-		)
-	}
-
-	pendingStartedAt := time.Now()
-	log.Printf("pending upload enqueue scan started")
-	enqueued, err := albumsService.EnqueuePending(ctx)
-	if err != nil {
-		log.Printf("pending upload enqueue scan skipped: %v", err)
-		return
-	}
-	log.Printf(
-		"pending upload enqueue scan finished enqueued=%d duration=%s",
-		enqueued,
-		time.Since(pendingStartedAt).Round(time.Millisecond),
-	)
 }

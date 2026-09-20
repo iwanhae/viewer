@@ -490,6 +490,24 @@ func TestSourceKeyAndBlobKeyLayout(t *testing.T) {
 	if got := BlobKey("deadbeef"); got != "blobs/deadbeef" {
 		t.Fatalf("BlobKey=%q", got)
 	}
+	if UploadPrefix != "uploads/" {
+		t.Fatalf("UploadPrefix=%q", UploadPrefix)
+	}
+}
+
+// TestStagedAlbumIDInvertsSourceKey pins the round trip the upload scan relies
+// on to match a listed object with the album row that owns it.
+func TestStagedAlbumIDInvertsSourceKey(t *testing.T) {
+	id, ok := StagedAlbumID(SourceKey("album-a"))
+	if !ok || id != "album-a" {
+		t.Fatalf("StagedAlbumID(SourceKey(album-a))=%q,%v want album-a,true", id, ok)
+	}
+
+	for _, key := range []string{"blobs/deadbeef", "uploads/", "uploads/.zip", "uploads/nested/a.zip", "uploads/a.zip.bak"} {
+		if id, ok := StagedAlbumID(key); ok {
+			t.Errorf("StagedAlbumID(%q)=%q,true want no match", key, id)
+		}
+	}
 }
 
 func TestImageEntriesFiltersAndSorts(t *testing.T) {

@@ -22,7 +22,7 @@ import (
 // callers pass and receive keys like "blobs/<hash>" while the store itself adds
 // the configured key prefix. Keeping the prefix out of the catalog means moving
 // a deployment's objects within the bucket never invalidates stored metadata,
-// and it keeps the batch scanner's keys in the same namespace it lists.
+// and it keeps listing results in the same namespace callers pass back in.
 type S3Store struct {
 	bucket    string
 	prefix    string
@@ -30,7 +30,8 @@ type S3Store struct {
 	presigner *s3.PresignClient
 }
 
-type BatchObject struct {
+// Object is one entry of a bucket listing.
+type Object struct {
 	Key          string
 	LastModified time.Time
 	Size         int64
@@ -149,38 +150,18 @@ func (s *S3Store) DeleteObject(ctx context.Context, key string) error {
 	return nil
 }
 
-func (s *S3Store) CopyObject(ctx context.Context, srcKey, dstKey string) error {
-	srcKey = strings.TrimSpace(srcKey)
-	dstKey = strings.TrimSpace(dstKey)
-	if srcKey == "" || dstKey == "" {
-		return fmt.Errorf("srcKey and dstKey are required")
-	}
-	if srcKey == dstKey {
-		return fmt.Errorf("srcKey and dstKey must differ")
-	}
-	copySource := fmt.Sprintf("%s/%s", s.bucket, s.physicalKey(srcKey))
-	_, err := s.client.CopyObject(ctx, &s3.CopyObjectInput{
-		Bucket:     aws.String(s.bucket),
-		CopySource: aws.String(copySource),
-		Key:        aws.String(s.physicalKey(dstKey)),
-	})
-	if err != nil {
-		return fmt.Errorf("copy object %s -> %s: %w", srcKey, dstKey, err)
-	}
-	return nil
-}
-
-// ListBatchObjects lists the batch prefix. It is the one method that reads keys
-// out of the bucket, so it strips the store's key prefix again: callers get a
-// listing in the same logical namespace they pass to the other methods.
-func (s *S3Store) ListBatchObjects(ctx context.Context, prefix string) ([]BatchObject, error) {
+// ListObjects lists every object under a logical prefix. It is the one method
+// that reads keys out of the bucket, so it strips the store's key prefix again:
+// callers get a listing in the same logical namespace they pass to the other
+// methods.
+func (s *S3Store) ListObjects(ctx context.Context, prefix string) ([]Object, error) {
 	prefix = strings.TrimSpace(prefix)
 	if prefix == "" {
 		return nil, fmt.Errorf("prefix is required")
 	}
 	listPrefix := s.physicalKey(prefix)
 
-	objects := make([]BatchObject, 0)
+	objects := make([]Object, 0)
 	var token *string
 	for {
 		out, err := s.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
@@ -189,14 +170,14 @@ func (s *S3Store) ListBatchObjects(ctx context.Context, prefix string) ([]BatchO
 			ContinuationToken: token,
 		})
 		if err != nil {
-			return nil, fmt.Errorf("list batch objects: %w", err)
+			return nil, fmt.Errorf("list objects: %w", err)
 		}
 		for _, obj := range out.Contents {
 			key := s.logicalKey(aws.ToString(obj.Key))
 			if key == "" {
 				continue
 			}
-			objects = append(objects, BatchObject{
+			objects = append(objects, Object{
 				Key:          key,
 				LastModified: aws.ToTime(obj.LastModified).UTC(),
 				Size:         aws.ToInt64(obj.Size),

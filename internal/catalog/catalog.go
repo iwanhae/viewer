@@ -114,6 +114,7 @@ CREATE TABLE IF NOT EXISTS albums (
 	updated_at        TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_albums_status ON albums(status);
+CREATE INDEX IF NOT EXISTS idx_albums_source_key ON albums(source_key);
 
 CREATE TABLE IF NOT EXISTS blobs (
 	hash                 TEXT PRIMARY KEY,
@@ -262,17 +263,41 @@ func (s *Store) GetAlbum(ctx context.Context, albumID string) (*Album, error) {
 		SELECT id, original_filename, size_bytes, status, source_key, photo_count, error, created_at, updated_at
 		FROM albums WHERE id = ?`, albumID)
 
-	var album Album
-	var status string
-	err := row.Scan(
-		&album.ID, &album.OriginalFilename, &album.SizeBytes, &status, &album.SourceKey,
-		&album.PhotoCount, &album.Error, &album.CreatedAt, &album.UpdatedAt,
-	)
+	album, err := scanAlbum(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, fmt.Errorf("%w: %s", ErrAlbumNotFound, albumID)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("get album %s: %w", albumID, err)
+	}
+	return album, nil
+}
+
+// GetAlbumBySourceKey returns the album whose staged zip is sourceKey, which is
+// how the upload scan tells an object it already knows from one to adopt.
+func (s *Store) GetAlbumBySourceKey(ctx context.Context, sourceKey string) (*Album, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT id, original_filename, size_bytes, status, source_key, photo_count, error, created_at, updated_at
+		FROM albums WHERE source_key = ? LIMIT 1`, sourceKey)
+
+	album, err := scanAlbum(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("%w: source_key=%s", ErrAlbumNotFound, sourceKey)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get album by source key %s: %w", sourceKey, err)
+	}
+	return album, nil
+}
+
+func scanAlbum(row scanner) (*Album, error) {
+	var album Album
+	var status string
+	if err := row.Scan(
+		&album.ID, &album.OriginalFilename, &album.SizeBytes, &status, &album.SourceKey,
+		&album.PhotoCount, &album.Error, &album.CreatedAt, &album.UpdatedAt,
+	); err != nil {
+		return nil, err
 	}
 	album.Status = AlbumStatus(status)
 	return &album, nil

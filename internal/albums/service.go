@@ -105,7 +105,7 @@ func (s *Service) CreateUpload(ctx context.Context, filename string, sizeBytes i
 }
 
 // RegisterStagedUpload records an album whose zip was placed in S3 out of band
-// (for example by the batch ingest scanner) and queues it for extraction.
+// (for example by the upload scan) and queues it for extraction.
 func (s *Service) RegisterStagedUpload(ctx context.Context, albumID string, filename string, sizeBytes int64, sourceKey string) error {
 	albumID = strings.TrimSpace(albumID)
 	if albumID == "" {
@@ -203,50 +203,52 @@ func (s *Service) GetFinalizeStatus(ctx context.Context, albumID string) (Finali
 	return finalizeStateFromAlbum(album), nil
 }
 
-// EnqueuePending schedules every album that still has a staged zip waiting.
-func (s *Service) EnqueuePending(ctx context.Context) (int, error) {
-	if s.enqueuer == nil {
-		return 0, fmt.Errorf("finalize worker is not initialized")
+// AlbumForStagedObject returns the album that already owns a staged object key.
+// The source_key recorded on the album is authoritative; a row written before
+// that column was populated is matched through the key its upload used, which
+// SourceKey still generates. A not-found result is not an error: it is how the
+// upload scan learns that an object needs an album of its own.
+func (s *Service) AlbumForStagedObject(ctx context.Context, sourceKey string) (*catalog.Album, bool, error) {
+	if s == nil || s.catalog == nil {
+		return nil, false, nil
+	}
+	sourceKey = strings.TrimSpace(sourceKey)
+	if sourceKey == "" {
+		return nil, false, nil
 	}
 
-	total := 0
-	// Collect first: processing an album mutates its status, so listing status
-	// by status while enqueueing would visit the same album twice.
-	byID := make(map[string]catalog.Album)
-	for _, status := range []catalog.AlbumStatus{catalog.AlbumStatusQueued, catalog.AlbumStatusProcessing} {
-		albums, err := s.catalog.ListAlbumsByStatus(ctx, status)
-		if err != nil {
-			return total, err
-		}
-		for _, album := range albums {
-			byID[album.ID] = album
-		}
+	album, err := s.catalog.GetAlbumBySourceKey(ctx, sourceKey)
+	if err == nil {
+		return album, true, nil
 	}
-	ids := make([]string, 0, len(byID))
-	for id := range byID {
-		ids = append(ids, id)
+	if !errors.Is(err, catalog.ErrAlbumNotFound) {
+		return nil, false, err
 	}
-	sort.Strings(ids)
 
-	for _, albumID := range ids {
-		album := byID[albumID]
-		sourceKey := album.SourceKey
-		if strings.TrimSpace(sourceKey) == "" {
-			sourceKey = pipeline.SourceKey(album.ID)
-		}
-		exists, size, err := s.store.HeadObject(ctx, sourceKey)
-		if err != nil || !exists || size <= 0 {
-			continue
-		}
-		if err := s.catalog.SetAlbumStatus(ctx, album.ID, catalog.AlbumStatusQueued, ""); err != nil {
-			continue
-		}
-		if err := s.enqueuer.Enqueue(album.ID); err != nil {
-			continue
-		}
-		total++
+	id, ok := pipeline.StagedAlbumID(sourceKey)
+	if !ok {
+		return nil, false, nil
 	}
-	return total, nil
+	album, err = s.catalog.GetAlbum(ctx, id)
+	if err == nil {
+		return album, true, nil
+	}
+	if errors.Is(err, catalog.ErrAlbumNotFound) {
+		return nil, false, nil
+	}
+	return nil, false, err
+}
+
+// EnqueueStaged schedules an album whose staged zip is still waiting. It leaves
+// the album status alone: the pipeline sets PROCESSING when it starts and the
+// terminal status when it finishes, so a scan that finds an album already being
+// extracted cannot leave it looking queued. A duplicate enqueue is ignored by
+// the pipeline.
+func (s *Service) EnqueueStaged(_ context.Context, albumID string) error {
+	if s == nil || s.enqueuer == nil {
+		return fmt.Errorf("finalize worker is not initialized")
+	}
+	return s.enqueuer.Enqueue(albumID)
 }
 
 // GetAlbum returns an album and its photos in the legacy API shape.

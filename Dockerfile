@@ -60,16 +60,20 @@ FROM debian:bookworm-slim AS runtime-base
 
 COPY --from=backend-build --chown=65532:65532 /out/viewer /app/viewer
 
+# /var/lib/viewer is the persistent state directory (the SQLite catalog); the
+# caches under /tmp are container-local and rebuilt from S3 on demand.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends ca-certificates && \
     rm -rf /var/lib/apt/lists/* && \
-    mkdir -p /app/siglip2 /tmp/viewer-cache/images /tmp/viewer-cache/zips && \
-    chown -R 65532:65532 /app /tmp/viewer-cache
+    mkdir -p /app/siglip2 /var/lib/viewer /tmp/viewer-cache/images /tmp/viewer-cache/zips && \
+    chown -R 65532:65532 /app /var/lib/viewer /tmp/viewer-cache
 
-# The line above pre-creates the default STATE_DIR. Another STATE_DIR works too,
-# since the viewer creates its subdirectories on demand, but a volume mounted
-# there must be writable by uid 65532.
 USER 65532:65532
+
+# The catalog is the only record of which album holds which photos and cannot be
+# rebuilt from the bucket, so give it a volume of its own. An operator can point
+# STATE_DIR elsewhere and mount there instead.
+VOLUME ["/var/lib/viewer"]
 
 EXPOSE 8080
 ENTRYPOINT ["/app/viewer"]

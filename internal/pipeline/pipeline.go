@@ -95,9 +95,30 @@ func NewService(cat *catalog.Store, store Store, embedder Embedder, opts Options
 	}
 }
 
+// UploadPrefix is the object-key prefix that holds staged uploads. It is the
+// only prefix the viewer accepts a zip from: a client uploads to a presigned
+// key under it, and anything else that appears there is adopted by the upload
+// scan.
+const UploadPrefix = "uploads/"
+
 // SourceKey is the staging object key a client uploads a zip to.
 func SourceKey(albumID string) string {
-	return fmt.Sprintf("uploads/%s.zip", albumID)
+	return UploadPrefix + albumID + ".zip"
+}
+
+// StagedAlbumID inverts SourceKey for the flat keys it generates. It lets a
+// listed object be matched against the album row it belongs to, including rows
+// written before the key was recorded on the album.
+func StagedAlbumID(key string) (string, bool) {
+	name, ok := strings.CutPrefix(key, UploadPrefix)
+	if !ok {
+		return "", false
+	}
+	id, ok := strings.CutSuffix(name, ".zip")
+	if !ok || id == "" || strings.Contains(id, "/") {
+		return "", false
+	}
+	return id, true
 }
 
 // BlobKey is the content-addressed S3 key for raw image bytes.

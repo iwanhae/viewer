@@ -3,44 +3,48 @@
 `README.md` walks through the request flow and the deployment settings. This note
 keeps the parts that are easy to get wrong later: the exact S3 key layout, the
 SQLite schema, and the reasoning behind the choices. Every statement below is
-taken from the code in `internal/pipeline`, `internal/catalog`, `internal/images`
-and `internal/recommend`.
+taken from the code in `internal/ingest`, `internal/pipeline`, `internal/catalog`,
+`internal/images` and `internal/recommend`.
 
 ## S3 key layout
 
 The bucket holds binary payloads only; every piece of metadata is in SQLite.
 
-- `batch/<name>.zip` — inbound drop prefix. Only top-level `.zip` objects are
-  considered, and the prefix is scanned once at startup.
-- `uploads/<albumId>.zip` — the staged upload. `albumId` is a UUID for
-  `POST /api/albums`; for batch ingest it is the first 16 hex characters of
-  `sha256("<etag>:<size>")`, so dropping identical bytes again resolves to the
-  same album and the staged object is reused.
+- `uploads/<albumId>.zip` — the staged upload and the only prefix the viewer
+  reads. `albumId` is a UUID for `POST /api/albums`; for a zip adopted by the
+  upload scan it is the first 16 hex characters of `sha256("<etag>:<size>")`, so
+  dropping identical bytes again resolves to the same album. A zip may sit at any
+  depth under the prefix and keeps the name it was uploaded with.
 - `blobs/<sha256>` — the durable image payload, keyed by the SHA-256 of the raw
   image bytes.
 
 The staging key is generated once and then stored on the album row
 (`albums.source_key`), and the pipeline reads it back from there rather than
 recomputing it. The generated name can therefore change between releases without
-stranding objects an older release already staged.
+stranding objects an older release already staged. The scan resolves a listed key
+back to an album through that column, and falls back to the key `SourceKey`
+generates for rows written before the column was populated.
 
 Every key above is logical. `S3_PREFIX` prepends one deployment-owned prefix to
 all of them (`photos/blobs/<sha256>` and so on); it is added and removed entirely
 inside `internal/storage`, so callers and the catalog only ever see the logical
-form. `ListBatchObjects` is the single method that reads keys back out of the
-bucket, so it strips the prefix again — the batch scanner feeds listed keys
-straight into `CopyObject`/`DeleteObject`, which would otherwise double it.
+form. `ListObjects` is the single method that reads keys back out of the bucket,
+so it strips the prefix again — the scan feeds listed keys straight back into the
+album lookup and the pipeline, which would otherwise see it doubled.
 
-There is no per-album manifest object. The album-to-photo mapping exists only in
-SQLite. Feed, viewer and search requests are answered from the catalog; S3 is
-read by key (image bytes) or by the `batch/` prefix.
+There is no per-album manifest object and no object is ever copied. The
+album-to-photo mapping exists only in SQLite. Feed, viewer and search requests
+are answered from the catalog; S3 is read by key (image bytes) or by the
+`uploads/` prefix.
 
 ## SQLite schema
 
-`$STATE_DIR/viewer.db` (default `/tmp/viewer-cache`), opened with WAL,
-`foreign_keys(1)`, `synchronous(NORMAL)`, a single connection and a 10 second
-busy timeout. The decoded-image cache and the zip staging directory are siblings
-under the same `STATE_DIR`.
+`$STATE_DIR/viewer.db` (default `/var/lib/viewer`, the path the image declares as
+a volume), opened with WAL, `foreign_keys(1)`, `synchronous(NORMAL)`, a single
+connection and a 10 second busy timeout. The catalog is the only thing under
+`STATE_DIR`. The decoded-image cache and the zip staging directory live under
+`config.CacheRoot` (`/tmp/viewer-cache`) instead, because both are rebuilt from
+the bucket and must not ride along on the volume that keeps the catalog.
 
 ```sql
 albums(id, original_filename, size_bytes, status, source_key,
@@ -53,9 +57,9 @@ photos(album_id, idx, name, hash, width, height, ratio,
        PRIMARY KEY (album_id, idx))
 ```
 
-Indexed on `albums(status)`, `blobs(embedding_status)` and `photos(hash)`.
-`albums.id` and `blobs.hash` are the primary keys, and `photos` is keyed by
-`(album_id, idx)`.
+Indexed on `albums(status)`, `albums(source_key)`, `blobs(embedding_status)` and
+`photos(hash)`. `albums.id` and `blobs.hash` are the primary keys, and `photos`
+is keyed by `(album_id, idx)`.
 
 Album status is persisted as `QUEUED` / `PROCESSING` / `SUCCEEDED` / `FAILED`
 (`albums.error` carries the failure text). Blob embedding status is `pending` /
@@ -83,6 +87,25 @@ A blob that is `failed` is terminal — `ListBlobsAwaitingEmbedding` selects onl
   keeping it would store the same bytes twice. The delete happens only after the
   album is marked `SUCCEEDED`; on failure the zip is kept and
   `POST /api/albums/{albumId}/finalize` can retry it.
+- **`uploads/` is the one staging prefix, and the upload scan watches it.** A
+  client puts its zip there through a presigned PUT; an operator or an external
+  tool can put one there directly. The scan (startup plus one pass a minute)
+  adopts what no album owns and re-queues an album whose zip is still waiting,
+  which replaced the separate startup-only batch scan and pending-enqueue pass.
+  It copies nothing: the two prefixes it used to shuffle objects between existed
+  only because the drop zone and the staging area were different places.
+- **The scan never writes an album status.** Only the pipeline moves an album
+  between `QUEUED`, `PROCESSING` and its terminal state, so a scan that runs
+  while an extraction is in flight cannot flip it back to `QUEUED` — which for a
+  startup-only pass was harmless but for a repeating one would strand an album
+  that had just been marked `SUCCEEDED` with its zip already deleted. A
+  duplicate enqueue is ignored by the pipeline, so re-queueing a live album is
+  free and a stale `PROCESSING` row heals itself on the next pass.
+- **The catalog and the caches are separate directories.** `STATE_DIR` is the
+  volume an operator mounts, and the only thing on it is `viewer.db`; the caches
+  are a fixed `/tmp` path because a miss is refetched. Putting gigabytes of
+  decoded images on a volume whose purpose is to preserve a few megabytes of
+  SQLite would grow the backup with data the bucket already holds.
 - **Photo indexes come from a case-insensitive filename sort.** `photos.idx` is
   what the API and UI address, so the ordering has to be deterministic. The
   pipeline uses the same sort as the earlier indexer, which keeps existing photo
@@ -98,5 +121,5 @@ A blob that is `failed` is terminal — `ListBlobsAwaitingEmbedding` selects onl
   rank them by cosine similarity and return only cross-album hits, at most one
   photo per album.
 - **Images are served from a local disk cache.** `images.Service` materialises a
-  blob into `$STATE_DIR/images` with an atomic temp-file rename and reuses the
-  cached file, so a repeated wall or viewer load never touches S3.
+  blob into `/tmp/viewer-cache/images` with an atomic temp-file rename and reuses
+  the cached file, so a repeated wall or viewer load never touches S3.

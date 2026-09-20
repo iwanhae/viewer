@@ -396,40 +396,85 @@ func TestSearchAlbumsByNamePrefixReturnsItems(t *testing.T) {
 	}
 }
 
-func TestEnqueuePendingOnlyQueuesAlbumsWithStagedZip(t *testing.T) {
-	store := newFakeStore()
-	enqueuer := &fakeEnqueuer{}
-	svc, cat := newTestService(t, store, enqueuer)
+// TestAlbumForStagedObjectMatchesRecordedAndImplicitKeys covers the lookup the
+// upload scan uses to tell an object it already knows from one to adopt: the
+// recorded source_key wins, and a row written before that column was populated
+// is still recognised through the key its upload used.
+func TestAlbumForStagedObjectMatchesRecordedAndImplicitKeys(t *testing.T) {
+	svc, cat := newTestService(t, newFakeStore(), nil)
 	ctx := context.Background()
 
 	if err := cat.CreateAlbum(ctx, catalog.Album{
-		ID: "with-zip", Status: catalog.AlbumStatusQueued, SourceKey: pipeline.SourceKey("with-zip"),
+		ID: "recorded", Status: catalog.AlbumStatusReady, SourceKey: "uploads/custom-name.zip",
 	}); err != nil {
 		t.Fatalf("create album: %v", err)
 	}
 	if err := cat.CreateAlbum(ctx, catalog.Album{
-		ID: "without-zip", Status: catalog.AlbumStatusQueued, SourceKey: pipeline.SourceKey("without-zip"),
+		ID: "implicit", Status: catalog.AlbumStatusReady,
 	}); err != nil {
 		t.Fatalf("create album: %v", err)
 	}
-	store.objects[pipeline.SourceKey("with-zip")] = 42
 
-	enqueued, err := svc.EnqueuePending(ctx)
-	if err != nil {
-		t.Fatalf("enqueue pending: %v", err)
+	cases := []struct {
+		name    string
+		key     string
+		wantID  string
+		wantHit bool
+	}{
+		{name: "recorded key", key: "uploads/custom-name.zip", wantID: "recorded", wantHit: true},
+		{name: "implicit key", key: pipeline.SourceKey("implicit"), wantID: "implicit", wantHit: true},
+		{name: "unknown album", key: pipeline.SourceKey("nobody"), wantHit: false},
+		{name: "unrelated key", key: "blobs/deadbeef", wantHit: false},
 	}
-	if enqueued != 1 || len(enqueuer.enqueued) != 1 || enqueuer.enqueued[0] != "with-zip" {
-		t.Fatalf("enqueued=%d list=%v", enqueued, enqueuer.enqueued)
-	}
-	album, _ := cat.GetAlbum(ctx, "with-zip")
-	if album.Status != catalog.AlbumStatusQueued {
-		t.Fatalf("status=%s want=%s", album.Status, catalog.AlbumStatusQueued)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			album, found, err := svc.AlbumForStagedObject(ctx, tc.key)
+			if err != nil {
+				t.Fatalf("AlbumForStagedObject: %v", err)
+			}
+			if found != tc.wantHit {
+				t.Fatalf("found=%v want=%v for key %q", found, tc.wantHit, tc.key)
+			}
+			if found && album.ID != tc.wantID {
+				t.Fatalf("album=%s want=%s", album.ID, tc.wantID)
+			}
+		})
 	}
 }
 
-func TestEnqueuePendingWithoutEnqueuerFails(t *testing.T) {
+// TestEnqueueStagedSchedulesWithoutTouchingStatus pins the recovery the scan
+// relies on: an album whose zip is still in the bucket is queued again, and its
+// status is left to the pipeline, so a scan cannot reset an album that is being
+// extracted right now back to QUEUED.
+func TestEnqueueStagedSchedulesWithoutTouchingStatus(t *testing.T) {
+	enqueuer := &fakeEnqueuer{}
+	svc, cat := newTestService(t, newFakeStore(), enqueuer)
+	ctx := context.Background()
+
+	if err := cat.CreateAlbum(ctx, catalog.Album{
+		ID: "stuck", Status: catalog.AlbumStatusProcessing, SourceKey: pipeline.SourceKey("stuck"),
+	}); err != nil {
+		t.Fatalf("create album: %v", err)
+	}
+
+	if err := svc.EnqueueStaged(ctx, "stuck"); err != nil {
+		t.Fatalf("enqueue staged: %v", err)
+	}
+	if want := []string{"stuck"}; !reflect.DeepEqual(enqueuer.enqueued, want) {
+		t.Fatalf("enqueued=%v want=%v", enqueuer.enqueued, want)
+	}
+	album, err := cat.GetAlbum(ctx, "stuck")
+	if err != nil {
+		t.Fatalf("get album: %v", err)
+	}
+	if album.Status != catalog.AlbumStatusProcessing {
+		t.Fatalf("status=%s want=%s (the pipeline owns the status)", album.Status, catalog.AlbumStatusProcessing)
+	}
+}
+
+func TestEnqueueStagedWithoutEnqueuerFails(t *testing.T) {
 	svc, _ := newTestService(t, newFakeStore(), nil)
-	if _, err := svc.EnqueuePending(context.Background()); err == nil {
+	if err := svc.EnqueueStaged(context.Background(), "album-a"); err == nil {
 		t.Fatalf("expected error when no enqueuer is configured")
 	}
 }
@@ -439,21 +484,21 @@ func TestRegisterStagedUploadQueuesAlbum(t *testing.T) {
 	svc, cat := newTestService(t, newFakeStore(), enqueuer)
 	ctx := context.Background()
 
-	if err := svc.RegisterStagedUpload(ctx, "album-a", "batch.zip", 128, pipeline.SourceKey("album-a")); err != nil {
+	if err := svc.RegisterStagedUpload(ctx, "album-a", "trip.zip", 128, pipeline.SourceKey("album-a")); err != nil {
 		t.Fatalf("register staged upload: %v", err)
 	}
 	album, err := cat.GetAlbum(ctx, "album-a")
 	if err != nil {
 		t.Fatalf("get album: %v", err)
 	}
-	if album.Status != catalog.AlbumStatusQueued || album.OriginalFilename != "batch.zip" || album.SizeBytes != 128 {
+	if album.Status != catalog.AlbumStatusQueued || album.OriginalFilename != "trip.zip" || album.SizeBytes != 128 {
 		t.Fatalf("unexpected album: %+v", album)
 	}
 	if len(enqueuer.enqueued) != 1 || enqueuer.enqueued[0] != "album-a" {
 		t.Fatalf("enqueued=%v", enqueuer.enqueued)
 	}
 
-	if err := svc.RegisterStagedUpload(ctx, "  ", "batch.zip", 1, ""); err == nil {
+	if err := svc.RegisterStagedUpload(ctx, "  ", "trip.zip", 1, ""); err == nil {
 		t.Fatalf("expected error for empty album id")
 	}
 }

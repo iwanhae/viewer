@@ -13,24 +13,24 @@ import (
 	cfgpkg "viewer/internal/config"
 )
 
-// listBatchXML is a canned ListObjectsV2 response whose keys already carry the
-// store's key prefix, exactly as a real bucket would return them.
-const listBatchXML = `<?xml version="1.0" encoding="UTF-8"?>
+// listObjectsXML is a canned ListObjectsV2 response whose keys already carry
+// the store's key prefix, exactly as a real bucket would return them.
+const listObjectsXML = `<?xml version="1.0" encoding="UTF-8"?>
 <ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
   <Name>viewer</Name>
-  <Prefix>viewer/batch/</Prefix>
+  <Prefix>viewer/uploads/</Prefix>
   <KeyCount>2</KeyCount>
   <MaxKeys>1000</MaxKeys>
   <IsTruncated>false</IsTruncated>
   <Contents>
-    <Key>viewer/batch/second.zip</Key>
+    <Key>viewer/uploads/second.zip</Key>
     <LastModified>2024-01-02T03:04:05.000Z</LastModified>
     <ETag>&quot;etag-2&quot;</ETag>
     <Size>20</Size>
     <StorageClass>STANDARD</StorageClass>
   </Contents>
   <Contents>
-    <Key>viewer/batch/first.zip</Key>
+    <Key>viewer/uploads/first.zip</Key>
     <LastModified>2024-01-01T00:00:00.000Z</LastModified>
     <ETag>&quot;etag-1&quot;</ETag>
     <Size>10</Size>
@@ -38,18 +38,11 @@ const listBatchXML = `<?xml version="1.0" encoding="UTF-8"?>
   </Contents>
 </ListBucketResult>`
 
-const copyResultXML = `<?xml version="1.0" encoding="UTF-8"?>
-<CopyObjectResult>
-  <ETag>&quot;etag-1&quot;</ETag>
-  <LastModified>2024-01-01T00:00:00.000Z</LastModified>
-</CopyObjectResult>`
-
 type recordedRequest struct {
 	method string
 	host   string
 	path   string
 	query  string
-	header http.Header
 }
 
 func (r recordedRequest) String() string {
@@ -76,15 +69,11 @@ func newRecordingStoreAt(t *testing.T, endpointPath string, keyPrefix string) (*
 			host:   r.Host,
 			path:   r.URL.Path,
 			query:  r.URL.RawQuery,
-			header: r.Header.Clone(),
 		})
 		switch {
 		case r.URL.Query().Get("list-type") == "2":
 			w.Header().Set("Content-Type", "application/xml")
-			_, _ = io.WriteString(w, listBatchXML)
-		case r.Method == http.MethodPut && r.Header.Get("X-Amz-Copy-Source") != "":
-			w.Header().Set("Content-Type", "application/xml")
-			_, _ = io.WriteString(w, copyResultXML)
+			_, _ = io.WriteString(w, listObjectsXML)
 		case r.Method == http.MethodHead:
 			w.Header().Set("Content-Length", "11")
 			w.Header().Set("ETag", `"etag-1"`)
@@ -112,8 +101,8 @@ func newRecordingStoreAt(t *testing.T, endpointPath string, keyPrefix string) (*
 }
 
 // TestS3StoreKeyPrefixReachesEveryRequest is the whole point of S3_PREFIX: the
-// prefix has to be added on every path, including the copy source header, so
-// that a deployment's objects live entirely under its own namespace.
+// prefix has to be added on every path, so that a deployment's objects live
+// entirely under its own namespace.
 func TestS3StoreKeyPrefixReachesEveryRequest(t *testing.T) {
 	store, requests := newRecordingStore(t, "viewer/")
 	ctx := context.Background()
@@ -152,16 +141,11 @@ func TestS3StoreKeyPrefixReachesEveryRequest(t *testing.T) {
 		t.Fatalf("DeleteObject: %v", err)
 	}
 
-	if err := store.CopyObject(ctx, "batch/first.zip", "uploads/album-1.zip"); err != nil {
-		t.Fatalf("CopyObject: %v", err)
-	}
-
 	want := []struct{ method, path string }{
 		{http.MethodPut, "/test-bucket/viewer/blobs/deadbeef"},
 		{http.MethodGet, "/test-bucket/viewer/blobs/deadbeef"},
 		{http.MethodHead, "/test-bucket/viewer/blobs/deadbeef"},
 		{http.MethodDelete, "/test-bucket/viewer/blobs/deadbeef"},
-		{http.MethodPut, "/test-bucket/viewer/uploads/album-1.zip"},
 	}
 	got := *requests
 	if len(got) != len(want) {
@@ -172,39 +156,33 @@ func TestS3StoreKeyPrefixReachesEveryRequest(t *testing.T) {
 			t.Errorf("request %d = %s, want %s %s", i, got[i], w.method, w.path)
 		}
 	}
-	// CopySource is "<bucket>/<physical key>", matching the format this method
-	// already sent before the key prefix existed (it carries no leading slash).
-	if source := got[4].header.Get("X-Amz-Copy-Source"); source != "test-bucket/viewer/batch/first.zip" {
-		t.Errorf("copy source=%q want=test-bucket/viewer/batch/first.zip", source)
-	}
 }
 
-// TestS3StoreListBatchObjectsStripsKeyPrefix covers the one method that reads
-// keys back out of the bucket: the batch scanner feeds listed keys straight
-// into CopyObject and DeleteObject, so they must stay logical or the prefix
-// would be applied twice.
-func TestS3StoreListBatchObjectsStripsKeyPrefix(t *testing.T) {
+// TestS3StoreListObjectsStripsKeyPrefix covers the one method that reads keys
+// back out of the bucket: the upload scan feeds listed keys straight into the
+// other methods, so they must stay logical or the prefix would be applied twice.
+func TestS3StoreListObjectsStripsKeyPrefix(t *testing.T) {
 	store, requests := newRecordingStore(t, "viewer/")
 
-	objects, err := store.ListBatchObjects(context.Background(), "batch/")
+	objects, err := store.ListObjects(context.Background(), "uploads/")
 	if err != nil {
-		t.Fatalf("ListBatchObjects: %v", err)
+		t.Fatalf("ListObjects: %v", err)
 	}
 
 	got := *requests
 	if len(got) != 1 {
 		t.Fatalf("recorded %d requests, want 1", len(got))
 	}
-	if got[0].query == "" || !strings.Contains(got[0].query, "prefix=viewer%2Fbatch%2F") {
-		t.Errorf("list query=%q want a prefixed prefix=viewer%%2Fbatch%%2F", got[0].query)
+	if got[0].query == "" || !strings.Contains(got[0].query, "prefix=viewer%2Fuploads%2F") {
+		t.Errorf("list query=%q want a prefixed prefix=viewer%%2Fuploads%%2F", got[0].query)
 	}
 
 	if len(objects) != 2 {
-		t.Fatalf("ListBatchObjects returned %d objects, want 2", len(objects))
+		t.Fatalf("ListObjects returned %d objects, want 2", len(objects))
 	}
 	// Sorted by logical key: the canned response is deliberately out of order.
-	if objects[0].Key != "batch/first.zip" || objects[1].Key != "batch/second.zip" {
-		t.Errorf("keys=%q,%q want batch/first.zip,batch/second.zip", objects[0].Key, objects[1].Key)
+	if objects[0].Key != "uploads/first.zip" || objects[1].Key != "uploads/second.zip" {
+		t.Errorf("keys=%q,%q want uploads/first.zip,uploads/second.zip", objects[0].Key, objects[1].Key)
 	}
 	if objects[0].ETag != `"etag-1"` || objects[0].Size != 10 {
 		t.Errorf("first object=%+v want etag-1 size 10", objects[0])
@@ -214,8 +192,8 @@ func TestS3StoreListBatchObjectsStripsKeyPrefix(t *testing.T) {
 	if err := store.DeleteObject(context.Background(), objects[0].Key); err != nil {
 		t.Fatalf("DeleteObject: %v", err)
 	}
-	if path := (*requests)[1].path; path != "/test-bucket/viewer/batch/first.zip" {
-		t.Errorf("delete path=%q want /test-bucket/viewer/batch/first.zip", path)
+	if path := (*requests)[1].path; path != "/test-bucket/viewer/uploads/first.zip" {
+		t.Errorf("delete path=%q want /test-bucket/viewer/uploads/first.zip", path)
 	}
 }
 

@@ -13,6 +13,7 @@ import (
 	"viewer/internal/feed"
 	"viewer/internal/httpapi"
 	"viewer/internal/images"
+	"viewer/internal/ingest"
 	"viewer/internal/pipeline"
 	"viewer/internal/recommend"
 	"viewer/internal/storage"
@@ -28,7 +29,10 @@ func Run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	log.Printf("viewer: config loaded on port=%d state_dir=%s s3_prefix=%s", cfg.Port, cfg.StateDir, cfg.DescribePrefix())
+	log.Printf(
+		"viewer: config loaded on port=%d catalog=%s cache=%s s3_prefix=%s",
+		cfg.Port, cfg.DBPath(), cfgpkg.CacheRoot, cfg.DescribePrefix(),
+	)
 
 	cat, err := catalog.Open(cfg.DBPath())
 	if err != nil {
@@ -41,7 +45,7 @@ func Run(ctx context.Context) error {
 		return err
 	}
 
-	imageService, err := images.NewService(cat, store, cfg.CacheDir())
+	imageService, err := images.NewService(cat, store, cfgpkg.ImageCacheDir())
 	if err != nil {
 		return err
 	}
@@ -74,7 +78,7 @@ func Run(ctx context.Context) error {
 		pipelineEmbedder = recommendService
 	}
 	pipelineService := pipeline.NewService(cat, store, pipelineEmbedder, pipeline.Options{
-		TempDir: cfg.ZipCacheDir(),
+		TempDir: cfgpkg.ZipCacheDir(),
 		OnAlbumReady: func(albumID string) {
 			if err := recommendService.ReloadAlbum(context.Background(), albumID); err != nil {
 				log.Printf("viewer: reload recommendation index for album=%s failed: %v", albumID, err)
@@ -94,17 +98,15 @@ func Run(ctx context.Context) error {
 	}
 	log.Printf("viewer: starting HTTP server on %s", srv.Addr)
 	log.Printf("viewer: startup warmup running in background")
-	warmupDone := make(chan struct{})
 	go func() {
-		httpapi.Warmup(ctx, albumService, recommendService, store)
-		close(warmupDone)
-	}()
-	go func() {
-		select {
-		case <-ctx.Done():
-			return
-		case <-warmupDone:
-		}
+		warmupRecommendations(ctx, recommendService)
+
+		// The upload prefix is the drop zone for the zips that did not come
+		// through POST /api/albums. It scans once here, after the index is
+		// loaded, and then keeps watching, so a zip dropped while the server is
+		// running needs no restart.
+		go ingest.NewWatcher(store, albumService).Run(ctx)
+
 		if !recommenderEnabled {
 			log.Printf("viewer: warmup completed; embedding workers disabled")
 			return
@@ -118,4 +120,17 @@ func Run(ctx context.Context) error {
 	}()
 
 	return srv.ListenAndServe()
+}
+
+// warmupRecommendations rebuilds the in-memory recommendation index from the
+// catalog. It runs before the upload scan on purpose: the scan queues albums,
+// and refreshing one album's slice of the index after an extraction costs less
+// than reloading the whole thing afterwards.
+func warmupRecommendations(ctx context.Context, recommendService *recommend.Service) {
+	startedAt := time.Now()
+	log.Printf("catalog warmup started")
+	if err := recommendService.LoadAll(ctx); err != nil {
+		log.Printf("recommendation index warmup failed: %v", err)
+	}
+	log.Printf("catalog warmup finished duration=%s", time.Since(startedAt).Round(time.Millisecond))
 }

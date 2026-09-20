@@ -56,6 +56,7 @@ run:
 
 clean:
 	rm -rf bin .cache frontend/node_modules
-	# The viewer writes its catalog and disk caches to a fixed container-local
-	# path (see config.StateDir), which on the host is /tmp/viewer-cache.
+	# The viewer keeps its caches at a fixed container-local path (see
+	# config.CacheRoot), which on the host is /tmp/viewer-cache. The catalog is
+	# left alone: it lives wherever STATE_DIR points.
 	rm -rf /tmp/viewer-cache
