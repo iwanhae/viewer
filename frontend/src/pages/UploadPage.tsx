@@ -1,9 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { createAlbum, finalizeAlbum, uploadAlbumObject } from '../api/client'
+import { createAlbum, fetchFinalizeStatus, finalizeAlbum, uploadAlbumObject } from '../api/client'
+import { formatBytes } from '../utils/format'
 
-type UploadStatus = 'uploading' | 'submitted' | 'failed' | 'canceled'
+type UploadStatus = 'uploading' | 'submitted' | 'ready' | 'failed' | 'canceled'
 const uploadWorkerCount = 3
+const finalizePollIntervalMs = 2000
+const finalizePollTimeoutMs = 30 * 60 * 1000
 
 type UploadItem = {
   id: string
@@ -40,17 +43,34 @@ function isAbortError(err: unknown): boolean {
   return false
 }
 
-function formatBytes(bytes: number): string {
-  if (!Number.isFinite(bytes) || bytes <= 0) return '0 B'
-  const units = ['B', 'KB', 'MB', 'GB', 'TB']
-  let value = bytes
-  let idx = 0
-  while (value >= 1024 && idx < units.length - 1) {
-    value /= 1024
-    idx++
+function abortedError(): Error {
+  if (typeof DOMException !== 'undefined') {
+    return new DOMException('Aborted', 'AbortError')
   }
-  const precision = value >= 100 || idx === 0 ? 0 : value >= 10 ? 1 : 2
-  return `${value.toFixed(precision)} ${units[idx]}`
+  const err = new Error('Aborted')
+  err.name = 'AbortError'
+  return err
+}
+
+// delay waits for the poll interval but rejects as soon as the upload's
+// AbortController fires, so cancellation is not held up by a pending timer.
+function delay(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) {
+      reject(abortedError())
+      return
+    }
+    let timer = 0
+    const onAbort = () => {
+      window.clearTimeout(timer)
+      reject(abortedError())
+    }
+    timer = window.setTimeout(() => {
+      signal.removeEventListener('abort', onAbort)
+      resolve()
+    }, ms)
+    signal.addEventListener('abort', onAbort, { once: true })
+  })
 }
 
 function statusLabel(status: UploadStatus): string {
@@ -59,6 +79,8 @@ function statusLabel(status: UploadStatus): string {
       return 'Uploading'
     case 'submitted':
       return 'Submitted'
+    case 'ready':
+      return 'Ready'
     case 'failed':
       return 'Failed'
     case 'canceled':
@@ -116,6 +138,26 @@ export function UploadPage() {
 
         await finalizeAlbum(albumID, { signal: controller.signal })
         updateItem(item.id, { status: 'submitted', error: undefined })
+
+        // Indexing runs in the background pipeline: keep polling until the
+        // album succeeds or fails. A deadline leaves the item submitted
+        // rather than falsely reporting a failure.
+        const deadline = Date.now() + finalizePollTimeoutMs
+        for (;;) {
+          const state = await fetchFinalizeStatus(albumID, { signal: controller.signal })
+          if (state.status === 'SUCCEEDED') {
+            updateItem(item.id, { status: 'ready', error: undefined })
+            return
+          }
+          if (state.status === 'FAILED') {
+            updateItem(item.id, { status: 'failed', error: state.error })
+            return
+          }
+          if (Date.now() >= deadline) {
+            return
+          }
+          await delay(finalizePollIntervalMs, controller.signal)
+        }
       } catch (err) {
         if (isAbortError(err)) {
           updateItem(item.id, { status: 'canceled', error: undefined })
@@ -260,12 +302,13 @@ export function UploadPage() {
 
   const summary = useMemo(() => {
     const totalFiles = items.length
-    const submittedFiles = items.filter((item) => item.status === 'submitted').length
+    const isSubmitted = (status: UploadStatus) => status === 'submitted' || status === 'ready'
+    const submittedFiles = items.filter((item) => isSubmitted(item.status)).length
     const failedFiles = items.filter((item) => item.status === 'failed' || item.status === 'canceled').length
     const totalBytes = items.reduce((sum, item) => sum + item.sizeBytes, 0)
     const uploadedBytes = items.reduce(
       (sum, item) =>
-        sum + (item.status === 'submitted' ? item.sizeBytes : Math.min(item.uploadedBytes, item.sizeBytes)),
+        sum + (isSubmitted(item.status) ? item.sizeBytes : Math.min(item.uploadedBytes, item.sizeBytes)),
       0,
     )
     const progressPct = totalBytes > 0 ? Math.round((uploadedBytes / totalBytes) * 100) : 0

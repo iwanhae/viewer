@@ -21,6 +21,7 @@ type AlbumSearchItem struct {
 	OriginalFilename string `json:"originalFilename"`
 	PhotoCount       int    `json:"photoCount"`
 	CreatedAt        string `json:"createdAt"`
+	SizeBytes        int64  `json:"sizeBytes"`
 }
 
 type FeedItem struct {

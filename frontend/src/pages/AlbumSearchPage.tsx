@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { fetchAlbumSearch, type AlbumSearchItem } from '../api/client'
+import { formatBytes } from '../utils/format'
 
 const SEARCH_LIMIT = 20
 const SEARCH_DEBOUNCE_MS = 200
@@ -134,7 +135,7 @@ export function AlbumSearchPage() {
                 <p className="album-search-name">{item.originalFilename || '(untitled album)'}</p>
               </div>
               <p className="album-search-item-meta">
-                {item.photoCount} photos  {formatCreatedAt(item.createdAt)}
+                {item.photoCount} photos  {formatBytes(item.sizeBytes)}  {formatCreatedAt(item.createdAt)}
               </p>
               <p className="album-search-item-meta album-search-item-meta-id">ID: {item.albumId}</p>
             </button>

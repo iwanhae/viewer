@@ -203,7 +203,7 @@ func (s *Server) getImage(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", "invalid image index")
 		return
 	}
-	result, err := s.images.GetImage(r.Context(), albumID, idx)
+	stream, err := s.images.OpenImage(r.Context(), albumID, idx)
 	if err != nil {
 		status := http.StatusInternalServerError
 		code := "INTERNAL"
@@ -217,12 +217,19 @@ func (s *Server) getImage(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, status, code, err.Error())
 		return
 	}
+	defer stream.Close()
 
-	w.Header().Set("Content-Type", result.ContentType)
-	w.Header().Set("Cache-Control", "public, max-age=86400")
-	w.WriteHeader(http.StatusOK)
-	if _, err := w.Write(result.Bytes); err != nil {
-		log.Printf("write image response failed: %v", err)
+	// An album id plus a photo index is immutable, so the content hash of the
+	// blob is a stable validator for the response.
+	w.Header().Set("Content-Type", stream.ContentType)
+	w.Header().Set("Cache-Control", "public, max-age=86400, immutable")
+	w.Header().Set("ETag", `"`+stream.Hash+`"`)
+	// A zero modtime keeps ServeContent from emitting a Last-Modified header;
+	// it still negotiates Content-Length, Range and If-None-Match.
+	recorder := &writeErrorRecorder{ResponseWriter: w}
+	http.ServeContent(recorder, r, "", time.Time{}, stream.Content)
+	if recorder.err != nil {
+		log.Printf("write image response failed: %v", recorder.err)
 	}
 }
 
