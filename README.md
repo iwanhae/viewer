@@ -159,6 +159,7 @@ fails the build instead of surfacing as "serving without embeddings" later.
 ## Commands
 - `make build` compiles `bin/viewer`, rebuilding frontend assets when their sources are newer than the committed `internal/web/static` bundle (`make build FORCE=1` forces a frontend rebuild).
 - `make test` runs the Go unit/integration tests (`go test ./cmd/... ./internal/...`). It needs no credentials or environment file.
+- `make typecheck` runs the frontend TypeScript check without producing a bundle.
 - `make run` starts `bin/viewer` (loads `.env` if present, does not rebuild binaries). Set `STATE_DIR` to a writable directory: the container default `/var/lib/viewer` is not writable for a local user.
 - `make clean` removes build outputs and dependency caches. The viewer itself keeps no caches: images stream from S3 and staged zips live in the OS temp directory.
 
@@ -217,7 +218,12 @@ difference below `1e-4`, cosine above `0.9995`). The test is skipped unless
 - Panics are logged with stack traces before the 500 response is returned.
 
 ## Known gaps
-- The wall serves original-resolution images. There is no thumbnail or resizing support, and `/api/image/{albumId}/{index}` ignores every query parameter and returns the original bytes. This is deliberate for now, but a wall of many large photos moves a lot of bytes.
-- There is no frontend typecheck gate: `vite build` (and therefore `make build` and the Docker build) does not run `tsc`. `npx tsc --noEmit` currently reports three pre-existing errors — two in `UploadPage.tsx` around `onRetryFailedUploads` (a widened `status: string`) and one in `ViewerPage.tsx` where `album` is possibly null.
-- The upload scan adopts zips but never advertises itself, so a drop zone is only discoverable from the docs. It also adopts a zip mid-library the moment it appears, with no way to park one aside.
+- The wall still serves original-resolution images. Scaled variants exist on the image endpoint for the places that need them — `GET /api/image/{albumId}/{index}?w=<320|640|1024>` resamples the blob to that width as a JPEG (an original already no wider than the request passes through untouched, and the scaled width joins the blob hash in the ETag) — but the wall does not use it yet, so a wall of many large photos still moves a lot of bytes.
+- `GET /api/albums/search` matches the query anywhere in the lowercased original filename (not just as a prefix) and each result carries a `cover` — the photo at index 0 with its dimensions — so the Find Albums page can render cover cards at `w=640` without a second request per album.
+- The upload scan adopts zips but never advertises itself: files dropped into the bucket from outside appear in the library without ever passing through the upload page. It also adopts a zip mid-library the moment it appears, with no way to park one aside.
 - Losing the catalog is still losing the albums: the scan can re-register only the zips still under `uploads/`, and the pipeline deletes them as it extracts. Mount the `STATE_DIR` volume.
+
+## Frontend
+- The bundle ships its own Space Grotesk (via fontsource, no CDN) over a design-token layer in `src/styles/tokens.css`; base primitives (focus ring, progress, skeleton, reduced-motion guards) live in `src/styles/base.css`, and the Find Albums and Upload pages own their styles next to their components.
+- `npm --prefix frontend run typecheck` runs `tsc --noEmit`; it gates `npm run build`, `make build` and the Docker build, so a type error fails the build instead of shipping.
+- Every reload revalidates `index.html` (`Cache-Control: no-cache`); the hashed files under `/assets/` are served `immutable`, so only a redeploy changes what the browser keeps.
