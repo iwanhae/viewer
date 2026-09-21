@@ -254,7 +254,7 @@ func TestEmbeddingCountsAndPendingListing(t *testing.T) {
 	}
 }
 
-func TestSearchAlbumsByPrefixOnlyMatchesReadyAlbums(t *testing.T) {
+func TestSearchAlbumsByNameMatchesSubstringsAndOnlyReady(t *testing.T) {
 	store := openTestStore(t)
 	ctx := context.Background()
 
@@ -274,20 +274,30 @@ func TestSearchAlbumsByPrefixOnlyMatchesReadyAlbums(t *testing.T) {
 		}
 	}
 
-	got, err := store.SearchAlbumsByNamePrefix(ctx, "  HoLiDaY ", 10)
+	// Prefix queries still work: they are just substrings at position one.
+	got, err := store.SearchAlbumsByName(ctx, "  HoLiDaY ", 10)
 	if err != nil {
 		t.Fatalf("search: %v", err)
 	}
 	if len(got) != 2 {
 		t.Fatalf("expected 2 ready matches, got %d (%+v)", len(got), got)
 	}
-	for _, album := range got {
-		if album.ID == "pending" {
+	for _, result := range got {
+		if result.Album.ID == "pending" {
 			t.Fatalf("pending album should not be searchable")
 		}
 	}
 
-	limited, err := store.SearchAlbumsByNamePrefix(ctx, "", 1)
+	// Mid-string queries must match too, not just prefixes.
+	midString, err := store.SearchAlbumsByName(ctx, "liday", 10)
+	if err != nil {
+		t.Fatalf("search mid-string: %v", err)
+	}
+	if len(midString) != 2 {
+		t.Fatalf("expected mid-string query to match both holiday albums, got %d (%+v)", len(midString), midString)
+	}
+
+	limited, err := store.SearchAlbumsByName(ctx, "", 1)
 	if err != nil {
 		t.Fatalf("search: %v", err)
 	}
@@ -302,20 +312,57 @@ func TestSearchAlbumsByPrefixOnlyMatchesReadyAlbums(t *testing.T) {
 	if err := store.CreateAlbum(ctx, Album{ID: "plain", OriginalFilename: "1000.zip", Status: AlbumStatusReady}); err != nil {
 		t.Fatalf("create plain album: %v", err)
 	}
-	wildcard, err := store.SearchAlbumsByNamePrefix(ctx, "100%", 10)
+	wildcard, err := store.SearchAlbumsByName(ctx, "100%", 10)
 	if err != nil {
 		t.Fatalf("search wildcard: %v", err)
 	}
-	if len(wildcard) != 1 || wildcard[0].ID != "wild" {
+	if len(wildcard) != 1 || wildcard[0].Album.ID != "wild" {
 		t.Fatalf("expected literal wildcard match, got %+v", wildcard)
 	}
 	// A wildcard in the middle must not act as "match anything".
-	noMatch, err := store.SearchAlbumsByNamePrefix(ctx, "1%0", 10)
+	noMatch, err := store.SearchAlbumsByName(ctx, "1%0", 10)
 	if err != nil {
 		t.Fatalf("search wildcard: %v", err)
 	}
 	if len(noMatch) != 0 {
 		t.Fatalf("expected '%%' to be literal, got %+v", noMatch)
+	}
+}
+
+func TestSearchAlbumsByNameAttachesCoverFromFirstPhoto(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+
+	seedReadyAlbum(t, store, "with-cover")
+	seedReadyAlbum(t, store, "without-photos")
+	if err := store.InsertPhoto(ctx, Photo{AlbumID: "with-cover", Index: 0, Name: "cover.png", Hash: "hash-cover", Width: 4, Height: 2, Ratio: 2}); err != nil {
+		t.Fatalf("insert cover photo: %v", err)
+	}
+	if err := store.InsertPhoto(ctx, Photo{AlbumID: "with-cover", Index: 1, Name: "second.png", Hash: "hash-second", Width: 3, Height: 3, Ratio: 1}); err != nil {
+		t.Fatalf("insert second photo: %v", err)
+	}
+
+	got, err := store.SearchAlbumsByName(ctx, "", 10)
+	if err != nil {
+		t.Fatalf("search: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("expected both albums, got %d (%+v)", len(got), got)
+	}
+	byID := make(map[string]AlbumSearchResult, len(got))
+	for _, result := range got {
+		byID[result.Album.ID] = result
+	}
+
+	cover := byID["with-cover"].Cover
+	if cover == nil {
+		t.Fatalf("expected cover from photo at index 0")
+	}
+	if cover.Index != 0 || cover.Width != 4 || cover.Height != 2 || cover.Ratio != 2 {
+		t.Fatalf("unexpected cover: %+v", cover)
+	}
+	if byID["without-photos"].Cover != nil {
+		t.Fatalf("expected no cover for an album without photos")
 	}
 }
 

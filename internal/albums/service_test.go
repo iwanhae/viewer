@@ -2,6 +2,7 @@ package albums
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"path/filepath"
 	"reflect"
@@ -374,7 +375,7 @@ func TestAllAlbumsOnlyReturnsReadyAlbums(t *testing.T) {
 	}
 }
 
-func TestSearchAlbumsByNamePrefixReturnsItems(t *testing.T) {
+func TestSearchAlbumsByNameReturnsItems(t *testing.T) {
 	svc, cat := newTestService(t, newFakeStore(), nil)
 	ctx := context.Background()
 	if err := cat.CreateAlbum(ctx, catalog.Album{
@@ -383,8 +384,13 @@ func TestSearchAlbumsByNamePrefixReturnsItems(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("create album: %v", err)
 	}
+	if err := cat.InsertPhoto(ctx, catalog.Photo{
+		AlbumID: "album-a", Index: 0, Name: "a.png", Hash: "hash-a", Width: 4, Height: 2, Ratio: 2,
+	}); err != nil {
+		t.Fatalf("insert photo: %v", err)
+	}
 
-	got, err := svc.SearchAlbumsByNamePrefix(ctx, "  HoLiDaY ", 10)
+	got, err := svc.SearchAlbumsByName(ctx, "  HoLiDaY ", 10)
 	if err != nil {
 		t.Fatalf("search: %v", err)
 	}
@@ -393,6 +399,16 @@ func TestSearchAlbumsByNamePrefixReturnsItems(t *testing.T) {
 	}
 	if got[0].SizeBytes != 2048 {
 		t.Fatalf("size bytes=%d want=2048", got[0].SizeBytes)
+	}
+	if got[0].Cover == nil || got[0].Cover.I != 0 || got[0].Cover.W != 4 || got[0].Cover.H != 2 || got[0].Cover.Ratio != 2 {
+		t.Fatalf("unexpected cover: %+v", got[0].Cover)
+	}
+	encoded, err := json.Marshal(got[0].Cover)
+	if err != nil {
+		t.Fatalf("marshal cover: %v", err)
+	}
+	if string(encoded) != `{"i":0,"w":4,"h":2,"ratio":2}` {
+		t.Fatalf("cover json=%s", encoded)
 	}
 }
 
@@ -511,7 +527,7 @@ func TestServiceWithNilCatalogDegradesGracefully(t *testing.T) {
 	if _, err := svc.GetAlbum(context.Background(), "album-a"); !errors.Is(err, ErrAlbumNotFound) {
 		t.Fatalf("expected ErrAlbumNotFound, got %v", err)
 	}
-	if _, err := svc.SearchAlbumsByNamePrefix(context.Background(), "", 10); err != nil {
+	if _, err := svc.SearchAlbumsByName(context.Background(), "", 10); err != nil {
 		t.Fatalf("expected empty search, got %v", err)
 	}
 	if _, err := svc.GetFinalizeStatus(context.Background(), "album-a"); !errors.Is(err, ErrAlbumNotFound) {

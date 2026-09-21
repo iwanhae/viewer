@@ -270,24 +270,34 @@ func (s *Service) GetAlbum(ctx context.Context, albumID string) (*models.AlbumIn
 	return albumIndexFromRows(album, photos), nil
 }
 
-// SearchAlbumsByNamePrefix matches ready albums by filename prefix.
-func (s *Service) SearchAlbumsByNamePrefix(ctx context.Context, q string, limit int) ([]models.AlbumSearchItem, error) {
+// SearchAlbumsByName matches ready albums whose filename contains the query
+// (case-insensitive substring), each with its cover photo when it has one.
+func (s *Service) SearchAlbumsByName(ctx context.Context, q string, limit int) ([]models.AlbumSearchItem, error) {
 	if s == nil || s.catalog == nil {
 		return []models.AlbumSearchItem{}, nil
 	}
-	albumsList, err := s.catalog.SearchAlbumsByNamePrefix(ctx, q, limit)
+	results, err := s.catalog.SearchAlbumsByName(ctx, q, limit)
 	if err != nil {
 		return nil, err
 	}
-	items := make([]models.AlbumSearchItem, 0, len(albumsList))
-	for _, album := range albumsList {
-		items = append(items, models.AlbumSearchItem{
-			AlbumID:          album.ID,
-			OriginalFilename: album.OriginalFilename,
-			PhotoCount:       album.PhotoCount,
-			CreatedAt:        album.CreatedAt,
-			SizeBytes:        album.SizeBytes,
-		})
+	items := make([]models.AlbumSearchItem, 0, len(results))
+	for _, res := range results {
+		item := models.AlbumSearchItem{
+			AlbumID:          res.Album.ID,
+			OriginalFilename: res.Album.OriginalFilename,
+			PhotoCount:       res.Album.PhotoCount,
+			CreatedAt:        res.Album.CreatedAt,
+			SizeBytes:        res.Album.SizeBytes,
+		}
+		if res.Cover != nil {
+			item.Cover = &models.AlbumCover{
+				I:     res.Cover.Index,
+				W:     res.Cover.Width,
+				H:     res.Cover.Height,
+				Ratio: res.Cover.Ratio,
+			}
+		}
+		items = append(items, item)
 	}
 	return items, nil
 }

@@ -16,12 +16,22 @@ type AlbumIndex struct {
 	Photos           []PhotoMeta `json:"photos"`
 }
 
+// AlbumCover points at the image that represents an album: the photo at
+// index 0. Ratio is width/height, denormalized from the photo row.
+type AlbumCover struct {
+	I     int     `json:"i"`
+	W     int     `json:"w"`
+	H     int     `json:"h"`
+	Ratio float64 `json:"ratio"`
+}
+
 type AlbumSearchItem struct {
-	AlbumID          string `json:"albumId"`
-	OriginalFilename string `json:"originalFilename"`
-	PhotoCount       int    `json:"photoCount"`
-	CreatedAt        string `json:"createdAt"`
-	SizeBytes        int64  `json:"sizeBytes"`
+	AlbumID          string      `json:"albumId"`
+	OriginalFilename string      `json:"originalFilename"`
+	PhotoCount       int         `json:"photoCount"`
+	CreatedAt        string      `json:"createdAt"`
+	SizeBytes        int64       `json:"sizeBytes"`
+	Cover            *AlbumCover `json:"cover,omitempty"`
 }
 
 type FeedItem struct {

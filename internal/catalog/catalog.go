@@ -308,25 +308,69 @@ func (s *Store) ListAlbumsByStatus(ctx context.Context, status AlbumStatus) ([]A
 	return s.queryAlbums(ctx, `SELECT id, original_filename, size_bytes, status, source_key, photo_count, error, created_at, updated_at FROM albums WHERE status = ? ORDER BY id`, string(status))
 }
 
-// SearchAlbumsByNamePrefix returns ready albums whose original filename starts
-// with prefix (case-insensitive), newest first.
-func (s *Store) SearchAlbumsByNamePrefix(ctx context.Context, prefix string, limit int) ([]Album, error) {
+// AlbumSearchResult is a ready album matched by name search, joined with its
+// cover photo (the image at index 0) when it has one.
+type AlbumSearchResult struct {
+	Album Album
+	Cover *Photo
+}
+
+// SearchAlbumsByName returns ready albums whose original filename contains the
+// query as a case-insensitive substring, newest first.
+func (s *Store) SearchAlbumsByName(ctx context.Context, q string, limit int) ([]AlbumSearchResult, error) {
 	if limit <= 0 {
 		limit = 20
 	}
-	normalized := strings.ToLower(strings.TrimSpace(prefix))
+	normalized := strings.ToLower(strings.TrimSpace(q))
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, original_filename, size_bytes, status, source_key, photo_count, error, created_at, updated_at
-		FROM albums
-		WHERE status = ?
-		  AND (? = '' OR substr(lower(original_filename), 1, length(?)) = ?)
-		ORDER BY created_at DESC, original_filename ASC, id ASC
-		LIMIT ?`, string(AlbumStatusReady), normalized, normalized, normalized, limit)
+		SELECT a.id, a.original_filename, a.size_bytes, a.status, a.source_key,
+		       a.photo_count, a.error, a.created_at, a.updated_at,
+		       p.idx, p.width, p.height, p.ratio
+		FROM albums a
+		LEFT JOIN photos p ON p.album_id = a.id AND p.idx = 0
+		WHERE a.status = ?
+		  AND (? = '' OR instr(lower(a.original_filename), ?) > 0)
+		ORDER BY a.created_at DESC, a.original_filename ASC, a.id ASC
+		LIMIT ?`, string(AlbumStatusReady), normalized, normalized, limit)
 	if err != nil {
 		return nil, fmt.Errorf("search albums: %w", err)
 	}
 	defer rows.Close()
-	return scanAlbums(rows)
+
+	results := make([]AlbumSearchResult, 0)
+	for rows.Next() {
+		var (
+			album       Album
+			status      string
+			coverIdx    sql.NullInt64
+			coverWidth  sql.NullInt64
+			coverHeight sql.NullInt64
+			coverRatio  sql.NullFloat64
+		)
+		if err := rows.Scan(
+			&album.ID, &album.OriginalFilename, &album.SizeBytes, &status, &album.SourceKey,
+			&album.PhotoCount, &album.Error, &album.CreatedAt, &album.UpdatedAt,
+			&coverIdx, &coverWidth, &coverHeight, &coverRatio,
+		); err != nil {
+			return nil, fmt.Errorf("scan album search row: %w", err)
+		}
+		album.Status = AlbumStatus(status)
+		result := AlbumSearchResult{Album: album}
+		if coverIdx.Valid {
+			result.Cover = &Photo{
+				AlbumID: album.ID,
+				Index:   int(coverIdx.Int64),
+				Width:   int(coverWidth.Int64),
+				Height:  int(coverHeight.Int64),
+				Ratio:   coverRatio.Float64,
+			}
+		}
+		results = append(results, result)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate album search rows: %w", err)
+	}
+	return results, nil
 }
 
 func (s *Store) queryAlbums(ctx context.Context, query string, args ...any) ([]Album, error) {

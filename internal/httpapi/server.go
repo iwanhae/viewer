@@ -187,7 +187,7 @@ func (s *Server) searchAlbums(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	results, err := s.albums.SearchAlbumsByNamePrefix(r.Context(), r.URL.Query().Get("q"), limit)
+	results, err := s.albums.SearchAlbumsByName(r.Context(), r.URL.Query().Get("q"), limit)
 	if err != nil {
 		writeError(w, r, http.StatusInternalServerError, "INTERNAL", err.Error())
 		return
