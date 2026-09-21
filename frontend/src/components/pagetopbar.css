@@ -1,0 +1,30 @@
+.page-topbar {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+  gap: 14px;
+}
+
+.page-topbar-home {
+  color: var(--ink-2);
+  font-size: var(--text-md);
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.page-topbar-home:hover {
+  color: var(--ink);
+}
+
+.page-topbar-title {
+  margin: 0;
+  font-size: var(--text-title);
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  line-height: 1.2;
+}
+
+.page-topbar-actions {
+  display: flex;
+  gap: 8px;
+}

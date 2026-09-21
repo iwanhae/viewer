@@ -33,12 +33,21 @@ export type AlbumIndex = {
 	photos: PhotoMeta[]
 }
 
+// AlbumCover points at the photo that represents an album: index 0.
+export type AlbumCover = {
+  i: number
+  w: number
+  h: number
+  ratio: number
+}
+
 export type AlbumSearchItem = {
   albumId: string
   originalFilename: string
   photoCount: number
   createdAt: string
   sizeBytes: number
+  cover?: AlbumCover
 }
 
 export type AlbumSearchResponse = {

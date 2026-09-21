@@ -13,6 +13,7 @@ import type {
 } from './types'
 
 export type {
+  AlbumCover,
   AlbumIndex,
   AlbumSearchItem,
   AlbumSearchResponse,
@@ -26,6 +27,14 @@ export type {
   RecommendationItem,
   RecommendationResponse,
 } from './types'
+
+// albumImageUrl builds the URL for one photo of an album. An optional width
+// from the server's ladder (320/640/1024) asks for a scaled JPEG variant;
+// without it the endpoint serves the untouched original.
+export function albumImageUrl(albumId: string, index: number, width?: number): string {
+  const base = `/api/image/${albumId}/${index}`
+  return width === undefined ? base : `${base}?w=${width}`
+}
 
 export function getCachedAlbum(albumId: string): AlbumIndex | null {
   return getCachedAlbumValue(albumId)

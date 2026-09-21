@@ -1,0 +1,212 @@
+/* Find Albums: the page sits directly on the paper ground — the results are
+   the visual, so there is no card shell around them. */
+
+.album-search-page {
+  min-height: 100vh;
+  padding: max(16px, env(safe-area-inset-top)) 20px max(48px, env(safe-area-inset-bottom));
+}
+
+.album-search-shell {
+  width: min(1120px, 100%);
+  margin: 0 auto;
+  display: grid;
+  gap: 18px;
+}
+
+/* The search field is the page's instrument: oversized, quiet, with its focus
+   ring carried by the wrapper so the ring hugs the whole field. */
+.search-field {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 54px;
+  padding: 0 16px;
+  background: var(--surface);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-small);
+  transition: border-color var(--speed-fast) var(--ease), box-shadow var(--speed-fast) var(--ease);
+}
+
+.search-field:focus-within {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+.search-field-icon {
+  width: 18px;
+  height: 18px;
+  color: var(--ink-3);
+  flex: 0 0 auto;
+}
+
+.search-field input {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  font: inherit;
+  font-size: var(--text-xl);
+  color: var(--ink);
+}
+
+.search-field input:focus-visible {
+  outline: none;
+}
+
+.search-field input::placeholder {
+  color: var(--ink-3);
+}
+
+/* type="search" ships a native clear button in some engines; the styled one
+   replaces it everywhere. */
+.search-field input::-webkit-search-cancel-button,
+.search-field input::-webkit-search-decoration {
+  -webkit-appearance: none;
+  appearance: none;
+}
+
+.search-clear {
+  flex: 0 0 auto;
+  width: 28px;
+  height: 28px;
+  border: 0;
+  border-radius: var(--radius-pill);
+  padding: 0;
+  background: var(--line);
+  color: var(--ink-2);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+}
+
+.search-clear:hover {
+  color: var(--ink);
+}
+
+.search-clear svg {
+  width: 12px;
+  height: 12px;
+}
+
+.album-search-toolbar {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.album-search-section {
+  margin: 0;
+  font-size: var(--text-sm);
+  font-weight: 600;
+  color: var(--ink-2);
+}
+
+.album-search-count {
+  margin: 0;
+  font-size: var(--text-sm);
+  color: var(--ink-3);
+}
+
+.album-card-grid {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 14px;
+}
+
+.album-card {
+  display: grid;
+  gap: 6px;
+  padding: 10px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-card);
+  text-decoration: none;
+  color: inherit;
+}
+
+.album-card-cover {
+  aspect-ratio: 4 / 3;
+  border-radius: var(--radius-small);
+  overflow: hidden;
+  background: var(--surface-2);
+}
+
+/* A uniform crop box keeps the grid calm and never shifts while covers load. */
+.album-card-cover img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+  transition: transform var(--speed-slow) var(--ease);
+}
+
+.album-card-name {
+  margin: 2px 0 0;
+  font-size: var(--text-md);
+  font-weight: 600;
+  line-height: 1.35;
+  word-break: break-word;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.album-card-meta {
+  margin: 0;
+  font-size: var(--text-sm);
+  color: var(--ink-2);
+}
+
+.album-card.is-skeleton {
+  pointer-events: none;
+}
+
+.skeleton-line {
+  height: 12px;
+  border-radius: 6px;
+}
+
+.skeleton-line.is-short {
+  width: 60%;
+}
+
+.album-search-note-block {
+  display: grid;
+  justify-items: start;
+  gap: 12px;
+  padding: 24px 0;
+}
+
+.album-search-note {
+  margin: 0;
+  font-size: var(--text-md);
+  color: var(--ink-2);
+}
+
+.album-search-note-error {
+  color: var(--err);
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .album-card:hover {
+    border-color: var(--line-strong);
+    box-shadow: var(--shadow-card);
+  }
+
+  .album-card:hover .album-card-cover img {
+    transform: scale(1.02);
+  }
+}
+
+@media (max-width: 560px) {
+  .album-card-grid {
+    grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  }
+}

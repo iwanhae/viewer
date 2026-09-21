@@ -1,146 +1,202 @@
-import { useEffect, useMemo, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
-import { fetchAlbumSearch, type AlbumSearchItem } from '../api/client'
+import { useEffect, useRef, useState } from 'react'
+import { Link } from 'react-router-dom'
+import { PageTopBar } from '../components/PageTopBar'
+import { albumImageUrl, type AlbumSearchItem } from '../api/client'
+import { useAlbumSearch } from '../hooks/useAlbumSearch'
 import { formatBytes } from '../utils/format'
+import './albumSearch.css'
 
-const SEARCH_LIMIT = 20
-const SEARCH_DEBOUNCE_MS = 200
+const SEARCH_LIMIT = 40
+const SKELETON_COUNT = 12
+
+const dateFormatter = new Intl.DateTimeFormat(undefined, {
+  year: 'numeric',
+  month: 'short',
+  day: 'numeric',
+})
 
 function formatCreatedAt(value: string): string {
   const parsed = new Date(value)
   if (Number.isNaN(parsed.getTime())) {
     return value
   }
-  return parsed.toLocaleString()
+  return dateFormatter.format(parsed)
+}
+
+function SearchIcon() {
+  return (
+    <svg className="search-field-icon" viewBox="0 0 20 20" aria-hidden="true">
+      <circle cx="8.5" cy="8.5" r="5.5" fill="none" stroke="currentColor" strokeWidth="1.6" />
+      <path d="m13 13 4.2 4.2" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+    </svg>
+  )
+}
+
+function AlbumCard({ item }: { item: AlbumSearchItem }) {
+  const name = item.originalFilename || '(untitled album)'
+  return (
+    <li>
+      <Link className="album-card" to={`/album/${item.albumId}`} data-testid="album-search-item">
+        <div className={`album-card-cover${item.cover ? '' : ' is-empty'}`}>
+          {item.cover && (
+            <img
+              src={albumImageUrl(item.albumId, item.cover.i, 640)}
+              alt=""
+              width={item.cover.w}
+              height={item.cover.h}
+              loading="lazy"
+              decoding="async"
+            />
+          )}
+        </div>
+        <p className="album-card-name">{name}</p>
+        <p className="album-card-meta tnum">
+          {item.photoCount} photos · {formatBytes(item.sizeBytes)} · {formatCreatedAt(item.createdAt)}
+        </p>
+      </Link>
+    </li>
+  )
+}
+
+function SkeletonGrid() {
+  return (
+    <ul className="album-card-grid" aria-hidden="true" data-testid="album-search-loading">
+      {Array.from({ length: SKELETON_COUNT }, (_, index) => (
+        <li key={index}>
+          <div className="album-card is-skeleton">
+            <div className="album-card-cover skeleton" />
+            <div className="skeleton-line skeleton" />
+            <div className="skeleton-line is-short skeleton" />
+          </div>
+        </li>
+      ))}
+    </ul>
+  )
 }
 
 export function AlbumSearchPage() {
   const [query, setQuery] = useState('')
-  const [debouncedQuery, setDebouncedQuery] = useState('')
-  const [items, setItems] = useState<AlbumSearchItem[]>([])
-  const [loading, setLoading] = useState(false)
-  const [error, setError] = useState<string | null>(null)
+  const inputRef = useRef<HTMLInputElement | null>(null)
+  const { items, status, error, refresh } = useAlbumSearch(query, SEARCH_LIMIT)
 
-  const navigate = useNavigate()
-
+  // "/" focuses the search field from anywhere on the page, unless the
+  // keystroke is already going into some text input.
   useEffect(() => {
-    const timeout = window.setTimeout(() => {
-      setDebouncedQuery(query)
-    }, SEARCH_DEBOUNCE_MS)
-    return () => window.clearTimeout(timeout)
-  }, [query])
-
-  useEffect(() => {
-    const abortController = new AbortController()
-    setLoading(true)
-    setError(null)
-
-    void (async () => {
-      try {
-        const response = await fetchAlbumSearch({
-          q: debouncedQuery,
-          limit: SEARCH_LIMIT,
-          signal: abortController.signal,
-        })
-        setItems(Array.isArray(response.albums) ? response.albums : [])
-      } catch (err) {
-        if (abortController.signal.aborted) return
-        setError((err as Error).message)
-      } finally {
-        if (!abortController.signal.aborted) {
-          setLoading(false)
-        }
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== '/') return
+      const target = event.target as HTMLElement | null
+      if (
+        target &&
+        (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable)
+      ) {
+        return
       }
-    })()
-
-    return () => {
-      abortController.abort()
+      event.preventDefault()
+      inputRef.current?.focus()
     }
-  }, [debouncedQuery])
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [])
 
-  const hasResults = items.length > 0
-  const hasQuery = debouncedQuery.trim().length > 0
-
-  const suggestions = useMemo(() => {
-    const seen = new Set<string>()
-    const values: string[] = []
-    for (const item of items) {
-      if (!item.originalFilename || seen.has(item.originalFilename)) continue
-      seen.add(item.originalFilename)
-      values.push(item.originalFilename)
-      if (values.length >= 10) break
+  const onInputKeyDown = (event: React.KeyboardEvent<HTMLInputElement>) => {
+    if (event.key === 'Escape' && query.length > 0) {
+      setQuery('')
     }
-    return values
-  }, [items])
-
-  const onBack = () => {
-    if (typeof window !== 'undefined' && window.history.length > 1) {
-      navigate(-1)
-      return
-    }
-    navigate('/')
   }
+
+  const hasQuery = query.trim().length > 0
+  const isSearching = status === 'loading'
+  const isTruncated = items.length >= SEARCH_LIMIT
+  const sectionLabel = hasQuery ? 'Results' : 'Recent albums'
 
   return (
     <div className="album-search-page" data-testid="album-search-page">
       <div className="album-search-shell">
-        <header className="album-search-header">
-          <button className="photo-nav-button" onClick={onBack} data-testid="album-search-back">
-            Back
-          </button>
-          <h1 className="album-search-title">Find albums</h1>
-        </header>
-
-        <label className="album-search-label" htmlFor="album-search-input">
-          Album name
-        </label>
-        <p className="album-search-note">Only indexed albums appear here.</p>
-        <input
-          id="album-search-input"
-          className="album-search-input"
-          list="album-search-suggestions"
-          type="search"
-          value={query}
-          onChange={(event) => setQuery(event.target.value)}
-          placeholder="Type album name prefix..."
-          autoComplete="off"
-          spellCheck={false}
-          data-testid="album-search-input"
+        <PageTopBar
+          title="Find albums"
+          actions={
+            <Link className="photo-nav-button" to="/upload">
+              Upload
+            </Link>
+          }
         />
-        <datalist id="album-search-suggestions">
-          {suggestions.map((value) => (
-            <option key={value} value={value} />
-          ))}
-        </datalist>
 
-        {loading && <p className="album-search-note">Searching albums...</p>}
-        {!loading && error && <p className="album-search-note album-search-note-error">{error}</p>}
-        {!loading && !error && !hasResults && hasQuery && (
-          <p className="album-search-note">No albums match that prefix.</p>
-        )}
-        {!loading && !error && !hasResults && !hasQuery && (
-          <p className="album-search-note">Type a prefix or pick a recent album below.</p>
-        )}
-
-        <div className="album-search-list" data-testid="album-search-list">
-          {items.map((item) => (
+        <div className="search-field">
+          <SearchIcon />
+          <input
+            ref={inputRef}
+            type="search"
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+            onKeyDown={onInputKeyDown}
+            placeholder="Search album names…"
+            aria-label="Search albums by name"
+            autoComplete="off"
+            spellCheck={false}
+            data-testid="album-search-input"
+          />
+          {query.length > 0 && (
             <button
-              key={item.albumId}
-              className="album-search-item"
               type="button"
-              onClick={() => navigate(`/album/${item.albumId}`)}
-              data-testid="album-search-item"
+              className="search-clear"
+              onClick={() => setQuery('')}
+              aria-label="Clear search"
+              data-testid="album-search-clear"
             >
-              <div className="album-search-item-head">
-                <p className="album-search-name">{item.originalFilename || '(untitled album)'}</p>
-              </div>
-              <p className="album-search-item-meta">
-                {item.photoCount} photos  {formatBytes(item.sizeBytes)}  {formatCreatedAt(item.createdAt)}
-              </p>
-              <p className="album-search-item-meta album-search-item-meta-id">ID: {item.albumId}</p>
+              <svg viewBox="0 0 14 14" aria-hidden="true">
+                <path d="m3 3 8 8m0-8-8 8" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+              </svg>
             </button>
-          ))}
+          )}
         </div>
+
+        <div className="album-search-toolbar">
+          <p className="album-search-section">{sectionLabel}</p>
+          <p className="album-search-count tnum" role="status">
+            {isSearching
+              ? 'Searching…'
+              : status === 'ready'
+                ? `${items.length} albums${isTruncated ? ' · most recent matches' : ''}`
+                : ''}
+          </p>
+        </div>
+
+        {status === 'error' && (
+          <div className="album-search-note-block" data-testid="album-search-error">
+            <p className="album-search-note album-search-note-error">{error}</p>
+            <button type="button" className="photo-nav-button" onClick={refresh}>
+              Try again
+            </button>
+          </div>
+        )}
+
+        {status === 'ready' && items.length === 0 && hasQuery && (
+          <div className="album-search-note-block" data-testid="album-search-empty">
+            <p className="album-search-note">No album name contains “{query.trim()}”.</p>
+            <button type="button" className="photo-nav-button" onClick={() => setQuery('')}>
+              Clear search
+            </button>
+          </div>
+        )}
+
+        {status === 'ready' && items.length === 0 && !hasQuery && (
+          <div className="album-search-note-block" data-testid="album-search-no-albums">
+            <p className="album-search-note">No albums yet. Upload a ZIP to start the archive.</p>
+            <Link className="photo-primary-action" to="/upload">
+              Upload
+            </Link>
+          </div>
+        )}
+
+        {isSearching && items.length === 0 && <SkeletonGrid />}
+
+        {items.length > 0 && (
+          <ul className="album-card-grid" data-testid="album-search-list">
+            {items.map((item) => (
+              <AlbumCard key={item.albumId} item={item} />
+            ))}
+          </ul>
+        )}
       </div>
     </div>
   )
