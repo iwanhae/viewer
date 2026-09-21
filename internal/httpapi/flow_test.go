@@ -74,13 +74,6 @@ func (m *memoryS3) HeadObject(_ context.Context, key string) (bool, int64, error
 	return true, int64(len(value)), nil
 }
 
-func (m *memoryS3) DeleteObject(_ context.Context, key string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	delete(m.data, key)
-	return nil
-}
-
 func (m *memoryS3) putCountFor(prefix string) int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -316,16 +309,17 @@ func TestUploadFinalizeServeFlow(t *testing.T) {
 		t.Fatalf("content type=%q want=image/png", contentType)
 	}
 
-	// The staged zip is deleted and only the two distinct image blobs remain
-	// under content-addressed keys.
+	// The two distinct image blobs are stored under content-addressed keys,
+	// and the staged zip stays until the backup finalizer deletes it after a
+	// drain.
 	if got := harness.s3.putCountFor("blobs/"); got != 2 {
 		t.Fatalf("blob puts=%d want=2", got)
 	}
 	harness.s3.mu.Lock()
 	staged := len(harness.s3.data)
 	harness.s3.mu.Unlock()
-	if staged != 2 {
-		t.Fatalf("expected only blobs to remain in storage, got %d objects", staged)
+	if staged != 3 {
+		t.Fatalf("expected the two blobs plus the staged zip in storage, got %d objects", staged)
 	}
 	if _, err := harness.catalog.GetAlbum(context.Background(), albumID); err != nil {
 		t.Fatalf("album should be in catalog: %v", err)

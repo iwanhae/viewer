@@ -61,14 +61,15 @@ func TestUploadDropZoneAdoptsZip(t *testing.T) {
 
 	album := waitForReadyAlbum(t, harness)
 
-	// The scan is repeatable: the pipeline deletes the zip once the album is
-	// extracted, so a second pass finds nothing and registers no second album.
+	// The scan is repeatable: the zip stays until the backup finalizer deletes
+	// it after a drain, so a second pass finds it but skips the album the
+	// extraction already finished.
 	again, err := ingest.Run(context.Background(), harness.s3, harness.albums)
 	if err != nil {
 		t.Fatalf("second ingest: %v", err)
 	}
-	if again != (ingest.Summary{}) {
-		t.Fatalf("second summary = %+v, want an empty scan", again)
+	if want := (ingest.Summary{Discovered: 1, Skipped: 1}); again != want {
+		t.Fatalf("second summary = %+v, want %+v", again, want)
 	}
 	ready, err := harness.catalog.ListAlbumsByStatus(context.Background(), catalog.AlbumStatusReady)
 	if err != nil {

@@ -3,6 +3,7 @@ package pipeline
 import (
 	"bytes"
 	"context"
+	"encoding/xml"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -11,11 +12,20 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
+	"viewer/internal/backup"
 	"viewer/internal/catalog"
 	cfgpkg "viewer/internal/config"
 	"viewer/internal/storage"
 )
+
+// s3DeleteRequest is the <Delete> body of a batch-delete call.
+type s3DeleteRequest struct {
+	Objects []struct {
+		Key string `xml:"Key"`
+	} `xml:"Object"`
+}
 
 // s3Stub is a minimal path-style object store: enough of the S3 API for the
 // pipeline to stage, download and delete a zip and to write image blobs. It
@@ -42,6 +52,19 @@ func (s *s3Stub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		s.objects[key] = body
 		w.Header().Set("ETag", `"stub"`)
+	case http.MethodPost:
+		// The only POST the store makes is a batch delete on the bucket root.
+		body, err := io.ReadAll(r.Body)
+		var batch s3DeleteRequest
+		if err != nil || xml.Unmarshal(body, &batch) != nil {
+			http.Error(w, "bad delete body", http.StatusBadRequest)
+			return
+		}
+		for _, obj := range batch.Objects {
+			delete(s.objects, obj.Key)
+		}
+		w.Header().Set("Content-Type", "application/xml")
+		_, _ = io.WriteString(w, `<?xml version="1.0" encoding="UTF-8"?><DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"/>`)
 	case http.MethodGet:
 		data, ok := s.objects[key]
 		if !ok {
@@ -90,10 +113,11 @@ func (s *s3Stub) has(key string) bool {
 	return ok
 }
 
-// TestPipelineStoresEveryObjectUnderKeyPrefix runs the real pipeline through the
-// real S3 store against a stub bucket. The callers only ever name logical keys,
-// so this pins the whole point of S3_PREFIX: every object the deployment writes,
-// and the staged zip it deletes, lives under the prefix.
+// TestPipelineStoresEveryObjectUnderKeyPrefix runs the real pipeline through
+// the real S3 store against a stub bucket, from extraction through the drain
+// finalize. The callers only ever name logical keys, so this pins the whole
+// point of S3_PREFIX: every object the deployment writes — the catalog backup
+// included — and every object it deletes lives under the prefix.
 func TestPipelineStoresEveryObjectUnderKeyPrefix(t *testing.T) {
 	const bucket = "test-bucket"
 
@@ -139,18 +163,36 @@ func TestPipelineStoresEveryObjectUnderKeyPrefix(t *testing.T) {
 		t.Fatalf("staged zip keys=%v want photos/%s", stub.keys(), sourceKey)
 	}
 
-	svc := NewService(cat, store, Options{TempDir: t.TempDir()})
-	if err := svc.ProcessAlbum(ctx, "album-a"); err != nil {
-		t.Fatalf("process album: %v", err)
+	// Drive the real wiring: the worker drains, OnIdle runs the finalizer, and
+	// only after the backup is durable is the staged zip deleted.
+	finalizer := backup.NewFinalizer(store, cat, t.TempDir())
+	svc := NewService(cat, store, Options{
+		TempDir: t.TempDir(),
+		OnIdle:  finalizer.Run,
+	})
+	svc.Start(ctx)
+	if err := svc.Enqueue("album-a"); err != nil {
+		t.Fatalf("enqueue album: %v", err)
 	}
 
-	for _, key := range []string{"photos/blobs/" + hashOf(imageA), "photos/blobs/" + hashOf(imageB)} {
+	// The batch delete is the finalize's last step, so waiting for the zip to
+	// go means everything before it — extraction, backup upload — has landed.
+	deadline := time.Now().Add(2 * time.Second)
+	for stub.has("photos/" + sourceKey) {
+		if time.Now().After(deadline) {
+			t.Fatalf("finalize never deleted the staged zip, keys=%v", stub.keys())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	for _, key := range []string{
+		"photos/blobs/" + hashOf(imageA),
+		"photos/blobs/" + hashOf(imageB),
+		"photos/" + backup.BackupObjectKey,
+	} {
 		if !stub.has(key) {
 			t.Errorf("keys=%v missing %s", stub.keys(), key)
 		}
-	}
-	if stub.has("photos/" + sourceKey) {
-		t.Errorf("staged zip should be deleted after extraction, keys=%v", stub.keys())
 	}
 	for _, key := range stub.keys() {
 		if !strings.HasPrefix(key, "photos/") {

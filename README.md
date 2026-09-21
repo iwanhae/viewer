@@ -25,15 +25,17 @@ content-addressed blob:
    - records the zip entry name, hash, width, height and ratio in SQLite,
    - computes an embedding and writes it to the blob row, unless that blob is
      already embedded.
-5. After a successful extraction the staged zip is deleted from S3. On failure
-   the zip is left in place and the album is marked `FAILED`, so
-   `POST /api/albums/<albumId>/finalize` can retry it.
+5. Once the worker has emptied its queue, the backup finalizer snapshots the
+   SQLite catalog to S3 (`backups/viewer.db`) and only then batch-deletes the
+   staged zips that snapshot covers — a failed extraction's zip included, since
+   the failure is now recorded in the catalog.
 
 All metadata lives in the local SQLite catalog at `$STATE_DIR/viewer.db`
-(default `/var/lib/viewer`); S3 only holds the staged zip (briefly) and the
-deduplicated image blobs. The `albums/<id>/index.json` objects of previous
-versions are no longer written or read. Object keys below are the logical ones:
-set `S3_PREFIX` to nest all of them under a single prefix in the bucket.
+(default `/var/lib/viewer`); S3 holds the staged zips (until the next drain),
+the deduplicated image blobs, and the catalog backup. The
+`albums/<id>/index.json` objects of previous versions are no longer written or
+read. Object keys below are the logical ones: set `S3_PREFIX` to nest all of
+them under a single prefix in the bucket.
 
 Image requests are resolved as `(albumId, index)` -> photo row -> blob hash ->
 `blobs/<hash>`. The blob is fetched from S3 per request and served through
@@ -46,8 +48,14 @@ the browser answers without reaching the server.
 it, registers an album for every zip nothing owns yet, and queues an album whose
 zip is still waiting. A zip copied in with `mc`/`aws s3 cp` is therefore picked
 up without a restart, and any zip left behind by an interrupted extraction is
-retried. The scan never copies, moves or deletes: the pipeline removes a staged
-zip itself once the album is extracted.
+retried. The scan never copies, moves or deletes: the backup finalizer empties
+the prefix in batches once a drain has backed the catalog up.
+
+The catalog itself is backed up to the bucket, and the bucket restores the
+catalog: at startup the viewer compares `backups/viewer.db`'s timestamp with
+`viewer.db.backup-stamp` in `STATE_DIR` and replaces the local database when
+the bucket is ahead — including when the local file is missing entirely, which
+is what makes a wiped state volume recoverable from the bucket alone.
 
 ## Configuration
 
@@ -71,12 +79,14 @@ wildcard DNS. An endpoint that itself carries a path prefix keeps it:
 requires the subdomain form, which then needs wildcard DNS for the endpoint. The
 signing region is fixed at `us-east-1` because these stores ignore it.
 
-`STATE_DIR` holds one thing: `viewer.db`, the SQLite catalog. It is the only
-state that cannot be rebuilt — the album-to-photo mapping exists nowhere else,
-and staged zips are deleted after extraction, so albums cannot be reconstructed
-from the blobs in the bucket. The image Dockerfile declares
-`VOLUME /var/lib/viewer`; mount a host volume there (or point `STATE_DIR` at your
-own mount) to keep albums across container replacements.
+`STATE_DIR` holds `viewer.db`, the SQLite catalog, plus the backup stamp that
+records which bucket backup it reflects. The catalog is the only state that
+cannot be rebuilt from the blobs — the album-to-photo mapping exists nowhere
+else — which is exactly why the viewer keeps a snapshot of it at
+`backups/viewer.db` in the bucket: losing the volume costs one restart, not the
+library. The image Dockerfile declares `VOLUME /var/lib/viewer`; mount a host
+volume there (or point `STATE_DIR` at your own mount) to keep albums across
+container replacements.
 
 The viewer keeps no local caches: images stream straight from S3, and the only
 thing it writes outside the volume is the staged zip being unpacked, which goes
@@ -165,7 +175,7 @@ fails the build instead of surfacing as "serving without embeddings" later.
 
 ## Upload drop zone
 - Whatever sits under `uploads/` is ingested: at startup and every minute the viewer lists the prefix, and for each zip it finds, it either queues the album that owns it again (its status is `QUEUED` or `PROCESSING`, so no worker holds it) or registers a new album and queues that. `albumId` is derived from the object's ETag and size, so dropping identical bytes twice resolves to one album.
-- Nothing is copied, moved or deleted by the scan. The pipeline removes a staged zip itself once the album is extracted, so a `SUCCEEDED` album with a leftover zip is skipped, and a `FAILED` one stays until `POST /api/albums/<albumId>/finalize` retries it on purpose.
+- Nothing is copied, moved or deleted by the scan. A finished album's zip is skipped and stays until the next drain-time batch delete, so a `SUCCEEDED` album with its zip still present is the normal state between a drain and the finalize that follows it.
 
 ## Verifying the vision port
 
@@ -221,7 +231,7 @@ difference below `1e-4`, cosine above `0.9995`). The test is skipped unless
 - The wall still serves original-resolution images. Scaled variants exist on the image endpoint for the places that need them — `GET /api/image/{albumId}/{index}?w=<320|640|1024>` resamples the blob to that width as a JPEG (an original already no wider than the request passes through untouched, and the scaled width joins the blob hash in the ETag) — but the wall does not use it yet, so a wall of many large photos still moves a lot of bytes.
 - `GET /api/albums/search` matches the query anywhere in the lowercased original filename (not just as a prefix) and each result carries a `cover` — the photo at index 0 with its dimensions — so the Find Albums page can render cover cards at `w=640` without a second request per album.
 - The upload scan adopts zips but never advertises itself: files dropped into the bucket from outside appear in the library without ever passing through the upload page. It also adopts a zip mid-library the moment it appears, with no way to park one aside.
-- Losing the catalog is still losing the albums: the scan can re-register only the zips still under `uploads/`, and the pipeline deletes them as it extracts. Mount the `STATE_DIR` volume.
+- Losing the state volume no longer loses the library — the bucket holds `backups/viewer.db` and startup restores it — but the backup lands only when the extraction queue drains, so anything uploaded since the last drain exists in exactly two places: the bucket's blobs and the local catalog. Backups of a deployment that never drains wait for its first drain.
 
 ## Frontend
 - The bundle ships its own Space Grotesk (via fontsource, no CDN) over a design-token layer in `src/styles/tokens.css`; base primitives (focus ring, progress, skeleton, reduced-motion guards) live in `src/styles/base.css`, and the Find Albums and Upload pages own their styles next to their components.

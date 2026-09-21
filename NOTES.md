@@ -3,8 +3,8 @@
 `README.md` walks through the request flow and the deployment settings. This note
 keeps the parts that are easy to get wrong later: the exact S3 key layout, the
 SQLite schema, and the reasoning behind the choices. Every statement below is
-taken from the code in `internal/ingest`, `internal/pipeline`, `internal/catalog`,
-`internal/images` and `internal/recommend`.
+taken from the code in `internal/ingest`, `internal/pipeline`, `internal/backup`,
+`internal/catalog`, `internal/images` and `internal/recommend`.
 
 ## S3 key layout
 
@@ -17,6 +17,10 @@ The bucket holds binary payloads only; every piece of metadata is in SQLite.
   depth under the prefix and keeps the name it was uploaded with.
 - `blobs/<sha256>` — the durable image payload, keyed by the SHA-256 of the raw
   image bytes.
+- `backups/viewer.db` — the catalog snapshot the finalizer uploads once the
+  extraction queue drains. One object, overwritten every time: the timestamp to
+  compare against is its Last-Modified, and restoring history is the bucket
+  operator's job (S3 versioning), not the viewer's.
 
 The staging key is generated once and then stored on the album row
 (`albums.source_key`), and the pipeline reads it back from there rather than
@@ -41,9 +45,12 @@ are answered from the catalog; S3 is read by key (image bytes) or by the
 
 `$STATE_DIR/viewer.db` (default `/var/lib/viewer`, the path the image declares as
 a volume), opened with WAL, `foreign_keys(1)`, `synchronous(NORMAL)`, a single
-connection and a 10 second busy timeout. The catalog is the only thing under
-`STATE_DIR`. The only data written anywhere else is the staged zip in the OS
-temp directory, and the bucket still holds that.
+connection and a 10 second busy timeout. The catalog is the only durable thing
+under `STATE_DIR`, next to `viewer.db.backup-stamp` — the marker recording which
+bucket backup the local file already reflects — and the transient snapshot and
+restore temp files, which only exist for the moment a backup or restore runs.
+The only data written anywhere else is the staged zip in the OS temp directory,
+and the bucket still holds that.
 
 ```sql
 albums(id, original_filename, size_bytes, status, source_key,
@@ -81,11 +88,36 @@ A blob that is `failed` is terminal — `ListBlobsAwaitingEmbedding` selects onl
   matter how many albums contain them. Extraction heads the key before
   uploading, so those bytes are uploaded once. Dedupe is exact — identical
   bytes, never perceptual similarity.
-- **The staged zip is deleted after a successful extraction.** The zip is a
-  transport container, not durable state: once every image is in `blobs/`,
-  keeping it would store the same bytes twice. The delete happens only after the
-  album is marked `SUCCEEDED`; on failure the zip is kept and
-  `POST /api/albums/{albumId}/finalize` can retry it.
+- **Staged zips are deleted in a batch, after a backup covers them.** The zip
+  is a transport container, not durable state, but it is also the only thing
+  that can rebuild an album — so nothing deletes one before the bucket holds a
+  catalog snapshot that already records its album as finished. The pipeline
+  worker runs the finalizer (`internal/backup`) the moment its queue drains:
+  snapshot via `VACUUM INTO`, upload to `backups/viewer.db`, record the
+  stamp, then batch-delete the `source_key`s of every `SUCCEEDED` and `FAILED`
+  album. Because only the worker marks an album `SUCCEEDED`, and the finalizer
+  runs on that same goroutine, nothing can change between the snapshot and the
+  delete list. A crash anywhere leaves a leftover zip for the next startup to
+  clean, never a lost one. A `FAILED` album's zip is deleted with the rest: its
+  extraction error is in the catalog, and `finalize` on it would only fail the
+  same way again.
+- **The catalog restores from the bucket when the bucket is ahead.** On
+  startup the store comes up before the catalog, and `backup.Restore` compares
+  the backup object's Last-Modified with `viewer.db.backup-stamp` — the time
+  of the last backup this local file is known to reflect, written after every
+  successful upload and restore. The stamp, not the database file's mtime,
+  because in WAL mode commits can land in the sidecar without touching the
+  main file. A database without a stamp — an existing deployment upgrading
+  into this, or a hand-replaced catalog — is authoritative and never rolled
+  back; a missing database restores outright, which is what makes the state
+  volume disposable: wipe it, restart, and the bucket rebuilds the catalog.
+  Restoring an older snapshot resurrects albums whose zips have not been
+  deleted yet, and the scan re-registers them from those zips — a recovery
+  property, not a bug.
+- **One deployment owns one `S3_PREFIX`.** Two replicas sharing a prefix would
+  fight over the same zips and overwrite each other's `backups/viewer.db`;
+  that was already true for blobs and staging, and the backup makes it
+  stateful.
 - **`uploads/` is the one staging prefix, and the upload scan watches it.** A
   client puts its zip there through a presigned PUT; an operator or an external
   tool can put one there directly. The scan (startup plus one pass a minute)

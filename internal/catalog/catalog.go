@@ -190,6 +190,21 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
+// BackupTo writes a consistent, self-contained snapshot of the catalog to path
+// using VACUUM INTO. The snapshot includes everything committed to the WAL, so
+// it does not depend on a checkpoint, and taking it does not block the
+// embedding workers that write concurrently. The target must not exist:
+// SQLite refuses to overwrite a backup file.
+func (s *Store) BackupTo(ctx context.Context, path string) error {
+	if strings.TrimSpace(path) == "" {
+		return fmt.Errorf("backup path is required")
+	}
+	if _, err := s.db.ExecContext(ctx, `VACUUM INTO ?1`, path); err != nil {
+		return fmt.Errorf("vacuum catalog into %s: %w", path, err)
+	}
+	return nil
+}
+
 func nowRFC3339() string {
 	return time.Now().UTC().Format(time.RFC3339Nano)
 }

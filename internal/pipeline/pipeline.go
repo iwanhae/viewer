@@ -6,6 +6,10 @@
 // records all metadata in the SQLite catalog. Because the blob key is the
 // content hash, identical image bytes are stored exactly once.
 //
+// The staged zip itself stays in the bucket after extraction: once the worker
+// drains the queue it signals OnIdle, where the backup package uploads the
+// catalog and only then deletes the zips that backup covers.
+//
 // Embedding is deliberately not part of extraction: blobs are recorded as
 // pending and the background workers in the recommend package drain them, so
 // an album becomes ready and visible as soon as its images are extracted.
@@ -56,7 +60,6 @@ type Store interface {
 	GetObject(ctx context.Context, key string) (io.ReadCloser, string, error)
 	PutObject(ctx context.Context, key string, body io.Reader, contentType string) error
 	HeadObject(ctx context.Context, key string) (bool, int64, error)
-	DeleteObject(ctx context.Context, key string) error
 }
 
 // Options configure a pipeline service.
@@ -67,6 +70,12 @@ type Options struct {
 	TempDir string
 	// OnAlbumReady is invoked after an album has been fully extracted.
 	OnAlbumReady func(albumID string)
+	// OnIdle is invoked by the worker after it released the last claimed
+	// album and nothing else is queued. It runs on the worker goroutine, so
+	// no album can turn SUCCEEDED while it runs — which is what lets the
+	// callback snapshot the catalog and delete the staged zips that snapshot
+	// covers. An error is logged and does not affect the worker.
+	OnIdle func(ctx context.Context) error
 }
 
 // Service downloads and unpacks staged uploads sequentially.
@@ -174,9 +183,14 @@ func (s *Service) runWorker(ctx context.Context) {
 			return
 		case albumID := <-s.queue:
 			err := s.ProcessAlbum(ctx, albumID)
-			s.release(albumID)
+			remaining := s.release(albumID)
 			if err != nil && !errors.Is(err, context.Canceled) {
 				log.Printf("pipeline: album=%s failed: %v", albumID, err)
+			}
+			if remaining == 0 && s.opts.OnIdle != nil && ctx.Err() == nil {
+				if err := s.opts.OnIdle(ctx); err != nil {
+					log.Printf("pipeline: drain finalize failed: %v", err)
+				}
 			}
 		}
 	}
@@ -211,10 +225,15 @@ func (s *Service) claim(albumID string) bool {
 	return true
 }
 
-func (s *Service) release(albumID string) {
+// release removes an album from the in-flight set and reports how many claims
+// are left. Zero means the queue holds nothing and no album is being
+// extracted. Because Enqueue claims before it sends to the channel, this is
+// an exact drain test — unlike len() of the channel, which only approximates.
+func (s *Service) release(albumID string) int {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	delete(s.inFlight, albumID)
-	s.mu.Unlock()
+	return len(s.inFlight)
 }
 
 // ProcessAlbum downloads the staged zip and extracts every image entry.
@@ -258,9 +277,9 @@ func (s *Service) ProcessAlbum(ctx context.Context, albumID string) error {
 		return err
 	}
 
-	if err := s.store.DeleteObject(ctx, sourceKey); err != nil {
-		log.Printf("pipeline: album=%s extracted but staged zip delete failed key=%s err=%v", albumID, sourceKey, err)
-	}
+	// The staged zip stays in the bucket for now: it is deleted in a batch
+	// after the queue drains, once a catalog backup that covers it is durable
+	// in S3 (see OnIdle).
 
 	if s.opts.OnAlbumReady != nil {
 		s.opts.OnAlbumReady(albumID)

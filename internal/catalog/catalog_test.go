@@ -3,6 +3,7 @@ package catalog
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"testing"
 )
@@ -495,6 +496,81 @@ func TestOpenMigratesLegacyAlbumStatuses(t *testing.T) {
 		if err := reopened.Close(); err != nil {
 			t.Fatalf("close reopened catalog: %v", err)
 		}
+	}
+}
+
+// TestBackupToRoundTrips verifies the snapshot the S3 backup uploads is a real
+// catalog: it carries every album, photo and blob — embeddings included — and
+// opens cleanly on its own.
+func TestBackupToRoundTrips(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+
+	if err := store.CreateAlbum(ctx, Album{
+		ID:               "album-a",
+		OriginalFilename: "trip.zip",
+		SizeBytes:        10,
+		Status:           AlbumStatusReady,
+		SourceKey:        "uploads/album-a.zip",
+	}); err != nil {
+		t.Fatalf("create album: %v", err)
+	}
+	if err := store.UpsertBlob(ctx, Blob{Hash: "hash-a", SizeBytes: 5, ContentType: "image/png"}); err != nil {
+		t.Fatalf("upsert blob: %v", err)
+	}
+	if err := store.SetBlobEmbedding(ctx, "hash-a", EmbeddingStatusReady, []float32{0.5, -2}, ""); err != nil {
+		t.Fatalf("set embedding: %v", err)
+	}
+	if err := store.InsertPhoto(ctx, Photo{AlbumID: "album-a", Index: 0, Name: "a.png", Hash: "hash-a", Width: 2, Height: 1, Ratio: 2}); err != nil {
+		t.Fatalf("insert photo: %v", err)
+	}
+
+	backupPath := filepath.Join(t.TempDir(), "snapshot.db")
+	if err := store.BackupTo(ctx, backupPath); err != nil {
+		t.Fatalf("BackupTo: %v", err)
+	}
+
+	restored, err := Open(backupPath)
+	if err != nil {
+		t.Fatalf("open snapshot: %v", err)
+	}
+	defer restored.Close()
+
+	album, err := restored.GetAlbum(ctx, "album-a")
+	if err != nil {
+		t.Fatalf("get album from snapshot: %v", err)
+	}
+	if album.Status != AlbumStatusReady || album.SourceKey != "uploads/album-a.zip" || album.PhotoCount != 0 {
+		t.Fatalf("unexpected album in snapshot: %+v", album)
+	}
+	blob, err := restored.GetBlob(ctx, "hash-a")
+	if err != nil {
+		t.Fatalf("get blob from snapshot: %v", err)
+	}
+	if blob.EmbeddingStatus != EmbeddingStatusReady || blob.Embedding[0] != 0.5 || blob.Embedding[1] != -2 {
+		t.Fatalf("embedding did not survive the snapshot: %+v", blob)
+	}
+	photos, err := restored.PhotosByAlbum(ctx, "album-a")
+	if err != nil {
+		t.Fatalf("photos from snapshot: %v", err)
+	}
+	if len(photos) != 1 || photos[0].Hash != "hash-a" {
+		t.Fatalf("unexpected photos in snapshot: %+v", photos)
+	}
+}
+
+// TestBackupToRefusesAnExistingTarget pins the VACUUM INTO contract the
+// finalizer relies on: it never overwrites, so a fresh temp path is required.
+func TestBackupToRefusesAnExistingTarget(t *testing.T) {
+	store := openTestStore(t)
+
+	target := filepath.Join(t.TempDir(), "snapshot.db")
+	if err := os.WriteFile(target, []byte("occupied"), 0o644); err != nil {
+		t.Fatalf("seed target: %v", err)
+	}
+
+	if err := store.BackupTo(context.Background(), target); err == nil {
+		t.Fatalf("expected BackupTo to refuse an existing target")
 	}
 }
 

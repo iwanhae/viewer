@@ -135,6 +135,27 @@ func (s *S3Store) HeadObject(ctx context.Context, key string) (bool, int64, erro
 	return true, size, nil
 }
 
+// StatObject reports one object's listing metadata, the way ListObjects
+// reports it. A missing object is (Object{}, false, nil), like HeadObject.
+func (s *S3Store) StatObject(ctx context.Context, key string) (Object, bool, error) {
+	o, err := s.client.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket: aws.String(s.bucket),
+		Key:    aws.String(s.physicalKey(key)),
+	})
+	if err != nil {
+		if isS3NotFound(err) {
+			return Object{}, false, nil
+		}
+		return Object{}, false, fmt.Errorf("stat object %s: %w", key, err)
+	}
+	return Object{
+		Key:          key,
+		LastModified: aws.ToTime(o.LastModified).UTC(),
+		Size:         aws.ToInt64(o.ContentLength),
+		ETag:         aws.ToString(o.ETag),
+	}, true, nil
+}
+
 func (s *S3Store) DeleteObject(ctx context.Context, key string) error {
 	key = strings.TrimSpace(key)
 	if key == "" {
@@ -146,6 +167,61 @@ func (s *S3Store) DeleteObject(ctx context.Context, key string) error {
 	})
 	if err != nil {
 		return fmt.Errorf("delete object %s: %w", key, err)
+	}
+	return nil
+}
+
+// maxDeleteObjectsPerRequest is the DeleteObjects API's per-request key limit.
+const maxDeleteObjectsPerRequest = 1000
+
+// DeleteObjects deletes logical keys in batches of 1000. Deleting a key that
+// does not exist is not an error. Per-key failures are collected and reported
+// with their logical keys; the batches that succeeded stay deleted.
+func (s *S3Store) DeleteObjects(ctx context.Context, keys []string) error {
+	requested := make([]string, 0, len(keys))
+	for _, key := range keys {
+		key = strings.TrimSpace(key)
+		if key != "" {
+			requested = append(requested, key)
+		}
+	}
+	if len(requested) == 0 {
+		return nil
+	}
+
+	var failures []string
+	for start := 0; start < len(requested); start += maxDeleteObjectsPerRequest {
+		end := start + maxDeleteObjectsPerRequest
+		if end > len(requested) {
+			end = len(requested)
+		}
+		chunk := requested[start:end]
+		ids := make([]types.ObjectIdentifier, 0, len(chunk))
+		for _, key := range chunk {
+			ids = append(ids, types.ObjectIdentifier{Key: aws.String(s.physicalKey(key))})
+		}
+		out, err := s.client.DeleteObjects(ctx, &s3.DeleteObjectsInput{
+			Bucket: aws.String(s.bucket),
+			Delete: &types.Delete{
+				Objects: ids,
+				// Quiet keeps the response to failures only, so anything that
+				// comes back in Errors is a real problem.
+				Quiet: aws.Bool(true),
+			},
+		})
+		if err != nil {
+			return fmt.Errorf("delete objects: %w", err)
+		}
+		for _, delErr := range out.Errors {
+			failures = append(failures, fmt.Sprintf(
+				"%s: %s",
+				s.logicalKey(aws.ToString(delErr.Key)),
+				strings.TrimSpace(aws.ToString(delErr.Message)+" ("+aws.ToString(delErr.Code)+")"),
+			))
+		}
+	}
+	if len(failures) > 0 {
+		return fmt.Errorf("delete objects failed for %d key(s): %s", len(failures), strings.Join(failures, "; "))
 	}
 	return nil
 }

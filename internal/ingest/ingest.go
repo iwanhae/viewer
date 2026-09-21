@@ -5,7 +5,8 @@
 // Anything else that lands under "uploads/" - a zip copied in by an operator or
 // an external tool - has no album row, so this scan creates one and queues it.
 // Both paths use the same directory, so the bucket has exactly one staging
-// prefix and the pipeline deletes an object from it once extraction succeeds.
+// prefix; the backup package empties it in batches once a drain has backed the
+// catalog up.
 package ingest
 
 import (
@@ -54,8 +55,8 @@ type Summary struct {
 
 // Run lists the upload prefix and makes sure every zip under it is queued for
 // extraction, registering an album for the ones that have none. Nothing is
-// copied, moved or deleted: the pipeline removes a staged zip itself once the
-// album is extracted, so a scan is safe to repeat.
+// copied, moved or deleted: the backup finalizer removes a staged zip after a
+// drain, so a scan is safe to repeat.
 func Run(ctx context.Context, store Store, sink Sink) (Summary, error) {
 	var summary Summary
 
@@ -120,8 +121,9 @@ func adopt(ctx context.Context, sink Sink, obj storage.Object, summary *Summary)
 			summary.Requeued++
 			log.Printf("upload ingest: requeued key=%s album_id=%s status=%s", obj.Key, album.ID, album.Status)
 		default:
-			// SUCCEEDED with a leftover zip (the delete failed) or FAILED,
-			// which stays put until someone finalizes it again on purpose.
+			// A terminal status: the zip waits for the next drain-time batch
+			// delete, which only ever runs between scans on the pipeline
+			// worker, so nothing removes it mid-extraction.
 			summary.Skipped++
 		}
 		return

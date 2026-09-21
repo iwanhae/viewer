@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	"viewer/internal/catalog"
 	"viewer/internal/storage"
@@ -24,7 +25,6 @@ type fakeStore struct {
 	mu      sync.Mutex
 	objects map[string][]byte
 	putKeys []string
-	deleted []string
 }
 
 func newFakeStore() *fakeStore {
@@ -61,14 +61,6 @@ func (f *fakeStore) HeadObject(_ context.Context, key string) (bool, int64, erro
 		return false, 0, nil
 	}
 	return true, int64(len(data)), nil
-}
-
-func (f *fakeStore) DeleteObject(_ context.Context, key string) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	delete(f.objects, key)
-	f.deleted = append(f.deleted, key)
-	return nil
 }
 
 func (f *fakeStore) putCount() int {
@@ -219,9 +211,10 @@ func TestProcessAlbumExtractsImagesAndDedupesBlobs(t *testing.T) {
 		t.Fatalf("expected content-addressed blob objects")
 	}
 
-	// The staged zip is removed after a successful extraction.
-	if store.has(SourceKey("album-a")) {
-		t.Fatalf("expected staged zip to be deleted")
+	// The staged zip stays after extraction: it is deleted in a batch by the
+	// backup finalizer once the queue drains (see OnIdle).
+	if !store.has(SourceKey("album-a")) {
+		t.Fatalf("expected staged zip to be retained after extraction")
 	}
 
 	// Extraction leaves embedding to the background workers: both blobs stay
@@ -523,5 +516,66 @@ func TestStartRemovesLeftoverStagedZips(t *testing.T) {
 	}
 	if _, err := os.Stat(keep); err != nil {
 		t.Fatalf("unrelated file was removed: %v", err)
+	}
+}
+
+// TestWorkerSignalsIdleAfterDrain pins the trigger the backup finalizer hangs
+// off: OnIdle fires once after the queue drains, and again after more work
+// arrives and finishes. It runs on the worker goroutine, so while it executes
+// no album can change status under its feet.
+func TestWorkerSignalsIdleAfterDrain(t *testing.T) {
+	cat := openTestCatalog(t)
+	store := newFakeStore()
+	ctx := context.Background()
+
+	for _, id := range []string{"album-a", "album-b", "album-c"} {
+		seedAlbum(t, cat, store, id, id+".zip", buildZip(t, zipEntry{name: "a.png", data: pngBytes(t, 2, 2, 1)}))
+	}
+
+	idle := make(chan struct{}, 4)
+	svc := NewService(cat, store, Options{
+		TempDir: t.TempDir(),
+		OnIdle: func(ctx context.Context) error {
+			idle <- struct{}{}
+			return nil
+		},
+	})
+	svc.Start(ctx)
+	for _, id := range []string{"album-a", "album-b", "album-c"} {
+		if err := svc.Enqueue(id); err != nil {
+			t.Fatalf("enqueue %s: %v", id, err)
+		}
+	}
+
+	waitForIdle := func() {
+		t.Helper()
+		select {
+		case <-idle:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("worker never signaled idle")
+		}
+	}
+	waitForIdle()
+
+	for _, id := range []string{"album-a", "album-b", "album-c"} {
+		album, err := cat.GetAlbum(ctx, id)
+		if err != nil {
+			t.Fatalf("get %s: %v", id, err)
+		}
+		if album.Status != catalog.AlbumStatusReady {
+			t.Fatalf("%s status=%s want=%s", id, album.Status, catalog.AlbumStatusReady)
+		}
+	}
+
+	// Work arriving after the drain: the next completion signals idle again.
+	seedAlbum(t, cat, store, "album-d", "d.zip", buildZip(t, zipEntry{name: "a.png", data: pngBytes(t, 2, 2, 2)}))
+	if err := svc.Enqueue("album-d"); err != nil {
+		t.Fatalf("enqueue album-d: %v", err)
+	}
+	waitForIdle()
+
+	album, err := cat.GetAlbum(ctx, "album-d")
+	if err != nil || album.Status != catalog.AlbumStatusReady {
+		t.Fatalf("album-d status=%+v err=%v want ready", album, err)
 	}
 }

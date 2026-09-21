@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -43,6 +44,7 @@ type recordedRequest struct {
 	host   string
 	path   string
 	query  string
+	body   string
 }
 
 func (r recordedRequest) String() string {
@@ -64,20 +66,26 @@ func newRecordingStoreAt(t *testing.T, endpointPath string, keyPrefix string) (*
 
 	requests := make([]recordedRequest, 0, 8)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
 		requests = append(requests, recordedRequest{
 			method: r.Method,
 			host:   r.Host,
 			path:   r.URL.Path,
 			query:  r.URL.RawQuery,
+			body:   string(body),
 		})
 		switch {
 		case r.URL.Query().Get("list-type") == "2":
 			w.Header().Set("Content-Type", "application/xml")
 			_, _ = io.WriteString(w, listObjectsXML)
+		case r.Method == http.MethodPost && r.URL.Query().Has("delete"):
+			w.Header().Set("Content-Type", "application/xml")
+			_, _ = io.WriteString(w, `<?xml version="1.0" encoding="UTF-8"?><DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"/>`)
 		case r.Method == http.MethodHead:
 			w.Header().Set("Content-Length", "11")
 			w.Header().Set("ETag", `"etag-1"`)
 			w.Header().Set("Content-Type", "image/png")
+			w.Header().Set("Last-Modified", time.Date(2024, 1, 2, 3, 4, 5, 0, time.UTC).Format(http.TimeFormat))
 		default:
 			w.Header().Set("ETag", `"etag-1"`)
 			w.Header().Set("Content-Type", "image/png")
@@ -311,5 +319,162 @@ func TestS3StoreVirtualHostedAddressing(t *testing.T) {
 				t.Errorf("path=%q want=%q (the bucket must not also appear in the path)", parsed.Path, tc.wantPath)
 			}
 		})
+	}
+}
+
+// TestS3StoreStatObjectReturnsListingMetadata checks the metadata the catalog
+// backup restore decision needs from a HEAD: last-modified above all, plus the
+// size the download is validated against.
+func TestS3StoreStatObjectReturnsListingMetadata(t *testing.T) {
+	store, requests := newRecordingStore(t, "viewer/")
+
+	obj, ok, err := store.StatObject(context.Background(), "blobs/deadbeef")
+	if err != nil {
+		t.Fatalf("StatObject: %v", err)
+	}
+	if !ok {
+		t.Fatalf("StatObject reported an existing object missing")
+	}
+	if obj.Key != "blobs/deadbeef" {
+		t.Errorf("key=%q want blobs/deadbeef (logical, not prefixed)", obj.Key)
+	}
+	if obj.Size != 11 {
+		t.Errorf("size=%d want 11", obj.Size)
+	}
+	if obj.ETag != `"etag-1"` {
+		t.Errorf("etag=%q want \"etag-1\"", obj.ETag)
+	}
+	if want := time.Date(2024, 1, 2, 3, 4, 5, 0, time.UTC); !obj.LastModified.Equal(want) {
+		t.Errorf("lastModified=%s want %s", obj.LastModified, want)
+	}
+
+	got := *requests
+	if len(got) != 1 {
+		t.Fatalf("recorded %d requests, want 1", len(got))
+	}
+	if got[0].method != http.MethodHead || got[0].path != "/test-bucket/viewer/blobs/deadbeef" {
+		t.Errorf("request = %s, want HEAD /test-bucket/viewer/blobs/deadbeef", got[0])
+	}
+}
+
+// TestS3StoreStatObjectReportsMissing pins the not-found contract the restore
+// decision relies on: a missing object is (Object{}, false, nil), not an error.
+func TestS3StoreStatObjectReportsMissing(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	t.Cleanup(server.Close)
+
+	store, err := NewS3Store(context.Background(), cfgpkg.Config{
+		S3Endpoint:     server.URL,
+		S3Bucket:       "test-bucket",
+		S3AccessKey:    "access",
+		S3SecretKey:    "secret",
+		S3UsePathStyle: true,
+	})
+	if err != nil {
+		t.Fatalf("NewS3Store: %v", err)
+	}
+
+	obj, ok, err := store.StatObject(context.Background(), "blobs/missing")
+	if err != nil {
+		t.Fatalf("StatObject on a missing object: %v", err)
+	}
+	if ok {
+		t.Errorf("ok=true want false")
+	}
+	if obj != (Object{}) {
+		t.Errorf("obj=%+v want the zero Object", obj)
+	}
+}
+
+// TestS3StoreDeleteObjectsBatchesAndPrefixes pins the wire shape of the batch
+// delete: POSTs on the bucket root whose keys carry the store's prefix, chunked
+// at the API's 1000-key limit.
+func TestS3StoreDeleteObjectsBatchesAndPrefixes(t *testing.T) {
+	store, requests := newRecordingStore(t, "viewer/")
+
+	keys := make([]string, 0, 1001)
+	for i := 0; i < 1001; i++ {
+		keys = append(keys, fmt.Sprintf("uploads/album-%d.zip", i))
+	}
+	if err := store.DeleteObjects(context.Background(), keys); err != nil {
+		t.Fatalf("DeleteObjects: %v", err)
+	}
+
+	got := *requests
+	if len(got) != 2 {
+		t.Fatalf("recorded %d requests, want 2 (one per 1000-key batch)", len(got))
+	}
+	for i, req := range got {
+		if req.method != http.MethodPost {
+			t.Errorf("request %d method=%q want POST", i, req.method)
+		}
+		if req.path != "/test-bucket" {
+			t.Errorf("request %d path=%q want /test-bucket (a batch delete targets the bucket root)", i, req.path)
+		}
+		query, err := neturl.ParseQuery(req.query)
+		if err != nil || !query.Has("delete") {
+			t.Errorf("request %d query=%q want a delete parameter", i, req.query)
+		}
+	}
+	if !strings.Contains(got[0].body, "<Key>viewer/uploads/album-0.zip</Key>") ||
+		!strings.Contains(got[0].body, "<Key>viewer/uploads/album-999.zip</Key>") ||
+		strings.Contains(got[0].body, "album-1000.zip") {
+		t.Errorf("first batch body=%q want keys 0..999 under the store prefix", got[0].body)
+	}
+	if !strings.Contains(got[1].body, "<Key>viewer/uploads/album-1000.zip</Key>") ||
+		strings.Contains(got[1].body, "album-0.zip") {
+		t.Errorf("second batch body=%q want only the 1001st key", got[1].body)
+	}
+}
+
+// TestS3StoreDeleteObjectsIgnoresBlankKeys keeps callers from having to filter:
+// the finalizer builds its key list straight from catalog rows.
+func TestS3StoreDeleteObjectsIgnoresBlankKeys(t *testing.T) {
+	store, requests := newRecordingStore(t, "viewer/")
+
+	if err := store.DeleteObjects(context.Background(), []string{"", "   "}); err != nil {
+		t.Fatalf("DeleteObjects with only blank keys: %v", err)
+	}
+	if got := *requests; len(got) != 0 {
+		t.Fatalf("recorded %d requests, want 0", len(got))
+	}
+}
+
+// TestS3StoreDeleteObjectsSurfacesLogicalKeysOnError checks that per-key
+// failures come back in the caller's namespace, ready to be logged as-is.
+func TestS3StoreDeleteObjectsSurfacesLogicalKeysOnError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/xml")
+		_, _ = io.WriteString(w, `<?xml version="1.0" encoding="UTF-8"?>
+<DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Error>
+    <Key>viewer/uploads/album-1.zip</Key>
+    <Code>AccessDenied</Code>
+    <Message>denied</Message>
+  </Error>
+</DeleteResult>`)
+	}))
+	t.Cleanup(server.Close)
+
+	store, err := NewS3Store(context.Background(), cfgpkg.Config{
+		S3Endpoint:     server.URL,
+		S3Bucket:       "test-bucket",
+		S3AccessKey:    "access",
+		S3SecretKey:    "secret",
+		S3Prefix:       "viewer/",
+		S3UsePathStyle: true,
+	})
+	if err != nil {
+		t.Fatalf("NewS3Store: %v", err)
+	}
+
+	err = store.DeleteObjects(context.Background(), []string{"uploads/album-1.zip"})
+	if err == nil {
+		t.Fatalf("DeleteObjects returned nil for a failed key")
+	}
+	if !strings.Contains(err.Error(), "uploads/album-1.zip") || strings.Contains(err.Error(), "viewer/uploads") {
+		t.Errorf("error=%v want the logical key without the store prefix", err)
 	}
 }

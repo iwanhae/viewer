@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"viewer/internal/albums"
+	"viewer/internal/backup"
 	"viewer/internal/catalog"
 	cfgpkg "viewer/internal/config"
 	"viewer/internal/feed"
@@ -34,16 +35,27 @@ func Run(ctx context.Context) error {
 		cfg.Port, cfg.DBPath(), cfg.DescribePrefix(),
 	)
 
+	// The store comes up before the catalog: the bucket holds a snapshot of
+	// the catalog, and a newer one replaces the local database file before
+	// anything opens it.
+	store, err := storage.NewS3Store(ctx, cfg)
+	if err != nil {
+		return err
+	}
+
+	restored, err := backup.Restore(ctx, store, cfg.DBPath(), backup.StampPath(cfg.StateDir))
+	if err != nil {
+		return fmt.Errorf("restore catalog backup: %w", err)
+	}
+	if restored {
+		log.Printf("viewer: serving the catalog restored from %s", backup.BackupObjectKey)
+	}
+
 	cat, err := catalog.Open(cfg.DBPath())
 	if err != nil {
 		return fmt.Errorf("open metadata catalog: %w", err)
 	}
 	defer cat.Close()
-
-	store, err := storage.NewS3Store(ctx, cfg)
-	if err != nil {
-		return err
-	}
 
 	imageService := images.NewService(cat, store)
 
@@ -72,13 +84,16 @@ func Run(ctx context.Context) error {
 
 	// Extraction and embedding are separate stages: the pipeline only makes an
 	// album ready, and the recommendation service's background workers embed
-	// the blobs it leaves pending.
+	// the blobs it leaves pending. When the extraction queue drains, the
+	// finalizer backs the catalog up and deletes the staged zips it covers.
+	finalizer := backup.NewFinalizer(store, cat, cfg.StateDir)
 	pipelineService := pipeline.NewService(cat, store, pipeline.Options{
 		OnAlbumReady: func(albumID string) {
 			if err := recommendService.ReloadAlbum(context.Background(), albumID); err != nil {
 				log.Printf("viewer: reload recommendation index for album=%s failed: %v", albumID, err)
 			}
 		},
+		OnIdle: finalizer.Run,
 	})
 	albumService := albums.NewService(cat, store, pipelineService)
 
@@ -95,6 +110,13 @@ func Run(ctx context.Context) error {
 	log.Printf("viewer: startup warmup running in background")
 	go func() {
 		warmupRecommendations(ctx, recommendService)
+
+		// A previous run can have crashed between the catalog backup and the
+		// zip deletes. Finalizing once here refreshes the backup and clears
+		// those leftovers; a scan that ran first could only skip them.
+		if err := finalizer.Run(ctx); err != nil {
+			log.Printf("viewer: startup catalog backup failed: %v", err)
+		}
 
 		// The upload prefix is the drop zone for the zips that did not come
 		// through POST /api/albums. It scans once here, after the index is
