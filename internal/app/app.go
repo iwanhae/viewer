@@ -56,9 +56,9 @@ func Run(ctx context.Context) error {
 		ModelID: cfgpkg.ModelDir,
 	}))
 
-	// Load the vision tower before wiring the ingest pipeline: a failed load
-	// must keep the embedder out of the pipeline entirely, otherwise every
-	// image would be marked as a failed embedding instead of staying pending.
+	// Load the vision tower before anything can request an embedding: a failed
+	// load marks the service disabled, and the background workers then stay off
+	// instead of failing every pending blob.
 	loadCtx, cancel := context.WithTimeout(context.Background(), embeddingLoadTimeout)
 	loadErr := recommendService.LoadModel(loadCtx)
 	cancel()
@@ -73,11 +73,10 @@ func Run(ctx context.Context) error {
 		log.Printf("viewer: embedding model unavailable; serving recommendations from stored embeddings only")
 	}
 
-	var pipelineEmbedder pipeline.Embedder
-	if recommenderEnabled {
-		pipelineEmbedder = recommendService
-	}
-	pipelineService := pipeline.NewService(cat, store, pipelineEmbedder, pipeline.Options{
+	// Extraction and embedding are separate stages: the pipeline only makes an
+	// album ready, and the recommendation service's background workers embed
+	// the blobs it leaves pending.
+	pipelineService := pipeline.NewService(cat, store, pipeline.Options{
 		TempDir: cfgpkg.ZipCacheDir(),
 		OnAlbumReady: func(albumID string) {
 			if err := recommendService.ReloadAlbum(context.Background(), albumID); err != nil {

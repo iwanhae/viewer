@@ -139,7 +139,7 @@ func TestPipelineStoresEveryObjectUnderKeyPrefix(t *testing.T) {
 		t.Fatalf("staged zip keys=%v want photos/%s", stub.keys(), sourceKey)
 	}
 
-	svc := NewService(cat, store, &fakeEmbedder{}, Options{TempDir: t.TempDir()})
+	svc := NewService(cat, store, Options{TempDir: t.TempDir()})
 	if err := svc.ProcessAlbum(ctx, "album-a"); err != nil {
 		t.Fatalf("process album: %v", err)
 	}

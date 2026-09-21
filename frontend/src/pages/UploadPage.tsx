@@ -5,7 +5,7 @@ import type { EmbeddingProgress } from '../api/types'
 import { useEmbeddingProgress } from '../hooks/useEmbeddingProgress'
 import { formatBytes } from '../utils/format'
 
-type UploadStatus = 'uploading' | 'submitted' | 'embedding' | 'ready' | 'failed' | 'canceled'
+type UploadStatus = 'uploading' | 'submitted' | 'ready' | 'failed' | 'canceled'
 const uploadWorkerCount = 3
 const finalizePollIntervalMs = 2000
 const finalizePollTimeoutMs = 30 * 60 * 1000
@@ -23,8 +23,10 @@ type UploadItem = {
 }
 
 // isEmbeddingPending reports whether the server still has images of this album
-// to embed. A disabled embedder means the counts will never move, so there is
-// nothing to wait for.
+// to embed. Embedding runs after an album is already visible, so a pending
+// count only keeps the informational progress line alive - it never blocks the
+// upload from finishing. A disabled embedder means the counts will never move,
+// so there is nothing to watch.
 function isEmbeddingPending(progress?: EmbeddingProgress): boolean {
   return progress !== undefined && progress.enabled && progress.pending > 0
 }
@@ -94,8 +96,6 @@ function statusLabel(status: UploadStatus): string {
       return 'Uploading'
     case 'submitted':
       return 'Submitted'
-    case 'embedding':
-      return 'Embedding'
     case 'ready':
       return 'Ready'
     case 'failed':
@@ -158,10 +158,11 @@ export function UploadPage() {
         updateItem(item.id, { status: 'submitted', error: undefined })
 
         // Indexing runs in the background pipeline: keep polling until the
-        // album succeeds or fails. Embedding is a second, slower stage that
-        // continues after the album is indexed, so an indexed album stays
-        // "embedding" until the server reports nothing left pending. A deadline
-        // leaves the item submitted rather than falsely reporting a failure.
+        // album succeeds or fails. Success is what makes the album visible, so
+        // the item turns ready right away - embedding is a slower stage that
+        // continues afterwards on the server, and the loop only stays alive to
+        // refresh the embedded counts until nothing is left pending. A deadline
+        // just stops that refresh; the item still reports ready.
         const deadline = Date.now() + finalizePollTimeoutMs
         for (;;) {
           const state = await fetchFinalizeStatus(albumID, { signal: controller.signal })
@@ -170,10 +171,8 @@ export function UploadPage() {
             return
           }
           if (state.status === 'SUCCEEDED') {
-            if (isEmbeddingPending(state.embedding)) {
-              updateItem(item.id, { status: 'embedding', embedding: state.embedding, error: undefined })
-            } else {
-              updateItem(item.id, { status: 'ready', embedding: state.embedding, error: undefined })
+            updateItem(item.id, { status: 'ready', embedding: state.embedding, error: undefined })
+            if (!isEmbeddingPending(state.embedding)) {
               return
             }
           } else if (state.embedding) {
@@ -455,7 +454,7 @@ export function UploadPage() {
                     ? ' | embeddings unavailable on this server'
                     : ''}
                 </p>
-                {item.status === 'embedding' && (
+                {item.embedding && isEmbeddingPending(item.embedding) && (
                   <div
                     className="progress"
                     data-testid="upload-embedding-progress"

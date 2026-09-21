@@ -35,8 +35,9 @@ const (
 )
 
 // Service keeps an in-memory similarity index of blob embeddings and runs the
-// background workers that fill in embeddings the ingest pipeline could not
-// compute.
+// background workers that compute embeddings for the catalog's pending blobs.
+// Extraction never embeds anything itself, so these workers are the only
+// producer of embeddings.
 type Service struct {
 	catalog *catalog.Store
 	images  *images.Service
@@ -72,8 +73,8 @@ type Service struct {
 }
 
 // NewService builds a recommendation service. A nil embedder switches the
-// feature off: the API keeps serving empty recommendation lists and the ingest
-// pipeline leaves every blob pending.
+// feature off: the API keeps serving empty recommendation lists, no worker
+// starts, and every blob stays pending.
 func NewService(cat *catalog.Store, imagesService *images.Service, embedder EmbeddingProvider) *Service {
 	return &Service{
 		catalog:          cat,
@@ -85,9 +86,6 @@ func NewService(cat *catalog.Store, imagesService *images.Service, embedder Embe
 		failedByHash:     make(map[string]string),
 	}
 }
-
-// ErrEmbeddingDisabled reports that embedding was switched off.
-var ErrEmbeddingDisabled = errors.New("image embedding is disabled")
 
 // LoadModel resolves the checkpoint and compiles the inference graph. Startup
 // calls it once so a broken checkpoint is reported at boot instead of on the
@@ -128,20 +126,14 @@ func (s *Service) Close() error {
 	return s.embedder.Close()
 }
 
-// Embed satisfies the pipeline's embedder interface.
-func (s *Service) Embed(ctx context.Context, imageBytes []byte) ([]float32, error) {
-	if s == nil || s.embedder == nil {
-		return nil, ErrEmbeddingDisabled
-	}
+// computeEmbedding runs one forward pass and keeps the live "embedding is
+// happening now" state current for the background worker. Each pass is bounded
+// by embeddingTimeout; a deadline counts as transient, so the blob stays
+// pending for a later retry instead of being marked failed.
+func (s *Service) computeEmbedding(ctx context.Context, imageBytes []byte) ([]float32, error) {
 	embedCtx, cancel := context.WithTimeout(ctx, embeddingTimeout)
 	defer cancel()
-	return s.computeEmbedding(embedCtx, imageBytes)
-}
 
-// computeEmbedding runs one forward pass and keeps the live "embedding is
-// happening now" state current for both the ingest pipeline and the background
-// worker.
-func (s *Service) computeEmbedding(ctx context.Context, imageBytes []byte) ([]float32, error) {
 	s.runMu.Lock()
 	s.activeEmbeds++
 	s.runMu.Unlock()
@@ -150,7 +142,7 @@ func (s *Service) computeEmbedding(ctx context.Context, imageBytes []byte) ([]fl
 		s.activeEmbeds--
 		s.runMu.Unlock()
 	}()
-	return s.embedder.Embed(ctx, imageBytes)
+	return s.embedder.Embed(embedCtx, imageBytes)
 }
 
 // LoadAll rebuilds the in-memory index from the SQLite catalog.

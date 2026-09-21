@@ -41,8 +41,8 @@ func TestEmbeddingTimeoutIsFiveMinutes(t *testing.T) {
 }
 
 // TestServiceWithoutEmbedderReportsDisabled covers the switched-off feature: a
-// nil provider means the API keeps serving and the pipeline leaves blobs
-// pending, while an always-erroring provider would mark every blob failed.
+// nil provider means the service reports disabled and never starts workers, so
+// blobs simply stay pending.
 func TestServiceWithoutEmbedderReportsDisabled(t *testing.T) {
 	cat := newTestCatalog(t)
 	svc := NewService(cat, nil, nil)
@@ -50,8 +50,8 @@ func TestServiceWithoutEmbedderReportsDisabled(t *testing.T) {
 	if svc.embedder != nil {
 		t.Fatalf("embedder=%T want nil when embedding is off", svc.embedder)
 	}
-	if _, err := svc.Embed(context.Background(), []byte("image")); !errors.Is(err, ErrEmbeddingDisabled) {
-		t.Fatalf("Embed err=%v want=%v", err, ErrEmbeddingDisabled)
+	if svc.Enabled() {
+		t.Fatalf("Enabled()=true want=false when embedding is off")
 	}
 	if err := svc.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
@@ -130,8 +130,8 @@ func TestServiceDisabledAfterModelLoadFailure(t *testing.T) {
 	if svc.Enabled() {
 		t.Fatalf("Enabled()=true after a failed model load")
 	}
-	if _, err := svc.Embed(context.Background(), []byte("image")); err == nil {
-		t.Fatalf("Embed expected an error after a failed model load")
+	if _, err := svc.computeEmbedding(context.Background(), []byte("image")); err == nil {
+		t.Fatalf("computeEmbedding expected an error after a failed model load")
 	}
 	// A second load reports the same failure rather than retrying or panicking.
 	if err := svc.LoadModel(context.Background()); err == nil {
@@ -168,9 +168,9 @@ func TestServiceEmbedsAndPersistsWithRealModel(t *testing.T) {
 		t.Fatalf("upsert blob: %v", err)
 	}
 
-	vector, err := svc.Embed(ctx, source)
+	vector, err := svc.computeEmbedding(ctx, source)
 	if err != nil {
-		t.Fatalf("Embed: %v", err)
+		t.Fatalf("computeEmbedding: %v", err)
 	}
 	if got, want := len(vector), 768; got != want {
 		t.Fatalf("embedding length=%d want=%d", got, want)

@@ -132,10 +132,11 @@ func newFlowHarness(t *testing.T) *flowHarness {
 		t.Fatalf("new image service: %v", err)
 	}
 	// A stub embedder keeps the recommendation endpoints available without a
-	// checkpoint. It is never asked to embed anything: the pipeline gets a nil
-	// embedder, so blobs stay pending.
+	// checkpoint. It is never asked to embed anything: the pipeline does not
+	// embed at all and the embedding workers are not started here, so blobs
+	// stay pending.
 	recommendService := recommend.NewService(cat, imageService, stubEmbedder{})
-	pipelineService := pipeline.NewService(cat, s3, nil, pipeline.Options{
+	pipelineService := pipeline.NewService(cat, s3, pipeline.Options{
 		TempDir: zipCacheDir,
 		OnAlbumReady: func(albumID string) {
 			_ = recommendService.ReloadAlbum(context.Background(), albumID)

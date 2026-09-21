@@ -777,7 +777,7 @@ func TestEmbeddingProgressReportsActiveWhileEmbedding(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		_, err := svc.Embed(context.Background(), []byte("image"))
+		_, err := svc.computeEmbedding(context.Background(), []byte("image"))
 		done <- err
 	}()
 

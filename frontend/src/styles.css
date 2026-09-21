@@ -862,11 +862,6 @@ body,
   color: #065f46;
 }
 
-.upload-item-status-embedding {
-  background: rgba(37, 99, 235, 0.16);
-  color: #1d4ed8;
-}
-
 .upload-item-status-failed,
 .upload-item-status-canceled {
   background: rgba(220, 38, 38, 0.14);

@@ -83,37 +83,6 @@ func (f *fakeStore) has(key string) bool {
 	return ok
 }
 
-type fakeEmbedder struct {
-	mu    sync.Mutex
-	calls int
-	err   error
-	dim   int
-}
-
-func (f *fakeEmbedder) Embed(_ context.Context, imageBytes []byte) ([]float32, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.calls++
-	if f.err != nil {
-		return nil, f.err
-	}
-	if f.dim <= 0 {
-		f.dim = 3
-	}
-	sum := sha256.Sum256(imageBytes)
-	vector := make([]float32, f.dim)
-	for i := range vector {
-		vector[i] = float32(sum[i])
-	}
-	return vector, nil
-}
-
-func (f *fakeEmbedder) callCount() int {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.calls
-}
-
 func openTestCatalog(t *testing.T) *catalog.Store {
 	t.Helper()
 	cat, err := catalog.Open(filepath.Join(t.TempDir(), "catalog.db"))
@@ -188,7 +157,6 @@ func seedAlbum(t *testing.T, cat *catalog.Store, store *fakeStore, albumID strin
 func TestProcessAlbumExtractsImagesAndDedupesBlobs(t *testing.T) {
 	cat := openTestCatalog(t)
 	store := newFakeStore()
-	embedder := &fakeEmbedder{}
 
 	imageA := pngBytes(t, 4, 2, 10)
 	imageB := pngBytes(t, 2, 6, 200)
@@ -200,7 +168,7 @@ func TestProcessAlbumExtractsImagesAndDedupesBlobs(t *testing.T) {
 	)
 	seedAlbum(t, cat, store, "album-a", "holiday.zip", zipData)
 
-	svc := NewService(cat, store, embedder, Options{TempDir: t.TempDir()})
+	svc := NewService(cat, store, Options{TempDir: t.TempDir()})
 	if err := svc.ProcessAlbum(context.Background(), "album-a"); err != nil {
 		t.Fatalf("process album: %v", err)
 	}
@@ -255,21 +223,19 @@ func TestProcessAlbumExtractsImagesAndDedupesBlobs(t *testing.T) {
 		t.Fatalf("expected staged zip to be deleted")
 	}
 
-	// The duplicate blob is embedded once, and both blobs end up ready.
+	// Extraction leaves embedding to the background workers: both blobs stay
+	// pending with the duplicate embedded (eventually) exactly once.
 	for _, hash := range []string{hashOf(imageA), hashOf(imageB)} {
 		blob, err := cat.GetBlob(context.Background(), hash)
 		if err != nil {
 			t.Fatalf("get blob %s: %v", hash, err)
 		}
-		if blob.EmbeddingStatus != catalog.EmbeddingStatusReady || len(blob.Embedding) == 0 {
-			t.Fatalf("blob %s embedding not ready: %+v", hash, blob)
+		if blob.EmbeddingStatus != catalog.EmbeddingStatusPending || len(blob.Embedding) != 0 {
+			t.Fatalf("blob %s should stay pending after extraction: %+v", hash, blob)
 		}
 		if blob.ContentType != "image/png" {
 			t.Fatalf("blob %s content type=%q", hash, blob.ContentType)
 		}
-	}
-	if got := embedder.callCount(); got != 2 {
-		t.Fatalf("embed calls=%d want=2 (duplicate content embedded once)", got)
 	}
 }
 
@@ -283,7 +249,7 @@ func TestProcessAlbumCrossAlbumDedupeStoresBlobOnce(t *testing.T) {
 	seedAlbum(t, cat, store, "album-a", "a.zip", zipA)
 	seedAlbum(t, cat, store, "album-b", "b.zip", zipB)
 
-	svc := NewService(cat, store, nil, Options{TempDir: t.TempDir()})
+	svc := NewService(cat, store, Options{TempDir: t.TempDir()})
 	if err := svc.ProcessAlbum(context.Background(), "album-a"); err != nil {
 		t.Fatalf("process album-a: %v", err)
 	}
@@ -310,7 +276,7 @@ func TestProcessAlbumNoValidImagesMarksFailedAndKeepsSource(t *testing.T) {
 	zipData := buildZip(t, zipEntry{name: "readme.txt", data: []byte("nothing here")}, zipEntry{name: "dir/", data: nil})
 	seedAlbum(t, cat, store, "album-a", "junk.zip", zipData)
 
-	svc := NewService(cat, store, nil, Options{TempDir: t.TempDir()})
+	svc := NewService(cat, store, Options{TempDir: t.TempDir()})
 	err := svc.ProcessAlbum(context.Background(), "album-a")
 	if !errors.Is(err, ErrNoValidImages) {
 		t.Fatalf("expected ErrNoValidImages, got %v", err)
@@ -339,7 +305,7 @@ func TestProcessAlbumMissingSourceMarksFailed(t *testing.T) {
 		t.Fatalf("create album: %v", err)
 	}
 
-	svc := NewService(cat, store, nil, Options{TempDir: t.TempDir()})
+	svc := NewService(cat, store, Options{TempDir: t.TempDir()})
 	if err := svc.ProcessAlbum(context.Background(), "album-a"); err == nil {
 		t.Fatalf("expected error for missing staged zip")
 	}
@@ -352,64 +318,45 @@ func TestProcessAlbumMissingSourceMarksFailed(t *testing.T) {
 func TestProcessAlbumIsIdempotentOnceReady(t *testing.T) {
 	cat := openTestCatalog(t)
 	store := newFakeStore()
-	embedder := &fakeEmbedder{}
 	zipData := buildZip(t, zipEntry{name: "a.png", data: pngBytes(t, 2, 2, 1)})
 	seedAlbum(t, cat, store, "album-a", "a.zip", zipData)
 
-	svc := NewService(cat, store, embedder, Options{TempDir: t.TempDir()})
+	svc := NewService(cat, store, Options{TempDir: t.TempDir()})
 	if err := svc.ProcessAlbum(context.Background(), "album-a"); err != nil {
 		t.Fatalf("first process: %v", err)
 	}
 	puts := store.putCount()
-	calls := embedder.callCount()
 
 	if err := svc.ProcessAlbum(context.Background(), "album-a"); err != nil {
 		t.Fatalf("second process: %v", err)
 	}
-	if store.putCount() != puts || embedder.callCount() != calls {
+	if store.putCount() != puts {
 		t.Fatalf("ready album should be a no-op")
 	}
 }
 
-func TestProcessAlbumRecordsEmbedFailureButKeepsAlbumReady(t *testing.T) {
-	cat := openTestCatalog(t)
-	store := newFakeStore()
-	embedder := &fakeEmbedder{err: errors.New("worker exploded")}
-	zipData := buildZip(t, zipEntry{name: "a.png", data: pngBytes(t, 2, 2, 7)})
-	seedAlbum(t, cat, store, "album-a", "a.zip", zipData)
-
-	svc := NewService(cat, store, embedder, Options{TempDir: t.TempDir()})
-	if err := svc.ProcessAlbum(context.Background(), "album-a"); err != nil {
-		t.Fatalf("process album: %v", err)
-	}
-
-	album, _ := cat.GetAlbum(context.Background(), "album-a")
-	if album.Status != catalog.AlbumStatusReady {
-		t.Fatalf("status=%s want=%s", album.Status, catalog.AlbumStatusReady)
-	}
-	blob, err := cat.GetBlob(context.Background(), hashOf(pngBytes(t, 2, 2, 7)))
-	if err != nil {
-		t.Fatalf("get blob: %v", err)
-	}
-	if blob.EmbeddingStatus != catalog.EmbeddingStatusFailed {
-		t.Fatalf("embedding status=%s want=%s", blob.EmbeddingStatus, catalog.EmbeddingStatusFailed)
-	}
-	if blob.EmbeddingError == "" {
-		t.Fatalf("expected embedding error to be stored")
-	}
-}
-
-func TestProcessAlbumLeavesEmbeddingPendingWithoutEmbedder(t *testing.T) {
+// TestProcessAlbumReadyWithPendingEmbeddings pins the contract the upload UI
+// relies on: the album turns ready (and becomes visible) right after
+// extraction, while its blobs wait as pending for the background embedding
+// workers.
+func TestProcessAlbumReadyWithPendingEmbeddings(t *testing.T) {
 	cat := openTestCatalog(t)
 	store := newFakeStore()
 	zipData := buildZip(t, zipEntry{name: "a.png", data: pngBytes(t, 2, 2, 3)})
 	seedAlbum(t, cat, store, "album-a", "a.zip", zipData)
 
-	svc := NewService(cat, store, nil, Options{TempDir: t.TempDir()})
+	svc := NewService(cat, store, Options{TempDir: t.TempDir()})
 	if err := svc.ProcessAlbum(context.Background(), "album-a"); err != nil {
 		t.Fatalf("process album: %v", err)
 	}
 
+	album, err := cat.GetAlbum(context.Background(), "album-a")
+	if err != nil {
+		t.Fatalf("get album: %v", err)
+	}
+	if album.Status != catalog.AlbumStatusReady {
+		t.Fatalf("status=%s want=%s", album.Status, catalog.AlbumStatusReady)
+	}
 	blob, err := cat.GetBlob(context.Background(), hashOf(pngBytes(t, 2, 2, 3)))
 	if err != nil {
 		t.Fatalf("get blob: %v", err)
@@ -426,7 +373,7 @@ func TestProcessAlbumInvokesReadyHook(t *testing.T) {
 	seedAlbum(t, cat, store, "album-a", "a.zip", zipData)
 
 	var ready []string
-	svc := NewService(cat, store, nil, Options{
+	svc := NewService(cat, store, Options{
 		TempDir:      t.TempDir(),
 		OnAlbumReady: func(albumID string) { ready = append(ready, albumID) },
 	})
@@ -444,7 +391,7 @@ func TestProcessAlbumReplacesPhotosOnReprocess(t *testing.T) {
 	first := buildZip(t, zipEntry{name: "a.png", data: pngBytes(t, 2, 2, 1)}, zipEntry{name: "b.png", data: pngBytes(t, 2, 2, 2)})
 	seedAlbum(t, cat, store, "album-a", "a.zip", first)
 
-	svc := NewService(cat, store, nil, Options{TempDir: t.TempDir()})
+	svc := NewService(cat, store, Options{TempDir: t.TempDir()})
 	if err := svc.ProcessAlbum(context.Background(), "album-a"); err != nil {
 		t.Fatalf("process album: %v", err)
 	}
@@ -471,7 +418,7 @@ func TestProcessAlbumReplacesPhotosOnReprocess(t *testing.T) {
 }
 
 func TestEnqueueDeduplicatesInFlightAlbums(t *testing.T) {
-	svc := NewService(nil, nil, nil, Options{})
+	svc := NewService(nil, nil, Options{})
 	if err := svc.Enqueue("album-a"); err != nil {
 		t.Fatalf("first enqueue: %v", err)
 	}

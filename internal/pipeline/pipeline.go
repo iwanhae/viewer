@@ -2,9 +2,13 @@
 //
 // A single background worker downloads one staged zip at a time and walks its
 // entries sequentially. For every image entry it computes a SHA-256 hash, gets
-// the image dimensions, computes an embedding, stores the raw bytes in S3 under
-// "blobs/<hash>", and records all metadata in the SQLite catalog. Because the
-// blob key is the content hash, identical image bytes are stored exactly once.
+// the image dimensions, stores the raw bytes in S3 under "blobs/<hash>", and
+// records all metadata in the SQLite catalog. Because the blob key is the
+// content hash, identical image bytes are stored exactly once.
+//
+// Embedding is deliberately not part of extraction: blobs are recorded as
+// pending and the background workers in the recommend package drain them, so
+// an album becomes ready and visible as soon as its images are extracted.
 package pipeline
 
 import (
@@ -26,7 +30,6 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"time"
 
 	_ "golang.org/x/image/webp"
 	"viewer/internal/catalog"
@@ -52,11 +55,6 @@ type Store interface {
 	DeleteObject(ctx context.Context, key string) error
 }
 
-// Embedder computes an embedding for raw image bytes.
-type Embedder interface {
-	Embed(ctx context.Context, imageBytes []byte) ([]float32, error)
-}
-
 // Options configure a pipeline service.
 type Options struct {
 	// TempDir holds the downloaded zip while it is being unpacked.
@@ -67,10 +65,9 @@ type Options struct {
 
 // Service downloads and unpacks staged uploads sequentially.
 type Service struct {
-	catalog  *catalog.Store
-	store    Store
-	embedder Embedder
-	opts     Options
+	catalog *catalog.Store
+	store   Store
+	opts    Options
 
 	queue     chan string
 	startOnce sync.Once
@@ -79,16 +76,16 @@ type Service struct {
 	inFlight map[string]struct{}
 }
 
-// NewService builds a pipeline service. embedder may be nil, in which case
-// images are stored without embeddings and left in the "pending" state.
-func NewService(cat *catalog.Store, store Store, embedder Embedder, opts Options) *Service {
+// NewService builds a pipeline service. It never computes embeddings: blobs
+// are recorded as pending and the recommend package's background workers pick
+// them up.
+func NewService(cat *catalog.Store, store Store, opts Options) *Service {
 	if strings.TrimSpace(opts.TempDir) == "" {
 		opts.TempDir = os.TempDir()
 	}
 	return &Service{
 		catalog:  cat,
 		store:    store,
-		embedder: embedder,
 		opts:     opts,
 		queue:    make(chan string, defaultQueueSize),
 		inFlight: make(map[string]struct{}),
@@ -238,9 +235,9 @@ func (s *Service) ProcessAlbum(ctx context.Context, albumID string) error {
 		s.opts.OnAlbumReady(albumID)
 	}
 
-	// Embedding is not part of "ready": the model may be missing, and the
-	// background workers may still have to finish what this album left pending.
-	// Report both so the log line says which of the two happened.
+	// Extraction never waits for embeddings, so a ready album almost always
+	// leaves blobs pending for the background workers. Report the split so the
+	// log line says how much embedding work is still queued for this album.
 	if embedder, err := s.catalog.EmbeddingCountsByAlbum(ctx, albumID); err == nil {
 		log.Printf(
 			"pipeline: album=%s ready photos=%d embedded=%d pending=%d failed=%d",
@@ -366,8 +363,7 @@ func (s *Service) extractEntry(ctx context.Context, albumID string, index int, e
 	hash := hex.EncodeToString(sum[:])
 	contentType := contentTypeFor(data, entry.Name)
 
-	created, err := s.ensureBlob(ctx, hash, data, contentType)
-	if err != nil {
+	if err := s.ensureBlob(ctx, hash, data, contentType); err != nil {
 		return false, err
 	}
 
@@ -391,63 +387,23 @@ func (s *Service) extractEntry(ctx context.Context, albumID string, index int, e
 		return false, err
 	}
 
-	if s.shouldEmbed(ctx, hash, created) {
-		s.embed(ctx, albumID, hash, data)
-	}
 	return true, nil
 }
 
-// shouldEmbed avoids recomputing an embedding for a blob that already has one.
-func (s *Service) shouldEmbed(ctx context.Context, hash string, created bool) bool {
-	if s.embedder == nil {
-		return false
-	}
-	if created {
-		return true
-	}
-	blob, err := s.catalog.GetBlob(ctx, hash)
-	if err != nil {
-		return true
-	}
-	return !(blob.EmbeddingStatus == catalog.EmbeddingStatusReady && len(blob.Embedding) > 0)
-}
-
 // ensureBlob uploads the raw image bytes to S3 exactly once per content hash.
-// It reports whether this call created the object.
-func (s *Service) ensureBlob(ctx context.Context, hash string, data []byte, contentType string) (bool, error) {
+// Repeated extractions of the same image reuse the stored object.
+func (s *Service) ensureBlob(ctx context.Context, hash string, data []byte, contentType string) error {
 	key := BlobKey(hash)
 	exists, size, err := s.store.HeadObject(ctx, key)
 	if err != nil {
-		return false, fmt.Errorf("head blob %s: %w", key, err)
+		return fmt.Errorf("head blob %s: %w", key, err)
 	}
 	if !exists || size <= 0 {
 		if err := s.store.PutObject(ctx, key, bytes.NewReader(data), contentType); err != nil {
-			return false, fmt.Errorf("put blob %s: %w", key, err)
+			return fmt.Errorf("put blob %s: %w", key, err)
 		}
-		return true, nil
 	}
-	return false, nil
-}
-
-func (s *Service) embed(ctx context.Context, albumID string, hash string, data []byte) {
-	if s.embedder == nil {
-		return
-	}
-	startedAt := time.Now()
-	vector, err := s.embedder.Embed(ctx, data)
-	if err != nil {
-		_ = s.catalog.SetBlobEmbedding(context.Background(), hash, catalog.EmbeddingStatusFailed, nil, err.Error())
-		log.Printf("pipeline: album=%s blob=%s embed failed: %v", albumID, hash, err)
-		return
-	}
-	if err := s.catalog.SetBlobEmbedding(ctx, hash, catalog.EmbeddingStatusReady, vector, ""); err != nil {
-		log.Printf("pipeline: album=%s blob=%s persist embedding failed: %v", albumID, hash, err)
-		return
-	}
-	log.Printf(
-		"pipeline: album=%s blob=%s embedded bytes=%d dim=%d elapsed=%s",
-		albumID, hash, len(data), len(vector), time.Since(startedAt).Round(time.Millisecond),
-	)
+	return nil
 }
 
 // imageEntries returns decodable image entries sorted the same way the legacy
