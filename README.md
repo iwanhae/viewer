@@ -106,17 +106,21 @@ the bucket root must move its `blobs/` and `uploads/` keys under the new prefix,
 or the viewer will not see them.
 
 Everything else is a constant in `internal/config`: the signing region, the 1 GiB
-upload limit, the 15 minute presign TTL, and the `/app/siglip2` checkpoint
-location. Copy `.env.example` to `.env` for a local run. The test suite uses no
+upload limit, the 15 minute presign TTL, the `/app/siglip2` checkpoint
+location, and the `SIGLIP2_MODEL_URL` mirror the checkpoint is fetched from.
+Copy `.env.example` to `.env` for a local run. The test suite uses no
 credentials, so `make test` needs no environment file.
 
 There is no separate inference service to run: `viewer` loads the checkpoint
-from `/app/siglip2` once at startup and runs the vision tower in-process. The
-tower needs no network access at startup, and a checkpoint that fails to load
-only degrades: the container logs the failure, keeps serving, and returns
-recommendations from whatever embeddings the catalog already holds. Mount a
-directory at `/app/siglip2` (holding `config.json` and `model.safetensors`) to
-supply a checkpoint to `runtime-slim`.
+from `/app/siglip2` once at startup and runs the vision tower in-process. A
+cold start first fetches the checkpoint into that directory from
+`SIGLIP2_MODEL_URL`, a public-read mirror of the upstream Hugging Face files;
+a directory that already holds a checkpoint - a previous download or a mount -
+is never re-fetched. A checkpoint that fails to load only degrades: the
+container logs the failure, keeps serving, and returns recommendations from
+whatever embeddings the catalog already holds. Mount a directory at
+`/app/siglip2` (holding `config.json` and `model.safetensors`) to supply a
+checkpoint by hand and skip the download entirely.
 
 Embeddings are stored as little-endian `float32` blobs on each image blob row in
 SQLite. The ingest pipeline embeds new blobs inline; a blob whose embedding was
@@ -154,17 +158,18 @@ picks them up. `failed` images are terminal — the retry worker skips them — 
 `ready + failed == total` instead of a bar that never fills.
 
 Docker:
-- `runtime` (default `docker build .`) is self-contained: the Go viewer, frontend
-  assets, and the prefetched SigLIP2 checkpoint at `/app/siglip2`.
-- `runtime-slim` omits the checkpoint for deployments that mount one at
-  `/app/siglip2`.
+- `docker build .` produces one image: the Go viewer and the frontend assets.
+  It carries no checkpoint - a cold start downloads it (~1.5 GiB) into
+  `/app/siglip2` from `SIGLIP2_MODEL_URL`, so the published image stays small.
+  Mount a volume at `/app/siglip2` to keep that download across container
+  replacements, or set `SIGLIP2_MODEL_URL` to mirror a different model.
 - CI publishes the viewer as `ghcr.io/<owner>/<repo>`.
 
-The checkpoint is fetched at build time through the `model-prefetch` stage, so
-pod startup does not require Hugging Face egress. To use a different model in
-Docker, build with `--build-arg SIGLIP2_MODEL_ID=<repo-id>`. The stage refuses to
-build an image whose `/app/siglip2` is missing or empty, so a broken prefetch
-fails the build instead of surfacing as "serving without embeddings" later.
+Only the first start needs egress to the mirror - the same host the viewer
+already talks to for object storage - and never to Hugging Face. A download
+that fails leaves no partial file behind: the next start retries, and in the
+meantime the viewer degrades to serving without embeddings rather than
+crashing.
 
 ## Commands
 - `make build` compiles `bin/viewer`, rebuilding frontend assets when their sources are newer than the committed `internal/web/static` bundle (`make build FORCE=1` forces a frontend rebuild).

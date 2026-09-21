@@ -73,11 +73,42 @@ func TestLoadFallsBackOnUnusablePort(t *testing.T) {
 	}
 }
 
-// TestDeploymentConstants pins the value the Dockerfile bakes the checkpoint
-// at, which has to stay in step with it.
+// TestDeploymentConstants pins the directory the image pre-creates for the
+// checkpoint: the startup download fills it and a volume mount can replace it.
 func TestDeploymentConstants(t *testing.T) {
 	if ModelDir != "/app/siglip2" {
-		t.Errorf("ModelDir=%q want /app/siglip2 (the Dockerfile prefetch target)", ModelDir)
+		t.Errorf("ModelDir=%q want /app/siglip2 (the checkpoint directory the image pre-creates)", ModelDir)
+	}
+}
+
+// TestLoadModelURL covers the checkpoint mirror default and the trailing-slash
+// trim, so the downloader can append a filename directly.
+func TestLoadModelURL(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{name: "unset", raw: "", want: DefaultModelURL},
+		{name: "blank", raw: "   ", want: DefaultModelURL},
+		{name: "slashes only", raw: "///", want: DefaultModelURL},
+		{name: "override", raw: "https://mirror.example.test/models/siglip2", want: "https://mirror.example.test/models/siglip2"},
+		{name: "trailing slash", raw: "https://mirror.example.test/models/siglip2/", want: "https://mirror.example.test/models/siglip2"},
+		{name: "surrounding spaces", raw: "  https://mirror.example.test/m  ", want: "https://mirror.example.test/m"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			setRequiredEnv(t)
+			t.Setenv("SIGLIP2_MODEL_URL", tc.raw)
+
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if cfg.ModelURL != tc.want {
+				t.Fatalf("ModelURL=%q want=%q for SIGLIP2_MODEL_URL=%q", cfg.ModelURL, tc.want, tc.raw)
+			}
+		})
 	}
 }
 

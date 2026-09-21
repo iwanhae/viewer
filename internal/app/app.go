@@ -10,6 +10,7 @@ import (
 	"viewer/internal/albums"
 	"viewer/internal/backup"
 	"viewer/internal/catalog"
+	"viewer/internal/checkpoint"
 	cfgpkg "viewer/internal/config"
 	"viewer/internal/feed"
 	"viewer/internal/httpapi"
@@ -59,16 +60,24 @@ func Run(ctx context.Context) error {
 
 	imageService := images.NewService(cat, store)
 
-	// The vision tower runs in-process against the checkpoint the Docker image
-	// bakes in at config.ModelDir.
+	// The vision tower runs in-process against the checkpoint in
+	// config.ModelDir. The image ships without one, so Ensure fetches it from
+	// the mirror on a cold start; a deployment that mounts a prepared
+	// directory there skips the download entirely.
 	recommendService := recommend.NewService(cat, imageService, recommend.NewVisionEmbedder(vision.Config{
 		ModelID: cfgpkg.ModelDir,
 	}))
 
 	// Load the vision tower before anything can request an embedding: a failed
 	// load marks the service disabled, and the background workers then stay off
-	// instead of failing every pending blob.
+	// instead of failing every pending blob. The timeout also bounds the
+	// checkpoint download a cold start performs first.
 	loadCtx, cancel := context.WithTimeout(context.Background(), embeddingLoadTimeout)
+	if err := checkpoint.Ensure(loadCtx, cfgpkg.ModelDir, cfg.ModelURL); err != nil {
+		// vision.Load then fails on the incomplete directory and marks the
+		// service disabled through the same path as any other missing model.
+		log.Printf("viewer: checkpoint fetch from %s failed: %v", cfg.ModelURL, err)
+	}
 	loadErr := recommendService.LoadModel(loadCtx)
 	cancel()
 	if loadErr != nil {

@@ -4,8 +4,8 @@
 // differ between deployments are the object-storage credentials and addressing,
 // the port the container listens on, the volume holding the SQLite catalog, and
 // the optional key prefix that lets two deployments share one bucket. Everything
-// else - the upload limits, the checkpoint location - is a constant here rather
-// than an environment variable.
+// else - the upload limits, the checkpoint location and the mirror it is
+// fetched from - is a constant here rather than an environment variable.
 package config
 
 import (
@@ -43,10 +43,18 @@ const (
 	// PresignTTL is how long a presigned zip upload URL stays valid.
 	PresignTTL = 15 * time.Minute
 
-	// ModelDir is where the Docker image bakes the SigLIP2 vision checkpoint.
-	// It is a directory, not a Hugging Face repository id, so a container never
-	// needs network access to Hugging Face at startup.
+	// ModelDir is the local directory holding the SigLIP2 vision checkpoint.
+	// The image ships it empty: at startup the viewer fetches the checkpoint
+	// into it from DefaultModelURL, and a deployment can mount a prepared
+	// directory there instead. It is a directory, not a Hugging Face
+	// repository id, so a running container never talks to the Hub.
 	ModelDir = "/app/siglip2"
+
+	// DefaultModelURL is the HTTPS mirror the checkpoint is fetched from when
+	// ModelDir does not hold one. It serves the upstream Hugging Face files
+	// (config.json, model.safetensors) from this deployment's public bucket,
+	// so neither the image build nor the container needs to reach Hugging Face.
+	DefaultModelURL = "https://s3.iwanhae.kr/public/google/siglip2-base-patch16-224"
 )
 
 // Config is the set of settings a deployment supplies. It carries no derived
@@ -76,6 +84,10 @@ type Config struct {
 	// process writes - the staged zip being unpacked - goes to the OS temp
 	// directory, because the bucket still holds the original.
 	StateDir string
+
+	// ModelURL is the base URL the checkpoint is fetched from when ModelDir
+	// holds no file: one download per <ModelURL>/<filename>.
+	ModelURL string
 }
 
 // DBPath is the SQLite catalog inside StateDir.
@@ -98,6 +110,7 @@ func Load() (Config, error) {
 		S3Prefix:       normalizePrefix(os.Getenv("S3_PREFIX")),
 		S3UsePathStyle: usePathStyle,
 		StateDir:       normalizeStateDir(os.Getenv("STATE_DIR")),
+		ModelURL:       normalizeModelURL(os.Getenv("SIGLIP2_MODEL_URL")),
 	}
 
 	switch {
@@ -175,4 +188,15 @@ func normalizeStateDir(raw string) string {
 		return DefaultStateDir
 	}
 	return filepath.Clean(trimmed)
+}
+
+// normalizeModelURL falls back to DefaultModelURL when SIGLIP2_MODEL_URL is
+// unset or blank, and drops trailing slashes so the checkpoint downloader can
+// append a filename directly.
+func normalizeModelURL(raw string) string {
+	trimmed := strings.TrimRight(strings.TrimSpace(raw), "/")
+	if trimmed == "" {
+		return DefaultModelURL
+	}
+	return trimmed
 }
