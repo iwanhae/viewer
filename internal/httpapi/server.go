@@ -227,7 +227,23 @@ func (s *Server) getImage(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", "invalid image index")
 		return
 	}
-	stream, err := s.images.OpenImage(r.Context(), albumID, idx)
+	// An absent w serves the untouched original; a w on the width ladder asks
+	// for a scaled variant. Anything else is a client error.
+	width, err := parseOptionalIntQuery(r, "w", 0, 1, 4096)
+	if err != nil {
+		writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", "invalid image width")
+		return
+	}
+	if width != 0 && !images.IsSupportedWidth(width) {
+		writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", fmt.Sprintf("unsupported width %d, supported: %v", width, images.WidthLadder()))
+		return
+	}
+	var stream *images.ImageStream
+	if width == 0 {
+		stream, err = s.images.OpenImage(r.Context(), albumID, idx)
+	} else {
+		stream, err = s.images.OpenImageScaled(r.Context(), albumID, idx, width)
+	}
 	if err != nil {
 		status := http.StatusInternalServerError
 		code := "INTERNAL"

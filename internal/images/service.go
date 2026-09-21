@@ -5,8 +5,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"image"
+	"image/jpeg"
 	"io"
 	"strings"
+
+	_ "image/gif"  // register the GIF decoder for image.Decode
+	_ "image/png"  // register the PNG decoder for image.Decode
+	_ "golang.org/x/image/webp" // register the WebP decoder for image.Decode
+
+	"golang.org/x/image/draw"
 
 	"viewer/internal/albums"
 	"viewer/internal/catalog"
@@ -81,6 +89,104 @@ func (s *Service) OpenImage(ctx context.Context, albumID string, idx int) (*Imag
 		return nil, err
 	}
 	return s.openImageByHash(ctx, photo.Hash)
+}
+
+// WidthLadder lists the scaled widths the image endpoint accepts. The ladder
+// is deliberately short: every entry is a compile-time choice, not config.
+func WidthLadder() []int {
+	return []int{320, 640, 1024}
+}
+
+// IsSupportedWidth reports whether w is on the width ladder.
+func IsSupportedWidth(w int) bool {
+	for _, candidate := range WidthLadder() {
+		if candidate == w {
+			return true
+		}
+	}
+	return false
+}
+
+// OpenImageScaled returns the image at the given index scaled to fit within
+// width, preserving aspect ratio. Images already no wider than the request are
+// served with their original bytes; anything larger becomes a JPEG so the
+// scaled response stays small. The content hash doubles as the response
+// validator: scaled variants append their width to the blob hash.
+func (s *Service) OpenImageScaled(ctx context.Context, albumID string, idx, width int) (*ImageStream, error) {
+	if !IsSupportedWidth(width) {
+		return nil, fmt.Errorf("%w: %d", ErrUnsupportedWidth, width)
+	}
+	if strings.TrimSpace(albumID) == "" {
+		return nil, fmt.Errorf("album id is required")
+	}
+	if idx < 0 {
+		return nil, fmt.Errorf("%w: %d", ErrPhotoIndexOutOfRange, idx)
+	}
+
+	if _, err := s.catalog.GetAlbum(ctx, albumID); err != nil {
+		if errors.Is(err, catalog.ErrAlbumNotFound) {
+			return nil, fmt.Errorf("%w: %s", albums.ErrAlbumNotFound, albumID)
+		}
+		return nil, err
+	}
+
+	photo, err := s.catalog.PhotoAt(ctx, albumID, idx)
+	if err != nil {
+		if errors.Is(err, catalog.ErrPhotoNotFound) {
+			return nil, fmt.Errorf("%w: %d", ErrPhotoIndexOutOfRange, idx)
+		}
+		return nil, err
+	}
+
+	data, contentType, err := s.fetchBlob(ctx, photo.Hash)
+	if err != nil {
+		return nil, err
+	}
+	// Up-scaling adds nothing, so a small original passes through untouched
+	// with its own content type and hash.
+	config, _, err := image.DecodeConfig(bytes.NewReader(data))
+	if err != nil {
+		return nil, fmt.Errorf("probe image %s: %w", photo.Hash, err)
+	}
+	if config.Width <= width {
+		return &ImageStream{
+			Content:     bytes.NewReader(data),
+			SizeBytes:   int64(len(data)),
+			ContentType: contentType,
+			Hash:        photo.Hash,
+		}, nil
+	}
+	encoded, err := encodeScaledJPEG(data, width)
+	if err != nil {
+		return nil, err
+	}
+	return &ImageStream{
+		Content:     bytes.NewReader(encoded),
+		SizeBytes:   int64(len(encoded)),
+		ContentType: "image/jpeg",
+		Hash:        fmt.Sprintf("%s:w%d", photo.Hash, width),
+	}, nil
+}
+
+// encodeScaledJPEG decodes an original image and resamples it to fit within
+// width, preserving aspect ratio.
+func encodeScaledJPEG(data []byte, width int) ([]byte, error) {
+	src, _, err := image.Decode(bytes.NewReader(data))
+	if err != nil {
+		return nil, fmt.Errorf("decode image: %w", err)
+	}
+	srcBounds := src.Bounds()
+	dstH := srcBounds.Dy() * width / srcBounds.Dx()
+	if dstH < 1 {
+		dstH = 1
+	}
+	dst := image.NewRGBA(image.Rect(0, 0, width, dstH))
+	draw.CatmullRom.Scale(dst, dst.Bounds(), src, srcBounds, draw.Over, nil)
+	var buf bytes.Buffer
+	if err := jpeg.Encode(&buf, dst, &jpeg.Options{Quality: 82}); err != nil {
+		return nil, fmt.Errorf("encode scaled image: %w", err)
+	}
+	return buf.Bytes(), nil
 }
 
 // GetImageByHash returns the raw bytes of a content-addressed blob. Embedding
