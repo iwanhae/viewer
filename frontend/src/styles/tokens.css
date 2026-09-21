@@ -1,0 +1,52 @@
+:root {
+  color-scheme: light;
+
+  /* Ground and surfaces: photos are the only saturated element on the page,
+     so the chrome stays ink-on-paper. */
+  --paper: #f7f8fa;
+  --surface: #ffffff;
+  --surface-2: #f2f3f6;
+
+  --ink: #151a20;
+  --ink-2: #5c6672;
+  --ink-3: #8b95a1;
+
+  --line: rgba(21, 26, 32, 0.12);
+  --line-strong: rgba(21, 26, 32, 0.24);
+
+  /* The accent is reserved for focus rings, links and progress fills;
+     primary actions stay ink-filled. */
+  --accent: #2451b8;
+  --accent-soft: rgba(36, 81, 184, 0.12);
+
+  --ok: #1a7f4c;
+  --ok-soft: rgba(26, 127, 76, 0.12);
+  --err: #b3261e;
+  --err-soft: rgba(179, 38, 30, 0.1);
+  --warn: #92400e;
+  --warn-soft: rgba(146, 64, 14, 0.12);
+
+  --radius-pill: 999px;
+  --radius-card: 16px;
+  --radius-small: 12px;
+  --radius-tiny: 8px;
+
+  --shadow-card: 0 1px 2px rgba(21, 26, 32, 0.04), 0 10px 28px rgba(21, 26, 32, 0.06);
+  --shadow-raised: 0 14px 32px rgba(15, 23, 42, 0.18), inset 0 1px 0 rgba(255, 255, 255, 0.52);
+
+  /* Hangul falls through to the system Korean faces; bundling a Korean
+     webfont would cost megabytes for glyphs the photos already carry. */
+  --font-sans: "Space Grotesk", "Apple SD Gothic Neo", "Malgun Gothic", "Noto Sans KR",
+    system-ui, -apple-system, "Segoe UI", sans-serif;
+
+  --text-xs: 0.6875rem;
+  --text-sm: 0.75rem;
+  --text-md: 0.8125rem;
+  --text-lg: 0.9375rem;
+  --text-xl: 1.0625rem;
+  --text-title: clamp(1.25rem, 1.2rem + 0.6vw, 1.6rem);
+
+  --speed-fast: 140ms;
+  --speed-slow: 240ms;
+  --ease: cubic-bezier(0.2, 0, 0, 1);
+}

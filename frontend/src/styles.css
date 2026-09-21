@@ -1,23 +1,9 @@
-:root {
-  font-family: "Space Grotesk", "Segoe UI", sans-serif;
-  color: #1f2933;
-  background: #f8fbfd;
-}
-
-* {
-  box-sizing: border-box;
-}
-
-html,
-body,
-#root {
-  margin: 0;
-  width: 100%;
-  min-height: 100%;
-  background:
-    radial-gradient(circle at 16% 18%, #e8f4ff, transparent 42%),
-    radial-gradient(circle at 82% 10%, #f6efe3, transparent 38%), #f8fbfd;
-}
+/*
+ * Page styles for the wall, the floating island chrome, the album grid and
+ * the photo page. Design tokens live in styles/tokens.css, base primitives
+ * in styles/base.css, and the Find Albums / Upload pages own their CSS in
+ * pages/albumSearch.css and pages/upload.css.
+ */
 
 .wall-page {
   min-height: 100vh;
@@ -53,7 +39,7 @@ body,
   width: 100%;
   display: block;
   object-fit: cover;
-  border-radius: 14px;
+  border-radius: var(--radius-small);
   transition: transform 180ms ease;
 }
 
@@ -65,12 +51,15 @@ body,
   height: 1px;
 }
 
+/* The island, the scroll-to-top pill and the status toast are the only
+   floating chrome, so they keep their frosted treatment. */
+
 .bottom-island {
   position: fixed;
   left: 50%;
   transform: translateX(-50%);
   bottom: calc(12px + env(safe-area-inset-bottom));
-  border-radius: 999px;
+  border-radius: var(--radius-pill);
   padding: 8px;
   display: flex;
   gap: 6px;
@@ -83,8 +72,7 @@ body,
     rgba(255, 255, 255, 0.22)
   );
   border: 1px solid rgba(255, 255, 255, 0.38);
-  box-shadow: 0 14px 32px rgba(15, 23, 42, 0.18),
-    inset 0 1px 0 rgba(255, 255, 255, 0.52);
+  box-shadow: var(--shadow-raised);
   z-index: 40;
 }
 
@@ -96,14 +84,13 @@ body,
 }
 
 .bottom-island-action {
-  border: 0;
-  border-radius: 999px;
+  border-radius: var(--radius-pill);
   width: 38px;
   height: 38px;
   padding: 0;
   background: rgba(255, 255, 255, 0.3);
   border: 1px solid rgba(255, 255, 255, 0.45);
-  color: #1f2933;
+  color: var(--ink);
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -118,7 +105,7 @@ body,
 .bottom-island-action.is-open {
   background: rgba(15, 23, 42, 0.76);
   border-color: rgba(255, 255, 255, 0.2);
-  color: #f8fbfd;
+  color: var(--paper);
 }
 
 .bottom-island-icon {
@@ -133,11 +120,11 @@ body,
   min-height: 38px;
   min-width: 94px;
   padding: 0 12px;
-  border-radius: 999px;
+  border-radius: var(--radius-pill);
   background: rgba(255, 255, 255, 0.28);
   border: 1px solid rgba(255, 255, 255, 0.4);
-  color: #334155;
-  font-size: 12px;
+  color: var(--ink-2);
+  font-size: var(--text-sm);
   font-weight: 650;
   display: inline-flex;
   align-items: center;
@@ -150,10 +137,10 @@ body,
   left: 50%;
   transform: translate(-50%, 4px);
   bottom: calc(100% + 8px);
-  border-radius: 999px;
+  border-radius: var(--radius-pill);
   padding: 4px 8px;
   background: rgba(15, 23, 42, 0.9);
-  color: #f8fbfd;
+  color: var(--paper);
   font-size: 11px;
   line-height: 1;
   white-space: nowrap;
@@ -183,10 +170,10 @@ body,
   left: 50%;
   transform: translateX(-50%);
   bottom: calc(100% + 10px);
-  border-radius: 14px;
-  border: 1px solid rgba(31, 41, 51, 0.14);
+  border-radius: var(--radius-small);
+  border: 1px solid var(--line);
   background: rgba(255, 255, 255, 0.96);
-  box-shadow: 0 16px 30px rgba(15, 23, 42, 0.12);
+  box-shadow: var(--shadow-card);
   backdrop-filter: blur(14px);
   padding: 8px;
 }
@@ -206,20 +193,20 @@ body,
 
 .bottom-island-popup-option {
   border: 0;
-  border-radius: 999px;
+  border-radius: var(--radius-pill);
   min-width: 34px;
   min-height: 32px;
   padding: 0 10px;
-  background: rgba(31, 41, 51, 0.1);
-  color: #1f2933;
+  background: var(--line);
+  color: var(--ink);
   font-weight: 600;
-  font-size: 13px;
+  font-size: var(--text-md);
   cursor: pointer;
 }
 
 .bottom-island-popup-option.active {
-  background: #1f2933;
-  color: #f8fbfd;
+  background: var(--ink);
+  color: var(--paper);
 }
 
 .status {
@@ -228,13 +215,13 @@ body,
   left: 50%;
   transform: translateX(-50%);
   background: rgba(255, 255, 255, 0.9);
-  border: 1px solid rgba(31, 41, 51, 0.14);
-  border-radius: 999px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-pill);
   padding: 8px 14px;
 }
 
 .status.error {
-  color: #a01f28;
+  color: var(--err);
 }
 
 .scroll-top-button {
@@ -244,8 +231,8 @@ body,
   width: 42px;
   height: 42px;
   border: 1px solid rgba(255, 255, 255, 0.45);
-  border-radius: 999px;
-  color: #1f2933;
+  border-radius: var(--radius-pill);
+  color: var(--ink);
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -257,8 +244,7 @@ body,
     rgba(255, 255, 255, 0.46),
     rgba(255, 255, 255, 0.22)
   );
-  box-shadow: 0 14px 32px rgba(15, 23, 42, 0.18),
-    inset 0 1px 0 rgba(255, 255, 255, 0.52);
+  box-shadow: var(--shadow-raised);
   z-index: 45;
   opacity: 0;
   pointer-events: none;
@@ -272,11 +258,6 @@ body,
   transform: translateY(0);
 }
 
-.scroll-top-button:focus-visible {
-  outline: 2px solid #1f2933;
-  outline-offset: 2px;
-}
-
 @media (hover: hover) and (pointer: fine) {
   .scroll-top-button:hover {
     background: linear-gradient(
@@ -287,74 +268,13 @@ body,
   }
 }
 
-.viewer {
-  position: fixed;
-  inset: 0;
-  background: #f8fbfd;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  overflow: hidden;
-}
-
-.viewer-image {
-  width: 100vw;
-  height: 100vh;
-  object-fit: cover;
-  user-select: none;
-}
-
-.viewer-overlay {
-  position: absolute;
-  left: 16px;
-  right: 16px;
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  z-index: 20;
-}
-
-.viewer-overlay.top {
-  top: max(16px, env(safe-area-inset-top));
-}
-
-.viewer-overlay.bottom {
-  bottom: max(16px, env(safe-area-inset-bottom));
-}
-
-.viewer-overlay button {
-  border: 0;
-  border-radius: 999px;
-  padding: 8px 12px;
-  background: rgba(255, 255, 255, 0.85);
-  color: #1f2933;
-}
-
-/* Progress bars are shared by the upload page's per-album embedding bar and
-   anything else that reports a fraction; they sit on light surfaces, not on
-   the photo overlay. */
-.progress {
-  width: 100%;
-  height: 6px;
-  border-radius: 999px;
-  background: rgba(37, 99, 235, 0.16);
-  overflow: hidden;
-}
-
-.progress-bar {
-  height: 100%;
-  border-radius: 999px;
-  background: #2563eb;
-  transition: width 240ms ease;
-}
-
 .viewer-loading,
 .viewer-error {
   min-height: 100vh;
   display: grid;
   place-items: center;
-  background: #f8fbfd;
-  color: #1f2933;
+  background: var(--paper);
+  color: var(--ink);
 }
 
 .album-page {
@@ -367,7 +287,7 @@ body,
 }
 
 .album-photo-tile {
-  border-radius: 14px;
+  border-radius: var(--radius-small);
   overflow: hidden;
   position: relative;
 }
@@ -382,11 +302,6 @@ body,
     0 0 44px rgba(217, 119, 6, 0.26);
 }
 
-.album-photo-tile:focus-visible {
-  outline: 2px solid #1f2933;
-  outline-offset: 2px;
-}
-
 .photo-page {
   min-height: 100vh;
   padding: max(12px, env(safe-area-inset-top)) 16px
@@ -396,11 +311,11 @@ body,
 .photo-nav-button,
 .photo-primary-action {
   border: 0;
-  border-radius: 999px;
+  border-radius: var(--radius-pill);
   min-height: 36px;
   padding: 0 14px;
   text-decoration: none;
-  font-size: 13px;
+  font-size: var(--text-md);
   font-weight: 700;
   letter-spacing: 0.01em;
   display: inline-flex;
@@ -410,20 +325,20 @@ body,
 }
 
 .photo-nav-button {
-  background: rgba(31, 41, 51, 0.12);
-  color: #1f2933;
+  background: var(--line);
+  color: var(--ink);
 }
 
 .photo-primary-action {
-  background: #1f2933;
-  color: #f8fbfd;
+  background: var(--ink);
+  color: var(--paper);
 }
 
 .photo-context {
   margin: 0 0 8px;
   text-align: left;
-  font-size: 12px;
-  color: #475569;
+  font-size: var(--text-sm);
+  color: var(--ink-2);
 }
 
 .photo-shell {
@@ -436,13 +351,8 @@ body,
 
 .photo-view-image-link {
   display: block;
-  border-radius: 20px;
+  border-radius: var(--radius-card);
   overflow: hidden;
-}
-
-.photo-view-image-link:focus-visible {
-  outline: 2px solid #1f2933;
-  outline-offset: 3px;
 }
 
 @keyframes photo-enter {
@@ -461,16 +371,16 @@ body,
   width: 100%;
   max-width: 100%;
   max-height: none;
-  border-radius: 20px;
+  border-radius: var(--radius-card);
   display: block;
   object-fit: cover;
   animation: photo-enter 240ms ease;
 }
 
 .photo-panel {
-  border-radius: 20px;
-  border: 1px solid rgba(31, 41, 51, 0.1);
-  background: rgba(255, 255, 255, 0.9);
+  border-radius: var(--radius-card);
+  border: 1px solid var(--line);
+  background: var(--surface);
   padding: 16px;
   animation: photo-enter 280ms ease;
 }
@@ -495,7 +405,7 @@ body,
   align-items: center;
   gap: 12px;
   padding: 10px 0;
-  border-bottom: 1px dashed rgba(31, 41, 51, 0.12);
+  border-bottom: 1px dashed var(--line);
 }
 
 .photo-meta-item:last-child {
@@ -503,24 +413,24 @@ body,
 }
 
 .photo-meta-item dt {
-  font-size: 12px;
+  font-size: var(--text-sm);
   letter-spacing: 0.03em;
   text-transform: uppercase;
   font-weight: 600;
-  color: #334155;
+  color: var(--ink-2);
 }
 
 .photo-meta-item dd {
   margin: 0;
   text-align: right;
   word-break: break-word;
-  color: #0f172a;
+  color: var(--ink);
 }
 
 .photo-recommendations {
   margin-top: 18px;
   padding-top: 14px;
-  border-top: 1px solid rgba(31, 41, 51, 0.12);
+  border-top: 1px solid var(--line);
   display: grid;
   gap: 10px;
 }
@@ -541,14 +451,14 @@ body,
 
 .photo-recommendations-meta {
   margin: 0;
-  font-size: 12px;
-  color: #64748b;
+  font-size: var(--text-sm);
+  color: var(--ink-3);
 }
 
 .photo-recommendations-note {
   margin: 0;
-  color: #475569;
-  font-size: 13px;
+  color: var(--ink-2);
+  font-size: var(--text-md);
 }
 
 .photo-recommendation-grid {
@@ -560,7 +470,7 @@ body,
   margin: 0;
   padding: 0;
   border: 0;
-  border-radius: 10px;
+  border-radius: var(--radius-tiny);
   overflow: hidden;
   cursor: pointer;
 }
@@ -576,314 +486,8 @@ body,
   min-height: 100vh;
   display: grid;
   place-items: center;
-  background: #f8fbfd;
-  color: #1f2933;
-}
-
-.album-search-page {
-  min-height: 100vh;
-  padding: max(16px, env(safe-area-inset-top)) 14px max(24px, env(safe-area-inset-bottom));
-}
-
-.album-search-shell {
-  width: min(960px, 100%);
-  margin: 0 auto;
-  border: 1px solid rgba(31, 41, 51, 0.1);
-  border-radius: 20px;
-  background: rgba(255, 255, 255, 0.84);
-  backdrop-filter: blur(12px);
-  padding: 16px;
-  display: grid;
-  gap: 12px;
-}
-
-.album-search-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-}
-
-.album-search-title {
-  margin: 0;
-  font-size: clamp(1.1rem, 1.8vw, 1.5rem);
-  letter-spacing: 0.01em;
-}
-
-.album-search-label {
-  font-size: 12px;
-  letter-spacing: 0.03em;
-  text-transform: uppercase;
-  color: #475569;
-  font-weight: 600;
-}
-
-.album-search-input {
-  width: 100%;
-  min-height: 42px;
-  border-radius: 12px;
-  border: 1px solid rgba(31, 41, 51, 0.22);
-  padding: 0 12px;
-  background: rgba(255, 255, 255, 0.95);
-  color: #0f172a;
-  font-size: 15px;
-}
-
-.album-search-input:focus-visible {
-  outline: 2px solid #1f2933;
-  outline-offset: 1px;
-}
-
-.album-search-note {
-  margin: 0;
-  font-size: 13px;
-  color: #475569;
-}
-
-.album-search-note-error {
-  color: #a01f28;
-}
-
-.album-search-list {
-  display: grid;
-  gap: 10px;
-}
-
-.album-search-item {
-  width: 100%;
-  border: 1px solid rgba(31, 41, 51, 0.14);
-  border-radius: 14px;
-  background:
-    linear-gradient(150deg, rgba(255, 255, 255, 0.94), rgba(228, 239, 247, 0.84)),
-    #f8fbfd;
-  padding: 12px;
-  display: grid;
-  gap: 6px;
-  text-align: left;
-  color: #0f172a;
-  cursor: pointer;
-}
-
-.album-search-item:hover {
-  border-color: rgba(31, 41, 51, 0.28);
-}
-
-.album-search-item:focus-visible {
-  outline: 2px solid #1f2933;
-  outline-offset: 1px;
-}
-
-.album-search-item-head {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 8px;
-}
-
-.album-search-name {
-  margin: 0;
-  font-size: 16px;
-  font-weight: 700;
-  line-height: 1.2;
-  word-break: break-word;
-}
-
-.album-search-status {
-  flex: 0 0 auto;
-  border-radius: 999px;
-  padding: 4px 8px;
-  font-size: 11px;
-  letter-spacing: 0.02em;
-  text-transform: uppercase;
-  font-weight: 700;
-}
-
-.album-search-status-ready {
-  background: rgba(5, 150, 105, 0.16);
-  color: #065f46;
-}
-
-.album-search-status-partial {
-  background: rgba(217, 119, 6, 0.16);
-  color: #92400e;
-}
-
-.album-search-status-pending {
-  background: rgba(59, 130, 246, 0.15);
-  color: #1d4ed8;
-}
-
-.album-search-status-failed {
-  background: rgba(220, 38, 38, 0.15);
-  color: #991b1b;
-}
-
-.album-search-item-meta {
-  margin: 0;
-  color: #334155;
-  font-size: 12px;
-  word-break: break-word;
-}
-
-.album-search-item-meta-id {
-  color: #475569;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
-  font-size: 11px;
-}
-
-.upload-page {
-  min-height: 100vh;
-  padding: max(16px, env(safe-area-inset-top)) 14px max(24px, env(safe-area-inset-bottom));
-}
-
-.upload-shell {
-  width: min(1080px, 100%);
-  margin: 0 auto;
-  border: 1px solid rgba(31, 41, 51, 0.1);
-  border-radius: 24px;
-  background:
-    linear-gradient(156deg, rgba(255, 255, 255, 0.95), rgba(227, 241, 246, 0.9)),
-    #f8fbfd;
-  backdrop-filter: blur(12px);
-  padding: 16px;
-  display: grid;
-  gap: 14px;
-}
-
-.upload-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  gap: 12px;
-}
-
-.upload-title {
-  margin: 0;
-  font-size: clamp(1.25rem, 2.5vw, 1.7rem);
-  letter-spacing: 0.02em;
-}
-
-.upload-subtitle {
-  margin: 0;
-  color: #334155;
-  font-size: 14px;
-}
-
-.upload-actions {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-}
-
-.upload-actions .photo-nav-button,
-.upload-actions .photo-primary-action {
-  min-height: 34px;
-}
-
-.upload-summary {
-  margin: 0;
-  border: 1px solid rgba(31, 41, 51, 0.14);
-  border-radius: 14px;
-  padding: 10px 12px;
-  display: grid;
-  gap: 4px;
-  background: rgba(255, 255, 255, 0.75);
-}
-
-.upload-summary p {
-  margin: 0;
-  color: #0f172a;
-  font-size: 13px;
-}
-
-.upload-page-error {
-  margin: 0;
-  color: #991b1b;
-  font-size: 13px;
-}
-
-.upload-list {
-  display: grid;
-  gap: 10px;
-}
-
-.upload-empty {
-  margin: 0;
-  border: 1px dashed rgba(31, 41, 51, 0.22);
-  border-radius: 12px;
-  padding: 12px;
-  color: #475569;
-  background: rgba(255, 255, 255, 0.7);
-}
-
-.upload-item {
-  border: 1px solid rgba(31, 41, 51, 0.14);
-  border-radius: 14px;
-  padding: 12px;
-  display: grid;
-  gap: 8px;
-  background: rgba(255, 255, 255, 0.92);
-}
-
-.upload-item-head {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 8px;
-}
-
-.upload-item-name {
-  margin: 0;
-  font-size: 14px;
-  font-weight: 700;
-  color: #0f172a;
-  word-break: break-word;
-}
-
-.upload-item-status {
-  flex: 0 0 auto;
-  border-radius: 999px;
-  padding: 4px 8px;
-  font-size: 11px;
-  letter-spacing: 0.02em;
-  text-transform: uppercase;
-  font-weight: 700;
-}
-
-.upload-item-status-uploading,
-.upload-item-status-finalizing {
-  background: rgba(217, 119, 6, 0.14);
-  color: #92400e;
-}
-
-.upload-item-status-ready,
-.upload-item-status-submitted {
-  background: rgba(5, 150, 105, 0.16);
-  color: #065f46;
-}
-
-.upload-item-status-failed,
-.upload-item-status-canceled {
-  background: rgba(220, 38, 38, 0.14);
-  color: #991b1b;
-}
-
-.upload-item-meta {
-  margin: 0;
-  color: #334155;
-  font-size: 12px;
-}
-
-.upload-item-error {
-  margin: 0;
-  font-size: 12px;
-  color: #991b1b;
-}
-
-.upload-item-actions {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
+  background: var(--paper);
+  color: var(--ink);
 }
 
 @media (min-width: 1024px) {
@@ -908,15 +512,5 @@ body,
   .bottom-island {
     width: calc(100vw - 20px);
     justify-content: space-between;
-  }
-
-  .upload-actions {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-  }
-
-  .upload-actions .photo-nav-button,
-  .upload-actions .photo-primary-action {
-    width: 100%;
   }
 }

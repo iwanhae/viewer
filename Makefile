@@ -13,7 +13,7 @@ GO_TEST_PKGS := ./cmd/... ./internal/...
 export GOCACHE ?= $(GO_CACHE_DIR)
 export NPM_CONFIG_CACHE ?= $(NPM_CACHE_DIR)
 
-.PHONY: build build-frontend build-backend test run clean
+.PHONY: build build-frontend typecheck build-backend test run clean
 
 # build compiles the Go binaries. The frontend is rebuilt only when its sources
 # are present and newer than the committed bundle in internal/web/static, so a
@@ -38,6 +38,11 @@ build-frontend:
 	else \
 		echo "$(FRONTEND_STATIC) is up to date"; \
 	fi
+
+# The typecheck is the same gate `npm run build` runs; this target exists so a
+# frontend-only pass can fail fast without producing a bundle.
+typecheck:
+	npm --prefix $(FRONTEND_DIR) run typecheck
 
 build-backend:
 	mkdir -p bin

@@ -134,7 +134,7 @@ export function ViewerPage() {
     } else if (seed) {
       query.set('seed', seed)
     }
-    if (focusIndex !== null) {
+    if (focusIndex !== null && album) {
       query.set('focus', wallFocusKey(album.albumId, focusIndex))
     }
     const queryString = query.toString()

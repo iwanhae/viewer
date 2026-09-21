@@ -25,11 +25,17 @@ function parseJson(text: string): unknown {
   }
 }
 
-function toApiError(res: Response, bodyText: string): ApiError {
+// apiErrorFromResponse turns a non-2xx status plus its raw body into the typed
+// error, whatever the transport: fetch wrappers and XHR uploads share it.
+export function apiErrorFromResponse(status: number, bodyText: string): ApiError {
   const parsed = bodyText ? (parseJson(bodyText) as ErrorEnvelope | null) : null
-  const code = parsed?.error?.code || `HTTP_${res.status}`
-  const message = parsed?.error?.message || `request failed: ${res.status}`
-  return new ApiError(res.status, code, message)
+  const code = parsed?.error?.code || `HTTP_${status}`
+  const message = parsed?.error?.message || `request failed: ${status}`
+  return new ApiError(status, code, message)
+}
+
+function toApiError(res: Response, bodyText: string): ApiError {
+  return apiErrorFromResponse(res.status, bodyText)
 }
 
 export async function requestJSON<T>(input: RequestInfo | URL, init?: RequestInit): Promise<T> {
