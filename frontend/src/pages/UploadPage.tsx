@@ -1,14 +1,29 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
-import { createAlbum, fetchFinalizeStatus, finalizeAlbum, uploadAlbumObject } from '../api/client'
+import { Link } from 'react-router-dom'
+import { createAlbum, fetchFinalizeStatus, finalizeAlbum } from '../api/client'
+import {
+  MAX_UPLOAD_BYTES,
+  abortError,
+  isAbortError,
+  uploadAlbumObject,
+  type UploadProgress,
+} from '../api/upload'
 import type { EmbeddingProgress } from '../api/types'
+import { PageTopBar } from '../components/PageTopBar'
 import { useEmbeddingProgress } from '../hooks/useEmbeddingProgress'
 import { formatBytes } from '../utils/format'
+import './upload.css'
 
-type UploadStatus = 'uploading' | 'submitted' | 'ready' | 'failed' | 'canceled'
+// A file walks the stages left to right: it waits in the queue, a worker PUTs
+// it to storage, the server extracts it, and then the album is ready - the
+// server marks an album ready as soon as its images are extracted, and the
+// poll loop only stays alive afterwards to refresh the embedding counts.
+type UploadStatus = 'queued' | 'uploading' | 'indexing' | 'ready' | 'failed' | 'canceled'
+
 const uploadWorkerCount = 3
 const finalizePollIntervalMs = 2000
 const finalizePollTimeoutMs = 30 * 60 * 1000
+const progressTickMs = 200
 
 type UploadItem = {
   id: string
@@ -50,37 +65,18 @@ function toErrorMessage(err: unknown): string {
   return 'request failed'
 }
 
-function isAbortError(err: unknown): boolean {
-  if (err instanceof DOMException) {
-    return err.name === 'AbortError'
-  }
-  if (typeof err === 'object' && err !== null && 'name' in err) {
-    return String((err as { name?: unknown }).name) === 'AbortError'
-  }
-  return false
-}
-
-function abortedError(): Error {
-  if (typeof DOMException !== 'undefined') {
-    return new DOMException('Aborted', 'AbortError')
-  }
-  const err = new Error('Aborted')
-  err.name = 'AbortError'
-  return err
-}
-
 // delay waits for the poll interval but rejects as soon as the upload's
 // AbortController fires, so cancellation is not held up by a pending timer.
 function delay(ms: number, signal: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
     if (signal.aborted) {
-      reject(abortedError())
+      reject(abortError())
       return
     }
     let timer = 0
     const onAbort = () => {
       window.clearTimeout(timer)
-      reject(abortedError())
+      reject(abortError())
     }
     timer = window.setTimeout(() => {
       signal.removeEventListener('abort', onAbort)
@@ -92,10 +88,12 @@ function delay(ms: number, signal: AbortSignal): Promise<void> {
 
 function statusLabel(status: UploadStatus): string {
   switch (status) {
+    case 'queued':
+      return 'Queued'
     case 'uploading':
       return 'Uploading'
-    case 'submitted':
-      return 'Submitted'
+    case 'indexing':
+      return 'Indexing'
     case 'ready':
       return 'Ready'
     case 'failed':
@@ -107,16 +105,24 @@ function statusLabel(status: UploadStatus): string {
   }
 }
 
+function hasDraggedFiles(event: React.DragEvent): boolean {
+  return Array.from(event.dataTransfer?.types ?? []).includes('Files')
+}
+
 export function UploadPage() {
-  const navigate = useNavigate()
   const fileInputRef = useRef<HTMLInputElement | null>(null)
   const controllersRef = useRef(new Map<string, AbortController>())
   const itemsRef = useRef<UploadItem[]>([])
   const pendingQueueRef = useRef<string[]>([])
   const activeWorkersRef = useRef(0)
+  // XHR progress events fire far more often than React should re-render, so
+  // they land in this map and a single ticker flushes it into state.
+  const progressRef = useRef(new Map<string, UploadProgress>())
+  const dragDepthRef = useRef(0)
 
   const [items, setItems] = useState<UploadItem[]>([])
-  const [pageError, setPageError] = useState<string | null>(null)
+  const [notice, setNotice] = useState<string | null>(null)
+  const [isDragActive, setIsDragActive] = useState(false)
   const embedding = useEmbeddingProgress()
 
   const updateItem = useCallback((itemID: string, next: Partial<UploadItem>) => {
@@ -130,6 +136,32 @@ export function UploadPage() {
   useEffect(() => {
     itemsRef.current = items
   }, [items])
+
+  const isUploading = items.some((item) => item.status === 'uploading')
+
+  useEffect(() => {
+    if (!isUploading) return
+    const timer = window.setInterval(() => {
+      setItems((prev) => {
+        let changed = false
+        const updated = prev.map((item) => {
+          if (item.status !== 'uploading') return item
+          const progress = progressRef.current.get(item.id)
+          if (!progress) return item
+          const bytes = Math.min(progress.bytes, item.sizeBytes)
+          if (bytes === item.uploadedBytes) return item
+          changed = true
+          return { ...item, uploadedBytes: bytes }
+        })
+        if (changed) {
+          itemsRef.current = updated
+          return updated
+        }
+        return prev
+      })
+    }, progressTickMs)
+    return () => window.clearInterval(timer)
+  }, [isUploading])
 
   const removeQueuedItem = useCallback((itemID: string): boolean => {
     const index = pendingQueueRef.current.indexOf(itemID)
@@ -147,15 +179,21 @@ export function UploadPage() {
 
       let albumID = item.albumId ?? ''
       try {
+        updateItem(item.id, { status: 'uploading', error: undefined })
         const created = await createAlbum(item.file)
         albumID = created.albumId
-        updateItem(item.id, { albumId: albumID, status: 'uploading' })
+        updateItem(item.id, { albumId: albumID })
 
-        await uploadAlbumObject(created.uploadUrl, item.file, created.uploadHeaders, controller.signal)
-        updateItem(item.id, { uploadedBytes: item.sizeBytes })
+        await uploadAlbumObject(created.uploadUrl, item.file, created.uploadHeaders, {
+          signal: controller.signal,
+          onProgress: (progress) => {
+            progressRef.current.set(item.id, progress)
+          },
+        })
+        progressRef.current.delete(item.id)
+        updateItem(item.id, { uploadedBytes: item.sizeBytes, status: 'indexing' })
 
         await finalizeAlbum(albumID, { signal: controller.signal })
-        updateItem(item.id, { status: 'submitted', error: undefined })
 
         // Indexing runs in the background pipeline: keep polling until the
         // album succeeds or fails. Success is what makes the album visible, so
@@ -184,6 +222,7 @@ export function UploadPage() {
           await delay(finalizePollIntervalMs, controller.signal)
         }
       } catch (err) {
+        progressRef.current.delete(item.id)
         if (isAbortError(err)) {
           updateItem(item.id, { status: 'canceled', error: undefined })
         } else {
@@ -199,7 +238,7 @@ export function UploadPage() {
   const runQueuedUpload = useCallback(
     async (itemID: string) => {
       const item = itemsRef.current.find((candidate) => candidate.id === itemID)
-      if (!item || item.status !== 'uploading' || controllersRef.current.has(itemID)) {
+      if (!item || item.status !== 'queued' || controllersRef.current.has(itemID)) {
         return
       }
       await runItemUpload(item)
@@ -215,7 +254,7 @@ export function UploadPage() {
       }
 
       const item = itemsRef.current.find((candidate) => candidate.id === nextID)
-      if (!item || item.status !== 'uploading' || controllersRef.current.has(nextID)) {
+      if (!item || item.status !== 'queued' || controllersRef.current.has(nextID)) {
         continue
       }
 
@@ -240,41 +279,95 @@ export function UploadPage() {
     [pumpQueue],
   )
 
-  const onPickFiles = (event: React.ChangeEvent<HTMLInputElement>) => {
-    const files = Array.from(event.target.files ?? [])
-    if (files.length === 0) return
+  const ingestFiles = useCallback(
+    (files: File[]) => {
+      if (files.length === 0) return
 
-    const picked = files
-      .filter((file) => file.name.toLowerCase().endsWith('.zip'))
-      .map<UploadItem>((file) => ({
-        id: nextItemID(),
-        file,
-        name: file.name,
-        sizeBytes: file.size,
-        status: 'uploading',
-        uploadedBytes: 0,
-      }))
+      const accepted: UploadItem[] = []
+      const rejectedNonZip: string[] = []
+      const rejectedOversize: string[] = []
+      for (const file of files) {
+        if (!file.name.toLowerCase().endsWith('.zip')) {
+          rejectedNonZip.push(file.name)
+          continue
+        }
+        if (file.size > MAX_UPLOAD_BYTES) {
+          rejectedOversize.push(file.name)
+          continue
+        }
+        accepted.push({
+          id: nextItemID(),
+          file,
+          name: file.name,
+          sizeBytes: file.size,
+          status: 'queued',
+          uploadedBytes: 0,
+        })
+      }
 
-    if (picked.length === 0) {
-      setPageError('Select at least one .zip file.')
-    } else {
-      setPageError(null)
+      const rejections: string[] = []
+      if (rejectedNonZip.length > 0) {
+        const names = rejectedNonZip.slice(0, 3).join(', ')
+        const suffix = rejectedNonZip.length > 3 ? ` and ${rejectedNonZip.length - 3} more` : ''
+        rejections.push(`Skipped ${rejectedNonZip.length} non-ZIP file${rejectedNonZip.length > 1 ? 's' : ''}: ${names}${suffix}`)
+      }
+      for (const name of rejectedOversize.slice(0, 3)) {
+        rejections.push(`${name} is over the 1 GiB limit`)
+      }
+
       // itemsRef is the upload queue's source of truth and pumpQueue runs
       // synchronously in the loop below, so the ref must be updated before
       // enqueueing. setItems' updater may be deferred by React's batching,
       // and a stale ref makes pumpQueue drop the ids it cannot resolve - the
       // upload then never starts and no request is sent.
-      const updated = [...itemsRef.current, ...picked]
-      itemsRef.current = updated
-      setItems(updated)
-      for (const item of picked) {
-        enqueueUpload(item.id)
+      if (accepted.length > 0) {
+        const updated = [...itemsRef.current, ...accepted]
+        itemsRef.current = updated
+        setItems(updated)
+        for (const item of accepted) {
+          enqueueUpload(item.id)
+        }
       }
-    }
+      setNotice(rejections.length > 0 ? rejections.join(' ') : null)
+    },
+    [enqueueUpload],
+  )
 
+  const onPickFiles = (event: React.ChangeEvent<HTMLInputElement>) => {
+    ingestFiles(Array.from(event.target.files ?? []))
     if (event.target) {
       event.target.value = ''
     }
+  }
+
+  const onDragEnter = (event: React.DragEvent<HTMLDivElement>) => {
+    if (!hasDraggedFiles(event)) return
+    event.preventDefault()
+    dragDepthRef.current += 1
+    setIsDragActive(true)
+  }
+
+  const onDragOver = (event: React.DragEvent<HTMLDivElement>) => {
+    if (!hasDraggedFiles(event)) return
+    // preventDefault is what marks the page as a drop target at all.
+    event.preventDefault()
+  }
+
+  const onDragLeave = (event: React.DragEvent<HTMLDivElement>) => {
+    if (!hasDraggedFiles(event)) return
+    // Child boundaries fire dragleave too, so only the last one closes.
+    dragDepthRef.current = Math.max(0, dragDepthRef.current - 1)
+    if (dragDepthRef.current === 0) {
+      setIsDragActive(false)
+    }
+  }
+
+  const onDrop = (event: React.DragEvent<HTMLDivElement>) => {
+    if (!hasDraggedFiles(event)) return
+    event.preventDefault()
+    dragDepthRef.current = 0
+    setIsDragActive(false)
+    ingestFiles(Array.from(event.dataTransfer.files ?? []))
   }
 
   const onCancelItem = (itemID: string) => {
@@ -294,6 +387,7 @@ export function UploadPage() {
       controller.abort()
     }
     removeQueuedItem(itemID)
+    progressRef.current.delete(itemID)
     setItems((prev) => {
       const updated = prev.filter((item) => item.id !== itemID)
       itemsRef.current = updated
@@ -307,16 +401,17 @@ export function UploadPage() {
       return
     }
 
-    // Same invariant as onPickFiles: pumpQueue reads itemsRef.current
+    // Same invariant as ingestFiles: pumpQueue reads itemsRef.current
     // synchronously right after this, so the ref leads and state follows.
     const updated = itemsRef.current.map((item) => {
       const isUploadFailure = item.status === 'canceled' || item.status === 'failed'
       if (!isUploadFailure) return item
       return {
         ...item,
-        status: 'uploading' as const,
+        status: 'queued' as const,
         uploadedBytes: 0,
         albumId: undefined,
+        embedding: undefined,
         error: undefined,
       }
     })
@@ -330,19 +425,19 @@ export function UploadPage() {
 
   const summary = useMemo(() => {
     const totalFiles = items.length
-    const isSubmitted = (status: UploadStatus) => status === 'submitted' || status === 'ready'
-    const submittedFiles = items.filter((item) => isSubmitted(item.status)).length
+    const isDone = (status: UploadStatus) => status === 'ready'
+    const doneFiles = items.filter((item) => isDone(item.status)).length
     const failedFiles = items.filter((item) => item.status === 'failed' || item.status === 'canceled').length
     const totalBytes = items.reduce((sum, item) => sum + item.sizeBytes, 0)
     const uploadedBytes = items.reduce(
       (sum, item) =>
-        sum + (isSubmitted(item.status) ? item.sizeBytes : Math.min(item.uploadedBytes, item.sizeBytes)),
+        sum + (isDone(item.status) ? item.sizeBytes : Math.min(item.uploadedBytes, item.sizeBytes)),
       0,
     )
     const progressPct = totalBytes > 0 ? Math.round((uploadedBytes / totalBytes) * 100) : 0
     return {
       totalFiles,
-      submittedFiles,
+      doneFiles,
       failedFiles,
       totalBytes,
       uploadedBytes,
@@ -353,50 +448,23 @@ export function UploadPage() {
   const hasRetryable = items.some((item) => item.status === 'canceled' || item.status === 'failed')
 
   return (
-    <div className="upload-page" data-testid="upload-page">
+    <div
+      className="upload-page"
+      data-testid="upload-page"
+      onDragEnter={onDragEnter}
+      onDragOver={onDragOver}
+      onDragLeave={onDragLeave}
+      onDrop={onDrop}
+    >
       <div className="upload-shell">
-        <header className="upload-header">
-          <button
-            type="button"
-            className="photo-nav-button"
-            onClick={() => navigate('/')}
-            data-testid="upload-back-wall"
-          >
-            Back to wall
-          </button>
-          <h1 className="upload-title">Album Uploads</h1>
-        </header>
-        <p className="upload-subtitle">
-          Upload ZIP files directly to object storage. Files are submitted for background indexing after upload.
-        </p>
-
-        <div className="upload-actions">
-          <button
-            type="button"
-            className="photo-primary-action"
-            onClick={() => fileInputRef.current?.click()}
-            data-testid="upload-add-button"
-          >
-            Add ZIP files
-          </button>
-          <button
-            type="button"
-            className="photo-nav-button"
-            onClick={onRetryFailedUploads}
-            disabled={!hasRetryable}
-            data-testid="upload-retry-failed"
-          >
-            Retry failed
-          </button>
-          <button
-            type="button"
-            className="photo-nav-button"
-            onClick={() => navigate('/albums/find')}
-            data-testid="upload-go-find"
-          >
-            Find albums
-          </button>
-        </div>
+        <PageTopBar
+          title="Upload"
+          actions={
+            <Link className="photo-nav-button" to="/albums/find" data-testid="upload-go-find">
+              Find albums
+            </Link>
+          }
+        />
 
         <input
           ref={fileInputRef}
@@ -408,28 +476,69 @@ export function UploadPage() {
           data-testid="upload-pick-input"
         />
 
-        <section className="upload-summary" data-testid="upload-summary">
-          <p>
-            {summary.submittedFiles}/{summary.totalFiles} submitted, {summary.failedFiles} failed
-          </p>
-          <p>
-            {formatBytes(summary.uploadedBytes)} / {formatBytes(summary.totalBytes)} ({summary.progressPct}%)
-          </p>
-          {embedding && embedding.enabled && embedding.pending > 0 && (
-            <p data-testid="upload-embedding-summary">
-              Embedding {embedding.ready}/{embedding.total} images ({Math.round(embedding.ratio * 100)}%)
-              {embedding.failed > 0 ? `, ${embedding.failed} failed` : ''}
-            </p>
-          )}
-          <p>Use Find albums to open albums once indexing is complete.</p>
-        </section>
+        {items.length === 0 ? (
+          <button
+            type="button"
+            className={`upload-hero${isDragActive ? ' is-active' : ''}`}
+            onClick={() => fileInputRef.current?.click()}
+            data-testid="upload-dropzone"
+          >
+            <span className="upload-hero-title">Drop ZIP files here</span>
+            <span className="upload-hero-sub">or browse files</span>
+            <span className="upload-hero-meta tnum">Each ZIP becomes one album · up to 1 GiB per file</span>
+          </button>
+        ) : (
+          <div className="upload-toolbar">
+            <button
+              type="button"
+              className="photo-primary-action"
+              onClick={() => fileInputRef.current?.click()}
+              data-testid="upload-add-button"
+            >
+              Add ZIP files
+            </button>
+            <button
+              type="button"
+              className="photo-nav-button"
+              onClick={onRetryFailedUploads}
+              disabled={!hasRetryable}
+              data-testid="upload-retry-failed"
+            >
+              Retry failed
+            </button>
+          </div>
+        )}
 
-        {pageError && <p className="upload-page-error">{pageError}</p>}
+        {notice && (
+          <p className="upload-notice" role="status" data-testid="upload-notices">
+            {notice}
+          </p>
+        )}
+
+        {items.length > 0 && (
+          <section className="upload-summary" data-testid="upload-summary">
+            <div className="upload-summary-head tnum">
+              <p>
+                {summary.doneFiles}/{summary.totalFiles} ready
+                {summary.failedFiles > 0 ? `, ${summary.failedFiles} failed` : ''}
+              </p>
+              <p>
+                {formatBytes(summary.uploadedBytes)} / {formatBytes(summary.totalBytes)} ({summary.progressPct}%)
+              </p>
+            </div>
+            <div className="progress">
+              <div className="progress-bar" style={{ width: `${summary.progressPct}%` }} />
+            </div>
+            {embedding && embedding.enabled && embedding.pending > 0 && (
+              <p className="upload-summary-embedding tnum" data-testid="upload-embedding-summary">
+                Embedding {embedding.ready}/{embedding.total} images ({Math.round(embedding.ratio * 100)}%)
+                {embedding.failed > 0 ? `, ${embedding.failed} failed` : ''}
+              </p>
+            )}
+          </section>
+        )}
 
         <div className="upload-list" data-testid="upload-list">
-          {items.length === 0 && (
-            <p className="upload-empty">No files selected yet. Add one or more ZIP files to begin.</p>
-          )}
           {items.map((item) => {
             const pct = item.sizeBytes > 0 ? Math.min(100, Math.round((item.uploadedBytes / item.sizeBytes) * 100)) : 0
             return (
@@ -443,17 +552,41 @@ export function UploadPage() {
                     {statusLabel(item.status)}
                   </span>
                 </div>
-                <p className="upload-item-meta">
-                  {formatBytes(item.sizeBytes)} | {pct}% uploaded
+                <p className="upload-item-meta tnum">
+                  {formatBytes(item.sizeBytes)}
+                  {item.status === 'uploading' ? ` · ${pct}% uploaded` : ''}
                   {item.embedding && item.embedding.enabled && item.embedding.total > 0
-                    ? ` | embedded ${item.embedding.ready}/${item.embedding.total}${
+                    ? ` · embedded ${item.embedding.ready}/${item.embedding.total}${
                         item.embedding.failed > 0 ? `, ${item.embedding.failed} failed` : ''
                       }`
                     : ''}
                   {item.embedding && !item.embedding.enabled && item.embedding.pending > 0
-                    ? ' | embeddings unavailable on this server'
+                    ? ' · embeddings unavailable on this server'
                     : ''}
                 </p>
+                {item.status === 'uploading' && (
+                  <div
+                    className="progress"
+                    data-testid="upload-item-progress"
+                    role="progressbar"
+                    aria-label={`Uploading ${item.name}`}
+                    aria-valuemin={0}
+                    aria-valuemax={100}
+                    aria-valuenow={pct}
+                  >
+                    <div className="progress-bar" style={{ width: `${pct}%` }} />
+                  </div>
+                )}
+                {item.status === 'indexing' && (
+                  <div
+                    className="progress is-indeterminate"
+                    data-testid="upload-item-indexing"
+                    role="progressbar"
+                    aria-label={`Indexing ${item.name}`}
+                  >
+                    <div className="progress-bar" />
+                  </div>
+                )}
                 {item.embedding && isEmbeddingPending(item.embedding) && (
                   <div
                     className="progress"
@@ -469,7 +602,7 @@ export function UploadPage() {
                 )}
                 {item.error && <p className="upload-item-error">{item.error}</p>}
                 <div className="upload-item-actions">
-                  {item.status === 'uploading' && (
+                  {(item.status === 'queued' || item.status === 'uploading') && (
                     <button
                       type="button"
                       className="photo-nav-button"
@@ -478,6 +611,15 @@ export function UploadPage() {
                     >
                       Cancel
                     </button>
+                  )}
+                  {item.status === 'ready' && item.albumId && (
+                    <Link
+                      className="photo-nav-button"
+                      to={`/album/${item.albumId}`}
+                      data-testid="upload-open-album"
+                    >
+                      Open album
+                    </Link>
                   )}
                   <button
                     type="button"
@@ -493,6 +635,12 @@ export function UploadPage() {
           })}
         </div>
       </div>
+
+      {isDragActive && (
+        <div className="upload-drop-overlay" data-testid="upload-drop-overlay" aria-hidden="true">
+          <p className="upload-drop-overlay-label">Drop to add ZIP files</p>
+        </div>
+      )}
     </div>
   )
 }

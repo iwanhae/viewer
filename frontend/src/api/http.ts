@@ -57,11 +57,3 @@ export async function requestJSON<T>(input: RequestInfo | URL, init?: RequestIni
 
   return parsed as T
 }
-
-export async function ensureOK(input: RequestInfo | URL, init?: RequestInit): Promise<void> {
-  const res = await fetch(input, init)
-  if (!res.ok) {
-    const text = await res.text()
-    throw toApiError(res, text)
-  }
-}

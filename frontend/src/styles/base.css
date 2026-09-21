@@ -104,7 +104,10 @@ body {
     display: none;
   }
 
+  /* The sweep animation would freeze past the container's edge, so the
+     indeterminate bar settles as a dim full track instead. */
   .progress.is-indeterminate .progress-bar {
     width: 100%;
+    opacity: 0.45;
   }
 }

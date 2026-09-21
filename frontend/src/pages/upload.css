@@ -1,0 +1,196 @@
+/* Upload: the whole page is a drop target; the hero is its visible face
+   while the queue is empty, and the stage pills carry the state machine
+   (queued → uploading → indexing → ready / failed / canceled) once it is not. */
+
+.upload-page {
+  min-height: 100vh;
+  padding: max(16px, env(safe-area-inset-top)) 20px max(48px, env(safe-area-inset-bottom));
+}
+
+.upload-shell {
+  width: min(880px, 100%);
+  margin: 0 auto;
+  display: grid;
+  gap: 18px;
+}
+
+.upload-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+/* The hero doubles as the empty state and the drop surface: one target to
+   click, drag onto, or focus and press Enter. */
+.upload-hero {
+  display: grid;
+  justify-items: center;
+  gap: 6px;
+  padding: 56px 24px;
+  background: var(--surface);
+  border: 1px dashed var(--line-strong);
+  border-radius: var(--radius-card);
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+  transition: border-color var(--speed-fast) var(--ease), background-color var(--speed-fast) var(--ease);
+}
+
+.upload-hero.is-active {
+  border-color: var(--accent);
+  border-style: solid;
+  background: var(--accent-soft);
+}
+
+.upload-hero-title {
+  font-size: var(--text-title);
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+.upload-hero-sub {
+  color: var(--accent);
+  font-size: var(--text-md);
+  font-weight: 600;
+}
+
+.upload-hero-meta {
+  margin-top: 10px;
+  color: var(--ink-3);
+  font-size: var(--text-sm);
+}
+
+.upload-notice {
+  margin: 0;
+  padding: 10px 12px;
+  background: var(--err-soft);
+  border-radius: var(--radius-small);
+  color: var(--err);
+  font-size: var(--text-md);
+  word-break: break-word;
+}
+
+.upload-summary {
+  display: grid;
+  gap: 8px;
+}
+
+.upload-summary-head {
+  margin: 0;
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.upload-summary-head p {
+  margin: 0;
+  font-size: var(--text-md);
+  color: var(--ink-2);
+}
+
+.upload-summary-embedding {
+  margin: 0;
+  font-size: var(--text-sm);
+  color: var(--ink-2);
+}
+
+.upload-list {
+  display: grid;
+  gap: 10px;
+}
+
+.upload-item {
+  border: 1px solid var(--line);
+  border-radius: var(--radius-card);
+  padding: 14px;
+  display: grid;
+  gap: 10px;
+  background: var(--surface);
+}
+
+.upload-item-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.upload-item-name {
+  margin: 0;
+  font-size: var(--text-lg);
+  font-weight: 600;
+  word-break: break-word;
+}
+
+.upload-item-status {
+  flex: 0 0 auto;
+  border-radius: var(--radius-pill);
+  padding: 4px 10px;
+  font-size: var(--text-sm);
+  font-weight: 600;
+}
+
+.upload-item-status-queued,
+.upload-item-status-indexing {
+  background: var(--surface-2);
+  color: var(--ink-2);
+}
+
+.upload-item-status-uploading {
+  background: var(--warn-soft);
+  color: var(--warn);
+}
+
+.upload-item-status-ready {
+  background: var(--ok-soft);
+  color: var(--ok);
+}
+
+.upload-item-status-failed,
+.upload-item-status-canceled {
+  background: var(--err-soft);
+  color: var(--err);
+}
+
+.upload-item-meta {
+  margin: 0;
+  color: var(--ink-2);
+  font-size: var(--text-sm);
+}
+
+.upload-item-error {
+  margin: 0;
+  font-size: var(--text-sm);
+  color: var(--err);
+  word-break: break-word;
+}
+
+.upload-item-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+/* The overlay covers the page while files are dragged over it. It ignores
+   pointer events so the drop lands on the page handler underneath. */
+.upload-drop-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: grid;
+  place-items: center;
+  background: rgba(247, 248, 250, 0.82);
+  border: 2px solid var(--accent);
+  border-radius: var(--radius-card);
+  pointer-events: none;
+}
+
+.upload-drop-overlay-label {
+  margin: 0;
+  padding: 10px 18px;
+  background: var(--ink);
+  color: var(--paper);
+  border-radius: var(--radius-pill);
+  font-size: var(--text-lg);
+  font-weight: 600;
+}

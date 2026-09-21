@@ -13,7 +13,7 @@ type PageTopBarProps = {
 export function PageTopBar({ title, actions }: PageTopBarProps) {
   return (
     <header className="page-topbar">
-      <Link className="page-topbar-home" to="/">
+      <Link className="page-topbar-home" to="/" data-testid="page-topbar-home">
         Wall
       </Link>
       <h1 className="page-topbar-title">{title}</h1>

@@ -1,5 +1,5 @@
 import { cacheAlbum, getCachedAlbum as getCachedAlbumValue } from './albumCache'
-import { ensureOK, requestJSON } from './http'
+import { requestJSON } from './http'
 import type {
   AlbumIndex,
   AlbumSearchResponse,
@@ -87,19 +87,8 @@ export async function createAlbum(file: File): Promise<{
   }
 }
 
-export async function uploadAlbumObject(
-  uploadURL: string,
-  file: File,
-  headers: Record<string, string>,
-  signal?: AbortSignal,
-): Promise<void> {
-  await ensureOK(uploadURL, {
-    method: 'PUT',
-    headers,
-    body: file,
-    signal,
-  })
-}
+// The PUT to the presigned URL lives in api/upload.ts: it needs XHR for
+// upload progress, which the fetch helpers here do not provide.
 
 export async function finalizeAlbum(albumId: string, options?: { signal?: AbortSignal }): Promise<FinalizeResponse> {
   return await requestJSON<FinalizeResponse>(`/api/albums/${albumId}/finalize`, {
