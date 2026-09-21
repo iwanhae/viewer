@@ -112,15 +112,19 @@ Copy `.env.example` to `.env` for a local run. The test suite uses no
 credentials, so `make test` needs no environment file.
 
 There is no separate inference service to run: `viewer` loads the checkpoint
-from `/app/siglip2` once at startup and runs the vision tower in-process. A
-cold start first fetches the checkpoint into that directory from
-`SIGLIP2_MODEL_URL`, a public-read mirror of the upstream Hugging Face files;
-a directory that already holds a checkpoint - a previous download or a mount -
-is never re-fetched. A checkpoint that fails to load only degrades: the
-container logs the failure, keeps serving, and returns recommendations from
-whatever embeddings the catalog already holds. Mount a directory at
-`/app/siglip2` (holding `config.json` and `model.safetensors`) to supply a
-checkpoint by hand and skip the download entirely.
+from `/app/siglip2` and runs the vision tower in-process. The server starts
+listening right away, and the checkpoint resolves in a background goroutine: a
+cold start fetches it into that directory from `SIGLIP2_MODEL_URL`, a
+public-read mirror of the upstream Hugging Face files, logging position and
+rate every 5 seconds while the download runs. Until the model is in, the API
+answers recommendations from whatever embeddings the catalog already holds and
+new blobs stay `pending`. A directory that already holds a checkpoint - a
+previous download or a mount - is never re-fetched. A checkpoint that fails to
+load or download only degrades: the container logs the failure, keeps serving,
+and returns recommendations from whatever embeddings the catalog already holds.
+Mount a directory at `/app/siglip2` (holding `config.json` and
+`model.safetensors`) to supply a checkpoint by hand and skip the download
+entirely.
 
 Embeddings are stored as little-endian `float32` blobs on each image blob row in
 SQLite. The ingest pipeline embeds new blobs inline; a blob whose embedding was
@@ -150,17 +154,20 @@ stages are reported:
 {"enabled":true,"active":true,"total":300,"ready":181,"failed":2,"pending":117,"ratio":0.603333}
 ```
 
-`enabled` is false when no checkpoint is loaded. Nothing is embedding then and
-nothing ever will be, so a client stops waiting instead of showing a bar that
-cannot move; the blobs simply stay `pending` until a deployment with a model
-picks them up. `failed` images are terminal — the retry worker skips them — so
+`enabled` is false when no checkpoint could be loaded - the fetch failed, or
+the files are missing. Nothing is embedding then and nothing ever will be, so
+a client stops waiting instead of showing a bar that cannot move; the blobs
+simply stay `pending` until a deployment with a model picks them up. During
+the cold-start download window `enabled` is already true while nothing is
+active yet: the workers come up when the checkpoint finishes loading. `failed` images are terminal — the retry worker skips them — so
 `ratio` reaches 1 only when nothing is pending, and a failure is visible as
 `ready + failed == total` instead of a bar that never fills.
 
 Docker:
 - `docker build .` produces one image: the Go viewer and the frontend assets.
   It carries no checkpoint - a cold start downloads it (~1.5 GiB) into
-  `/app/siglip2` from `SIGLIP2_MODEL_URL`, so the published image stays small.
+  `/app/siglip2` from `SIGLIP2_MODEL_URL` in the background while the server
+  is already serving, so the published image stays small.
   Mount a volume at `/app/siglip2` to keep that download across container
   replacements, or set `SIGLIP2_MODEL_URL` to mirror a different model.
 - CI publishes the viewer as `ghcr.io/<owner>/<repo>`.

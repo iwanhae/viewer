@@ -22,8 +22,9 @@ import (
 	"viewer/internal/vision"
 )
 
-// embeddingLoadTimeout bounds resolving the checkpoint and compiling the
-// inference graph at startup. The checkpoint may need to be downloaded first.
+// embeddingLoadTimeout bounds the background startup load: fetching the
+// checkpoint and compiling the inference graph. The checkpoint may need to be
+// downloaded first.
 const embeddingLoadTimeout = 15 * time.Minute
 
 func Run(ctx context.Context) error {
@@ -61,35 +62,12 @@ func Run(ctx context.Context) error {
 	imageService := images.NewService(cat, store)
 
 	// The vision tower runs in-process against the checkpoint in
-	// config.ModelDir. The image ships without one, so Ensure fetches it from
-	// the mirror on a cold start; a deployment that mounts a prepared
-	// directory there skips the download entirely.
+	// config.ModelDir. The image ships without one, so the background load
+	// below fetches it from the mirror on a cold start; a deployment that
+	// mounts a prepared directory there skips the download entirely.
 	recommendService := recommend.NewService(cat, imageService, recommend.NewVisionEmbedder(vision.Config{
 		ModelID: cfgpkg.ModelDir,
 	}))
-
-	// Load the vision tower before anything can request an embedding: a failed
-	// load marks the service disabled, and the background workers then stay off
-	// instead of failing every pending blob. The timeout also bounds the
-	// checkpoint download a cold start performs first.
-	loadCtx, cancel := context.WithTimeout(context.Background(), embeddingLoadTimeout)
-	if err := checkpoint.Ensure(loadCtx, cfgpkg.ModelDir, cfg.ModelURL); err != nil {
-		// vision.Load then fails on the incomplete directory and marks the
-		// service disabled through the same path as any other missing model.
-		log.Printf("viewer: checkpoint fetch from %s failed: %v", cfg.ModelURL, err)
-	}
-	loadErr := recommendService.LoadModel(loadCtx)
-	cancel()
-	if loadErr != nil {
-		log.Printf("viewer: embedding model unavailable, continuing without embeddings: %v", loadErr)
-	}
-	// Enabled reports a failed load, so ask the service rather than assuming.
-	recommenderEnabled := recommendService.Enabled()
-	if recommenderEnabled {
-		log.Printf("viewer: recommendation service enabled (model=%s)", cfgpkg.ModelDir)
-	} else {
-		log.Printf("viewer: embedding model unavailable; serving recommendations from stored embeddings only")
-	}
 
 	// Extraction and embedding are separate stages: the pipeline only makes an
 	// album ready, and the recommendation service's background workers embed
@@ -116,6 +94,37 @@ func Run(ctx context.Context) error {
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	log.Printf("viewer: starting HTTP server on %s", srv.Addr)
+
+	// The model resolves in the background so a cold start serves requests
+	// while the checkpoint is still downloading: fetch it, load the vision
+	// tower, and only then start the embedding workers. Until the load
+	// finishes the API answers from stored embeddings and new blobs stay
+	// pending - the same degradation as a missing checkpoint. The workers must
+	// not start earlier: an embed attempt against an incomplete directory
+	// caches the load failure permanently.
+	go func() {
+		loadCtx, cancel := context.WithTimeout(context.Background(), embeddingLoadTimeout)
+		defer cancel()
+		if err := checkpoint.Ensure(loadCtx, cfgpkg.ModelDir, cfg.ModelURL); err != nil {
+			// vision.Load then fails on the incomplete directory and marks the
+			// service disabled through the same path as any other missing model.
+			log.Printf("viewer: checkpoint fetch from %s failed: %v", cfg.ModelURL, err)
+		}
+		if err := recommendService.LoadModel(loadCtx); err != nil {
+			log.Printf("viewer: embedding model unavailable, continuing without embeddings: %v", err)
+		}
+		if !recommendService.Enabled() {
+			log.Printf("viewer: embedding model unavailable; serving recommendations from stored embeddings only")
+			return
+		}
+		log.Printf("viewer: recommendation service enabled (model=%s)", cfgpkg.ModelDir)
+		if err := recommendService.Start(ctx); err != nil {
+			log.Printf("viewer: embedding worker startup failed: %v", err)
+			return
+		}
+		log.Printf("viewer: embedding background workers started")
+	}()
+
 	log.Printf("viewer: startup warmup running in background")
 	go func() {
 		warmupRecommendations(ctx, recommendService)
@@ -133,16 +142,7 @@ func Run(ctx context.Context) error {
 		// running needs no restart.
 		go ingest.NewWatcher(store, albumService).Run(ctx)
 
-		if !recommenderEnabled {
-			log.Printf("viewer: warmup completed; embedding workers disabled")
-			return
-		}
-		log.Printf("viewer: warmup completed, starting embedding workers")
-		if err := recommendService.Start(ctx); err != nil {
-			log.Printf("viewer: embedding worker startup failed: %v", err)
-			return
-		}
-		log.Printf("viewer: embedding background workers started")
+		log.Printf("viewer: warmup completed")
 	}()
 
 	return srv.ListenAndServe()

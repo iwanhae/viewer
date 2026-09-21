@@ -1,12 +1,17 @@
 package checkpoint
 
 import (
+	"bytes"
 	"context"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 // serveCheckpoint stands up a mirror with the two files under one prefix and
@@ -129,5 +134,60 @@ func TestEnsureFailsWithoutPartialFile(t *testing.T) {
 	}
 	if len(entries) != 0 {
 		t.Fatalf("failed download left %d entries behind", len(entries))
+	}
+}
+
+// lockedWriter lets the standard logger write from the download and its
+// progress goroutine concurrently.
+type lockedWriter struct {
+	mu *sync.Mutex
+	w  *strings.Builder
+}
+
+func (l *lockedWriter) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.w.Write(p)
+}
+
+// TestEnsureLogsDownloadProgress pins the periodic line: a download slow
+// enough to span several intervals reports its position against the
+// Content-Length and a rate while it is still running, and the completed fetch
+// reports the average.
+func TestEnsureLogsDownloadProgress(t *testing.T) {
+	oldEvery := progressEvery
+	progressEvery = 10 * time.Millisecond
+	t.Cleanup(func() { progressEvery = oldEvery })
+
+	var mu sync.Mutex
+	var out strings.Builder
+	log.SetOutput(&lockedWriter{mu: &mu, w: &out})
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "4000")
+		for i := 0; i < 40; i++ {
+			_, _ = w.Write(bytes.Repeat([]byte("x"), 100))
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	dir := t.TempDir()
+	if err := Ensure(context.Background(), dir, srv.URL); err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	logs := out.String()
+	if !strings.Contains(logs, "fetching model.safetensors") || !strings.Contains(logs, ") at ") {
+		t.Fatalf("no in-flight progress line with a rate in logs:\n%s", logs)
+	}
+	if !strings.Contains(logs, "average") {
+		t.Fatalf("no completed-fetch line with the average rate in logs:\n%s", logs)
 	}
 }
