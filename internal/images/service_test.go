@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"io"
-	"os"
 	"path/filepath"
 	"testing"
 
@@ -89,11 +88,7 @@ func seedPhoto(t *testing.T, cat *catalog.Store, albumID string, index int, hash
 
 func newTestService(t *testing.T, cat *catalog.Store, store blobStore) *Service {
 	t.Helper()
-	svc, err := NewService(cat, store, t.TempDir())
-	if err != nil {
-		t.Fatalf("new service: %v", err)
-	}
-	return svc
+	return NewService(cat, store)
 }
 
 func readStream(t *testing.T, stream *ImageStream) []byte {
@@ -105,7 +100,7 @@ func readStream(t *testing.T, stream *ImageStream) []byte {
 	return data
 }
 
-func TestOpenImageMaterialisesBlobInDiskCache(t *testing.T) {
+func TestOpenImageFetchesFromStorage(t *testing.T) {
 	cat := openTestCatalog(t)
 	store := newFakeBlobStore()
 	store.objects[pipeline.BlobKey("hash-a")] = []byte("image-bytes")
@@ -135,8 +130,9 @@ func TestOpenImageMaterialisesBlobInDiskCache(t *testing.T) {
 		t.Fatalf("expected one S3 get, got %d", got)
 	}
 
-	// A second open of the same content hash is served from the disk cache
-	// without touching the store.
+	// There is no server-side cache: a second open of the same content hash
+	// fetches from the store again. Repeat views are absorbed by the browser
+	// via the blob-hash ETag instead.
 	second, err := svc.OpenImage(context.Background(), "album-a", 0)
 	if err != nil {
 		t.Fatalf("second open image: %v", err)
@@ -144,8 +140,8 @@ func TestOpenImageMaterialisesBlobInDiskCache(t *testing.T) {
 	if got := readStream(t, second); string(got) != "image-bytes" {
 		t.Fatalf("second bytes=%q", got)
 	}
-	if got := store.getCount(); got != 1 {
-		t.Fatalf("expected cache hit, s3 gets=%d", got)
+	if got := store.getCount(); got != 2 {
+		t.Fatalf("expected a second S3 get, got %d", got)
 	}
 	if err := second.Close(); err != nil {
 		t.Fatalf("close second stream: %v", err)
@@ -270,34 +266,24 @@ func TestOpenImageFallsBackToRemoteContentType(t *testing.T) {
 	}
 }
 
-func TestOpenImageFetchFailureLeavesNoCacheEntry(t *testing.T) {
+func TestOpenImageFetchFailurePropagatesAndRetries(t *testing.T) {
 	cat := openTestCatalog(t)
 	store := newFakeBlobStore()
 	store.objects[pipeline.BlobKey("hash-a")] = []byte("image-bytes")
 	store.readErr[pipeline.BlobKey("hash-a")] = errors.New("connection reset")
 	seedPhoto(t, cat, "album-a", 0, "hash-a", "image/png")
 
-	cacheDir := t.TempDir()
-	svc, err := NewService(cat, store, cacheDir)
-	if err != nil {
-		t.Fatalf("new service: %v", err)
-	}
+	svc := newTestService(t, cat, store)
 
 	if _, err := svc.OpenImage(context.Background(), "album-a", 0); err == nil {
 		t.Fatalf("expected streaming failure")
 	}
 
-	entries, err := os.ReadDir(cacheDir)
-	if err != nil {
-		t.Fatalf("read cache dir: %v", err)
-	}
-	if len(entries) != 0 {
-		t.Fatalf("expected no cache entry after a failed fetch, found %d", len(entries))
-	}
-
-	// The failed attempt must not be cached: the next open fetches again.
-	if _, err := svc.OpenImage(context.Background(), "album-a", 0); err == nil {
-		t.Fatalf("expected streaming failure on retry")
+	// Nothing is cached, so a retry after the store recovers fetches again
+	// and succeeds.
+	delete(store.readErr, pipeline.BlobKey("hash-a"))
+	if _, err := svc.OpenImage(context.Background(), "album-a", 0); err != nil {
+		t.Fatalf("retry after failure: %v", err)
 	}
 	if got := store.getCount(); got != 2 {
 		t.Fatalf("expected two S3 gets, got %d", got)

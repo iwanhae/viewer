@@ -4,8 +4,8 @@
 // differ between deployments are the object-storage credentials and addressing,
 // the port the container listens on, the volume holding the SQLite catalog, and
 // the optional key prefix that lets two deployments share one bucket. Everything
-// else - the cache paths, the upload limits, the checkpoint location - is a
-// constant here rather than an environment variable.
+// else - the upload limits, the checkpoint location - is a constant here rather
+// than an environment variable.
 package config
 
 import (
@@ -25,12 +25,6 @@ const (
 	// directory. The Docker image pre-creates it, owns it as the unprivileged
 	// user the container runs as, and declares it a volume.
 	DefaultStateDir = "/var/lib/viewer"
-
-	// CacheRoot holds everything the viewer can rebuild from the bucket: the
-	// decoded image blobs and the zip staging area. It is deliberately not
-	// configurable and deliberately not under StateDir, so the volume that
-	// keeps the catalog never collects cache data.
-	CacheRoot = "/tmp/viewer-cache"
 
 	// S3Region targets the self-hosted object stores this deployment runs
 	// against. They ignore the region, but the AWS SDK requires a non-empty
@@ -78,22 +72,14 @@ type Config struct {
 	// StateDir holds the SQLite catalog. It is the one directory that has to
 	// survive a container replacement: the album-to-photo mapping exists
 	// nowhere else, and staged zips are deleted after extraction, so albums
-	// cannot be reconstructed from the blobs in S3. The caches live in
-	// CacheRoot instead, because they can be rebuilt.
+	// cannot be reconstructed from the blobs in S3. Everything else the
+	// process writes - the staged zip being unpacked - goes to the OS temp
+	// directory, because the bucket still holds the original.
 	StateDir string
 }
 
 // DBPath is the SQLite catalog inside StateDir.
 func (c Config) DBPath() string { return filepath.Join(c.StateDir, "viewer.db") }
-
-// ImageCacheDir holds decoded image blobs. It is disposable: a miss is served
-// from the blob in S3.
-func ImageCacheDir() string { return filepath.Join(CacheRoot, "images") }
-
-// ZipCacheDir stages a downloaded upload while it is unpacked. It is disposable
-// for the same reason: the zip is still in the bucket until extraction
-// succeeds.
-func ZipCacheDir() string { return filepath.Join(CacheRoot, "zips") }
 
 // Load reads the deployment settings from the environment and validates that
 // the object store is fully configured.

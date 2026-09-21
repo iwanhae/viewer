@@ -1,7 +1,6 @@
 package config
 
 import (
-	"strings"
 	"testing"
 )
 
@@ -82,25 +81,13 @@ func TestDeploymentConstants(t *testing.T) {
 	}
 }
 
-// TestStateDirAccessors pins the one path derived from STATE_DIR: the catalog.
-// The caches must not land there, because STATE_DIR is the volume an operator
-// mounts to keep the catalog across container replacements.
+// TestStateDirAccessors pins the one path derived from STATE_DIR: the catalog,
+// which is the only thing an operator's volume is asked to preserve.
 func TestStateDirAccessors(t *testing.T) {
 	cfg := Config{StateDir: "/data"}
 
 	if got := cfg.DBPath(); got != "/data/viewer.db" {
 		t.Errorf("DBPath=%q want /data/viewer.db", got)
-	}
-	if got := ImageCacheDir(); got != CacheRoot+"/images" {
-		t.Errorf("ImageCacheDir()=%q want %q", got, CacheRoot+"/images")
-	}
-	if got := ZipCacheDir(); got != CacheRoot+"/zips" {
-		t.Errorf("ZipCacheDir()=%q want %q", got, CacheRoot+"/zips")
-	}
-	for _, dir := range []string{ImageCacheDir(), ZipCacheDir()} {
-		if strings.HasPrefix(dir, "/data") {
-			t.Errorf("cache dir %q must not live under StateDir", dir)
-		}
 	}
 }
 

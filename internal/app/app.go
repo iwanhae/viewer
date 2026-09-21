@@ -30,8 +30,8 @@ func Run(ctx context.Context) error {
 		return err
 	}
 	log.Printf(
-		"viewer: config loaded on port=%d catalog=%s cache=%s s3_prefix=%s",
-		cfg.Port, cfg.DBPath(), cfgpkg.CacheRoot, cfg.DescribePrefix(),
+		"viewer: config loaded on port=%d catalog=%s s3_prefix=%s",
+		cfg.Port, cfg.DBPath(), cfg.DescribePrefix(),
 	)
 
 	cat, err := catalog.Open(cfg.DBPath())
@@ -45,10 +45,7 @@ func Run(ctx context.Context) error {
 		return err
 	}
 
-	imageService, err := images.NewService(cat, store, cfgpkg.ImageCacheDir())
-	if err != nil {
-		return err
-	}
+	imageService := images.NewService(cat, store)
 
 	// The vision tower runs in-process against the checkpoint the Docker image
 	// bakes in at config.ModelDir.
@@ -77,7 +74,6 @@ func Run(ctx context.Context) error {
 	// album ready, and the recommendation service's background workers embed
 	// the blobs it leaves pending.
 	pipelineService := pipeline.NewService(cat, store, pipeline.Options{
-		TempDir: cfgpkg.ZipCacheDir(),
 		OnAlbumReady: func(albumID string) {
 			if err := recommendService.ReloadAlbum(context.Background(), albumID); err != nil {
 				log.Printf("viewer: reload recommendation index for album=%s failed: %v", albumID, err)

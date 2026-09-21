@@ -102,10 +102,7 @@ func TestEmbeddingWorkerReportsProgressWithRealModel(t *testing.T) {
 		}
 	}
 
-	imageService, err := images.NewService(cat, store, t.TempDir())
-	if err != nil {
-		t.Fatalf("new image service: %v", err)
-	}
+	imageService := images.NewService(cat, store)
 	svc := NewService(cat, imageService, NewVisionEmbedder(vision.Config{ModelID: filepath.Join(dir, "model"), Backend: "go"}))
 	t.Cleanup(func() { _ = svc.Close() })
 	if err := svc.LoadModel(ctx); err != nil {

@@ -124,13 +124,9 @@ func newFlowHarness(t *testing.T) *flowHarness {
 	t.Cleanup(func() { _ = cat.Close() })
 
 	s3 := newMemoryS3()
-	cacheDir := t.TempDir()
 	zipCacheDir := t.TempDir()
 
-	imageService, err := images.NewService(cat, s3, cacheDir)
-	if err != nil {
-		t.Fatalf("new image service: %v", err)
-	}
+	imageService := images.NewService(cat, s3)
 	// A stub embedder keeps the recommendation endpoints available without a
 	// checkpoint. It is never asked to embed anything: the pipeline does not
 	// embed at all and the embedding workers are not started here, so blobs
@@ -335,14 +331,43 @@ func TestUploadFinalizeServeFlow(t *testing.T) {
 		t.Fatalf("album should be in catalog: %v", err)
 	}
 
-	// Search and feed both see the ready album.
+	// Search and feed both see the ready album. The search response carries the
+	// cover: the photo at index 0 with its denormalized dimensions.
 	searchRec := harness.do(t, http.MethodGet, "/api/albums/search?q=holiday", nil)
 	if searchRec.Code != http.StatusOK || !bytes.Contains(searchRec.Body.Bytes(), []byte(albumID)) {
 		t.Fatalf("search did not return the album: %d %s", searchRec.Code, searchRec.Body.String())
 	}
+	if !bytes.Contains(searchRec.Body.Bytes(), []byte(`"cover":{"i":0,"w":4,"h":2,"ratio":2}`)) {
+		t.Fatalf("search response missing cover: %s", searchRec.Body.String())
+	}
 	feedRec := harness.do(t, http.MethodGet, "/api/feed?limit=10", nil)
 	if feedRec.Code != http.StatusOK || !bytes.Contains(feedRec.Body.Bytes(), []byte(albumID)) {
 		t.Fatalf("feed did not return the album: %d %s", feedRec.Code, feedRec.Body.String())
+	}
+}
+
+func TestAlbumSearchMatchesSubstringsAndValidatesLimit(t *testing.T) {
+	harness := newFlowHarness(t)
+
+	imageA := testPNG(t, 4, 2, 10)
+	zipData := testZip(t, map[string][]byte{"001.png": imageA}, []string{"001.png"})
+	albumID := harness.uploadZip(t, "2026-holiday.zip", zipData)
+	harness.finalizeAndWait(t, albumID)
+
+	// A mid-string fragment finds the album, not just a filename prefix.
+	midRec := harness.do(t, http.MethodGet, "/api/albums/search?q=liday", nil)
+	if midRec.Code != http.StatusOK || !bytes.Contains(midRec.Body.Bytes(), []byte(albumID)) {
+		t.Fatalf("mid-string search did not return the album: %d %s", midRec.Code, midRec.Body.String())
+	}
+
+	missRec := harness.do(t, http.MethodGet, "/api/albums/search?q=zzzz", nil)
+	if missRec.Code != http.StatusOK || !bytes.Contains(missRec.Body.Bytes(), []byte(`"albums":[]`)) {
+		t.Fatalf("unexpected miss response: %d %s", missRec.Code, missRec.Body.String())
+	}
+
+	limitRec := harness.do(t, http.MethodGet, "/api/albums/search?limit=0", nil)
+	if limitRec.Code != http.StatusBadRequest {
+		t.Fatalf("limit=0 status=%d body=%s", limitRec.Code, limitRec.Body.String())
 	}
 }
 

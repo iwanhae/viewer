@@ -36,10 +36,11 @@ versions are no longer written or read. Object keys below are the logical ones:
 set `S3_PREFIX` to nest all of them under a single prefix in the bucket.
 
 Image requests are resolved as `(albumId, index)` -> photo row -> blob hash ->
-`blobs/<hash>`, with a local disk cache in `/tmp/viewer-cache/images`. The cached
-file is served through `http.ServeContent`, so responses carry a
-`Content-Length`, support `Range`, and are revalidated with an `ETag` equal to
-the blob hash under `Cache-Control: public, max-age=86400, immutable`.
+`blobs/<hash>`. The blob is fetched from S3 per request and served through
+`http.ServeContent`, so responses carry a `Content-Length`, support `Range`, and
+are revalidated with an `ETag` equal to the blob hash under
+`Cache-Control: public, max-age=86400, immutable` — a repeat view is a `304`
+the browser answers without reaching the server.
 
 `uploads/` is also the drop zone: at startup and every minute the viewer lists
 it, registers an album for every zip nothing owns yet, and queues an album whose
@@ -77,10 +78,11 @@ from the blobs in the bucket. The image Dockerfile declares
 `VOLUME /var/lib/viewer`; mount a host volume there (or point `STATE_DIR` at your
 own mount) to keep albums across container replacements.
 
-The caches are not settings and never live on that volume: decoded image blobs
-and the staged zip being unpacked go to `/tmp/viewer-cache` inside the container,
-because a miss is refetched from the bucket. Replacing the container loses them,
-which costs bandwidth and nothing else.
+The viewer keeps no local caches: images stream straight from S3, and the only
+thing it writes outside the volume is the staged zip being unpacked, which goes
+to the OS temp directory. Startup clears that directory of leftovers from a
+crashed run, so a container replacement or a restart leaves nothing to clean up
+by hand.
 
 `S3_PREFIX=photos` stores this deployment's objects under `photos/`
 (`photos/blobs/<sha256>`, `photos/uploads/<albumId>.zip`). Surrounding slashes
@@ -158,7 +160,7 @@ fails the build instead of surfacing as "serving without embeddings" later.
 - `make build` compiles `bin/viewer`, rebuilding frontend assets when their sources are newer than the committed `internal/web/static` bundle (`make build FORCE=1` forces a frontend rebuild).
 - `make test` runs the Go unit/integration tests (`go test ./cmd/... ./internal/...`). It needs no credentials or environment file.
 - `make run` starts `bin/viewer` (loads `.env` if present, does not rebuild binaries). Set `STATE_DIR` to a writable directory: the container default `/var/lib/viewer` is not writable for a local user.
-- `make clean` removes build outputs, dependency caches, and the host-side `/tmp/viewer-cache` cache directory.
+- `make clean` removes build outputs and dependency caches. The viewer itself keeps no caches: images stream from S3 and staged zips live in the OS temp directory.
 
 ## Upload drop zone
 - Whatever sits under `uploads/` is ingested: at startup and every minute the viewer lists the prefix, and for each zip it finds, it either queues the album that owns it again (its status is `QUEUED` or `PROCESSING`, so no worker holds it) or registers a new album and queues that. `albumId` is derived from the object's ETag and size, so dropping identical bytes twice resolves to one album.

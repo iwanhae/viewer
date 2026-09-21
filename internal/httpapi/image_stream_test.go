@@ -9,10 +9,10 @@ import (
 	"testing"
 )
 
-// TestGetImageServesCachedFileWithHTTPMetadata exercises the streaming image
-// read path end to end: the cached file must back a response that carries a
-// length, an ETag derived from the blob hash, revalidation and range support.
-func TestGetImageServesCachedFileWithHTTPMetadata(t *testing.T) {
+// TestGetImageServesBlobWithHTTPMetadata exercises the streaming image read
+// path end to end: the response must carry a length, an ETag derived from the
+// blob hash, revalidation and range support.
+func TestGetImageServesBlobWithHTTPMetadata(t *testing.T) {
 	harness := newFlowHarness(t)
 
 	imageA := testPNG(t, 8, 4, 33)
@@ -58,7 +58,7 @@ func TestGetImageServesCachedFileWithHTTPMetadata(t *testing.T) {
 		t.Fatalf("conditional body=%d bytes want=0", condRec.Body.Len())
 	}
 
-	// A range request is served from the cached file.
+	// A range request is answered from the in-memory copy of the blob.
 	rangeReq := httptest.NewRequest(http.MethodGet, path, nil)
 	rangeReq.Header.Set("Range", "bytes=1-3")
 	rangeRec := httptest.NewRecorder()

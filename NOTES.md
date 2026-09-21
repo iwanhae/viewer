@@ -42,9 +42,8 @@ are answered from the catalog; S3 is read by key (image bytes) or by the
 `$STATE_DIR/viewer.db` (default `/var/lib/viewer`, the path the image declares as
 a volume), opened with WAL, `foreign_keys(1)`, `synchronous(NORMAL)`, a single
 connection and a 10 second busy timeout. The catalog is the only thing under
-`STATE_DIR`. The decoded-image cache and the zip staging directory live under
-`config.CacheRoot` (`/tmp/viewer-cache`) instead, because both are rebuilt from
-the bucket and must not ride along on the volume that keeps the catalog.
+`STATE_DIR`. The only data written anywhere else is the staged zip in the OS
+temp directory, and the bucket still holds that.
 
 ```sql
 albums(id, original_filename, size_bytes, status, source_key,
@@ -101,11 +100,13 @@ A blob that is `failed` is terminal — `ListBlobsAwaitingEmbedding` selects onl
   that had just been marked `SUCCEEDED` with its zip already deleted. A
   duplicate enqueue is ignored by the pipeline, so re-queueing a live album is
   free and a stale `PROCESSING` row heals itself on the next pass.
-- **The catalog and the caches are separate directories.** `STATE_DIR` is the
-  volume an operator mounts, and the only thing on it is `viewer.db`; the caches
-  are a fixed `/tmp` path because a miss is refetched. Putting gigabytes of
-  decoded images on a volume whose purpose is to preserve a few megabytes of
-  SQLite would grow the backup with data the bucket already holds.
+- **The catalog volume holds only the catalog.** `STATE_DIR` is the volume an
+  operator mounts, and the only thing on it is `viewer.db`. There is no
+  server-side image cache — blobs stream from S3 per request — and the staged
+  zip being unpacked lives in the OS temp directory, which startup clears of
+  crash leftovers. Putting gigabytes of decoded images on a volume whose purpose
+  is to preserve a few megabytes of SQLite would grow the backup with data the
+  bucket already holds.
 - **Photo indexes come from a case-insensitive filename sort.** `photos.idx` is
   what the API and UI address, so the ordering has to be deterministic. The
   pipeline uses the same sort as the earlier indexer, which keeps existing photo
@@ -120,6 +121,9 @@ A blob that is `failed` is terminal — `ListBlobsAwaitingEmbedding` selects onl
   (`catalog.EncodeVector`), computed once per distinct image. Recommendations
   rank them by cosine similarity and return only cross-album hits, at most one
   photo per album.
-- **Images are served from a local disk cache.** `images.Service` materialises a
-  blob into `/tmp/viewer-cache/images` with an atomic temp-file rename and reuses
-  the cached file, so a repeated wall or viewer load never touches S3.
+- **Images are streamed from S3 per request.** `images.Service` reads the blob
+  into memory and serves it through `http.ServeContent`, which answers ranges
+  and conditional requests. The browser holds the blob-hash `ETag` under
+  `Cache-Control: immutable`, so a repeated wall or viewer load is a `304` that
+  never reaches the server; a server-side disk cache would only duplicate what
+  the browser and the bucket already hold.

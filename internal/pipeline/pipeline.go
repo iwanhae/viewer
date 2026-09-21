@@ -47,6 +47,10 @@ var allowedContentTypes = map[string]string{
 
 const defaultQueueSize = 1024
 
+// leftoverZipPattern names a downloaded staged zip in TempDir. It is shared by
+// the download and by the startup sweep so the two cannot drift apart.
+const leftoverZipPattern = "ingest-*.zip"
+
 // Store is the S3 surface the pipeline needs.
 type Store interface {
 	GetObject(ctx context.Context, key string) (io.ReadCloser, string, error)
@@ -57,7 +61,9 @@ type Store interface {
 
 // Options configure a pipeline service.
 type Options struct {
-	// TempDir holds the downloaded zip while it is being unpacked.
+	// TempDir holds the downloaded zip while it is being unpacked. An empty
+	// value means os.TempDir(). Start removes ingest-*.zip leftovers of a
+	// crashed run from it before the worker comes up.
 	TempDir string
 	// OnAlbumReady is invoked after an album has been fully extracted.
 	OnAlbumReady func(albumID string)
@@ -132,8 +138,33 @@ func (s *Service) Start(ctx context.Context) {
 		ctx = context.Background()
 	}
 	s.startOnce.Do(func() {
+		s.removeLeftoverZips()
 		go s.runWorker(ctx)
 	})
+}
+
+// removeLeftoverZips deletes the staged-zip downloads a crashed run left
+// behind. It runs before the worker starts, and the worker is the only thing
+// that ever creates an ingest-*.zip, so anything matching at this point is a
+// leftover by definition. Files that appear later are in-flight downloads and
+// are never touched.
+func (s *Service) removeLeftoverZips() {
+	leftovers, err := filepath.Glob(filepath.Join(s.opts.TempDir, leftoverZipPattern))
+	if err != nil {
+		log.Printf("pipeline: listing leftover staged zips in %s failed: %v", s.opts.TempDir, err)
+		return
+	}
+	removed := 0
+	for _, path := range leftovers {
+		if err := os.Remove(path); err != nil {
+			log.Printf("pipeline: removing leftover staged zip %s failed: %v", path, err)
+			continue
+		}
+		removed++
+	}
+	if removed > 0 {
+		log.Printf("pipeline: removed %d leftover staged zip(s) from %s", removed, s.opts.TempDir)
+	}
 }
 
 func (s *Service) runWorker(ctx context.Context) {
@@ -314,7 +345,7 @@ func (s *Service) download(ctx context.Context, sourceKey string) (string, int64
 	}
 	defer body.Close()
 
-	tmp, err := os.CreateTemp(dir, "ingest-*.zip")
+	tmp, err := os.CreateTemp(dir, leftoverZipPattern)
 	if err != nil {
 		return "", 0, fmt.Errorf("create zip temp file: %w", err)
 	}

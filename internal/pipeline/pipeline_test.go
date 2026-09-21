@@ -11,6 +11,7 @@ import (
 	"image/color"
 	"image/png"
 	"io"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -496,5 +497,31 @@ func TestContentTypeFor(t *testing.T) {
 		if got := contentTypeFor(nil, name); got != want {
 			t.Fatalf("contentTypeFor(%q)=%q want=%q", name, got, want)
 		}
+	}
+}
+
+// TestStartRemovesLeftoverStagedZips covers the crash-recovery sweep: a
+// download left behind by a previous run is gone once Start has run, while
+// anything that is not a staged-zip download is untouched.
+func TestStartRemovesLeftoverStagedZips(t *testing.T) {
+	dir := t.TempDir()
+	leftover := filepath.Join(dir, "ingest-stopped-mid-run.zip")
+	if err := os.WriteFile(leftover, []byte("stale"), 0o644); err != nil {
+		t.Fatalf("write leftover zip: %v", err)
+	}
+	keep := filepath.Join(dir, "keep.txt")
+	if err := os.WriteFile(keep, []byte("keep"), 0o644); err != nil {
+		t.Fatalf("write keep.txt: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	NewService(nil, newFakeStore(), Options{TempDir: dir}).Start(ctx)
+
+	if _, err := os.Stat(leftover); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("leftover zip still on disk: stat err=%v", err)
+	}
+	if _, err := os.Stat(keep); err != nil {
+		t.Fatalf("unrelated file was removed: %v", err)
 	}
 }

@@ -56,7 +56,6 @@ run:
 
 clean:
 	rm -rf bin .cache frontend/node_modules
-	# The viewer keeps its caches at a fixed container-local path (see
-	# config.CacheRoot), which on the host is /tmp/viewer-cache. The catalog is
-	# left alone: it lives wherever STATE_DIR points.
-	rm -rf /tmp/viewer-cache
+	# The viewer keeps no local caches: images stream straight from S3 and the
+	# staged zip lives in the OS temp directory, which the startup sweep cleans.
+	# The catalog is left alone: it lives wherever STATE_DIR points.
