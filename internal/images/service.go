@@ -10,9 +10,9 @@ import (
 	"strings"
 	"time"
 
-	_ "image/gif" // register the GIF decoder for image.Decode
-	_ "image/png" // register the PNG decoder for image.Decode
 	_ "golang.org/x/image/webp" // register the WebP decoder for image.Decode
+	_ "image/gif"               // register the GIF decoder for image.Decode
+	_ "image/png"               // register the PNG decoder for image.Decode
 
 	"golang.org/x/image/draw"
 
