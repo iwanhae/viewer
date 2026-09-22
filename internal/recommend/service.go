@@ -35,10 +35,12 @@ const (
 	maxTopK     = 48
 )
 
-// Service keeps an in-memory similarity index of blob embeddings and runs the
+// Service maps photos to the blob hashes they appear under and runs the
 // background workers that compute embeddings for the catalog's pending blobs.
-// Extraction never embeds anything itself: the in-process workers and external
-// workers leasing batches through ClaimEmbeddings are the only producers of
+// The similarity index itself lives in the catalog's blob_embeddings vec0
+// table: embeddings are queried through SQL and never held here. Extraction
+// never embeds anything itself: the in-process workers and external workers
+// leasing batches through ClaimEmbeddings are the only producers of
 // embeddings, and both write through ApplyEmbeddingResults.
 type Service struct {
 	catalog *catalog.Store
@@ -73,11 +75,11 @@ type Service struct {
 	runStartedAt time.Time
 	runEmbedded  int
 
-	mu               sync.RWMutex
-	photosByHash     map[string][]photoRef
-	hashesByAlbum    map[string]map[string]struct{}
-	embeddingsByHash map[string][]float32
-	failedByHash     map[string]string
+	// mu guards the photo-ref maps that fan a neighbor blob hash out to the
+	// photos (across albums) showing it.
+	mu            sync.RWMutex
+	photosByHash  map[string][]photoRef
+	hashesByAlbum map[string]map[string]struct{}
 }
 
 // NewService builds a recommendation service. A nil embedder switches the
@@ -93,8 +95,6 @@ func NewService(cat *catalog.Store, imagesService *images.Service, embedder Embe
 		onEmbeddingDrain: onEmbeddingDrain,
 		photosByHash:     make(map[string][]photoRef),
 		hashesByAlbum:    make(map[string]map[string]struct{}),
-		embeddingsByHash: make(map[string][]float32),
-		failedByHash:     make(map[string]string),
 	}
 }
 
@@ -156,11 +156,12 @@ func (s *Service) computeEmbedding(ctx context.Context, imageBytes []byte) ([]fl
 	return s.embedder.Embed(embedCtx, imageBytes)
 }
 
-// LoadAll rebuilds the in-memory index from the SQLite catalog. The rebuild
-// reads its snapshot of the catalog outside the map lock, so a write-back that
-// lands between the read and the swap can be dropped from memory until the
-// next reload; queries self-heal through queryVector's catalog fallback, so
-// the transient gap is cheaper than holding the lock across a full scan.
+// LoadAll rebuilds the photo-ref maps from the SQLite catalog. Embeddings are
+// not read: they live in the catalog's vec0 index and are queried there. The
+// rebuild reads its snapshot of the catalog outside the map lock, so an album
+// extraction landing between the read and the swap can leave the refs stale
+// until the next reload — the same transient gap as before, but it can no
+// longer drop vectors, which never enter memory.
 func (s *Service) LoadAll(ctx context.Context) error {
 	if s == nil || s.catalog == nil {
 		return nil
@@ -205,8 +206,6 @@ func (s *Service) ReloadAlbum(ctx context.Context, albumID string) error {
 func (s *Service) resetLocked() {
 	s.photosByHash = make(map[string][]photoRef)
 	s.hashesByAlbum = make(map[string]map[string]struct{})
-	s.embeddingsByHash = make(map[string][]float32)
-	s.failedByHash = make(map[string]string)
 }
 
 func (s *Service) addPairLocked(pair catalog.PhotoWithBlob) {
@@ -226,16 +225,6 @@ func (s *Service) addPairLocked(pair catalog.PhotoWithBlob) {
 		s.hashesByAlbum[pair.Photo.AlbumID] = make(map[string]struct{})
 	}
 	s.hashesByAlbum[pair.Photo.AlbumID][hash] = struct{}{}
-
-	switch pair.Blob.EmbeddingStatus {
-	case catalog.EmbeddingStatusReady:
-		if len(pair.Blob.Embedding) > 0 {
-			s.embeddingsByHash[hash] = normalizeVector(pair.Blob.Embedding)
-			delete(s.failedByHash, hash)
-		}
-	case catalog.EmbeddingStatusFailed:
-		s.failedByHash[hash] = pair.Blob.EmbeddingError
-	}
 }
 
 func (s *Service) removeHashForAlbumLocked(hash string, albumID string) {
@@ -519,26 +508,27 @@ func (s *Service) ReleaseClaims(ctx context.Context, hashes []string) error {
 	return s.catalog.ReleaseEmbeddingClaims(ctx, hashes)
 }
 
-// ApplyEmbeddingResults validates a batch of worker outcomes, persists the
-// acceptable ones in one transaction, and refreshes the in-memory similarity
-// index for everything that landed. It is the single write path for the
-// in-process worker and external workers alike, which is what keeps the index
-// and the catalog in lockstep.
+// ApplyEmbeddingResults validates a batch of worker outcomes and persists the
+// acceptable ones in one transaction. It is the single write path for the
+// in-process worker and external workers alike, and the catalog mirrors each
+// landed ready vector into the vec0 index inside that same transaction — which
+// is what keeps the index and the catalog in lockstep and makes results
+// queryable the moment this returns.
 func (s *Service) ApplyEmbeddingResults(ctx context.Context, results []catalog.EmbeddingResult) (applied int, rejected []catalog.RejectedEmbedding, err error) {
 	if s == nil || s.catalog == nil {
 		return 0, nil, fmt.Errorf("catalog is not available")
 	}
 
-	// Validate before the catalog sees anything: a vector of the wrong length
-	// or with non-finite entries would silently poison similarity scores,
-	// because cosineNormalized truncates instead of failing.
+	// Validate before the catalog sees anything: a vector of the wrong length,
+	// with non-finite entries, or with zero length would poison the index —
+	// cosine distance divides by the norm, so a zero vector ranks as NaN and
+	// NaN drags the whole neighbor ranking down with it.
 	valid := make([]catalog.EmbeddingResult, 0, len(results))
-	byHash := make(map[string]catalog.EmbeddingResult, len(results))
 	rejected = make([]catalog.RejectedEmbedding, 0)
 	for _, result := range results {
 		// Key by the trimmed hash: the catalog normalizes the same way, so
-		// looking up its applied hashes by the raw string would miss and
-		// poison the in-memory index for a blob the catalog just stored.
+		// reporting rejections under an untrimmed string would disagree with
+		// the catalog's own rejected list for the same result.
 		result.Hash = strings.TrimSpace(result.Hash)
 		if result.Hash == "" {
 			rejected = append(rejected, catalog.RejectedEmbedding{Hash: result.Hash, Reason: catalog.EmbeddingRejectInvalidHash})
@@ -549,16 +539,10 @@ func (s *Service) ApplyEmbeddingResults(ctx context.Context, results []catalog.E
 				rejected = append(rejected, catalog.RejectedEmbedding{Hash: result.Hash, Reason: RejectWrongDim})
 				continue
 			}
-			if !allFinite(result.Vector) {
+			if !allFinite(result.Vector) || isZeroNorm(result.Vector) {
 				rejected = append(rejected, catalog.RejectedEmbedding{Hash: result.Hash, Reason: RejectBadVector})
 				continue
 			}
-		}
-		// The catalog applies the first result per hash and rejects the rest,
-		// so first-wins here keeps the in-memory index on the same side of a
-		// duplicate submission.
-		if _, seen := byHash[result.Hash]; !seen {
-			byHash[result.Hash] = result
 		}
 		valid = append(valid, result)
 	}
@@ -568,18 +552,9 @@ func (s *Service) ApplyEmbeddingResults(ctx context.Context, results []catalog.E
 		return 0, nil, err
 	}
 	rejected = append(rejected, catalogRejected...)
-
-	s.mu.Lock()
-	for _, hash := range appliedHashes {
-		if byHash[hash].Status == catalog.EmbeddingStatusReady {
-			s.embeddingsByHash[hash] = normalizeVector(byHash[hash].Vector)
-			delete(s.failedByHash, hash)
-		} else {
-			s.failedByHash[hash] = byHash[hash].Error
-		}
-	}
-	s.mu.Unlock()
-
+	// First-wins per hash falls out of the catalog: only the first UPDATE per
+	// hash still sees the processing state, and the index row lands in that
+	// same transaction.
 	return len(appliedHashes), rejected, nil
 }
 
@@ -599,6 +574,18 @@ func clampClaimLimit(limit int) int {
 func allFinite(vector []float32) bool {
 	for _, value := range vector {
 		if math.IsNaN(float64(value)) || math.IsInf(float64(value), 0) {
+			return false
+		}
+	}
+	return true
+}
+
+// isZeroNorm reports whether the vector's Euclidean length is zero: every
+// entry is zero. Cosine distance divides by the norm, so such a vector's
+// distance is NaN anywhere it is compared.
+func isZeroNorm(vector []float32) bool {
+	for _, value := range vector {
+		if value != 0 {
 			return false
 		}
 	}
@@ -691,7 +678,9 @@ func rejectionSummary(rejected []catalog.RejectedEmbedding) string {
 	return strings.Join(parts, ",")
 }
 
-// Recommend returns cross-album neighbors of a query photo.
+// Recommend returns cross-album neighbors of a query photo. Neighbors come
+// from the catalog's vec0 index (distance-ascending, hash tie-broken); this
+// only resolves which photos those blob hashes surface as.
 func (s *Service) Recommend(ctx context.Context, albumID string, photoIndex int, limit int) (RecommendationResponse, error) {
 	if limit <= 0 {
 		limit = defaultTopK
@@ -716,11 +705,21 @@ func (s *Service) Recommend(ctx context.Context, albumID string, photoIndex int,
 		return RecommendationResponse{Items: []RecommendationItem{}}, nil
 	}
 
+	neighbors, err := s.catalog.FindNeighborEmbeddings(ctx, query, catalog.MaxNeighborK)
+	if err != nil {
+		return RecommendationResponse{}, fmt.Errorf("rank neighbors: %w", err)
+	}
+
 	s.mu.RLock()
-	neighbors := findNeighbors(s.embeddingsByHash, query, len(s.embeddingsByHash), photo.Hash)
+	defer s.mu.RUnlock()
 	items := make([]RecommendationItem, 0, limit)
 	seenAlbumIDs := make(map[string]struct{}, limit)
 	for _, neighbor := range neighbors {
+		// Same rule the index-side exclusion used to implement: the query
+		// blob never surfaces as its own neighbor, in any album.
+		if neighbor.Hash == photo.Hash {
+			continue
+		}
 		for _, ref := range s.photosByHash[neighbor.Hash] {
 			// Recommendations are cross-album only.
 			if ref.AlbumID == albumID {
@@ -736,7 +735,7 @@ func (s *Service) Recommend(ctx context.Context, albumID string, photoIndex int,
 				Hash:    ref.Hash,
 				W:       ref.Width,
 				H:       ref.Height,
-				Score:   neighbor.Score,
+				Score:   1 - neighbor.Distance,
 			})
 			break
 		}
@@ -744,44 +743,30 @@ func (s *Service) Recommend(ctx context.Context, albumID string, photoIndex int,
 			break
 		}
 	}
-	s.mu.RUnlock()
 
 	return RecommendationResponse{Items: items}, nil
 }
 
-// queryVector returns a normalized embedding for a hash, falling back to the
-// catalog when the in-memory index has not seen it yet.
+// queryVector reads the query blob's own embedding from the catalog. It
+// reports failed=true for a blob whose embedding failed terminally, so such a
+// query answers with an empty list instead of neighbors ranked against
+// nothing.
 func (s *Service) queryVector(ctx context.Context, hash string) ([]float32, bool) {
-	s.mu.RLock()
-	if _, failed := s.failedByHash[hash]; failed {
-		s.mu.RUnlock()
-		return nil, true
-	}
-	if vector, ok := s.embeddingsByHash[hash]; ok {
-		s.mu.RUnlock()
-		return vector, false
-	}
-	s.mu.RUnlock()
-
 	blob, err := s.catalog.GetBlob(ctx, hash)
 	if err != nil {
 		return nil, false
 	}
 	switch blob.EmbeddingStatus {
-	case catalog.EmbeddingStatusFailed:
-		s.mu.Lock()
-		s.failedByHash[hash] = blob.EmbeddingError
-		s.mu.Unlock()
-		return nil, true
 	case catalog.EmbeddingStatusReady:
-		if len(blob.Embedding) == 0 {
-			return nil, false
+		// The dim check keeps a legacy mis-sized "ready" row (which the
+		// index backfill skipped) from erroring the KNN query; it serves
+		// empty items, matching the pending case.
+		if len(blob.Embedding) == catalog.EmbeddingDim {
+			return blob.Embedding, false
 		}
-		normalized := normalizeVector(blob.Embedding)
-		s.mu.Lock()
-		s.embeddingsByHash[hash] = normalized
-		s.mu.Unlock()
-		return normalized, false
+		return nil, false
+	case catalog.EmbeddingStatusFailed:
+		return nil, true
 	default:
 		return nil, false
 	}

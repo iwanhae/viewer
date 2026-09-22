@@ -1,18 +1,24 @@
 package recommend
 
-import "time"
+import (
+	"time"
+
+	"viewer/internal/catalog"
+)
 
 // defaultWorkerBatchSize is how many blobs the in-process worker claims per
 // drain of the pending queue. One image at a time keeps the single forward
 // pass fed without queueing behind itself.
 const defaultWorkerBatchSize = 32
 
-// EmbeddingDim is the vector length every embedding must have. The checkpoint
-// is pinned by DefaultModelURL to a siglip2-base model, whose hidden size is
-// 768; a deployment that mounts a different checkpoint has to move this with
-// it, and the external worker API enforces the same value so the in-memory
-// index can never mix incompatible vectors.
-const EmbeddingDim = 768
+// EmbeddingDim is the vector length every embedding must have. The schema owns
+// this number — it is baked into the catalog's blob_embeddings vec0 column —
+// and the checkpoint is pinned by DefaultModelURL to a siglip2-base model whose
+// hidden size matches it. A deployment that mounts a differently-sized
+// checkpoint has to move both the constant and the schema with it, and the
+// external worker API enforces the same value so the index can never mix
+// incompatible vectors.
+const EmbeddingDim = catalog.EmbeddingDim
 
 // DefaultLeaseTTL is how long a claim keeps a blob out of the pending queue.
 // The internal worker renews it between images; external workers have the

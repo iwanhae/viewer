@@ -178,7 +178,7 @@ func seedEmbeddingFixture(t *testing.T, cat *catalog.Store) {
 			t.Fatalf("upsert blob: %v", err)
 		}
 	}
-	if err := cat.SetBlobEmbedding(ctx, "hash-a", catalog.EmbeddingStatusReady, []float32{1, 2, 3}, ""); err != nil {
+	if err := cat.SetBlobEmbedding(ctx, "hash-a", catalog.EmbeddingStatusReady, make([]float32, catalog.EmbeddingDim), ""); err != nil {
 		t.Fatalf("set ready embedding: %v", err)
 	}
 	if err := cat.SetBlobEmbedding(ctx, "hash-b", catalog.EmbeddingStatusFailed, nil, "embed failed"); err != nil {

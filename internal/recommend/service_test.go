@@ -95,6 +95,16 @@ func seedFailedEmbedding(t *testing.T, cat *catalog.Store, hash string, errText 
 	}
 }
 
+// vec768 builds a full-length embedding whose first components are vals and
+// whose remainder is zero, so tests can write short direction literals while
+// satisfying the catalog's float[768] column. Cosine similarity between two
+// vec768 vectors equals the cosine of the short forms they encode.
+func vec768(vals ...float32) []float32 {
+	vector := make([]float32, EmbeddingDim)
+	copy(vector, vals)
+	return vector
+}
+
 // ---------------------------------------------------------------------------
 // LoadAll
 // ---------------------------------------------------------------------------
@@ -103,7 +113,7 @@ func TestLoadAllBuildsIndexFromCatalogRows(t *testing.T) {
 	cat := newTestCatalog(t)
 	ctx := context.Background()
 
-	seedReadyEmbedding(t, cat, "hash-a", []float32{3, 4}) // normalizes to [0.6, 0.8]
+	seedReadyEmbedding(t, cat, "hash-a", vec768(3, 4))
 	seedFailedEmbedding(t, cat, "hash-b", "embed image: boom")
 	seedBlob(t, cat, "hash-pending")
 	seedBlob(t, cat, "hash-orphan") // no photo references it
@@ -121,28 +131,15 @@ func TestLoadAllBuildsIndexFromCatalogRows(t *testing.T) {
 		t.Fatalf("LoadAll: %v", err)
 	}
 
-	// Ready blobs are normalized and indexed for similarity search.
-	embedding, ok := svc.embeddingsByHash["hash-a"]
-	if !ok {
-		t.Fatalf("expected hash-a embedding in index")
+	// Ready embeddings live in the catalog's vector index, not in memory:
+	// only the correctly-sized vector is queryable, while failed and pending
+	// blobs never enter it.
+	neighbors, err := cat.FindNeighborEmbeddings(ctx, vec768(3, 4), 10)
+	if err != nil {
+		t.Fatalf("FindNeighborEmbeddings: %v", err)
 	}
-	if len(embedding) != 2 || !approxEqual(float64(embedding[0]), 0.6) || !approxEqual(float64(embedding[1]), 0.8) {
-		t.Fatalf("hash-a embedding=%v want=[0.6 0.8]", embedding)
-	}
-
-	// Failed blobs carry their reason and no vector.
-	if got := svc.failedByHash["hash-b"]; got != "embed image: boom" {
-		t.Fatalf("hash-b failure=%q want=%q", got, "embed image: boom")
-	}
-	if _, ok := svc.embeddingsByHash["hash-b"]; ok {
-		t.Fatalf("failed blob must not have an embedding")
-	}
-	// Pending blobs and blobs without photos never enter the similarity index.
-	if _, ok := svc.embeddingsByHash["hash-pending"]; ok {
-		t.Fatalf("pending blob must not have an embedding")
-	}
-	if _, ok := svc.embeddingsByHash["hash-orphan"]; ok {
-		t.Fatalf("blob without photos must not be indexed")
+	if len(neighbors) != 1 || neighbors[0].Hash != "hash-a" {
+		t.Fatalf("neighbors=%+v want only hash-a", neighbors)
 	}
 
 	refs := svc.photosByHash["hash-a"]
@@ -187,7 +184,7 @@ func TestReloadAlbumAddsAndRefreshes(t *testing.T) {
 	cat := newTestCatalog(t)
 	ctx := context.Background()
 
-	seedReadyEmbedding(t, cat, "hash-a0", []float32{1, 0})
+	seedReadyEmbedding(t, cat, "hash-a0", vec768(1, 0))
 	seedAlbum(t, cat, "album-a", catalog.Photo{Index: 0, Name: "a0.jpg", Hash: "hash-a0", Width: 1, Height: 1, Ratio: 1})
 
 	svc := newTestService(t, cat, nil)
@@ -196,7 +193,7 @@ func TestReloadAlbumAddsAndRefreshes(t *testing.T) {
 	}
 
 	// album-b exists in the catalog but is not in the in-memory index yet.
-	seedReadyEmbedding(t, cat, "hash-b0", []float32{0, 1})
+	seedReadyEmbedding(t, cat, "hash-b0", vec768(0, 1))
 	seedAlbum(t, cat, "album-b", catalog.Photo{Index: 0, Name: "b0.jpg", Hash: "hash-b0", Width: 2, Height: 2, Ratio: 1})
 	if _, ok := svc.hashesByAlbum["album-b"]; ok {
 		t.Fatalf("album-b indexed before ReloadAlbum")
@@ -211,12 +208,9 @@ func TestReloadAlbumAddsAndRefreshes(t *testing.T) {
 	if refs := svc.photosByHash["hash-b0"]; len(refs) != 1 || refs[0].AlbumID != "album-b" {
 		t.Fatalf("unexpected hash-b0 refs: %+v", refs)
 	}
-	if _, ok := svc.embeddingsByHash["hash-b0"]; !ok {
-		t.Fatalf("ReloadAlbum did not index album-b embedding")
-	}
 
 	// Refreshing an album drops stale hashes and picks up the new photo.
-	seedReadyEmbedding(t, cat, "hash-a1", []float32{0, 1})
+	seedReadyEmbedding(t, cat, "hash-a1", vec768(0, 1))
 	seedAlbum(t, cat, "album-a", catalog.Photo{Index: 0, Name: "a1.jpg", Hash: "hash-a1", Width: 3, Height: 3, Ratio: 1})
 
 	if err := svc.ReloadAlbum(ctx, "album-a"); err != nil {
@@ -259,10 +253,10 @@ func TestRecommendOrdersCrossAlbumNeighborsByScore(t *testing.T) {
 	cat := newTestCatalog(t)
 	ctx := context.Background()
 
-	seedReadyEmbedding(t, cat, "hash-query", []float32{1, 0})
-	seedReadyEmbedding(t, cat, "hash-same-album", []float32{1, 0})
-	seedReadyEmbedding(t, cat, "hash-b", []float32{0.9, 0.1})
-	seedReadyEmbedding(t, cat, "hash-c", []float32{0, 1})
+	seedReadyEmbedding(t, cat, "hash-query", vec768(1, 0))
+	seedReadyEmbedding(t, cat, "hash-same-album", vec768(1, 0))
+	seedReadyEmbedding(t, cat, "hash-b", vec768(0.9, 0.1))
+	seedReadyEmbedding(t, cat, "hash-c", vec768(0, 1))
 
 	seedAlbum(t, cat, "album-a",
 		catalog.Photo{Index: 0, Name: "a0.jpg", Hash: "hash-query", Width: 100, Height: 200, Ratio: 0.5},
@@ -305,9 +299,9 @@ func TestRecommendExcludesPhotosFromQueryAlbum(t *testing.T) {
 
 	// The same-album twin is a perfect match, so it would rank first if the
 	// album filter were missing.
-	seedReadyEmbedding(t, cat, "hash-query", []float32{1, 0})
-	seedReadyEmbedding(t, cat, "hash-twin", []float32{1, 0})
-	seedReadyEmbedding(t, cat, "hash-other", []float32{0.5, 0.5})
+	seedReadyEmbedding(t, cat, "hash-query", vec768(1, 0))
+	seedReadyEmbedding(t, cat, "hash-twin", vec768(1, 0))
+	seedReadyEmbedding(t, cat, "hash-other", vec768(0.5, 0.5))
 
 	seedAlbum(t, cat, "album-a",
 		catalog.Photo{Index: 0, Name: "a0.jpg", Hash: "hash-query", Width: 1, Height: 1, Ratio: 1},
@@ -336,8 +330,8 @@ func TestRecommendReturnsEmptyItemsWhenNoCrossAlbumNeighbors(t *testing.T) {
 	cat := newTestCatalog(t)
 	ctx := context.Background()
 
-	seedReadyEmbedding(t, cat, "hash-a0", []float32{1, 0})
-	seedReadyEmbedding(t, cat, "hash-a1", []float32{0.9, 0.1})
+	seedReadyEmbedding(t, cat, "hash-a0", vec768(1, 0))
+	seedReadyEmbedding(t, cat, "hash-a1", vec768(0.9, 0.1))
 	seedAlbum(t, cat, "album-a",
 		catalog.Photo{Index: 0, Name: "a0.jpg", Hash: "hash-a0", Width: 1, Height: 1, Ratio: 1},
 		catalog.Photo{Index: 1, Name: "a1.jpg", Hash: "hash-a1", Width: 1, Height: 1, Ratio: 1},
@@ -365,7 +359,7 @@ func TestRecommendReturnsEmptyItemsWhenQueryEmbeddingPending(t *testing.T) {
 	ctx := context.Background()
 
 	seedBlob(t, cat, "hash-pending")
-	seedReadyEmbedding(t, cat, "hash-b", []float32{1, 0})
+	seedReadyEmbedding(t, cat, "hash-b", vec768(1, 0))
 	seedAlbum(t, cat, "album-a", catalog.Photo{Index: 0, Name: "a0.jpg", Hash: "hash-pending", Width: 1, Height: 1, Ratio: 1})
 	seedAlbum(t, cat, "album-b", catalog.Photo{Index: 0, Name: "b0.jpg", Hash: "hash-b", Width: 1, Height: 1, Ratio: 1})
 
@@ -388,7 +382,7 @@ func TestRecommendReturnsEmptyItemsWhenQueryEmbeddingFailed(t *testing.T) {
 	ctx := context.Background()
 
 	seedFailedEmbedding(t, cat, "hash-failed", "embed image: boom")
-	seedReadyEmbedding(t, cat, "hash-b", []float32{1, 0})
+	seedReadyEmbedding(t, cat, "hash-b", vec768(1, 0))
 	seedAlbum(t, cat, "album-a", catalog.Photo{Index: 0, Name: "a0.jpg", Hash: "hash-failed", Width: 1, Height: 1, Ratio: 1})
 	seedAlbum(t, cat, "album-b", catalog.Photo{Index: 0, Name: "b0.jpg", Hash: "hash-b", Width: 1, Height: 1, Ratio: 1})
 
@@ -413,7 +407,7 @@ func TestRecommendUnknownPhotoWrapsErrPhotoNotFound(t *testing.T) {
 	cat := newTestCatalog(t)
 	ctx := context.Background()
 
-	seedReadyEmbedding(t, cat, "hash-a", []float32{1, 0})
+	seedReadyEmbedding(t, cat, "hash-a", vec768(1, 0))
 	seedAlbum(t, cat, "album-a", catalog.Photo{Index: 0, Name: "a0.jpg", Hash: "hash-a", Width: 1, Height: 1, Ratio: 1})
 
 	svc := newTestService(t, cat, nil)
@@ -460,12 +454,12 @@ func TestRecommendWithoutLoadedIndexReturnsEmptyNotPanic(t *testing.T) {
 	cat := newTestCatalog(t)
 	ctx := context.Background()
 
-	seedReadyEmbedding(t, cat, "hash-a", []float32{1, 0})
+	seedReadyEmbedding(t, cat, "hash-a", vec768(1, 0))
 	seedAlbum(t, cat, "album-a", catalog.Photo{Index: 0, Name: "a0.jpg", Hash: "hash-a", Width: 1, Height: 1, Ratio: 1})
 
-	// No LoadAll: the in-memory index is empty even though the catalog has the
-	// photo. The query vector comes from the catalog fallback; there are no
-	// indexed neighbors, so the result is an empty list rather than a panic.
+	// No LoadAll: the photo-ref maps are empty even though the catalog has the
+	// photo, and the query blob is the only indexed vector — excluded as the
+	// query itself. The result is an empty list rather than a panic.
 	svc := newTestService(t, cat, nil)
 	resp, err := svc.Recommend(ctx, "album-a", 0, 12)
 	if err != nil {
@@ -474,17 +468,13 @@ func TestRecommendWithoutLoadedIndexReturnsEmptyNotPanic(t *testing.T) {
 	if len(resp.Items) != 0 {
 		t.Fatalf("expected no recommendations, got %+v", resp.Items)
 	}
-	// The catalog fallback populated the embedding cache.
-	if _, ok := svc.embeddingsByHash["hash-a"]; !ok {
-		t.Fatalf("expected catalog fallback to cache the query embedding")
-	}
 }
 
 func TestRecommendLimitClamping(t *testing.T) {
 	cat := newTestCatalog(t)
 	ctx := context.Background()
 
-	seedReadyEmbedding(t, cat, "hash-query", []float32{1, 0})
+	seedReadyEmbedding(t, cat, "hash-query", vec768(1, 0))
 	seedAlbum(t, cat, "album-query", catalog.Photo{Index: 0, Name: "q.jpg", Hash: "hash-query", Width: 1, Height: 1, Ratio: 1})
 
 	// Enough distinct target albums to exercise the maxTopK clamp.
@@ -492,7 +482,7 @@ func TestRecommendLimitClamping(t *testing.T) {
 	for i := 0; i < targets; i++ {
 		hash := fmt.Sprintf("hash-target-%02d", i)
 		// Strictly decreasing similarity to the [1, 0] query.
-		seedReadyEmbedding(t, cat, hash, []float32{1 - 0.001*float32(i), 0.001 * float32(i)})
+		seedReadyEmbedding(t, cat, hash, vec768(1-0.001*float32(i), 0.001*float32(i)))
 		albumID := fmt.Sprintf("album-target-%02d", i)
 		seedAlbum(t, cat, albumID, catalog.Photo{Index: 0, Name: albumID + ".jpg", Hash: hash, Width: 1, Height: 1, Ratio: 1})
 	}
@@ -550,8 +540,8 @@ func TestRecommendLimitClamping(t *testing.T) {
 func TestEmbeddingProgressFromCatalogCounts(t *testing.T) {
 	cat := newTestCatalog(t)
 
-	seedReadyEmbedding(t, cat, "hash-ready-1", []float32{1, 0})
-	seedReadyEmbedding(t, cat, "hash-ready-2", []float32{0, 1})
+	seedReadyEmbedding(t, cat, "hash-ready-1", vec768(1, 0))
+	seedReadyEmbedding(t, cat, "hash-ready-2", vec768(0, 1))
 	seedFailedEmbedding(t, cat, "hash-failed", "embed image: boom")
 	seedBlob(t, cat, "hash-pending")
 
@@ -594,114 +584,15 @@ func TestEmbeddingProgressNilDependencies(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Vector helpers
+// Vector validation helpers
 // ---------------------------------------------------------------------------
 
-func TestNormalizeVector(t *testing.T) {
-	if got := normalizeVector(nil); got != nil {
-		t.Fatalf("normalizeVector(nil)=%v want=nil", got)
+func TestIsZeroNorm(t *testing.T) {
+	if !isZeroNorm(vec768()) {
+		t.Fatalf("expected an all-zero vector to report zero norm")
 	}
-	if got := normalizeVector([]float32{}); got != nil {
-		t.Fatalf("normalizeVector(empty)=%v want=nil", got)
-	}
-
-	got := normalizeVector([]float32{3, 4})
-	if len(got) != 2 || !approxEqual(float64(got[0]), 0.6) || !approxEqual(float64(got[1]), 0.8) {
-		t.Fatalf("normalizeVector([3 4])=%v want=[0.6 0.8]", got)
-	}
-
-	// A zero vector has no direction; the implementation substitutes norm=1 so
-	// the result stays finite and keeps its length.
-	zero := normalizeVector([]float32{0, 0})
-	if len(zero) != 2 || zero[0] != 0 || zero[1] != 0 {
-		t.Fatalf("normalizeVector([0 0])=%v want=[0 0]", zero)
-	}
-
-	input := []float32{3, 4}
-	_ = normalizeVector(input)
-	if input[0] != 3 || input[1] != 4 {
-		t.Fatalf("normalizeVector mutated its input: %v", input)
-	}
-}
-
-func TestCosineNormalized(t *testing.T) {
-	if got := cosineNormalized(nil, []float32{1}); got != 0 {
-		t.Fatalf("cosineNormalized(nil, x)=%f want=0", got)
-	}
-	if got := cosineNormalized([]float32{1}, nil); got != 0 {
-		t.Fatalf("cosineNormalized(x, nil)=%f want=0", got)
-	}
-	if got := cosineNormalized([]float32{1, 0}, []float32{1, 0}); !approxEqual(got, 1) {
-		t.Fatalf("cosineNormalized identical=%f want=1", got)
-	}
-	if got := cosineNormalized([]float32{1, 0}, []float32{0, 1}); !approxEqual(got, 0) {
-		t.Fatalf("cosineNormalized orthogonal=%f want=0", got)
-	}
-	// Mismatched lengths compare only the shorter prefix.
-	if got := cosineNormalized([]float32{1, 0}, []float32{1, 0, 5}); !approxEqual(got, 1) {
-		t.Fatalf("cosineNormalized mismatched=%f want=1", got)
-	}
-	// Inputs are expected to be normalized already: this is a dot product.
-	if got := cosineNormalized([]float32{2, 0}, []float32{3, 0}); !approxEqual(got, 6) {
-		t.Fatalf("cosineNormalized dot product=%f want=6", got)
-	}
-}
-
-func TestFindNeighborsOrdersAndTieBreaksByHash(t *testing.T) {
-	embeddings := map[string][]float32{
-		"hash-z": {1, 0},
-		"hash-a": {1, 0},
-		"hash-m": {0, 1},
-	}
-	query := []float32{1, 0}
-
-	want := []Neighbor{
-		{Hash: "hash-a", Score: 1},
-		{Hash: "hash-z", Score: 1},
-		{Hash: "hash-m", Score: 0},
-	}
-
-	// The map iteration order is random, so repeat to prove the sort is stable.
-	for i := 0; i < 25; i++ {
-		got := findNeighbors(embeddings, query, len(embeddings), "")
-		if len(got) != len(want) {
-			t.Fatalf("neighbors=%d want=%d: %+v", len(got), len(want), got)
-		}
-		for j := range want {
-			if got[j].Hash != want[j].Hash || !approxEqual(got[j].Score, want[j].Score) {
-				t.Fatalf("iteration %d neighbors[%d]=%+v want=%+v", i, j, got[j], want[j])
-			}
-		}
-	}
-
-	// The query is normalized before scoring, so magnitude does not matter.
-	scaled := findNeighbors(embeddings, []float32{5, 0}, len(embeddings), "")
-	for j := range want {
-		if scaled[j].Hash != want[j].Hash {
-			t.Fatalf("scaled query neighbors[%d]=%+v want=%+v", j, scaled[j], want[j])
-		}
-	}
-
-	// excludeHash drops the query itself from the results.
-	excluded := findNeighbors(embeddings, query, len(embeddings), "hash-a")
-	if len(excluded) != 2 || excluded[0].Hash != "hash-z" || excluded[1].Hash != "hash-m" {
-		t.Fatalf("excludeHash result=%+v", excluded)
-	}
-
-	// limit truncates after sorting.
-	limited := findNeighbors(embeddings, query, 1, "")
-	if len(limited) != 1 || limited[0].Hash != "hash-a" {
-		t.Fatalf("limit=1 result=%+v", limited)
-	}
-
-	if got := findNeighbors(embeddings, query, 0, ""); got != nil {
-		t.Fatalf("limit=0 result=%+v want=nil", got)
-	}
-	if got := findNeighbors(embeddings, nil, len(embeddings), ""); got != nil {
-		t.Fatalf("empty query result=%+v want=nil", got)
-	}
-	if got := findNeighbors(nil, query, 10, ""); len(got) != 0 {
-		t.Fatalf("empty embeddings result=%+v want empty", got)
+	if isZeroNorm(vec768(0, 1)) {
+		t.Fatalf("expected a vector with a non-zero entry to report a norm")
 	}
 }
 
@@ -718,7 +609,7 @@ func (g *gateEmbedder) Embed(ctx context.Context, _ []byte) ([]float32, error) {
 	close(g.started)
 	select {
 	case <-g.release:
-		return []float32{1, 0}, nil
+		return dimVector(1), nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
@@ -736,7 +627,7 @@ func TestEmbeddingProgressCountsAndEnabled(t *testing.T) {
 	seedBlob(t, cat, "hash-shared")
 	seedBlob(t, cat, "hash-only-a")
 
-	if err := cat.SetBlobEmbedding(context.Background(), "hash-shared", catalog.EmbeddingStatusReady, []float32{1, 0}, ""); err != nil {
+	if err := cat.SetBlobEmbedding(context.Background(), "hash-shared", catalog.EmbeddingStatusReady, dimVector(1), ""); err != nil {
 		t.Fatalf("set ready embedding: %v", err)
 	}
 
@@ -931,8 +822,8 @@ func TestExternalWorkerReleaseAndFailedReport(t *testing.T) {
 		t.Fatalf("expected the failure to land, got applied=%d rejected=%+v", applied, rejected)
 	}
 
-	// A failed blob is terminal: never claimable, and excluded from
-	// recommendations via the in-memory failed set.
+	// A failed blob is terminal: never claimable, and its failed status makes
+	// it poison its own queries instead of ranking neighbors against nothing.
 	if pending, _, err := svc.ClaimEmbeddings(ctx, 0); err != nil || len(pending) != 0 {
 		t.Fatalf("expected failed blob to stay unclaimed, got %d err=%v", len(pending), err)
 	}
@@ -945,9 +836,8 @@ func TestExternalWorkerReleaseAndFailedReport(t *testing.T) {
 }
 
 // A buggy worker can pad the hash with whitespace: the catalog trims it and
-// applies to the clean row, so the in-memory index must key the same trimmed
-// hash — otherwise the blob is ready in the catalog but permanently "failed"
-// in the index.
+// applies to the clean row, so the vec0 index and the report both land under
+// the same trimmed hash.
 func TestExternalWorkerAppliesTrimmedHash(t *testing.T) {
 	cat := newTestCatalog(t)
 	ctx := context.Background()
@@ -987,8 +877,8 @@ func TestExternalWorkerAppliesTrimmedHash(t *testing.T) {
 }
 
 // The catalog applies the first result per hash in a batch and rejects the
-// rest; the in-memory index must follow the same side of that race, not the
-// last submission.
+// rest; the recommendation view must follow the same side of that race, not
+// the last submission.
 func TestExternalWorkerDuplicateHashIsFirstWins(t *testing.T) {
 	cat := newTestCatalog(t)
 	ctx := context.Background()

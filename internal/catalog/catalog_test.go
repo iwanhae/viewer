@@ -22,6 +22,15 @@ func openTestStore(t *testing.T) *Store {
 	return store
 }
 
+// vec768 builds an EmbeddingDim-length vector whose leading values are vals and
+// whose tail is zeros, so tests can write short distinctive vectors that still
+// satisfy the blob_embeddings column's fixed width.
+func vec768(vals ...float32) []float32 {
+	vec := make([]float32, EmbeddingDim)
+	copy(vec, vals)
+	return vec
+}
+
 func TestAlbumLifecycleAndStatusTransitions(t *testing.T) {
 	store := openTestStore(t)
 	ctx := context.Background()
@@ -198,7 +207,7 @@ func TestBlobUpsertPreservesEmbedding(t *testing.T) {
 	if err := store.UpsertBlob(ctx, Blob{Hash: "hash-a", SizeBytes: 11, ContentType: "image/png"}); err != nil {
 		t.Fatalf("upsert blob: %v", err)
 	}
-	if err := store.SetBlobEmbedding(ctx, "hash-a", EmbeddingStatusReady, []float32{0.25, -1, 3}, ""); err != nil {
+	if err := store.SetBlobEmbedding(ctx, "hash-a", EmbeddingStatusReady, vec768(0.25, -1, 3), ""); err != nil {
 		t.Fatalf("set embedding: %v", err)
 	}
 
@@ -214,7 +223,7 @@ func TestBlobUpsertPreservesEmbedding(t *testing.T) {
 	if blob.SizeBytes != 22 {
 		t.Fatalf("expected refreshed size, got %d", blob.SizeBytes)
 	}
-	if blob.EmbeddingStatus != EmbeddingStatusReady || len(blob.Embedding) != 3 {
+	if blob.EmbeddingStatus != EmbeddingStatusReady || len(blob.Embedding) != EmbeddingDim {
 		t.Fatalf("expected embedding preserved, got %+v", blob)
 	}
 	if blob.Embedding[0] != 0.25 || blob.Embedding[1] != -1 || blob.Embedding[2] != 3 {
@@ -235,7 +244,7 @@ func TestEmbeddingCountsAndClaim(t *testing.T) {
 			t.Fatalf("upsert blob %s: %v", hash, err)
 		}
 	}
-	if err := store.SetBlobEmbedding(ctx, "ready", EmbeddingStatusReady, []float32{1}, ""); err != nil {
+	if err := store.SetBlobEmbedding(ctx, "ready", EmbeddingStatusReady, vec768(1), ""); err != nil {
 		t.Fatalf("set ready: %v", err)
 	}
 	if err := store.SetBlobEmbedding(ctx, "failed", EmbeddingStatusFailed, nil, "boom"); err != nil {
@@ -356,11 +365,11 @@ func TestApplyEmbeddingResultsMixedBatch(t *testing.T) {
 
 	longError := strings.Repeat("x", 600)
 	applied, rejected, err := store.ApplyEmbeddingResults(ctx, []EmbeddingResult{
-		{Hash: "a", Status: EmbeddingStatusReady, Vector: []float32{1, 2, 3}},
+		{Hash: "a", Status: EmbeddingStatusReady, Vector: vec768(1, 2, 3)},
 		{Hash: "b", Status: EmbeddingStatusFailed, Error: longError},
 		{Hash: "c", Status: EmbeddingStatusPending},
-		{Hash: "d", Status: EmbeddingStatusReady, Vector: []float32{9}},
-		{Hash: "ghost", Status: EmbeddingStatusReady, Vector: []float32{9}},
+		{Hash: "d", Status: EmbeddingStatusReady, Vector: vec768(9)},
+		{Hash: "ghost", Status: EmbeddingStatusReady, Vector: vec768(9)},
 	})
 	if err != nil {
 		t.Fatalf("apply results: %v", err)
@@ -386,7 +395,7 @@ func TestApplyEmbeddingResultsMixedBatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get a: %v", err)
 	}
-	if blobA.EmbeddingStatus != EmbeddingStatusReady || len(blobA.Embedding) != 3 || blobA.Embedding[0] != 1 {
+	if blobA.EmbeddingStatus != EmbeddingStatusReady || len(blobA.Embedding) != EmbeddingDim || blobA.Embedding[0] != 1 {
 		t.Fatalf("expected ready vector on a, got %+v", blobA)
 	}
 	blobB, err := store.GetBlob(ctx, "b")
@@ -681,53 +690,59 @@ func TestOpenRequiresPath(t *testing.T) {
 // TestOpenMigratesLegacyAlbumStatuses covers a catalog written before album
 // statuses matched the wire format: READY must become SUCCEEDED and PENDING
 // must fold into QUEUED, and reopening the migrated file must be harmless.
+// The rewrite lives in migration 0001, so the legacy rows have to predate the
+// first Open — a fresh catalog never holds them.
 func TestOpenMigratesLegacyAlbumStatuses(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "catalog.db")
 	ctx := context.Background()
 
-	store, err := Open(path)
+	legacy, err := sql.Open("sqlite", path)
 	if err != nil {
-		t.Fatalf("open catalog: %v", err)
+		t.Fatalf("open legacy db: %v", err)
 	}
-	for _, album := range []Album{
-		{ID: "legacy-ready", OriginalFilename: "ready.zip", Status: AlbumStatusReady},
-		{ID: "legacy-pending", OriginalFilename: "pending.zip", Status: AlbumStatusQueued},
-	} {
-		if err := store.CreateAlbum(ctx, album); err != nil {
-			t.Fatalf("create album %s: %v", album.ID, err)
-		}
-	}
-	if _, err := store.db.Exec(`
-		UPDATE albums SET status = 'READY' WHERE id = 'legacy-ready';
-		UPDATE albums SET status = 'PENDING' WHERE id = 'legacy-pending';`); err != nil {
+	if _, err := legacy.Exec(`
+		CREATE TABLE albums (
+			id                TEXT PRIMARY KEY,
+			original_filename TEXT NOT NULL,
+			size_bytes        INTEGER NOT NULL DEFAULT 0,
+			status            TEXT NOT NULL,
+			source_key        TEXT NOT NULL DEFAULT '',
+			photo_count       INTEGER NOT NULL DEFAULT 0,
+			error             TEXT NOT NULL DEFAULT '',
+			created_at        TEXT NOT NULL,
+			updated_at        TEXT NOT NULL
+		);
+		INSERT INTO albums (id, original_filename, status, created_at, updated_at) VALUES
+			('legacy-ready',  'ready.zip',   'READY',   '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z'),
+			('legacy-pending','pending.zip', 'PENDING', '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z');`); err != nil {
 		t.Fatalf("seed legacy statuses: %v", err)
 	}
-	if err := store.Close(); err != nil {
-		t.Fatalf("close catalog: %v", err)
+	if err := legacy.Close(); err != nil {
+		t.Fatalf("close legacy db: %v", err)
 	}
 
-	// Opening rewrites the legacy rows, and a second open is a no-op.
+	// The first open rewrites the legacy rows; a second open is a no-op.
 	for attempt := 0; attempt < 2; attempt++ {
-		reopened, err := Open(path)
+		store, err := Open(path)
 		if err != nil {
-			t.Fatalf("reopen catalog (attempt %d): %v", attempt, err)
+			t.Fatalf("open catalog (attempt %d): %v", attempt, err)
 		}
-		ready, err := reopened.GetAlbum(ctx, "legacy-ready")
+		ready, err := store.GetAlbum(ctx, "legacy-ready")
 		if err != nil {
 			t.Fatalf("get legacy-ready: %v", err)
 		}
 		if ready.Status != AlbumStatusReady {
 			t.Fatalf("legacy READY status=%s want=%s", ready.Status, AlbumStatusReady)
 		}
-		pending, err := reopened.GetAlbum(ctx, "legacy-pending")
+		pending, err := store.GetAlbum(ctx, "legacy-pending")
 		if err != nil {
 			t.Fatalf("get legacy-pending: %v", err)
 		}
 		if pending.Status != AlbumStatusQueued {
 			t.Fatalf("legacy PENDING status=%s want=%s", pending.Status, AlbumStatusQueued)
 		}
-		if err := reopened.Close(); err != nil {
-			t.Fatalf("close reopened catalog: %v", err)
+		if err := store.Close(); err != nil {
+			t.Fatalf("close catalog (attempt %d): %v", attempt, err)
 		}
 	}
 }
@@ -751,7 +766,7 @@ func TestBackupToRoundTrips(t *testing.T) {
 	if err := store.UpsertBlob(ctx, Blob{Hash: "hash-a", SizeBytes: 5, ContentType: "image/png"}); err != nil {
 		t.Fatalf("upsert blob: %v", err)
 	}
-	if err := store.SetBlobEmbedding(ctx, "hash-a", EmbeddingStatusReady, []float32{0.5, -2}, ""); err != nil {
+	if err := store.SetBlobEmbedding(ctx, "hash-a", EmbeddingStatusReady, vec768(0.5, -2), ""); err != nil {
 		t.Fatalf("set embedding: %v", err)
 	}
 	if err := store.InsertPhoto(ctx, Photo{AlbumID: "album-a", Index: 0, Name: "a.png", Hash: "hash-a", Width: 2, Height: 1, Ratio: 2}); err != nil {
@@ -782,6 +797,15 @@ func TestBackupToRoundTrips(t *testing.T) {
 	}
 	if blob.EmbeddingStatus != EmbeddingStatusReady || blob.Embedding[0] != 0.5 || blob.Embedding[1] != -2 {
 		t.Fatalf("embedding did not survive the snapshot: %+v", blob)
+	}
+	// The vec0 index and its shadow tables ride along inside the snapshot file,
+	// so the restored catalog answers vector queries without a rebuild.
+	neighbors, err := restored.FindNeighborEmbeddings(ctx, vec768(0.5, -2), 5)
+	if err != nil {
+		t.Fatalf("vector query on snapshot: %v", err)
+	}
+	if len(neighbors) != 1 || neighbors[0].Hash != "hash-a" || neighbors[0].Distance > 1e-6 {
+		t.Fatalf("unexpected neighbors from snapshot: %+v", neighbors)
 	}
 	photos, err := restored.PhotosByAlbum(ctx, "album-a")
 	if err != nil {
@@ -847,7 +871,7 @@ func TestEmbeddingCountsByAlbumCountsSharedBlobsPerAlbum(t *testing.T) {
 			t.Fatalf("upsert blob %s: %v", hash, err)
 		}
 	}
-	if err := store.SetBlobEmbedding(ctx, "hash-shared", EmbeddingStatusReady, []float32{1, 0}, ""); err != nil {
+	if err := store.SetBlobEmbedding(ctx, "hash-shared", EmbeddingStatusReady, vec768(1, 0), ""); err != nil {
 		t.Fatalf("set embedding: %v", err)
 	}
 
@@ -950,7 +974,7 @@ func TestApplyEmbeddingResultsReadyClearsErrorAndTruncatesUTF8(t *testing.T) {
 		t.Fatalf("claim blob-b: %v", err)
 	}
 	if _, _, err := store.ApplyEmbeddingResults(ctx, []EmbeddingResult{
-		{Hash: "hash-b", Status: EmbeddingStatusReady, Vector: []float32{1, 2, 3}, Error: "stale failure"},
+		{Hash: "hash-b", Status: EmbeddingStatusReady, Vector: vec768(1, 2, 3), Error: "stale failure"},
 	}); err != nil {
 		t.Fatalf("apply ready report: %v", err)
 	}
@@ -990,5 +1014,234 @@ func TestRenewEmbeddingLeasesReportsWhatRenewed(t *testing.T) {
 	want := []string{"hash-a", "hash-b", "hash-c"}
 	if strings.Join(renewed, ",") != strings.Join(want, ",") {
 		t.Fatalf("renewed=%v want=%v", renewed, want)
+	}
+}
+
+// TestFindNeighborEmbeddingsOrdersAndBreaksTiesByHash pins the ranking contract
+// Recommend serves to users: distance ascending, and identical distances in
+// hash order so repeated queries answer identically.
+func TestFindNeighborEmbeddingsOrdersAndBreaksTiesByHash(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+	for _, hash := range []string{"hash-a", "hash-z", "hash-m"} {
+		if err := store.UpsertBlob(ctx, Blob{Hash: hash, SizeBytes: 1}); err != nil {
+			t.Fatalf("upsert blob %s: %v", hash, err)
+		}
+	}
+	// hash-a and hash-z point the same way; hash-m points elsewhere. Cosine
+	// ignores length, so the doubled vector ranks identically to the original.
+	if err := store.SetBlobEmbedding(ctx, "hash-a", EmbeddingStatusReady, vec768(1), ""); err != nil {
+		t.Fatalf("set hash-a: %v", err)
+	}
+	if err := store.SetBlobEmbedding(ctx, "hash-z", EmbeddingStatusReady, vec768(2), ""); err != nil {
+		t.Fatalf("set hash-z: %v", err)
+	}
+	if err := store.SetBlobEmbedding(ctx, "hash-m", EmbeddingStatusReady, vec768(-1), ""); err != nil {
+		t.Fatalf("set hash-m: %v", err)
+	}
+
+	want := []string{"hash-a", "hash-z", "hash-m"}
+	for attempt := 0; attempt < 3; attempt++ {
+		neighbors, err := store.FindNeighborEmbeddings(ctx, vec768(1), 10)
+		if err != nil {
+			t.Fatalf("find neighbors: %v", err)
+		}
+		if len(neighbors) != len(want) {
+			t.Fatalf("got %d neighbors, want %d", len(neighbors), len(want))
+		}
+		for i, neighbor := range neighbors {
+			if neighbor.Hash != want[i] {
+				t.Fatalf("rank %d: got %s want %s (all %+v)", i, neighbor.Hash, want[i], neighbors)
+			}
+		}
+		if neighbors[0].Distance > 1e-6 || neighbors[2].Distance < 1 {
+			t.Fatalf("distances not cosine-ordered: %+v", neighbors)
+		}
+	}
+}
+
+// TestFindNeighborEmbeddingsGuards pins the query-side guards: a wrong-sized
+// query is an error, a non-positive k asks for nothing, an empty index has no
+// neighbors, and a k beyond sqlite-vec's hard cap clamps instead of erroring.
+func TestFindNeighborEmbeddingsGuards(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+
+	if _, err := store.FindNeighborEmbeddings(ctx, []float32{1, 2, 3}, 5); err == nil {
+		t.Fatalf("expected error for wrong-dim query")
+	}
+	neighbors, err := store.FindNeighborEmbeddings(ctx, vec768(1), 0)
+	if err != nil || len(neighbors) != 0 {
+		t.Fatalf("k=0: neighbors=%+v err=%v want empty", neighbors, err)
+	}
+	neighbors, err = store.FindNeighborEmbeddings(ctx, vec768(1), -3)
+	if err != nil || len(neighbors) != 0 {
+		t.Fatalf("k<0: neighbors=%+v err=%v want empty", neighbors, err)
+	}
+	neighbors, err = store.FindNeighborEmbeddings(ctx, vec768(1), 2*MaxNeighborK)
+	if err != nil {
+		t.Fatalf("k beyond the cap must clamp, not error: %v", err)
+	}
+	if len(neighbors) != 0 {
+		t.Fatalf("empty index returned %+v", neighbors)
+	}
+}
+
+// TestApplyEmbeddingResultsSyncsVectorIndex walks the production write path:
+// claimed blobs come back ready and are queryable the moment the batch is
+// acknowledged, failed results never enter the index, and a replayed result is
+// refused without disturbing what is already indexed.
+func TestApplyEmbeddingResultsSyncsVectorIndex(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+	seedClaimBlobs(t, store, "a", "b", "c")
+
+	if _, err := store.ClaimPendingEmbeddings(ctx, 3, time.Now().Add(10*time.Minute)); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	applied, rejected, err := store.ApplyEmbeddingResults(ctx, []EmbeddingResult{
+		{Hash: "a", Status: EmbeddingStatusReady, Vector: vec768(1)},
+		{Hash: "b", Status: EmbeddingStatusFailed, Error: "boom"},
+		{Hash: "c", Status: EmbeddingStatusReady, Vector: vec768(-1)},
+	})
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if len(applied) != 3 || len(rejected) != 0 {
+		t.Fatalf("applied=%v rejected=%+v", applied, rejected)
+	}
+
+	neighbors, err := store.FindNeighborEmbeddings(ctx, vec768(1), 10)
+	if err != nil {
+		t.Fatalf("find neighbors: %v", err)
+	}
+	if len(neighbors) != 2 || neighbors[0].Hash != "a" || neighbors[1].Hash != "c" {
+		t.Fatalf("neighbors=%+v want a then c", neighbors)
+	}
+
+	// The failed blob stays out of the index even though the query matches
+	// nothing else nearby.
+	blobB, err := store.GetBlob(ctx, "b")
+	if err != nil || blobB.EmbeddingStatus != EmbeddingStatusFailed {
+		t.Fatalf("blob b=%+v err=%v want failed", blobB, err)
+	}
+
+	// A replay hits the terminal-state guard: not_claimed, and no duplicate
+	// index entry for a.
+	applied, rejected, err = store.ApplyEmbeddingResults(ctx, []EmbeddingResult{
+		{Hash: "a", Status: EmbeddingStatusReady, Vector: vec768(1)},
+	})
+	if err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	if len(applied) != 0 || len(rejected) != 1 || rejected[0].Reason != EmbeddingRejectNotClaimed {
+		t.Fatalf("replay applied=%v rejected=%+v want not_claimed", applied, rejected)
+	}
+	neighbors, err = store.FindNeighborEmbeddings(ctx, vec768(1), 10)
+	if err != nil {
+		t.Fatalf("find neighbors after replay: %v", err)
+	}
+	if len(neighbors) != 2 {
+		t.Fatalf("replay duplicated the index: %+v", neighbors)
+	}
+}
+
+// TestApplyEmbeddingResultsRejectsWrongDimVector pins the batch contract: a
+// ready result that does not fill the float[768] column is refused per item —
+// it must not abort the batch's transaction nor strand the blob's claim.
+func TestApplyEmbeddingResultsRejectsWrongDimVector(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+	seedClaimBlobs(t, store, "a", "b")
+
+	if _, err := store.ClaimPendingEmbeddings(ctx, 2, time.Now().Add(10*time.Minute)); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	applied, rejected, err := store.ApplyEmbeddingResults(ctx, []EmbeddingResult{
+		{Hash: "a", Status: EmbeddingStatusReady, Vector: []float32{1, 2, 3}},
+		{Hash: "b", Status: EmbeddingStatusReady, Vector: vec768(1)},
+	})
+	if err != nil {
+		t.Fatalf("one bad vector must not fail the batch: %v", err)
+	}
+	if len(applied) != 1 || applied[0] != "b" {
+		t.Fatalf("applied=%v want only b", applied)
+	}
+	if len(rejected) != 1 || rejected[0].Hash != "a" || rejected[0].Reason != EmbeddingRejectWrongDim {
+		t.Fatalf("rejected=%+v want a/wrong_dim", rejected)
+	}
+
+	// The refused blob keeps its processing claim so its worker can retry it
+	// with a correct payload, and nothing of it entered the index.
+	blobA, err := store.GetBlob(ctx, "a")
+	if err != nil || blobA.EmbeddingStatus != EmbeddingStatusProcessing {
+		t.Fatalf("blob a=%+v err=%v want still processing", blobA, err)
+	}
+	neighbors, err := store.FindNeighborEmbeddings(ctx, vec768(1), 10)
+	if err != nil {
+		t.Fatalf("find neighbors: %v", err)
+	}
+	if len(neighbors) != 1 || neighbors[0].Hash != "b" {
+		t.Fatalf("neighbors=%+v want only b", neighbors)
+	}
+}
+
+// TestSetBlobEmbeddingSyncsVectorIndex covers the administrative write: an
+// unknown hash is refused instead of orphaning an index entry, overwriting a
+// vector replaces the indexed one, and demoting to failed un-indexes the blob.
+func TestSetBlobEmbeddingSyncsVectorIndex(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+
+	// No blob row: refuse, and leave nothing in the index.
+	if err := store.SetBlobEmbedding(ctx, "ghost", EmbeddingStatusReady, vec768(1), ""); !errors.Is(err, ErrBlobNotFound) {
+		t.Fatalf("set on unknown hash: err=%v want ErrBlobNotFound", err)
+	}
+	neighbors, err := store.FindNeighborEmbeddings(ctx, vec768(1), 10)
+	if err != nil || len(neighbors) != 0 {
+		t.Fatalf("unknown hash left index entries: %+v err=%v", neighbors, err)
+	}
+
+	if err := store.UpsertBlob(ctx, Blob{Hash: "hash-a", SizeBytes: 1}); err != nil {
+		t.Fatalf("upsert blob: %v", err)
+	}
+	if err := store.SetBlobEmbedding(ctx, "hash-a", EmbeddingStatusReady, vec768(1), ""); err != nil {
+		t.Fatalf("set ready: %v", err)
+	}
+	neighbors, err = store.FindNeighborEmbeddings(ctx, vec768(1), 10)
+	if err != nil || len(neighbors) != 1 || neighbors[0].Hash != "hash-a" {
+		t.Fatalf("neighbors=%+v err=%v want hash-a", neighbors, err)
+	}
+
+	// An overwrite replaces the stored and indexed vector instead of
+	// colliding with it.
+	if err := store.SetBlobEmbedding(ctx, "hash-a", EmbeddingStatusReady, vec768(-1), ""); err != nil {
+		t.Fatalf("overwrite ready: %v", err)
+	}
+	blob, err := store.GetBlob(ctx, "hash-a")
+	if err != nil || blob.Embedding[0] != -1 {
+		t.Fatalf("blob=%+v err=%v want overwritten vector", blob, err)
+	}
+	neighbors, err = store.FindNeighborEmbeddings(ctx, vec768(-1), 10)
+	if err != nil || len(neighbors) != 1 || neighbors[0].Hash != "hash-a" || neighbors[0].Distance > 1e-6 {
+		t.Fatalf("neighbors for new vector=%+v err=%v", neighbors, err)
+	}
+	far, err := store.FindNeighborEmbeddings(ctx, vec768(1), 10)
+	if err != nil || len(far) != 1 || far[0].Distance < 1 {
+		t.Fatalf("old vector still indexed at distance %v err=%v", far, err)
+	}
+
+	// A wrong-sized vector is refused up front and changes nothing.
+	if err := store.SetBlobEmbedding(ctx, "hash-a", EmbeddingStatusReady, vec768(1)[:3], ""); err == nil {
+		t.Fatalf("expected error for wrong-dim vector")
+	}
+
+	// Demoting to failed un-indexes the blob.
+	if err := store.SetBlobEmbedding(ctx, "hash-a", EmbeddingStatusFailed, nil, "boom"); err != nil {
+		t.Fatalf("demote to failed: %v", err)
+	}
+	neighbors, err = store.FindNeighborEmbeddings(ctx, vec768(-1), 10)
+	if err != nil || len(neighbors) != 0 {
+		t.Fatalf("failed blob still indexed: %+v err=%v", neighbors, err)
 	}
 }

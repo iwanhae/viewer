@@ -57,10 +57,13 @@ albums(id, original_filename, size_bytes, status, source_key,
        photo_count, error, created_at, updated_at)
 
 blobs(hash, size_bytes, content_type, embedding_status, embedding,
-      embedding_error, created_at)
+      embedding_error, embedding_lease_until, created_at)
 
 photos(album_id, idx, name, hash, width, height, ratio,
        PRIMARY KEY (album_id, idx))
+
+blob_embeddings — vec0 virtual table: hash text primary key,
+                  embedding float[768] distance_metric=cosine
 ```
 
 Indexed on `albums(status)`, `albums(source_key)`, `blobs(embedding_status)` and
@@ -69,8 +72,17 @@ is keyed by `(album_id, idx)`.
 
 Album status is persisted as `QUEUED` / `PROCESSING` / `SUCCEEDED` / `FAILED`
 (`albums.error` carries the failure text). Blob embedding status is `pending` /
-`ready` / `failed`. Opening the catalog rewrites the pre-merge `PENDING` and
-`READY` album rows, so an existing database keeps working.
+`ready` / `failed`.
+
+The schema evolves through a forward-only migration chain keyed by
+`PRAGMA user_version` (`internal/catalog/migrate.go`): every open applies the
+migrations newer than the file's version, each inside one transaction that also
+bumps the version — a failure aborts startup with the file untouched. Migration
+0001 is the baseline schema plus the data fixes that used to run on every open
+(the pre-merge `READY`/`PENDING` album rows are rewritten once by it, not
+repeatedly), and 0002 creates `blob_embeddings` and backfills it. A file whose
+version is newer than the binary's chain is left alone with a warning, so
+restoring a newer backup under an older binary does not brick the store.
 
 The two statuses are independent and the API keeps them that way: an album is
 `SUCCEEDED` once its zip has been extracted, which says nothing about whether
@@ -162,10 +174,21 @@ A blob that is `failed` is terminal — `ListBlobsAwaitingEmbedding` selects onl
   queue depth.
 - **Photos carry width, height and ratio directly.** They are denormalized so
   album reads never need to join `blobs`.
-- **Embeddings live on the blob row.** They are little-endian `float32` vectors
-  (`catalog.EncodeVector`), computed once per distinct image. Recommendations
-  rank them by cosine similarity and return only cross-album hits, at most one
-  photo per album.
+- **Embeddings live on the blob row; the vec0 table is only an index.**
+  `blobs.embedding` is the little-endian `float32` vector
+  (`catalog.EncodeVector`), computed once per distinct image and the source of
+  truth. `blob_embeddings` — a sqlite-vec virtual table (bundled CGo-free in
+  `modernc.org/sqlite/vec`) keyed by the blob hash with cosine distance — is
+  derived state, written inside the same transaction as the blob row by the
+  single production write path (`ApplyEmbeddingResults`), so a committed ready
+  row is always queryable and a failed row never enters the index. Backfills
+  can rebuild it from the blob rows; migration 0002 did exactly that, skipping
+  embeddings whose byte length does not match 768 floats. Nothing holds
+  embeddings in memory any more: recommendations run `FindNeighborEmbeddings`
+  (an exhaustive vec0 KNN — sqlite-vec has no ANN yet — clamped at k=4096,
+  ties broken by hash in Go because vec0 permits only `ORDER BY distance`) and
+  fan out to photo refs only, which makes the catalog the sole thing to load,
+  back up and restore.
 - **Images are streamed from S3 per request.** `images.Service` reads the blob
   into memory and serves it through `http.ServeContent`, which answers ranges
   and conditional requests. The browser holds the blob-hash `ETag` under
