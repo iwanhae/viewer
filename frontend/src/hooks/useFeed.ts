@@ -30,8 +30,13 @@ export function useFeed(seed: string, mode: FeedMode, afterCursor: string): UseF
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [pageInfo, setPageInfo] = useState<FeedPageInfo>(defaultPageInfo)
+  // latestRequest is what keeps concurrent loads honest: only the most recent
+  // call may touch state, so a superseded response is discarded on arrival.
+  // In-flight requests are deliberately NOT aborted - the response is a few KB,
+  // so cancelling saves nothing, and an abort hooked into effects' cleanup
+  // fires on React StrictMode's dev double-mount, killing the first fetch as
+  // soon as it starts.
   const latestRequest = useRef(0)
-  const inflightRef = useRef<AbortController | null>(null)
 
   const load = useCallback(async (seedValue: string, modeValue: FeedMode, latestAfter: string): Promise<void> => {
     if (modeValue === 'random' && !seedValue.trim()) {
@@ -45,13 +50,6 @@ export function useFeed(seed: string, mode: FeedMode, afterCursor: string): UseF
     const requestID = latestRequest.current + 1
     latestRequest.current = requestID
 
-    // The request id already ignores stale responses; aborting the previous
-    // request also stops its download instead of letting superseded pages
-    // finish streaming in the background.
-    inflightRef.current?.abort()
-    const controller = new AbortController()
-    inflightRef.current = controller
-
     setLoading(true)
     setError(null)
 
@@ -60,7 +58,6 @@ export function useFeed(seed: string, mode: FeedMode, afterCursor: string): UseF
         mode: modeValue,
         seed: modeValue === 'random' ? seedValue : undefined,
         after: modeValue === 'latest' ? latestAfter : undefined,
-        signal: controller.signal,
       })
       if (latestRequest.current !== requestID) return
       setItems(data.items)
@@ -79,12 +76,6 @@ export function useFeed(seed: string, mode: FeedMode, afterCursor: string): UseF
       if (latestRequest.current === requestID) {
         setLoading(false)
       }
-    }
-  }, [])
-
-  useEffect(() => {
-    return () => {
-      inflightRef.current?.abort()
     }
   }, [])
 
