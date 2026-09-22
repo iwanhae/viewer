@@ -2,10 +2,14 @@
 // deletes the staged zips that snapshot covers.
 //
 // The safety invariant: no staged zip is deleted before a backup that already
-// records its album's terminal state is durable in S3. Status SUCCEEDED is
-// only ever written by the pipeline's single worker, and the finalizer runs on
-// that same worker when the queue drains, so nothing can change between the
-// snapshot and the delete list. On startup Restore brings the bucket's
+// records its album's terminal state is durable in S3. The delete list is read
+// from the uploaded snapshot file itself, not from the live database, so no
+// concurrent writer — the pipeline worker, the embedding workers, external
+// workers — can slip a status change between the backup and the delete. The
+// finalizer runs from several places (the extraction queue drain, the boot
+// sweep, the embedding drain, an hourly schedule) and skips the upload when
+// the catalog has not changed since the last successful backup. On startup
+// Restore brings the bucket's
 // snapshot back when it is newer than what the local database has seen, so a
 // wiped state volume recovers from the bucket alone.
 //
@@ -79,10 +83,12 @@ type Store interface {
 }
 
 // Catalog is the catalog surface the backup needs: one way to snapshot the
-// database file and one way to learn which staged zips a snapshot covers.
+// database file, one way to learn how many row changes the connection has
+// applied, and one way to read a snapshot file back for its delete list.
 type Catalog interface {
 	BackupTo(ctx context.Context, path string) error
-	ListAlbumsByStatus(ctx context.Context, status catalog.AlbumStatus) ([]catalog.Album, error)
+	ChangeCount(ctx context.Context) (int64, error)
+	SnapshotAlbums(ctx context.Context, path string) ([]catalog.Album, error)
 }
 
 // Finalizer backs the catalog up once per batch of finished albums and deletes
@@ -98,6 +104,12 @@ type Finalizer struct {
 	// smaller than the backup it would replace is refused unless this is set.
 	allowOverwrite bool
 
+	// lastChangeCount is the catalog change counter recorded at the last fully
+	// successful backup. A run that reads the same count skips the upload:
+	// nothing has been written since. -1 means "never backed up", so the
+	// first run of a process always uploads.
+	lastChangeCount int64
+
 	// mu keeps overlapping runs — the startup sweep and a queue drain — from
 	// interleaving their steps.
 	mu sync.Mutex
@@ -109,11 +121,12 @@ type Finalizer struct {
 // guard would refuse; see Finalizer.Run.
 func NewFinalizer(store Store, cat Catalog, stateDir string, allowOverwrite bool) *Finalizer {
 	return &Finalizer{
-		store:          store,
-		catalog:        cat,
-		stateDir:       stateDir,
-		stampPath:      StampPath(stateDir),
-		allowOverwrite: allowOverwrite,
+		store:           store,
+		catalog:         cat,
+		stateDir:        stateDir,
+		stampPath:       StampPath(stateDir),
+		allowOverwrite:  allowOverwrite,
+		lastChangeCount: -1,
 	}
 }
 
@@ -148,6 +161,20 @@ func (f *Finalizer) Run(ctx context.Context) error {
 		"backup: finalize pre-state: existing backup=%t (size=%d, last-modified=%s), local stamp=%s",
 		hadExisting, existing.Size, formatTime(existing.LastModified), formatStamp(stampAt, stampSet),
 	)
+
+	// A catalog without writes since the last successful backup needs no new
+	// upload — the hourly schedule would otherwise re-upload the same file
+	// forever. The count is read before the snapshot, so writes landing during
+	// this run still count as changes for the next one. A failed count never
+	// skips the backup; it just records nothing.
+	changeCount, err := f.catalog.ChangeCount(ctx)
+	if err != nil {
+		log.Printf("backup: could not read the catalog change count: %v", err)
+		changeCount = -1
+	} else if f.lastChangeCount >= 0 && changeCount == f.lastChangeCount {
+		log.Printf("backup: catalog unchanged since the last backup (changes=%d); skipping", changeCount)
+		return nil
+	}
 
 	snapshot, err := f.snapshot(ctx)
 	if err != nil {
@@ -189,8 +216,13 @@ func (f *Finalizer) Run(ctx context.Context) error {
 	if err := writeStamp(f.stampPath, stamp); err != nil {
 		return err
 	}
-
-	return f.deleteStagedZips(ctx)
+	if err := f.deleteStagedZips(ctx, snapshot); err != nil {
+		return err
+	}
+	// Recorded only after a fully successful run, so a failed delete makes the
+	// next run retry the whole finalize instead of skipping it.
+	f.lastChangeCount = changeCount
+	return nil
 }
 
 // overwriteConcern names the reason a fresh snapshot must not replace the
@@ -266,26 +298,23 @@ func (f *Finalizer) uploadSnapshot(ctx context.Context, path string) (time.Time,
 	return obj.LastModified, nil
 }
 
-// deleteStagedZips removes the staged zips of every album in a terminal state:
-// extraction either succeeded or failed for good, so the backup now records
-// everything the zip carried. Albums still queued or processing — and zips no
-// album row covers yet — stay, so nothing that could still be extracted is
-// ever deleted.
-func (f *Finalizer) deleteStagedZips(ctx context.Context) error {
-	albums := make([]catalog.Album, 0)
-	counts := make(map[catalog.AlbumStatus]int, 2)
-	for _, status := range []catalog.AlbumStatus{catalog.AlbumStatusReady, catalog.AlbumStatusFailed} {
-		rows, err := f.catalog.ListAlbumsByStatus(ctx, status)
-		if err != nil {
-			return fmt.Errorf("list %s albums: %w", status, err)
-		}
-		counts[status] = len(rows)
-		albums = append(albums, rows...)
+// deleteStagedZips removes the staged zips of every album the uploaded
+// snapshot records as terminal: extraction either succeeded or failed for
+// good, so the backup now stores everything the zip carried. The list comes
+// from the snapshot file, not the live database, so the invariant holds no
+// matter who writes status in parallel — an album that turns terminal while
+// this run is going keeps its zip until a later finalize covers it.
+func (f *Finalizer) deleteStagedZips(ctx context.Context, snapshotPath string) error {
+	albums, err := f.catalog.SnapshotAlbums(ctx, snapshotPath)
+	if err != nil {
+		return fmt.Errorf("list terminal albums from the snapshot: %w", err)
 	}
 
+	counts := make(map[catalog.AlbumStatus]int, 2)
 	keys := make([]string, 0, len(albums))
 	seen := make(map[string]struct{}, len(albums))
 	for _, album := range albums {
+		counts[album.Status]++
 		key := strings.TrimSpace(album.SourceKey)
 		if key == "" {
 			continue
@@ -298,7 +327,7 @@ func (f *Finalizer) deleteStagedZips(ctx context.Context) error {
 	}
 	if len(keys) == 0 {
 		log.Printf(
-			"backup: no staged zips to delete (SUCCEEDED=%d, FAILED=%d albums)",
+			"backup: no staged zips to delete (SUCCEEDED=%d, FAILED=%d albums in the snapshot)",
 			counts[catalog.AlbumStatusReady], counts[catalog.AlbumStatusFailed],
 		)
 		return nil
@@ -309,7 +338,7 @@ func (f *Finalizer) deleteStagedZips(ctx context.Context) error {
 		return fmt.Errorf("delete staged zips: %w", err)
 	}
 	log.Printf(
-		"backup: catalog uploaded to %s and %d staged zip(s) deleted (SUCCEEDED=%d, FAILED=%d albums)",
+		"backup: catalog uploaded to %s and %d staged zip(s) deleted (SUCCEEDED=%d, FAILED=%d albums in the snapshot)",
 		BackupObjectKey, len(keys), counts[catalog.AlbumStatusReady], counts[catalog.AlbumStatusFailed],
 	)
 	return nil

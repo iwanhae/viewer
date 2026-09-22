@@ -91,16 +91,21 @@ A blob that is `failed` is terminal — `ListBlobsAwaitingEmbedding` selects onl
 - **Staged zips are deleted in a batch, after a backup covers them.** The zip
   is a transport container, not durable state, but it is also the only thing
   that can rebuild an album — so nothing deletes one before the bucket holds a
-  catalog snapshot that already records its album as finished. The pipeline
-  worker runs the finalizer (`internal/backup`) the moment its queue drains:
-  snapshot via `VACUUM INTO`, upload to `backups/viewer.db`, record the
-  stamp, then batch-delete the `source_key`s of every `SUCCEEDED` and `FAILED`
-  album. Because only the worker marks an album `SUCCEEDED`, and the finalizer
-  runs on that same goroutine, nothing can change between the snapshot and the
-  delete list. A crash anywhere leaves a leftover zip for the next startup to
-  clean, never a lost one. A `FAILED` album's zip is deleted with the rest: its
-  extraction error is in the catalog, and `finalize` on it would only fail the
-  same way again.
+  catalog snapshot that already records its album as finished. The finalizer
+  (`internal/backup`) runs when the extraction queue drains, when the
+  embedding queue drains, once at boot, and hourly on a timer: the extra
+  triggers bound how long catalog writes that no drain covers — embedding
+  results landing after their albums, external worker results — can go
+  without a backup, and the finalizer skips the upload entirely when the
+  catalog has not changed since the last one. Every run is the same
+  sequence: snapshot via `VACUUM INTO`, upload to `backups/viewer.db`, record
+  the stamp, then batch-delete the `source_key`s of every `SUCCEEDED` and
+  `FAILED` album — read from the uploaded snapshot file itself, not the live
+  database, so no concurrent writer can slip a status change between the
+  backup and the delete. A crash anywhere leaves a leftover zip for the next
+  startup to clean, never a lost one. A `FAILED` album's zip is deleted with
+  the rest: its extraction error is in the catalog, and `finalize` on it
+  would only fail the same way again.
 - **The catalog restores from the bucket when the bucket is ahead.** On
   startup the store comes up before the catalog, and `backup.Restore` compares
   the backup object's Last-Modified with `viewer.db.backup-stamp` — the time

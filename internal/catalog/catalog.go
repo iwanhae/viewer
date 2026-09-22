@@ -237,6 +237,60 @@ func (s *Store) BackupTo(ctx context.Context, path string) error {
 	return nil
 }
 
+// OpenReadOnly opens an existing catalog file for reading, without applying
+// the schema or any migration. It is how the backup package reads a snapshot:
+// a VACUUM INTO output is a complete, standalone database, and opening it
+// read-only guarantees the snapshot file is never modified.
+func OpenReadOnly(path string) (*Store, error) {
+	clean := strings.TrimSpace(path)
+	if clean == "" {
+		return nil, fmt.Errorf("catalog path is required")
+	}
+	dsn := fmt.Sprintf("file:%s?mode=ro&_pragma=query_only(1)", clean)
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("open catalog read-only: %w", err)
+	}
+	db.SetMaxOpenConns(1)
+	return &Store{db: db}, nil
+}
+
+// ChangeCount reports the connection's cumulative row-change counter
+// (PRAGMA total_changes). Every INSERT, UPDATE and DELETE this process has
+// run through the pooled connection bumps it, so two equal readings mean no
+// write happened in between — the signal the backup finalizer uses to skip
+// re-uploading an unchanged catalog. The counter lives on the single pooled
+// connection, which stays open for the life of the process.
+func (s *Store) ChangeCount(ctx context.Context) (int64, error) {
+	var count int64
+	if err := s.db.QueryRowContext(ctx, `SELECT total_changes()`).Scan(&count); err != nil {
+		return 0, fmt.Errorf("read catalog change count: %w", err)
+	}
+	return count, nil
+}
+
+// SnapshotAlbums lists the terminal-state albums (SUCCEEDED and FAILED) that
+// a snapshot file records, opening it read-only. The backup finalizer takes
+// its zip delete list from here, so the list describes exactly the state the
+// uploaded backup covers — not whatever the live database says by delete
+// time.
+func (s *Store) SnapshotAlbums(ctx context.Context, path string) ([]Album, error) {
+	reader, err := OpenReadOnly(path)
+	if err != nil {
+		return nil, err
+	}
+	defer reader.Close()
+	albums := make([]Album, 0)
+	for _, status := range []AlbumStatus{AlbumStatusReady, AlbumStatusFailed} {
+		rows, err := reader.ListAlbumsByStatus(ctx, status)
+		if err != nil {
+			return nil, fmt.Errorf("list %s albums from the snapshot: %w", status, err)
+		}
+		albums = append(albums, rows...)
+	}
+	return albums, nil
+}
+
 func nowRFC3339() string {
 	return time.Now().UTC().Format(time.RFC3339Nano)
 }

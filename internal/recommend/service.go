@@ -48,6 +48,12 @@ type Service struct {
 	// how tests run without a checkpoint.
 	embedder EmbeddingProvider
 
+	// onEmbeddingDrain, when set, runs after the background embedding queue
+	// drains. The catalog backup uses it to capture embedding writes that
+	// landed after the last extraction-drain backup — without it, a quiet
+	// deployment could go days between backups while embeddings still land.
+	onEmbeddingDrain func(ctx context.Context) error
+
 	startOnce sync.Once
 	startErr  error
 
@@ -76,12 +82,15 @@ type Service struct {
 
 // NewService builds a recommendation service. A nil embedder switches the
 // feature off: the API keeps serving empty recommendation lists, no worker
-// starts, and every blob stays pending.
-func NewService(cat *catalog.Store, imagesService *images.Service, embedder EmbeddingProvider) *Service {
+// starts, and every blob stays pending. onEmbeddingDrain, when non-nil, is
+// invoked on the worker goroutine after the embedding queue drains; a backup
+// hook there is allowed to block, because there is no pending work to delay.
+func NewService(cat *catalog.Store, imagesService *images.Service, embedder EmbeddingProvider, onEmbeddingDrain func(ctx context.Context) error) *Service {
 	return &Service{
 		catalog:          cat,
 		images:           imagesService,
 		embedder:         embedder,
+		onEmbeddingDrain: onEmbeddingDrain,
 		photosByHash:     make(map[string][]photoRef),
 		hashesByAlbum:    make(map[string]map[string]struct{}),
 		embeddingsByHash: make(map[string][]float32),
@@ -289,7 +298,16 @@ func (s *Service) workerLoop(ctx context.Context) {
 			continue
 		}
 		if len(blobs) == 0 {
-			s.finishEmbeddingRun()
+			// A tick that actually closes a drain is the moment the catalog has
+			// gained everything this process computed: hand it to the finalize
+			// hook so a backup captures the embedding writes. The hook runs on
+			// this goroutine and may take a while; that is fine at a drain —
+			// the queue is empty, and blobs arriving meanwhile wait one tick.
+			if s.finishEmbeddingRun() && s.onEmbeddingDrain != nil {
+				if err := s.onEmbeddingDrain(ctx); err != nil {
+					log.Printf("recommend: embedding drain finalize failed: %v", err)
+				}
+			}
 			continue
 		}
 		s.beginEmbeddingRun(len(blobs))
@@ -370,12 +388,14 @@ func (s *Service) beginEmbeddingRun(batch int) {
 }
 
 // finishEmbeddingRun closes the record opened by beginEmbeddingRun. It is
-// called on every idle tick and logs nothing unless a drain was in progress.
-func (s *Service) finishEmbeddingRun() {
+// called on every idle tick and on shutdown, and reports whether a drain was
+// actually in progress and has now closed — the signal the drain hook keys on,
+// so a quiet ticker never re-triggers it.
+func (s *Service) finishEmbeddingRun() bool {
 	s.runMu.Lock()
 	if !s.runActive {
 		s.runMu.Unlock()
-		return
+		return false
 	}
 	embedded := s.runEmbedded
 	startedAt := s.runStartedAt
@@ -393,6 +413,7 @@ func (s *Service) finishEmbeddingRun() {
 		embedded, progress.Ready, progress.Total, progress.Pending, progress.Failed,
 		duration.Round(time.Millisecond), average.Round(time.Millisecond),
 	)
+	return true
 }
 
 // logEmbeddingProgress reports how far a long drain has come. The counts come

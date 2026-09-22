@@ -45,7 +45,7 @@ func TestEmbeddingTimeoutIsFiveMinutes(t *testing.T) {
 // blobs simply stay pending.
 func TestServiceWithoutEmbedderReportsDisabled(t *testing.T) {
 	cat := newTestCatalog(t)
-	svc := NewService(cat, nil, nil)
+	svc := NewService(cat, nil, nil, nil)
 
 	if svc.embedder != nil {
 		t.Fatalf("embedder=%T want nil when embedding is off", svc.embedder)
@@ -122,7 +122,7 @@ func TestServiceDisabledAfterModelLoadFailure(t *testing.T) {
 		ModelID: filepath.Join(t.TempDir(), "missing-model"),
 		Backend: "go",
 	})
-	svc := NewService(cat, nil, embedder)
+	svc := NewService(cat, nil, embedder, nil)
 
 	if err := svc.LoadModel(context.Background()); err == nil {
 		t.Fatalf("LoadModel expected an error for a missing model directory")
@@ -155,7 +155,7 @@ func TestServiceEmbedsAndPersistsWithRealModel(t *testing.T) {
 
 	cat := newTestCatalog(t)
 	ctx := context.Background()
-	svc := NewService(cat, nil, NewVisionEmbedder(vision.Config{ModelID: dir + "/model", Backend: "go"}))
+	svc := NewService(cat, nil, NewVisionEmbedder(vision.Config{ModelID: dir + "/model", Backend: "go"}), nil)
 	if !svc.Enabled() {
 		t.Fatalf("Enabled()=false want=true")
 	}

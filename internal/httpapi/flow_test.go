@@ -142,7 +142,7 @@ func newFlowHarnessWithToken(t *testing.T, workerToken string) *flowHarness {
 	// checkpoint. It is never asked to embed anything: the pipeline does not
 	// embed at all and the embedding workers are not started here, so blobs
 	// stay pending.
-	recommendService := recommend.NewService(cat, imageService, stubEmbedder{})
+	recommendService := recommend.NewService(cat, imageService, stubEmbedder{}, nil)
 	pipelineService := pipeline.NewService(cat, s3, pipeline.Options{
 		TempDir: zipCacheDir,
 		OnAlbumReady: func(albumID string) {

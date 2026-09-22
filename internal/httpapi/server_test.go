@@ -196,7 +196,7 @@ func TestEmbeddingEndpointReportsCatalogCoverage(t *testing.T) {
 
 	// The provider is nil, so the counts are real but nothing can ever move
 	// them: a client has to be told that instead of waiting forever.
-	router := New(nil, nil, nil, recommend.NewService(cat, nil, nil), "").Router()
+	router := New(nil, nil, nil, recommend.NewService(cat, nil, nil, nil), "").Router()
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/embedding", nil))
 
@@ -239,7 +239,7 @@ func TestMetricsEndpointPrometheusPayload(t *testing.T) {
 	defer cat.Close()
 	seedEmbeddingFixture(t, cat)
 
-	recommendService := recommend.NewService(cat, nil, nil)
+	recommendService := recommend.NewService(cat, nil, nil, nil)
 
 	router := New(nil, nil, nil, recommendService, "").Router()
 	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)

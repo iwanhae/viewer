@@ -107,7 +107,7 @@ func TestEmbeddingWorkerReportsProgressWithRealModel(t *testing.T) {
 	}
 
 	imageService := images.NewService(cat, store)
-	svc := NewService(cat, imageService, NewVisionEmbedder(vision.Config{ModelID: filepath.Join(dir, "model"), Backend: "go"}))
+	svc := NewService(cat, imageService, NewVisionEmbedder(vision.Config{ModelID: filepath.Join(dir, "model"), Backend: "go"}), nil)
 	t.Cleanup(func() { _ = svc.Close() })
 	if err := svc.LoadModel(ctx); err != nil {
 		t.Fatalf("LoadModel: %v", err)
@@ -154,5 +154,60 @@ func TestEmbeddingWorkerReportsProgressWithRealModel(t *testing.T) {
 		if !capture.contains(want) {
 			t.Fatalf("missing %q in the log output:\n%s", want, strings.Join(capture.lines, ""))
 		}
+	}
+}
+
+// okEmbedder is a provider that always succeeds with a valid-dimension vector.
+type okEmbedder struct{}
+
+func (okEmbedder) Load(context.Context) error { return nil }
+
+func (okEmbedder) Embed(_ context.Context, _ []byte) ([]float32, error) {
+	vector := make([]float32, EmbeddingDim)
+	vector[0] = 1
+	return vector, nil
+}
+
+func (okEmbedder) Close() error { return nil }
+
+// TestEmbeddingDrainHookFiresAfterTheQueueDrains pins the backup trigger: the
+// drain hook runs exactly once per completed embedding run — when the queue
+// empties — and stays quiet on the idle ticks that follow.
+func TestEmbeddingDrainHookFiresAfterTheQueueDrains(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cat := newTestCatalog(t)
+	seedAlbum(t, cat, "album-a", catalog.Photo{Index: 0, Name: "a.jpg", Hash: "hash-a"})
+	seedBlob(t, cat, "hash-a")
+
+	store := &blobStoreStub{objects: map[string][]byte{"blobs/hash-a": []byte("fake image bytes")}}
+	imageService := images.NewService(cat, store)
+
+	drains := make(chan struct{}, 4)
+	svc := NewService(cat, imageService, okEmbedder{}, func(_ context.Context) error {
+		drains <- struct{}{}
+		return nil
+	})
+	if err := svc.LoadModel(ctx); err != nil {
+		t.Fatalf("LoadModel: %v", err)
+	}
+	t.Cleanup(func() { _ = svc.Close() })
+	if err := svc.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	select {
+	case <-drains:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("the embedding drain hook never fired")
+	}
+
+	// The idle ticks after the drain must not re-trigger the hook: without a
+	// new run there is nothing new to back up.
+	select {
+	case <-drains:
+		t.Fatalf("the drain hook fired twice for one drain")
+	case <-time.After(1500 * time.Millisecond):
 	}
 }

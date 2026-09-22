@@ -41,7 +41,7 @@ func newTestCatalog(t *testing.T) *catalog.Store {
 // embedder, which switches embedding off.
 func newTestService(t *testing.T, cat *catalog.Store, embedder EmbeddingProvider) *Service {
 	t.Helper()
-	svc := NewService(cat, nil, embedder)
+	svc := NewService(cat, nil, embedder, nil)
 	if svc == nil {
 		t.Fatalf("new recommend service returned nil")
 	}

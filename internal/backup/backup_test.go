@@ -659,6 +659,114 @@ func TestRestoreRejectsNonSQLiteBackup(t *testing.T) {
 	}
 }
 
+// TestFinalizerSkipsUnchangedCatalog pins the unchanged-skip: a run with no
+// catalog writes since the last fully successful backup must not re-upload,
+// while any write re-enables the backup.
+func TestFinalizerSkipsUnchangedCatalog(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+
+	cat, err := catalog.Open(filepath.Join(dir, "viewer.db"))
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	defer cat.Close()
+	if err := cat.CreateAlbum(ctx, catalog.Album{
+		ID:               "album-ok",
+		OriginalFilename: "ok.zip",
+		Status:           catalog.AlbumStatusReady,
+		SourceKey:        "uploads/album-ok.zip",
+	}); err != nil {
+		t.Fatalf("seed album: %v", err)
+	}
+
+	store := newFakeStore(map[string]fakeObject{
+		"uploads/album-ok.zip": {body: []byte("ok")},
+	})
+	finalizer := NewFinalizer(store, cat, dir, false)
+
+	if err := finalizer.Run(ctx); err != nil {
+		t.Fatalf("first Run: %v", err)
+	}
+	if got := store.putCount(); got != 1 {
+		t.Fatalf("first run put count=%d want 1", got)
+	}
+
+	// No writes since the first backup: the second run skips the upload.
+	if err := finalizer.Run(ctx); err != nil {
+		t.Fatalf("second Run: %v", err)
+	}
+	if got := store.putCount(); got != 1 {
+		t.Fatalf("unchanged run re-uploaded (put count=%d)", got)
+	}
+
+	// Any write re-enables the backup, even though nothing about the terminal
+	// albums changed.
+	if err := cat.CreateAlbum(ctx, catalog.Album{
+		ID:               "album-new",
+		OriginalFilename: "new.zip",
+		Status:           catalog.AlbumStatusQueued,
+		SourceKey:        "uploads/album-new.zip",
+	}); err != nil {
+		t.Fatalf("seed new album: %v", err)
+	}
+	if err := finalizer.Run(ctx); err != nil {
+		t.Fatalf("third Run: %v", err)
+	}
+	if got := store.putCount(); got != 2 {
+		t.Fatalf("changed run put count=%d want 2", got)
+	}
+}
+
+// TestSnapshotAlbumsFreezeTheDeleteList pins the race the snapshot-based
+// delete list exists for: an album that turns terminal after the snapshot was
+// taken is invisible to SnapshotAlbums, so its zip survives until a later
+// finalize covers it — no concurrent writer can slip between the backup and
+// the delete.
+func TestSnapshotAlbumsFreezeTheDeleteList(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+
+	cat, err := catalog.Open(filepath.Join(dir, "viewer.db"))
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	defer cat.Close()
+	for _, album := range []catalog.Album{
+		{ID: "album-done", OriginalFilename: "done.zip", Status: catalog.AlbumStatusReady, SourceKey: "uploads/done.zip"},
+		{ID: "album-late", OriginalFilename: "late.zip", Status: catalog.AlbumStatusQueued, SourceKey: "uploads/late.zip"},
+	} {
+		if err := cat.CreateAlbum(ctx, album); err != nil {
+			t.Fatalf("seed album %s: %v", album.ID, err)
+		}
+	}
+
+	snapshot := filepath.Join(dir, "snapshot.db")
+	if err := cat.BackupTo(ctx, snapshot); err != nil {
+		t.Fatalf("backup catalog: %v", err)
+	}
+
+	// The late album finishes after the snapshot was taken.
+	if err := cat.SetAlbumStatus(ctx, "album-late", catalog.AlbumStatusFailed, "boom"); err != nil {
+		t.Fatalf("flip album-late: %v", err)
+	}
+
+	albums, err := cat.SnapshotAlbums(ctx, snapshot)
+	if err != nil {
+		t.Fatalf("SnapshotAlbums: %v", err)
+	}
+	got := make(map[string]bool, len(albums))
+	for _, album := range albums {
+		got[album.ID] = true
+	}
+	if !got["album-done"] {
+		t.Errorf("snapshot misses the terminal album album-done: %v", got)
+	}
+	if got["album-late"] {
+		t.Errorf("snapshot includes a status flip that happened after it was taken")
+	}
+}
+
 // TestFinalizerSkipsOverlappingRun covers the startup sweep racing a queue
 // drain: the second run must return at once instead of interleaving steps.
 func TestFinalizerSkipsOverlappingRun(t *testing.T) {

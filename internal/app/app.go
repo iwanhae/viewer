@@ -27,6 +27,13 @@ import (
 // downloaded first.
 const embeddingLoadTimeout = 15 * time.Minute
 
+// backupInterval bounds how long catalog writes that no queue drain covers —
+// embedding results landing hours after their albums, external embedding
+// worker results — can go without a backup. The finalizer itself skips the
+// upload when the catalog is unchanged since the last backup, so a quiet hour
+// costs only one local snapshot attempt, not an upload.
+const backupInterval = time.Hour
+
 func Run(ctx context.Context) error {
 	cfg, err := cfgpkg.Load()
 	if err != nil {
@@ -70,15 +77,16 @@ func Run(ctx context.Context) error {
 	// config.ModelDir. The image ships without one, so the background load
 	// below fetches it from the mirror on a cold start; a deployment that
 	// mounts a prepared directory there skips the download entirely.
-	recommendService := recommend.NewService(cat, imageService, recommend.NewVisionEmbedder(vision.Config{
-		ModelID: cfgpkg.ModelDir,
-	}))
-
 	// Extraction and embedding are separate stages: the pipeline only makes an
 	// album ready, and the recommendation service's background workers embed
-	// the blobs it leaves pending. When the extraction queue drains, the
-	// finalizer backs the catalog up and deletes the staged zips it covers.
+	// the blobs it leaves pending. The finalizer backs the catalog up and
+	// deletes the staged zips a backup covers. It runs on the extraction drain
+	// below, on the embedding drain, hourly, and once at boot — the boot sweep
+	// also cleans up a run that crashed between its backup and its deletes.
 	finalizer := backup.NewFinalizer(store, cat, cfg.StateDir, cfg.AllowBackupOverwrite)
+	recommendService := recommend.NewService(cat, imageService, recommend.NewVisionEmbedder(vision.Config{
+		ModelID: cfgpkg.ModelDir,
+	}), finalizer.Run)
 	pipelineService := pipeline.NewService(cat, store, pipeline.Options{
 		OnAlbumReady: func(albumID string) {
 			if err := recommendService.ReloadAlbum(context.Background(), albumID); err != nil {
@@ -91,6 +99,24 @@ func Run(ctx context.Context) error {
 
 	feedService := feed.NewService(albumService)
 	pipelineService.Start(ctx)
+
+	// The hourly backup fires no matter how quiet the queues are. It is the
+	// safety net for catalog writes nothing drains behind; the finalizer's
+	// unchanged-skip turns a quiet hour into a no-op.
+	go func() {
+		ticker := time.NewTicker(backupInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if err := finalizer.Run(ctx); err != nil {
+					log.Printf("viewer: scheduled catalog backup failed: %v", err)
+				}
+			}
+		}
+	}()
 
 	h := httpapi.New(albumService, feedService, imageService, recommendService, cfg.WorkerToken).Router()
 	srv := &http.Server{
