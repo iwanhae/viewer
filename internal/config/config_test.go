@@ -270,3 +270,18 @@ func setRequiredEnv(t *testing.T) {
 	t.Setenv("S3_ACCESS_KEY", "access")
 	t.Setenv("S3_SECRET_KEY", "secret")
 }
+
+// A whitespace-only token was set by an operator who meant to protect the
+// worker API, so it must fail loudly instead of silently running open.
+func TestLoadRejectsBlankWorkerToken(t *testing.T) {
+	t.Setenv("S3_ENDPOINT", "https://s3.example.com")
+	t.Setenv("S3_BUCKET", "viewer")
+	t.Setenv("S3_ACCESS_KEY", "ak")
+	t.Setenv("S3_SECRET_KEY", "sk")
+	t.Setenv("STATE_DIR", "/tmp/viewer-test")
+	t.Setenv("EMBEDDING_WORKER_TOKEN", "   ")
+
+	if _, err := Load(); err == nil {
+		t.Fatalf("expected a blank EMBEDDING_WORKER_TOKEN to be rejected")
+	}
+}

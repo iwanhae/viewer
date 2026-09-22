@@ -327,7 +327,7 @@ func TestGetAlbumReturnsPhotosInLegacyShape(t *testing.T) {
 	if idx.AlbumID != "album-a" || idx.OriginalFilename != "holiday.zip" || idx.PhotoCount != 1 {
 		t.Fatalf("unexpected album index: %+v", idx)
 	}
-	want := []models.PhotoMeta{{I: 0, Name: "a.png", W: 4, H: 2, Ratio: 2}}
+	want := []models.PhotoMeta{{I: 0, Name: "a.png", Hash: "hash-a", W: 4, H: 2, Ratio: 2}}
 	if !reflect.DeepEqual(idx.Photos, want) {
 		t.Fatalf("photos=%+v want=%+v", idx.Photos, want)
 	}
@@ -407,7 +407,7 @@ func TestSearchAlbumsByNameReturnsItems(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal cover: %v", err)
 	}
-	if string(encoded) != `{"i":0,"w":4,"h":2,"ratio":2}` {
+	if string(encoded) != `{"i":0,"hash":"hash-a","w":4,"h":2,"ratio":2}` {
 		t.Fatalf("cover json=%s", encoded)
 	}
 }

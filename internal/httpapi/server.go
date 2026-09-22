@@ -24,18 +24,22 @@ import (
 )
 
 type Server struct {
-	albums    *albums.Service
-	feed      *feed.Service
-	images    *images.Service
-	recommend *recommend.Service
+	albums      *albums.Service
+	feed        *feed.Service
+	images      *images.Service
+	recommend   *recommend.Service
+	workerToken string
 }
 
-func New(albumsService *albums.Service, feedService *feed.Service, imageService *images.Service, recommendService *recommend.Service) *Server {
+// New wires the API together. An empty workerToken runs the external worker
+// endpoints without auth, which is only sensible on a trusted network.
+func New(albumsService *albums.Service, feedService *feed.Service, imageService *images.Service, recommendService *recommend.Service, workerToken string) *Server {
 	return &Server{
-		albums:    albumsService,
-		feed:      feedService,
-		images:    imageService,
-		recommend: recommendService,
+		albums:      albumsService,
+		feed:        feedService,
+		images:      imageService,
+		recommend:   recommendService,
+		workerToken: workerToken,
 	}
 }
 
@@ -60,8 +64,20 @@ func (s *Server) Router() http.Handler {
 		r.Get("/albums/{albumId}", s.getAlbum)
 		r.Get("/embedding", s.getEmbeddingStatus)
 		r.Get("/feed", s.getFeed)
-		r.Get("/image/{albumId}/{index}", s.getImage)
+		r.Get("/image/{hash}", s.getImageByHash)
+		r.Head("/image/{hash}", s.getImageByHash)
 		r.Get("/recommendations/{albumId}/{index}", s.getRecommendations)
+	})
+
+	// The worker endpoints are the write surface for external embedding
+	// fleets, so they carry their own token check. A group rather than a
+	// mounted subrouter: a mount on /api/embedding would swallow the public
+	// GET /api/embedding status endpoint above.
+	r.Group(func(r chi.Router) {
+		r.Use(s.requireWorkerToken)
+		r.Post("/api/embedding/claim", s.claimEmbeddings)
+		r.Post("/api/embedding/renew", s.renewLeases)
+		r.Post("/api/embedding/results", s.postEmbeddingResults)
 	})
 
 	staticHandler := web.Handler()
@@ -220,11 +236,10 @@ func (s *Server) getFeed(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
-func (s *Server) getImage(w http.ResponseWriter, r *http.Request) {
-	albumID := chi.URLParam(r, "albumId")
-	idx, err := parseNonNegativePathIntParam(r, "index")
-	if err != nil {
-		writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", "invalid image index")
+func (s *Server) getImageByHash(w http.ResponseWriter, r *http.Request) {
+	hash := strings.TrimSpace(chi.URLParam(r, "hash"))
+	if hash == "" {
+		writeError(w, r, http.StatusNotFound, "NOT_FOUND", "resource not found")
 		return
 	}
 	// An absent w serves the untouched original; a w on the width ladder asks
@@ -240,27 +255,26 @@ func (s *Server) getImage(w http.ResponseWriter, r *http.Request) {
 	}
 	var stream *images.ImageStream
 	if width == 0 {
-		stream, err = s.images.OpenImage(r.Context(), albumID, idx)
+		stream, err = s.images.OpenImageByHash(r.Context(), hash)
 	} else {
-		stream, err = s.images.OpenImageScaled(r.Context(), albumID, idx, width)
+		stream, err = s.images.OpenImageByHashScaled(r.Context(), hash, width)
 	}
 	if err != nil {
-		status := http.StatusInternalServerError
-		code := "INTERNAL"
-		if errors.Is(err, albums.ErrAlbumNotFound) ||
-			errors.Is(err, albums.ErrAlbumSourceNotFound) ||
-			errors.Is(err, images.ErrPhotoIndexOutOfRange) ||
-			errors.Is(err, images.ErrImageEntryNotFound) {
-			status = http.StatusNotFound
-			code = "NOT_FOUND"
+		if errors.Is(err, images.ErrImageEntryNotFound) {
+			writeError(w, r, http.StatusNotFound, "NOT_FOUND", err.Error())
+			return
 		}
-		writeError(w, r, status, code, err.Error())
+		// This is the one anonymous endpoint that takes an arbitrary key, so
+		// the raw storage error (endpoints, bucket, request ids) stays in the
+		// log instead of the response.
+		log.Printf("image fetch failed hash=%s: %v", hash, err)
+		writeError(w, r, http.StatusInternalServerError, "INTERNAL", "image is temporarily unavailable")
 		return
 	}
 	defer stream.Close()
 
-	// An album id plus a photo index is immutable, so the content hash of the
-	// blob is a stable validator for the response.
+	// The content hash is immutable, so it is a stable validator for the
+	// response; scaled variants append their width.
 	w.Header().Set("Content-Type", stream.ContentType)
 	w.Header().Set("Cache-Control", "public, max-age=86400, immutable")
 	w.Header().Set("ETag", `"`+stream.Hash+`"`)
@@ -336,6 +350,9 @@ func (s *Server) getMetrics(w http.ResponseWriter, r *http.Request) {
 	_, _ = fmt.Fprintf(w, "# HELP viewer_embedding_images_pending Number of images pending embedding.\n")
 	_, _ = fmt.Fprintf(w, "# TYPE viewer_embedding_images_pending gauge\n")
 	_, _ = fmt.Fprintf(w, "viewer_embedding_images_pending %d\n", progress.Pending)
+	_, _ = fmt.Fprintf(w, "# HELP viewer_embedding_images_processing Number of images currently leased by an embedding worker.\n")
+	_, _ = fmt.Fprintf(w, "# TYPE viewer_embedding_images_processing gauge\n")
+	_, _ = fmt.Fprintf(w, "viewer_embedding_images_processing %d\n", progress.Processing)
 	_, _ = fmt.Fprintf(w, "# HELP viewer_embedding_progress_ratio Ready embeddings divided by total images.\n")
 	_, _ = fmt.Fprintf(w, "# TYPE viewer_embedding_progress_ratio gauge\n")
 	_, _ = fmt.Fprintf(w, "viewer_embedding_progress_ratio %.6f\n", progress.Ratio)

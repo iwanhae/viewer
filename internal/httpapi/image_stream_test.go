@@ -26,7 +26,9 @@ func TestGetImageServesBlobWithHTTPMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatalf("photo at 0: %v", err)
 	}
-	path := fmt.Sprintf("/api/image/%s/0", albumID)
+	// The image route is keyed by the blob hash, so serving needs no album
+	// lookup at all.
+	path := "/api/image/" + photo.Hash
 
 	rec := harness.do(t, http.MethodGet, path, nil)
 	if rec.Code != http.StatusOK {
@@ -92,9 +94,13 @@ func TestGetImageServesScaledVariant(t *testing.T) {
 	if err != nil {
 		t.Fatalf("photo at 0: %v", err)
 	}
+	smallPhoto, err := harness.catalog.PhotoAt(context.Background(), albumID, 1)
+	if err != nil {
+		t.Fatalf("photo at 1: %v", err)
+	}
 
 	// A wide original is served resampled to the requested width.
-	scaledRec := harness.do(t, http.MethodGet, fmt.Sprintf("/api/image/%s/0?w=320", albumID), nil)
+	scaledRec := harness.do(t, http.MethodGet, fmt.Sprintf("/api/image/%s?w=320", photo.Hash), nil)
 	if scaledRec.Code != http.StatusOK {
 		t.Fatalf("scaled status=%d body=%s", scaledRec.Code, scaledRec.Body.String())
 	}
@@ -113,7 +119,7 @@ func TestGetImageServesScaledVariant(t *testing.T) {
 	}
 
 	// A small original is passed through with its own bytes and validator.
-	smallRec := harness.do(t, http.MethodGet, fmt.Sprintf("/api/image/%s/1?w=640", albumID), nil)
+	smallRec := harness.do(t, http.MethodGet, fmt.Sprintf("/api/image/%s?w=640", smallPhoto.Hash), nil)
 	if smallRec.Code != http.StatusOK {
 		t.Fatalf("small status=%d body=%s", smallRec.Code, smallRec.Body.String())
 	}
@@ -125,14 +131,92 @@ func TestGetImageServesScaledVariant(t *testing.T) {
 	}
 
 	// Off-ladder widths are rejected instead of silently resampled.
-	offRec := harness.do(t, http.MethodGet, fmt.Sprintf("/api/image/%s/0?w=500", albumID), nil)
+	offRec := harness.do(t, http.MethodGet, fmt.Sprintf("/api/image/%s?w=500", photo.Hash), nil)
 	if offRec.Code != http.StatusBadRequest {
 		t.Fatalf("off-ladder status=%d body=%s", offRec.Code, offRec.Body.String())
 	}
 
 	// Without w the endpoint still serves the untouched original.
-	plainRec := harness.do(t, http.MethodGet, fmt.Sprintf("/api/image/%s/0", albumID), nil)
+	plainRec := harness.do(t, http.MethodGet, "/api/image/"+photo.Hash, nil)
 	if plainRec.Code != http.StatusOK || !bytes.Equal(plainRec.Body.Bytes(), imageA) {
 		t.Fatalf("plain request must serve the original: %d", plainRec.Code)
+	}
+}
+
+// A hash nobody uploaded is a plain 404 — and it must not carry cache
+// headers, or a negative answer would stick in a shared cache.
+func TestGetImageUnknownHashIsPlainNotFound(t *testing.T) {
+	harness := newFlowHarness(t)
+
+	rec := harness.do(t, http.MethodGet, "/api/image/0000000000000000000000000000000000000000000000000000000000000000", nil)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status=%d want=404 body=%s", rec.Code, rec.Body.String())
+	}
+	for _, header := range []string{"Cache-Control", "ETag"} {
+		if got := rec.Header().Get(header); got != "" {
+			t.Fatalf("error response carried %s=%q", header, got)
+		}
+	}
+}
+
+// Health checks and prefetchers issue HEAD; the hash route answers it with the
+// same metadata and no body.
+func TestGetImageSupportsHead(t *testing.T) {
+	harness := newFlowHarness(t)
+
+	imageA := testPNG(t, 8, 4, 90)
+	zipData := testZip(t, map[string][]byte{"only.png": imageA}, []string{"only.png"})
+	albumID := harness.uploadZip(t, "head.zip", zipData)
+	harness.finalizeAndWait(t, albumID)
+	photo, err := harness.catalog.PhotoAt(context.Background(), albumID, 0)
+	if err != nil {
+		t.Fatalf("photo at 0: %v", err)
+	}
+
+	rec := harness.do(t, http.MethodHead, "/api/image/"+photo.Hash, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("head status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if got, want := rec.Header().Get("ETag"), `"`+photo.Hash+`"`; got != want {
+		t.Fatalf("etag=%q want=%q", got, want)
+	}
+	if got := rec.Header().Get("Cache-Control"); got != "public, max-age=86400, immutable" {
+		t.Fatalf("cache-control=%q", got)
+	}
+	if rec.Body.Len() != 0 {
+		t.Fatalf("head body=%d bytes want=0", rec.Body.Len())
+	}
+}
+
+// A scaled variant validates against its width-suffixed ETag.
+func TestGetImageScaledConditionalRequest(t *testing.T) {
+	harness := newFlowHarness(t)
+
+	imageA := testPNG(t, 400, 200, 91)
+	zipData := testZip(t, map[string][]byte{"only.png": imageA}, []string{"only.png"})
+	albumID := harness.uploadZip(t, "scaled-304.zip", zipData)
+	harness.finalizeAndWait(t, albumID)
+	photo, err := harness.catalog.PhotoAt(context.Background(), albumID, 0)
+	if err != nil {
+		t.Fatalf("photo at 0: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/image/"+photo.Hash+"?w=320", nil)
+	req.Header.Set("If-None-Match", `"`+photo.Hash+`:w320"`)
+	rec := httptest.NewRecorder()
+	harness.router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotModified {
+		t.Fatalf("scaled conditional status=%d want=304 body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+// Width validation runs before the blob lookup: an off-ladder width is a 400
+// even when the hash would not resolve.
+func TestGetImageRejectsBadWidthBeforeLookup(t *testing.T) {
+	harness := newFlowHarness(t)
+
+	rec := harness.do(t, http.MethodGet, "/api/image/0000000000000000000000000000000000000000000000000000000000000000?w=500", nil)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d want=400 body=%s", rec.Code, rec.Body.String())
 	}
 }

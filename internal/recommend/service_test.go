@@ -7,6 +7,7 @@ import (
 	"math"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"viewer/internal/catalog"
 )
@@ -792,5 +793,263 @@ func TestEmbeddingProgressReportsActiveWhileEmbedding(t *testing.T) {
 	}
 	if progress := svc.EmbeddingProgress(); progress.Active {
 		t.Fatalf("expected Active=false once the pass finished: %+v", progress)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// External worker claim / write-back
+// ---------------------------------------------------------------------------
+
+// dimVector builds a valid-length embedding filled with one value, so tests
+// can express "the same vector" without spelling out 768 floats.
+func dimVector(fill float32) []float32 {
+	vector := make([]float32, EmbeddingDim)
+	for i := range vector {
+		vector[i] = fill
+	}
+	return vector
+}
+
+func nanVector() []float32 {
+	vector := dimVector(1)
+	vector[0] = float32(math.NaN())
+	return vector
+}
+
+func TestExternalWorkerClaimAndApplyRoundTrip(t *testing.T) {
+	cat := newTestCatalog(t)
+	ctx := context.Background()
+
+	seedBlob(t, cat, "hash-x")
+	seedAlbum(t, cat, "album-a",
+		catalog.Photo{Index: 0, Name: "a0.jpg", Hash: "hash-x", Width: 10, Height: 20, Ratio: 0.5})
+	seedReadyEmbedding(t, cat, "hash-y", dimVector(1))
+	seedAlbum(t, cat, "album-b",
+		catalog.Photo{Index: 0, Name: "b0.jpg", Hash: "hash-y", Width: 10, Height: 20, Ratio: 0.5})
+
+	// A nil embedder means the local model never loads; external backfill must
+	// work regardless.
+	svc := newTestService(t, cat, nil)
+	if err := svc.LoadAll(ctx); err != nil {
+		t.Fatalf("LoadAll: %v", err)
+	}
+
+	blobs, leaseUntil, err := svc.ClaimEmbeddings(ctx, 0)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if len(blobs) != 1 || blobs[0].Hash != "hash-x" {
+		t.Fatalf("expected hash-x claimed, got %+v", blobs)
+	}
+	if !leaseUntil.After(time.Now()) {
+		t.Fatalf("expected a future lease deadline, got %s", leaseUntil)
+	}
+
+	// The claimed blob is in flight, so a second claim comes back empty and
+	// the pending count still includes it.
+	if again, _, err := svc.ClaimEmbeddings(ctx, 0); err != nil || len(again) != 0 {
+		t.Fatalf("expected empty second claim, got %+v err=%v", again, err)
+	}
+	if progress := svc.EmbeddingProgress(); progress.Pending != 1 || progress.Processing != 1 {
+		t.Fatalf("expected pending=1 processing=1 while claimed, got %+v", progress)
+	}
+
+	// Bad vectors are rejected before anything is persisted.
+	_, rejected, err := svc.ApplyEmbeddingResults(ctx, []catalog.EmbeddingResult{
+		{Hash: "hash-x", Status: catalog.EmbeddingStatusReady, Vector: []float32{1, 2}},
+		{Hash: "hash-x", Status: catalog.EmbeddingStatusReady, Vector: nanVector()},
+	})
+	if err != nil {
+		t.Fatalf("apply bad vectors: %v", err)
+	}
+	if len(rejected) != 2 || rejected[0].Reason != RejectWrongDim || rejected[1].Reason != RejectBadVector {
+		t.Fatalf("expected wrong_dim then bad_vector rejections, got %+v", rejected)
+	}
+
+	applied, rejected, err := svc.ApplyEmbeddingResults(ctx, []catalog.EmbeddingResult{
+		{Hash: "hash-x", Status: catalog.EmbeddingStatusReady, Vector: dimVector(2)},
+	})
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if applied != 1 || len(rejected) != 0 {
+		t.Fatalf("expected one applied result, got applied=%d rejected=%+v", applied, rejected)
+	}
+
+	progress := svc.EmbeddingProgress()
+	if progress.Ready != 2 || progress.Pending != 0 || progress.Processing != 0 || progress.Ratio != 1 {
+		t.Fatalf("expected full coverage after write-back, got %+v", progress)
+	}
+
+	// The in-memory index picked the vector up without a reload, so the new
+	// photo immediately recommends across albums.
+	resp, err := svc.Recommend(ctx, "album-a", 0, 5)
+	if err != nil {
+		t.Fatalf("recommend: %v", err)
+	}
+	if len(resp.Items) != 1 || resp.Items[0].AlbumID != "album-b" || !approxEqual(resp.Items[0].Score, 1) {
+		t.Fatalf("expected the cross-album neighbor, got %+v", resp.Items)
+	}
+	if resp.Items[0].Hash != "hash-y" {
+		t.Fatalf("expected hash on the wire, got %+v", resp.Items[0])
+	}
+}
+
+func TestExternalWorkerReleaseAndFailedReport(t *testing.T) {
+	cat := newTestCatalog(t)
+	ctx := context.Background()
+
+	seedBlob(t, cat, "hash-x")
+	seedAlbum(t, cat, "album-a",
+		catalog.Photo{Index: 0, Name: "a0.jpg", Hash: "hash-x", Width: 10, Height: 20, Ratio: 0.5})
+
+	svc := newTestService(t, cat, nil)
+	if err := svc.LoadAll(ctx); err != nil {
+		t.Fatalf("LoadAll: %v", err)
+	}
+
+	blobs, _, err := svc.ClaimEmbeddings(ctx, 0)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if err := svc.ReleaseClaims(ctx, claimHashes(blobs)); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+
+	// A released blob is claimable again right away, without a lease wait.
+	if again, _, err := svc.ClaimEmbeddings(ctx, 0); err != nil || len(again) != 1 {
+		t.Fatalf("expected the released blob claimable again, got %d err=%v", len(again), err)
+	}
+
+	applied, rejected, err := svc.ApplyEmbeddingResults(ctx, []catalog.EmbeddingResult{
+		{Hash: "hash-x", Status: catalog.EmbeddingStatusFailed, Error: "decode image: boom"},
+	})
+	if err != nil {
+		t.Fatalf("apply failed report: %v", err)
+	}
+	if applied != 1 || len(rejected) != 0 {
+		t.Fatalf("expected the failure to land, got applied=%d rejected=%+v", applied, rejected)
+	}
+
+	// A failed blob is terminal: never claimable, and excluded from
+	// recommendations via the in-memory failed set.
+	if pending, _, err := svc.ClaimEmbeddings(ctx, 0); err != nil || len(pending) != 0 {
+		t.Fatalf("expected failed blob to stay unclaimed, got %d err=%v", len(pending), err)
+	}
+	if progress := svc.EmbeddingProgress(); progress.Failed != 1 || progress.Pending != 0 {
+		t.Fatalf("expected failed=1 pending=0, got %+v", progress)
+	}
+	if _, failed := svc.queryVector(ctx, "hash-x"); !failed {
+		t.Fatalf("expected the failed hash to poison queries")
+	}
+}
+
+// A buggy worker can pad the hash with whitespace: the catalog trims it and
+// applies to the clean row, so the in-memory index must key the same trimmed
+// hash — otherwise the blob is ready in the catalog but permanently "failed"
+// in the index.
+func TestExternalWorkerAppliesTrimmedHash(t *testing.T) {
+	cat := newTestCatalog(t)
+	ctx := context.Background()
+
+	seedBlob(t, cat, "hash-x")
+	seedAlbum(t, cat, "album-a",
+		catalog.Photo{Index: 0, Name: "a0.jpg", Hash: "hash-x", Width: 10, Height: 20, Ratio: 0.5})
+	seedReadyEmbedding(t, cat, "hash-y", dimVector(1))
+	seedAlbum(t, cat, "album-b",
+		catalog.Photo{Index: 0, Name: "b0.jpg", Hash: "hash-y", Width: 10, Height: 20, Ratio: 0.5})
+
+	svc := newTestService(t, cat, nil)
+	if err := svc.LoadAll(ctx); err != nil {
+		t.Fatalf("LoadAll: %v", err)
+	}
+
+	blobs, _, err := svc.ClaimEmbeddings(ctx, 0)
+	if err != nil || len(blobs) != 1 {
+		t.Fatalf("claim: %v blobs=%+v", err, blobs)
+	}
+	applied, rejected, err := svc.ApplyEmbeddingResults(ctx, []catalog.EmbeddingResult{
+		{Hash: " hash-x ", Status: catalog.EmbeddingStatusReady, Vector: dimVector(3)},
+	})
+	if err != nil || applied != 1 || len(rejected) != 0 {
+		t.Fatalf("apply: err=%v applied=%d rejected=%+v", err, applied, rejected)
+	}
+
+	// The index knows the trimmed hash: the cross-album neighbor query works,
+	// which it would not if the padded hash had poisoned the maps.
+	result, err := svc.Recommend(ctx, "album-b", 0, 5)
+	if err != nil {
+		t.Fatalf("recommend: %v", err)
+	}
+	if len(result.Items) != 1 || result.Items[0].Hash != "hash-x" {
+		t.Fatalf("items=%+v want the trimmed-hash neighbor", result.Items)
+	}
+}
+
+// The catalog applies the first result per hash in a batch and rejects the
+// rest; the in-memory index must follow the same side of that race, not the
+// last submission.
+func TestExternalWorkerDuplicateHashIsFirstWins(t *testing.T) {
+	cat := newTestCatalog(t)
+	ctx := context.Background()
+
+	seedBlob(t, cat, "hash-x")
+	seedAlbum(t, cat, "album-a",
+		catalog.Photo{Index: 0, Name: "a0.jpg", Hash: "hash-x", Width: 10, Height: 20, Ratio: 0.5})
+	seedReadyEmbedding(t, cat, "hash-y", dimVector(1))
+	seedAlbum(t, cat, "album-b",
+		catalog.Photo{Index: 0, Name: "b0.jpg", Hash: "hash-y", Width: 10, Height: 20, Ratio: 0.5})
+
+	svc := newTestService(t, cat, nil)
+	if err := svc.LoadAll(ctx); err != nil {
+		t.Fatalf("LoadAll: %v", err)
+	}
+	if _, _, err := svc.ClaimEmbeddings(ctx, 0); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+
+	// ready first, failed second: the catalog stores ready, so the index must
+	// know the vector, not the failure.
+	applied, rejected, err := svc.ApplyEmbeddingResults(ctx, []catalog.EmbeddingResult{
+		{Hash: "hash-x", Status: catalog.EmbeddingStatusReady, Vector: dimVector(4)},
+		{Hash: "hash-x", Status: catalog.EmbeddingStatusFailed, Error: "second submission"},
+	})
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if applied != 1 || len(rejected) != 1 || rejected[0].Reason != catalog.EmbeddingRejectNotClaimed {
+		t.Fatalf("applied=%d rejected=%+v want one apply and one not_claimed", applied, rejected)
+	}
+	result, err := svc.Recommend(ctx, "album-b", 0, 5)
+	if err != nil {
+		t.Fatalf("recommend: %v", err)
+	}
+	if len(result.Items) != 1 {
+		t.Fatalf("items=%+v want the ready neighbor despite the duplicate failed submission", result.Items)
+	}
+}
+
+func TestExternalWorkerRenewReportsWhatRenewed(t *testing.T) {
+	cat := newTestCatalog(t)
+	ctx := context.Background()
+
+	seedBlob(t, cat, "hash-x")
+	seedAlbum(t, cat, "album-a",
+		catalog.Photo{Index: 0, Name: "a0.jpg", Hash: "hash-x", Width: 10, Height: 20, Ratio: 0.5})
+
+	svc := newTestService(t, cat, nil)
+	if _, _, err := svc.ClaimEmbeddings(ctx, 0); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+
+	leaseUntil, renewed, err := svc.RenewLeases(ctx, []string{"hash-x", "ghost"})
+	if err != nil {
+		t.Fatalf("renew: %v", err)
+	}
+	if !leaseUntil.After(time.Now()) {
+		t.Fatalf("leaseUntil=%v want a future deadline", leaseUntil)
+	}
+	if len(renewed) != 1 || renewed[0] != "hash-x" {
+		t.Fatalf("renewed=%v want only hash-x: the ghost never had a lease", renewed)
 	}
 }

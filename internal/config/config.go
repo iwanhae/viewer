@@ -40,7 +40,9 @@ const (
 	// MaxUploadBytes caps the staged zip size accepted by POST /api/albums.
 	MaxUploadBytes int64 = 1 << 30 // 1 GiB
 
-	// PresignTTL is how long a presigned zip upload URL stays valid.
+	// PresignTTL is how long a presigned URL stays valid - both the zip upload
+	// URL handed to the browser and the blob download URL handed to external
+	// embedding workers on claim.
 	PresignTTL = 15 * time.Minute
 
 	// ModelDir is the local directory holding the SigLIP2 vision checkpoint.
@@ -88,6 +90,12 @@ type Config struct {
 	// ModelURL is the base URL the checkpoint is fetched from when ModelDir
 	// holds no file: one download per <ModelURL>/<filename>.
 	ModelURL string
+
+	// WorkerToken is the shared bearer token external embedding workers must
+	// present on the claim/renew/results endpoints. Empty switches the worker
+	// auth off, which is only sensible on a network that cannot be reached by
+	// untrusted clients.
+	WorkerToken string
 }
 
 // DBPath is the SQLite catalog inside StateDir.
@@ -100,6 +108,7 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	workerToken := strings.TrimSpace(os.Getenv("EMBEDDING_WORKER_TOKEN"))
 
 	cfg := Config{
 		Port:           getenvInt("PORT", DefaultPort),
@@ -111,6 +120,7 @@ func Load() (Config, error) {
 		S3UsePathStyle: usePathStyle,
 		StateDir:       normalizeStateDir(os.Getenv("STATE_DIR")),
 		ModelURL:       normalizeModelURL(os.Getenv("SIGLIP2_MODEL_URL")),
+		WorkerToken:    workerToken,
 	}
 
 	switch {
@@ -126,6 +136,11 @@ func Load() (Config, error) {
 		// A relative path would silently land next to the binary instead of in
 		// a mounted volume, which loses the catalog on the next replacement.
 		return Config{}, fmt.Errorf("STATE_DIR must be an absolute path, got %q", cfg.StateDir)
+	case os.Getenv("EMBEDDING_WORKER_TOKEN") != "" && workerToken == "":
+		// The variable was set, so the operator meant to protect the worker
+		// API. A whitespace-only value would silently run it unauthenticated,
+		// which is exactly the accident this check exists to prevent.
+		return Config{}, fmt.Errorf("EMBEDDING_WORKER_TOKEN is set but blank")
 	}
 
 	return cfg, nil

@@ -89,6 +89,20 @@ func (s *S3Store) PresignPut(ctx context.Context, key string, ttl time.Duration)
 	return out.URL, map[string]string{}, nil
 }
 
+// PresignGet returns a short-lived URL that downloads one object directly from
+// the bucket. It lets external workers fetch blob bytes without proxying them
+// through this process.
+func (s *S3Store) PresignGet(ctx context.Context, key string, ttl time.Duration) (string, error) {
+	out, err := s.presigner.PresignGetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(s.bucket),
+		Key:    aws.String(s.physicalKey(key)),
+	}, s3.WithPresignExpires(ttl))
+	if err != nil {
+		return "", fmt.Errorf("presign get: %w", err)
+	}
+	return out.URL, nil
+}
+
 func (s *S3Store) PutObject(ctx context.Context, key string, body io.Reader, contentType string) error {
 	_, err := s.client.PutObject(ctx, &s3.PutObjectInput{
 		Bucket:      aws.String(s.bucket),

@@ -3,6 +3,7 @@ package models
 type PhotoMeta struct {
 	I     int     `json:"i"`
 	Name  string  `json:"name"`
+	Hash  string  `json:"hash"`
 	W     int     `json:"w"`
 	H     int     `json:"h"`
 	Ratio float64 `json:"ratio"`
@@ -20,6 +21,7 @@ type AlbumIndex struct {
 // index 0. Ratio is width/height, denormalized from the photo row.
 type AlbumCover struct {
 	I     int     `json:"i"`
+	Hash  string  `json:"hash"`
 	W     int     `json:"w"`
 	H     int     `json:"h"`
 	Ratio float64 `json:"ratio"`
@@ -37,6 +39,7 @@ type AlbumSearchItem struct {
 type FeedItem struct {
 	AlbumID string  `json:"albumId"`
 	I       int     `json:"i"`
+	Hash    string  `json:"hash"`
 	W       int     `json:"w"`
 	H       int     `json:"h"`
 	Ratio   float64 `json:"ratio"`

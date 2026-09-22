@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"image"
+	"image/png"
 	"io"
 	"path/filepath"
 	"testing"
+	"time"
 
-	"viewer/internal/albums"
 	"viewer/internal/catalog"
 	"viewer/internal/pipeline"
 	"viewer/internal/storage"
@@ -16,12 +18,20 @@ import (
 
 type fakeBlobStore struct {
 	objects map[string][]byte
-	readErr map[string]error
-	gets    []string
+	// contentTypes overrides the advertised content type per key; the default
+	// is image/png, which is what extraction uploads carry.
+	contentTypes map[string]string
+	readErr      map[string]error
+	gets         []string
+	presigned    []string
 }
 
 func newFakeBlobStore() *fakeBlobStore {
-	return &fakeBlobStore{objects: make(map[string][]byte), readErr: make(map[string]error)}
+	return &fakeBlobStore{
+		objects:      make(map[string][]byte),
+		contentTypes: make(map[string]string),
+		readErr:      make(map[string]error),
+	}
 }
 
 func (f *fakeBlobStore) GetObject(_ context.Context, key string) (io.ReadCloser, string, error) {
@@ -33,7 +43,16 @@ func (f *fakeBlobStore) GetObject(_ context.Context, key string) (io.ReadCloser,
 	if err := f.readErr[key]; err != nil {
 		return io.NopCloser(&failingReader{data: data, err: err}), "image/png", nil
 	}
-	return io.NopCloser(bytes.NewReader(data)), "image/png", nil
+	contentType := f.contentTypes[key]
+	if contentType == "" {
+		contentType = "image/png"
+	}
+	return io.NopCloser(bytes.NewReader(data)), contentType, nil
+}
+
+func (f *fakeBlobStore) PresignGet(_ context.Context, key string, ttl time.Duration) (string, error) {
+	f.presigned = append(f.presigned, key)
+	return "memory://" + key + "?ttl=" + ttl.String(), nil
 }
 
 func (f *fakeBlobStore) getCount() int {
@@ -100,14 +119,23 @@ func readStream(t *testing.T, stream *ImageStream) []byte {
 	return data
 }
 
-func TestOpenImageFetchesFromStorage(t *testing.T) {
+func pngBytes(t *testing.T, width, height int) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, image.NewRGBA(image.Rect(0, 0, width, height))); err != nil {
+		t.Fatalf("encode png: %v", err)
+	}
+	return buf.Bytes()
+}
+
+func TestOpenImageByHashFetchesFromStorage(t *testing.T) {
 	cat := openTestCatalog(t)
 	store := newFakeBlobStore()
 	store.objects[pipeline.BlobKey("hash-a")] = []byte("image-bytes")
 	seedPhoto(t, cat, "album-a", 0, "hash-a", "image/png")
 
 	svc := newTestService(t, cat, store)
-	stream, err := svc.OpenImage(context.Background(), "album-a", 0)
+	stream, err := svc.OpenImageByHash(context.Background(), "hash-a")
 	if err != nil {
 		t.Fatalf("open image: %v", err)
 	}
@@ -133,7 +161,7 @@ func TestOpenImageFetchesFromStorage(t *testing.T) {
 	// There is no server-side cache: a second open of the same content hash
 	// fetches from the store again. Repeat views are absorbed by the browser
 	// via the blob-hash ETag instead.
-	second, err := svc.OpenImage(context.Background(), "album-a", 0)
+	second, err := svc.OpenImageByHash(context.Background(), "hash-a")
 	if err != nil {
 		t.Fatalf("second open image: %v", err)
 	}
@@ -148,14 +176,36 @@ func TestOpenImageFetchesFromStorage(t *testing.T) {
 	}
 }
 
-func TestOpenImageStreamSupportsSeeking(t *testing.T) {
+func TestOpenImageByHashSkipsCatalogWhenS3HasType(t *testing.T) {
 	cat := openTestCatalog(t)
 	store := newFakeBlobStore()
-	store.objects[pipeline.BlobKey("hash-a")] = []byte("0123456789")
+	store.objects[pipeline.BlobKey("hash-a")] = []byte("image-bytes")
 	seedPhoto(t, cat, "album-a", 0, "hash-a", "image/png")
 
 	svc := newTestService(t, cat, store)
-	stream, err := svc.OpenImage(context.Background(), "album-a", 0)
+	stream, err := svc.OpenImageByHash(context.Background(), "hash-a")
+	if err != nil {
+		t.Fatalf("open image: %v", err)
+	}
+	defer stream.Close()
+
+	// The S3 response carries a real type, so the request makes no catalog
+	// round trip at all.
+	if stream.ContentType != "image/png" {
+		t.Fatalf("content type=%q", stream.ContentType)
+	}
+	if got := store.getCount(); got != 1 {
+		t.Fatalf("expected exactly one store call, got %d", got)
+	}
+}
+
+func TestOpenImageByHashSupportsSeeking(t *testing.T) {
+	cat := openTestCatalog(t)
+	store := newFakeBlobStore()
+	store.objects[pipeline.BlobKey("hash-a")] = []byte("0123456789")
+
+	svc := newTestService(t, cat, store)
+	stream, err := svc.OpenImageByHash(context.Background(), "hash-a")
 	if err != nil {
 		t.Fatalf("open image: %v", err)
 	}
@@ -192,100 +242,141 @@ func TestGetImageByHashReturnsBytes(t *testing.T) {
 	}
 }
 
-func TestOpenImageIndexOutOfRange(t *testing.T) {
-	cat := openTestCatalog(t)
-	seedPhoto(t, cat, "album-a", 0, "hash-a", "image/png")
-	svc := newTestService(t, cat, newFakeBlobStore())
-
-	if _, err := svc.OpenImage(context.Background(), "album-a", 5); !errors.Is(err, ErrPhotoIndexOutOfRange) {
-		t.Fatalf("expected ErrPhotoIndexOutOfRange, got %v", err)
-	}
-	if _, err := svc.OpenImage(context.Background(), "album-a", -1); !errors.Is(err, ErrPhotoIndexOutOfRange) {
-		t.Fatalf("expected ErrPhotoIndexOutOfRange for negative index, got %v", err)
-	}
-}
-
-func TestOpenImageUnknownAlbum(t *testing.T) {
+func TestOpenImageByHashMissingBlob(t *testing.T) {
 	cat := openTestCatalog(t)
 	svc := newTestService(t, cat, newFakeBlobStore())
 
-	if _, err := svc.OpenImage(context.Background(), "missing", 0); !errors.Is(err, albums.ErrAlbumNotFound) {
-		t.Fatalf("expected ErrAlbumNotFound, got %v", err)
-	}
-	if _, err := svc.OpenImage(context.Background(), "  ", 0); err == nil {
-		t.Fatalf("expected error for empty album id")
-	}
-}
-
-func TestOpenImageMissingBlobInStorage(t *testing.T) {
-	cat := openTestCatalog(t)
-	seedPhoto(t, cat, "album-a", 0, "hash-a", "image/png")
-	svc := newTestService(t, cat, newFakeBlobStore())
-
-	if _, err := svc.OpenImage(context.Background(), "album-a", 0); !errors.Is(err, ErrImageEntryNotFound) {
+	if _, err := svc.OpenImageByHash(context.Background(), "nope"); !errors.Is(err, ErrImageEntryNotFound) {
 		t.Fatalf("expected ErrImageEntryNotFound, got %v", err)
 	}
-}
-
-func TestGetImageByHashUnknownBlob(t *testing.T) {
-	cat := openTestCatalog(t)
-	svc := newTestService(t, cat, newFakeBlobStore())
-
+	if _, err := svc.OpenImageByHash(context.Background(), "  "); err == nil {
+		t.Fatalf("expected error for empty hash")
+	}
 	if _, err := svc.GetImageByHash(context.Background(), "nope"); !errors.Is(err, ErrImageEntryNotFound) {
 		t.Fatalf("expected ErrImageEntryNotFound, got %v", err)
 	}
-	if _, err := svc.GetImageByHash(context.Background(), "  "); err == nil {
-		t.Fatalf("expected error for empty hash")
-	}
 }
 
-func TestOpenImageFallsBackToRemoteContentType(t *testing.T) {
+// The catalog is only a content-type fallback: it is consulted when S3
+// advertises nothing useful, and an unknown catalog row must not block a
+// servable blob.
+func TestFetchBlobCatalogContentTypeFallback(t *testing.T) {
 	cat := openTestCatalog(t)
 	store := newFakeBlobStore()
 	store.objects[pipeline.BlobKey("hash-a")] = []byte("bytes")
-	ctx := context.Background()
-	if err := cat.CreateAlbum(ctx, catalog.Album{ID: "album-a", Status: catalog.AlbumStatusReady}); err != nil {
-		t.Fatalf("create album: %v", err)
-	}
-	// Blob row without a content type: the S3 response value is used.
-	if err := cat.UpsertBlob(ctx, catalog.Blob{Hash: "hash-a", SizeBytes: 5}); err != nil {
-		t.Fatalf("upsert blob: %v", err)
-	}
-	if err := cat.InsertPhoto(ctx, catalog.Photo{AlbumID: "album-a", Index: 0, Name: "p.png", Hash: "hash-a", Width: 1, Height: 1, Ratio: 1}); err != nil {
-		t.Fatalf("insert photo: %v", err)
-	}
+	store.contentTypes[pipeline.BlobKey("hash-a")] = "application/octet-stream"
+	seedPhoto(t, cat, "album-a", 0, "hash-a", "image/webp")
+	seedPhoto(t, cat, "album-b", 0, "hash-b", "image/webp")
+	store.objects[pipeline.BlobKey("hash-b")] = []byte("bytes")
+	store.contentTypes[pipeline.BlobKey("hash-b")] = "application/octet-stream"
 
 	svc := newTestService(t, cat, store)
-	stream, err := svc.OpenImage(ctx, "album-a", 0)
+	stream, err := svc.OpenImageByHash(context.Background(), "hash-a")
 	if err != nil {
 		t.Fatalf("open image: %v", err)
 	}
 	defer stream.Close()
-	if stream.ContentType != "image/png" {
-		t.Fatalf("content type=%q want=image/png", stream.ContentType)
+	if stream.ContentType != "image/webp" {
+		t.Fatalf("expected the catalog type, got %q", stream.ContentType)
+	}
+
+	// Known to S3 but not to the catalog: still servable.
+	streamB, err := svc.OpenImageByHash(context.Background(), "hash-b")
+	if err != nil {
+		t.Fatalf("open unknown-to-catalog blob: %v", err)
+	}
+	defer streamB.Close()
+	if got := readStream(t, streamB); string(got) != "bytes" {
+		t.Fatalf("bytes=%q", got)
 	}
 }
 
-func TestOpenImageFetchFailurePropagatesAndRetries(t *testing.T) {
+func TestOpenImageByHashFetchFailurePropagatesAndRetries(t *testing.T) {
 	cat := openTestCatalog(t)
 	store := newFakeBlobStore()
 	store.objects[pipeline.BlobKey("hash-a")] = []byte("image-bytes")
 	store.readErr[pipeline.BlobKey("hash-a")] = errors.New("connection reset")
-	seedPhoto(t, cat, "album-a", 0, "hash-a", "image/png")
 
 	svc := newTestService(t, cat, store)
 
-	if _, err := svc.OpenImage(context.Background(), "album-a", 0); err == nil {
+	if _, err := svc.OpenImageByHash(context.Background(), "hash-a"); err == nil {
 		t.Fatalf("expected streaming failure")
 	}
 
 	// Nothing is cached, so a retry after the store recovers fetches again
 	// and succeeds.
 	delete(store.readErr, pipeline.BlobKey("hash-a"))
-	if _, err := svc.OpenImage(context.Background(), "album-a", 0); err != nil {
+	if _, err := svc.OpenImageByHash(context.Background(), "hash-a"); err != nil {
 		t.Fatalf("retry after failure: %v", err)
 	}
 	if got := store.getCount(); got != 2 {
 		t.Fatalf("expected two S3 gets, got %d", got)
+	}
+}
+
+func TestOpenImageByHashScaled(t *testing.T) {
+	cat := openTestCatalog(t)
+	store := newFakeBlobStore()
+	small := pngBytes(t, 13, 7)
+	large := pngBytes(t, 400, 300)
+	store.objects[pipeline.BlobKey("hash-small")] = small
+	store.objects[pipeline.BlobKey("hash-large")] = large
+
+	svc := newTestService(t, cat, store)
+	ctx := context.Background()
+
+	// Up-scaling adds nothing: the original passes through untouched.
+	passthrough, err := svc.OpenImageByHashScaled(ctx, "hash-small", 320)
+	if err != nil {
+		t.Fatalf("passthrough: %v", err)
+	}
+	defer passthrough.Close()
+	if got := readStream(t, passthrough); !bytes.Equal(got, small) {
+		t.Fatalf("expected original bytes for a small image")
+	}
+	if passthrough.ContentType != "image/png" || passthrough.Hash != "hash-small" {
+		t.Fatalf("passthrough metadata: %+v", passthrough)
+	}
+
+	// A large image becomes a scaled JPEG whose validator carries the width.
+	scaled, err := svc.OpenImageByHashScaled(ctx, "hash-large", 320)
+	if err != nil {
+		t.Fatalf("scaled: %v", err)
+	}
+	defer scaled.Close()
+	if scaled.ContentType != "image/jpeg" || scaled.Hash != "hash-large:w320" {
+		t.Fatalf("scaled metadata: %+v", scaled)
+	}
+	config, _, err := image.DecodeConfig(bytes.NewReader(readStream(t, scaled)))
+	if err != nil {
+		t.Fatalf("decode scaled: %v", err)
+	}
+	if config.Width != 320 {
+		t.Fatalf("scaled width=%d", config.Width)
+	}
+
+	if _, err := svc.OpenImageByHashScaled(ctx, "hash-small", 500); !errors.Is(err, ErrUnsupportedWidth) {
+		t.Fatalf("expected ErrUnsupportedWidth, got %v", err)
+	}
+}
+
+func TestPresignBlobURL(t *testing.T) {
+	cat := openTestCatalog(t)
+	store := newFakeBlobStore()
+	svc := newTestService(t, cat, store)
+
+	url, err := svc.PresignBlobURL(context.Background(), "hash-a", time.Minute)
+	if err != nil {
+		t.Fatalf("presign: %v", err)
+	}
+	if url != "memory://blobs/hash-a?ttl=1m0s" {
+		t.Fatalf("unexpected url %q", url)
+	}
+	if got := store.presigned; len(got) != 1 || got[0] != "blobs/hash-a" {
+		t.Fatalf("expected the logical blob key presigned, got %v", got)
+	}
+
+	if _, err := svc.PresignBlobURL(context.Background(), "  ", time.Minute); err == nil {
+		t.Fatalf("expected error for empty hash")
 	}
 }

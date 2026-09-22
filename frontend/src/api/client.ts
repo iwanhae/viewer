@@ -28,11 +28,11 @@ export type {
   RecommendationResponse,
 } from './types'
 
-// albumImageUrl builds the URL for one photo of an album. An optional width
-// from the server's ladder (320/640/1024) asks for a scaled JPEG variant;
+// imageByHashUrl builds the URL for one image by its content hash. An optional
+// width from the server's ladder (320/640/1024) asks for a scaled JPEG variant;
 // without it the endpoint serves the untouched original.
-export function albumImageUrl(albumId: string, index: number, width?: number): string {
-  const base = `/api/image/${albumId}/${index}`
+export function imageByHashUrl(hash: string, width?: number): string {
+  const base = `/api/image/${hash}`
   return width === undefined ? base : `${base}?w=${width}`
 }
 

@@ -185,6 +185,7 @@ func buildLatestPage(limit int, albumsList []*models.AlbumIndex, afterCursor str
 		items = append(items, models.FeedItem{
 			AlbumID: album.AlbumID,
 			I:       photo.I,
+			Hash:    photo.Hash,
 			W:       photo.W,
 			H:       photo.H,
 			Ratio:   photo.Ratio,
@@ -297,6 +298,7 @@ func sampleFeedItem(seed int64, position int64, pool []*models.AlbumIndex) model
 	return models.FeedItem{
 		AlbumID: album.AlbumID,
 		I:       photo.I,
+		Hash:    photo.Hash,
 		W:       photo.W,
 		H:       photo.H,
 		Ratio:   photo.Ratio,

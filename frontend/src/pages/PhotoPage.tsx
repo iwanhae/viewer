@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { useLocation, useNavigate, useParams } from 'react-router-dom'
-import { seedCachedAlbum, type AlbumIndex } from '../api/client'
+import { imageByHashUrl, seedCachedAlbum, type AlbumIndex } from '../api/client'
 import { useAlbum } from '../hooks/useAlbum'
 import { useRecommendations } from '../hooks/useRecommendations'
 import { MasonryWall } from '../components/MasonryWall'
@@ -109,14 +109,14 @@ export function PhotoPage() {
       <div className="photo-shell">
         <a
           className="photo-view-image-link"
-          href={`/api/image/${album.albumId}/${photo.i}`}
+          href={imageByHashUrl(photo.hash)}
           target="_blank"
           rel="noopener noreferrer"
           data-testid="photo-image-original-link"
         >
           <img
             className="photo-view-image"
-            src={`/api/image/${album.albumId}/${photo.i}`}
+            src={imageByHashUrl(photo.hash)}
             alt={photo.name || `Photo ${photo.i + 1}`}
           />
         </a>
@@ -183,7 +183,7 @@ export function PhotoPage() {
                     data-testid="photo-recommendation-tile"
                   >
                     <img
-                      src={`/api/image/${item.albumId}/${item.i}`}
+                      src={imageByHashUrl(item.hash)}
                       alt=""
                       loading="lazy"
                       style={{

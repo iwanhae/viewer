@@ -2,10 +2,14 @@ package catalog
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
+	"unicode/utf8"
 )
 
 func openTestStore(t *testing.T) *Store {
@@ -222,7 +226,7 @@ func TestBlobUpsertPreservesEmbedding(t *testing.T) {
 	}
 }
 
-func TestEmbeddingCountsAndPendingListing(t *testing.T) {
+func TestEmbeddingCountsAndClaim(t *testing.T) {
 	store := openTestStore(t)
 	ctx := context.Background()
 
@@ -242,16 +246,211 @@ func TestEmbeddingCountsAndPendingListing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("embedding counts: %v", err)
 	}
-	if counts.Total != 3 || counts.Ready != 1 || counts.Failed != 1 || counts.Pending != 1 {
+	if counts.Total != 3 || counts.Ready != 1 || counts.Failed != 1 || counts.Pending != 1 || counts.Processing != 0 {
 		t.Fatalf("unexpected counts: %+v", counts)
 	}
 
-	awaiting, err := store.ListBlobsAwaitingEmbedding(ctx, 10)
+	// A claim moves the pending blob to processing, which keeps counting as
+	// pending (not done yet) but is no longer claimable.
+	leaseUntil := time.Now().Add(10 * time.Minute)
+	claimed, err := store.ClaimPendingEmbeddings(ctx, 10, leaseUntil)
 	if err != nil {
-		t.Fatalf("list awaiting: %v", err)
+		t.Fatalf("claim pending: %v", err)
 	}
-	if len(awaiting) != 1 || awaiting[0].Hash != "pending" {
-		t.Fatalf("expected only pending blob, got %+v", awaiting)
+	if len(claimed) != 1 || claimed[0].Hash != "pending" {
+		t.Fatalf("expected only pending blob, got %+v", claimed)
+	}
+	if claimed[0].EmbeddingStatus != EmbeddingStatusProcessing {
+		t.Fatalf("expected processing status, got %s", claimed[0].EmbeddingStatus)
+	}
+
+	counts, err = store.EmbeddingCounts(ctx)
+	if err != nil {
+		t.Fatalf("embedding counts after claim: %v", err)
+	}
+	if counts.Pending != 1 || counts.Processing != 1 {
+		t.Fatalf("expected pending=1 processing=1, got %+v", counts)
+	}
+
+	if again, err := store.ClaimPendingEmbeddings(ctx, 10, leaseUntil); err != nil || len(again) != 0 {
+		t.Fatalf("expected empty claim, got %+v err=%v", again, err)
+	}
+}
+
+// seedClaimBlobs inserts one blob per hash with a distinct created_at so claim
+// ordering is deterministic (RFC3339Nano strings with trimmed trailing zeros do
+// not sort chronologically on their own).
+func seedClaimBlobs(t *testing.T, store *Store, hashes ...string) {
+	t.Helper()
+	ctx := context.Background()
+	for i, hash := range hashes {
+		if err := store.UpsertBlob(ctx, Blob{Hash: hash, SizeBytes: 1, ContentType: "image/jpeg"}); err != nil {
+			t.Fatalf("upsert blob %s: %v", hash, err)
+		}
+		createdAt := time.Date(2024, 1, 1, 0, 0, i, 0, time.UTC).Format(time.RFC3339)
+		if _, err := store.db.Exec(`UPDATE blobs SET created_at = ? WHERE hash = ?`, createdAt, hash); err != nil {
+			t.Fatalf("backdate blob %s: %v", hash, err)
+		}
+	}
+}
+
+func claimedHashes(blobs []Blob) []string {
+	hashes := make([]string, 0, len(blobs))
+	for _, blob := range blobs {
+		hashes = append(hashes, blob.Hash)
+	}
+	return hashes
+}
+
+func TestClaimOrdersByCreatedAndReclaimsExpiredLeases(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+	seedClaimBlobs(t, store, "old", "middle", "new")
+
+	claimed, err := store.ClaimPendingEmbeddings(ctx, 2, time.Now().Add(10*time.Minute))
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if got := claimedHashes(claimed); len(got) != 2 || got[0] != "old" || got[1] != "middle" {
+		t.Fatalf("expected oldest two blobs in created order, got %v", got)
+	}
+
+	// Let both leases lapse, then reclaim: all three blobs come back, oldest
+	// first, including the still-pending "new".
+	if _, err := store.RenewEmbeddingLeases(ctx, claimedHashes(claimed), time.Now().Add(-time.Minute)); err != nil {
+		t.Fatalf("expire leases: %v", err)
+	}
+	reclaimed, err := store.ClaimPendingEmbeddings(ctx, 10, time.Now().Add(10*time.Minute))
+	if err != nil {
+		t.Fatalf("reclaim: %v", err)
+	}
+	if got := claimedHashes(reclaimed); len(got) != 3 || got[0] != "old" || got[1] != "middle" || got[2] != "new" {
+		t.Fatalf("expected expired and pending blobs reclaimed in order, got %v", got)
+	}
+
+	// Releasing hands blobs back to pending, so the next claim sees them again.
+	if err := store.ReleaseEmbeddingClaims(ctx, claimedHashes(reclaimed)); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	if again, err := store.ClaimPendingEmbeddings(ctx, 10, time.Now().Add(10*time.Minute)); err != nil || len(again) != 3 {
+		t.Fatalf("expected released blobs claimable again, got %d err=%v", len(again), err)
+	}
+
+	// Renewals and releases for hashes nobody claimed are no-ops.
+	if _, err := store.RenewEmbeddingLeases(ctx, []string{"ghost"}, time.Now().Add(time.Minute)); err != nil {
+		t.Fatalf("renew unknown: %v", err)
+	}
+	if err := store.ReleaseEmbeddingClaims(ctx, []string{"ghost"}); err != nil {
+		t.Fatalf("release unknown: %v", err)
+	}
+}
+
+func TestApplyEmbeddingResultsMixedBatch(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+	seedClaimBlobs(t, store, "a", "b", "c", "d")
+
+	if _, err := store.ClaimPendingEmbeddings(ctx, 3, time.Now().Add(10*time.Minute)); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+
+	longError := strings.Repeat("x", 600)
+	applied, rejected, err := store.ApplyEmbeddingResults(ctx, []EmbeddingResult{
+		{Hash: "a", Status: EmbeddingStatusReady, Vector: []float32{1, 2, 3}},
+		{Hash: "b", Status: EmbeddingStatusFailed, Error: longError},
+		{Hash: "c", Status: EmbeddingStatusPending},
+		{Hash: "d", Status: EmbeddingStatusReady, Vector: []float32{9}},
+		{Hash: "ghost", Status: EmbeddingStatusReady, Vector: []float32{9}},
+	})
+	if err != nil {
+		t.Fatalf("apply results: %v", err)
+	}
+	if len(applied) != 2 || applied[0] != "a" || applied[1] != "b" {
+		t.Fatalf("expected a and b applied, got %v", applied)
+	}
+	wantRejected := []RejectedEmbedding{
+		{Hash: "c", Reason: EmbeddingRejectInvalidState},
+		{Hash: "d", Reason: EmbeddingRejectNotClaimed},
+		{Hash: "ghost", Reason: EmbeddingRejectUnknownHash},
+	}
+	if len(rejected) != len(wantRejected) {
+		t.Fatalf("expected %d rejections, got %+v", len(wantRejected), rejected)
+	}
+	for i, want := range wantRejected {
+		if rejected[i] != want {
+			t.Fatalf("rejection %d: expected %+v, got %+v", i, want, rejected[i])
+		}
+	}
+
+	blobA, err := store.GetBlob(ctx, "a")
+	if err != nil {
+		t.Fatalf("get a: %v", err)
+	}
+	if blobA.EmbeddingStatus != EmbeddingStatusReady || len(blobA.Embedding) != 3 || blobA.Embedding[0] != 1 {
+		t.Fatalf("expected ready vector on a, got %+v", blobA)
+	}
+	blobB, err := store.GetBlob(ctx, "b")
+	if err != nil {
+		t.Fatalf("get b: %v", err)
+	}
+	if blobB.EmbeddingStatus != EmbeddingStatusFailed || blobB.EmbeddingError != strings.Repeat("x", 512) {
+		t.Fatalf("expected truncated failed error on b, got %+v", blobB)
+	}
+	// A rejected processing blob keeps its claim, so the worker that holds it
+	// can still finish it.
+	blobC, err := store.GetBlob(ctx, "c")
+	if err != nil {
+		t.Fatalf("get c: %v", err)
+	}
+	if blobC.EmbeddingStatus != EmbeddingStatusProcessing {
+		t.Fatalf("expected c still processing, got %s", blobC.EmbeddingStatus)
+	}
+
+	if _, _, err := store.ApplyEmbeddingResults(ctx, nil); err != nil {
+		t.Fatalf("empty batch should be a no-op: %v", err)
+	}
+}
+
+func TestOpenAddsLeaseColumnAndResetsProcessing(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "catalog.db")
+
+	// Build a database with the pre-lease schema and a blob stuck in
+	// processing, as a crashed process would have left it.
+	legacy, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open legacy db: %v", err)
+	}
+	if _, err := legacy.Exec(`
+		CREATE TABLE blobs (
+			hash             TEXT PRIMARY KEY,
+			size_bytes       INTEGER NOT NULL,
+			content_type     TEXT NOT NULL DEFAULT 'application/octet-stream',
+			embedding_status TEXT NOT NULL DEFAULT 'pending',
+			embedding        BLOB,
+			embedding_error  TEXT NOT NULL DEFAULT '',
+			created_at       TEXT NOT NULL
+		);
+		INSERT INTO blobs (hash, size_bytes, content_type, embedding_status, created_at)
+		VALUES ('stuck', 1, 'image/jpeg', 'processing', '2024-01-01T00:00:00Z');`); err != nil {
+		t.Fatalf("seed legacy schema: %v", err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatalf("close legacy db: %v", err)
+	}
+
+	store, err := Open(path)
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	defer store.Close()
+
+	// The column exists and the stuck blob is claimable again.
+	claimed, err := store.ClaimPendingEmbeddings(context.Background(), 10, time.Now().Add(time.Minute))
+	if err != nil {
+		t.Fatalf("claim after migration: %v", err)
+	}
+	if len(claimed) != 1 || claimed[0].Hash != "stuck" {
+		t.Fatalf("expected stuck blob reclaimed after migration, got %+v", claimed)
 	}
 }
 
@@ -648,5 +847,114 @@ func TestEmbeddingCountsByAlbumCountsSharedBlobsPerAlbum(t *testing.T) {
 	}
 	if empty.Total != 0 || empty.Pending != 0 {
 		t.Fatalf("missing album counts=%+v want all zero", empty)
+	}
+}
+
+func TestApplyEmbeddingResultsRejectsBlankHash(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+	if err := store.UpsertBlob(ctx, Blob{Hash: "hash-a", SizeBytes: 1}); err != nil {
+		t.Fatalf("upsert blob: %v", err)
+	}
+	if _, err := store.ClaimPendingEmbeddings(ctx, 10, time.Now().Add(time.Minute)); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+
+	applied, rejected, err := store.ApplyEmbeddingResults(ctx, []EmbeddingResult{
+		{Hash: "   ", Status: EmbeddingStatusReady, Vector: []float32{1}},
+	})
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if len(applied) != 0 {
+		t.Fatalf("applied=%v want none", applied)
+	}
+	if len(rejected) != 1 || rejected[0].Reason != EmbeddingRejectInvalidHash {
+		t.Fatalf("rejected=%+v want invalid_hash", rejected)
+	}
+}
+
+func TestApplyEmbeddingResultsReadyClearsErrorAndTruncatesUTF8(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+	if err := store.UpsertBlob(ctx, Blob{Hash: "hash-a", SizeBytes: 1}); err != nil {
+		t.Fatalf("upsert blob: %v", err)
+	}
+	if _, err := store.ClaimPendingEmbeddings(ctx, 10, time.Now().Add(time.Minute)); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+
+	// A failed report whose message is cut mid-rune still stores valid UTF-8:
+	// the cut lands inside the Korean run, and the trailing partial rune is
+	// dropped instead of being persisted as garbage.
+	torn := strings.Repeat("에", 200) + "abc"
+	_, _, err := store.ApplyEmbeddingResults(ctx, []EmbeddingResult{
+		{Hash: "hash-a", Status: EmbeddingStatusFailed, Error: torn},
+	})
+	if err != nil {
+		t.Fatalf("apply failed report: %v", err)
+	}
+	blob, err := store.GetBlob(ctx, "hash-a")
+	if err != nil {
+		t.Fatalf("get blob: %v", err)
+	}
+	if len(blob.EmbeddingError) > maxEmbeddingErrorBytes {
+		t.Fatalf("error text=%d bytes want<=%d", len(blob.EmbeddingError), maxEmbeddingErrorBytes)
+	}
+	if !utf8.ValidString(blob.EmbeddingError) || !strings.HasSuffix(blob.EmbeddingError, "에") {
+		t.Fatalf("truncation tore a rune: %q", blob.EmbeddingError[len(blob.EmbeddingError)-4:])
+	}
+
+	// A ready result that still carries an error field stores no error: a
+	// success row quoting a failure would read as a contradiction everywhere
+	// the blob is shown. (A failed blob itself is terminal, so the reverse
+	// order is unreachable by design.)
+	if err := store.UpsertBlob(ctx, Blob{Hash: "hash-b", SizeBytes: 1}); err != nil {
+		t.Fatalf("upsert blob-b: %v", err)
+	}
+	if _, err := store.ClaimPendingEmbeddings(ctx, 10, time.Now().Add(time.Minute)); err != nil {
+		t.Fatalf("claim blob-b: %v", err)
+	}
+	if _, _, err := store.ApplyEmbeddingResults(ctx, []EmbeddingResult{
+		{Hash: "hash-b", Status: EmbeddingStatusReady, Vector: []float32{1, 2, 3}, Error: "stale failure"},
+	}); err != nil {
+		t.Fatalf("apply ready report: %v", err)
+	}
+	blob, err = store.GetBlob(ctx, "hash-b")
+	if err != nil {
+		t.Fatalf("get blob-b: %v", err)
+	}
+	if blob.EmbeddingStatus != EmbeddingStatusReady || blob.EmbeddingError != "" {
+		t.Fatalf("ready blob=%+v want clean ready", blob)
+	}
+}
+
+func TestRenewEmbeddingLeasesReportsWhatRenewed(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+	for _, hash := range []string{"hash-a", "hash-b", "hash-c"} {
+		if err := store.UpsertBlob(ctx, Blob{Hash: hash, SizeBytes: 1}); err != nil {
+			t.Fatalf("upsert blob: %v", err)
+		}
+	}
+	claimed, err := store.ClaimPendingEmbeddings(ctx, 10, time.Now().Add(time.Minute))
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if len(claimed) != 3 {
+		t.Fatalf("claimed=%d want=3", len(claimed))
+	}
+
+	// A renewal covers exactly the still-processing rows: claimed ones yes, a
+	// pending one it never held and a ghost no.
+	renewed, err := store.RenewEmbeddingLeases(ctx,
+		[]string{"hash-a", "hash-b", "hash-c", "blob-pending", "ghost"},
+		time.Now().Add(time.Minute))
+	if err != nil {
+		t.Fatalf("renew: %v", err)
+	}
+	want := []string{"hash-a", "hash-b", "hash-c"}
+	if strings.Join(renewed, ",") != strings.Join(want, ",") {
+		t.Fatalf("renewed=%v want=%v", renewed, want)
 	}
 }

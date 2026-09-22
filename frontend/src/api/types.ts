@@ -3,6 +3,9 @@ export type FeedMode = 'random' | 'latest'
 export type FeedItem = {
   albumId: string
   i: number
+  // hash is the content-addressed blob key: image URLs are built from it
+  // directly, no album lookup needed.
+  hash: string
   w: number
   h: number
   ratio: number
@@ -20,6 +23,7 @@ export type FeedResponse = {
 export type PhotoMeta = {
   i: number
   name: string
+  hash: string
   w: number
   h: number
   ratio: number
@@ -36,6 +40,7 @@ export type AlbumIndex = {
 // AlbumCover points at the photo that represents an album: index 0.
 export type AlbumCover = {
   i: number
+  hash: string
   w: number
   h: number
   ratio: number
@@ -57,6 +62,7 @@ export type AlbumSearchResponse = {
 export type RecommendationItem = {
 	albumId: string
 	i: number
+	hash: string
   w: number
   h: number
   score: number
@@ -79,6 +85,8 @@ export type EmbeddingProgress = {
   ready: number
   failed: number
   pending: number
+  // processing is the subset of pending currently leased by a worker.
+  processing: number
   ratio: number
 }
 

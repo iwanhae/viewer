@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { PageTopBar } from '../components/PageTopBar'
-import { albumImageUrl, type AlbumSearchItem } from '../api/client'
+import { imageByHashUrl, type AlbumSearchItem } from '../api/client'
 import { useAlbumSearch } from '../hooks/useAlbumSearch'
 import { formatBytes } from '../utils/format'
 import './albumSearch.css'
@@ -40,7 +40,7 @@ function AlbumCard({ item }: { item: AlbumSearchItem }) {
         <div className={`album-card-cover${item.cover ? '' : ' is-empty'}`}>
           {item.cover && (
             <img
-              src={albumImageUrl(item.albumId, item.cover.i, 640)}
+              src={imageByHashUrl(item.cover.hash, 640)}
               alt=""
               width={item.cover.w}
               height={item.cover.h}

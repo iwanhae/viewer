@@ -292,6 +292,7 @@ func (s *Service) SearchAlbumsByName(ctx context.Context, q string, limit int) (
 		if res.Cover != nil {
 			item.Cover = &models.AlbumCover{
 				I:     res.Cover.Index,
+				Hash:  res.Cover.Hash,
 				W:     res.Cover.Width,
 				H:     res.Cover.Height,
 				Ratio: res.Cover.Ratio,
@@ -364,6 +365,7 @@ func photoMetaFromRow(photo catalog.Photo) models.PhotoMeta {
 	return models.PhotoMeta{
 		I:     photo.Index,
 		Name:  photo.Name,
+		Hash:  photo.Hash,
 		W:     photo.Width,
 		H:     photo.Height,
 		Ratio: photo.Ratio,

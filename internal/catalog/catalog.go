@@ -12,8 +12,10 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	_ "modernc.org/sqlite"
 )
@@ -38,9 +40,10 @@ const (
 type EmbeddingStatus string
 
 const (
-	EmbeddingStatusPending EmbeddingStatus = "pending"
-	EmbeddingStatusReady   EmbeddingStatus = "ready"
-	EmbeddingStatusFailed  EmbeddingStatus = "failed"
+	EmbeddingStatusPending    EmbeddingStatus = "pending"
+	EmbeddingStatusProcessing EmbeddingStatus = "processing"
+	EmbeddingStatusReady      EmbeddingStatus = "ready"
+	EmbeddingStatusFailed     EmbeddingStatus = "failed"
 )
 
 // Album is one uploaded zip and its extraction state.
@@ -88,12 +91,15 @@ type PhotoWithBlob struct {
 	Blob  Blob
 }
 
-// EmbeddingCounts summarizes embedding coverage across distinct blobs.
+// EmbeddingCounts summarizes embedding coverage across distinct blobs. Pending
+// is derived as Total-Ready-Failed on purpose: it means "not done yet", so
+// blobs a worker is currently embedding keep counting toward it.
 type EmbeddingCounts struct {
-	Total   int
-	Ready   int
-	Failed  int
-	Pending int
+	Total      int
+	Ready      int
+	Failed     int
+	Processing int
+	Pending    int
 }
 
 // Store is a SQLite-backed metadata catalog.
@@ -123,6 +129,7 @@ CREATE TABLE IF NOT EXISTS blobs (
 	embedding_status     TEXT NOT NULL DEFAULT 'pending',
 	embedding            BLOB,
 	embedding_error      TEXT NOT NULL DEFAULT '',
+	embedding_lease_until INTEGER NOT NULL DEFAULT 0,
 	created_at           TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_blobs_embedding_status ON blobs(embedding_status);
@@ -179,6 +186,31 @@ func Open(path string) (*Store, error) {
 		UPDATE albums SET status = 'QUEUED' WHERE status = 'PENDING';`); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("migrate album statuses: %w", err)
+	}
+	// Catalogs written before external embedding workers existed have no lease
+	// column on blobs. Add it behind a pragma check instead of matching driver
+	// error strings, so the same statement is safe to run on every open.
+	var leaseColumn int
+	if err := db.QueryRow(
+		`SELECT COUNT(*) FROM pragma_table_info('blobs') WHERE name = 'embedding_lease_until'`,
+	).Scan(&leaseColumn); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("inspect blob columns: %w", err)
+	}
+	if leaseColumn == 0 {
+		if _, err := db.Exec(`ALTER TABLE blobs ADD COLUMN embedding_lease_until INTEGER NOT NULL DEFAULT 0`); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("add blob lease column: %w", err)
+		}
+	}
+	// A lease belongs to the lifetime of one process: anything still marked
+	// processing at startup was in flight when the previous run died, so hand
+	// those blobs straight back to the pending queue.
+	if _, err := db.Exec(`
+		UPDATE blobs SET embedding_status = 'pending', embedding_lease_until = 0
+		WHERE embedding_status = 'processing'`); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("reset stale embedding leases: %w", err)
 	}
 	return &Store{db: db}, nil
 }
@@ -340,7 +372,7 @@ func (s *Store) SearchAlbumsByName(ctx context.Context, q string, limit int) ([]
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT a.id, a.original_filename, a.size_bytes, a.status, a.source_key,
 		       a.photo_count, a.error, a.created_at, a.updated_at,
-		       p.idx, p.width, p.height, p.ratio
+		       p.idx, p.hash, p.width, p.height, p.ratio
 		FROM albums a
 		LEFT JOIN photos p ON p.album_id = a.id AND p.idx = 0
 		WHERE a.status = ?
@@ -358,6 +390,7 @@ func (s *Store) SearchAlbumsByName(ctx context.Context, q string, limit int) ([]
 			album       Album
 			status      string
 			coverIdx    sql.NullInt64
+			coverHash   sql.NullString
 			coverWidth  sql.NullInt64
 			coverHeight sql.NullInt64
 			coverRatio  sql.NullFloat64
@@ -365,7 +398,7 @@ func (s *Store) SearchAlbumsByName(ctx context.Context, q string, limit int) ([]
 		if err := rows.Scan(
 			&album.ID, &album.OriginalFilename, &album.SizeBytes, &status, &album.SourceKey,
 			&album.PhotoCount, &album.Error, &album.CreatedAt, &album.UpdatedAt,
-			&coverIdx, &coverWidth, &coverHeight, &coverRatio,
+			&coverIdx, &coverHash, &coverWidth, &coverHeight, &coverRatio,
 		); err != nil {
 			return nil, fmt.Errorf("scan album search row: %w", err)
 		}
@@ -375,6 +408,7 @@ func (s *Store) SearchAlbumsByName(ctx context.Context, q string, limit int) ([]
 			result.Cover = &Photo{
 				AlbumID: album.ID,
 				Index:   int(coverIdx.Int64),
+				Hash:    coverHash.String,
 				Width:   int(coverWidth.Int64),
 				Height:  int(coverHeight.Int64),
 				Ratio:   coverRatio.Float64,
@@ -593,7 +627,11 @@ func (s *Store) GetBlob(ctx context.Context, hash string) (*Blob, error) {
 	return &blob, nil
 }
 
-// SetBlobEmbedding stores the embedding outcome for a blob.
+// SetBlobEmbedding is the unconditional low-level write for a blob's embedding
+// outcome: it overwrites whichever status the blob currently has. Production
+// workers must go through ClaimPendingEmbeddings + ApplyEmbeddingResults so a
+// terminal result can never be clobbered; this stays for tests and one-off
+// administrative fixes.
 func (s *Store) SetBlobEmbedding(ctx context.Context, hash string, status EmbeddingStatus, vector []float32, errorText string) error {
 	_, err := s.db.ExecContext(ctx, `
 		UPDATE blobs
@@ -606,43 +644,255 @@ func (s *Store) SetBlobEmbedding(ctx context.Context, hash string, status Embedd
 	return nil
 }
 
-// ListBlobsAwaitingEmbedding returns blobs that have not been embedded yet.
-// Failed blobs are deliberately excluded so the retry worker does not spin on
-// permanently unembeddable images.
-func (s *Store) ListBlobsAwaitingEmbedding(ctx context.Context, limit int) ([]Blob, error) {
+// EmbeddingResult is one blob's embedding outcome as reported by a worker —
+// either the in-process one or an external one calling the worker API. Only
+// Ready and Failed are accepted here; claimable blobs are handled by claim, not
+// by results.
+type EmbeddingResult struct {
+	Hash   string
+	Status EmbeddingStatus
+	Vector []float32
+	Error  string
+}
+
+// Rejection reasons reported by ApplyEmbeddingResults. They are informational:
+// a worker must re-claim rather than retry a rejected item.
+const (
+	EmbeddingRejectUnknownHash  = "unknown_hash"
+	EmbeddingRejectNotClaimed   = "not_claimed"
+	EmbeddingRejectInvalidState = "invalid_status"
+	// EmbeddingRejectInvalidHash marks a result whose hash is blank: there is
+	// no row it could name, and silently dropping the item would leave a
+	// worker counting results that went nowhere.
+	EmbeddingRejectInvalidHash = "invalid_hash"
+)
+
+// RejectedEmbedding is one result a write-back refused, with the reason.
+type RejectedEmbedding struct {
+	Hash   string
+	Reason string
+}
+
+// ClaimPendingEmbeddings atomically moves up to limit blobs into the
+// processing state and returns them. Pending blobs and processing blobs whose
+// lease has already expired are both claimable, so a worker that dies mid-batch
+// is not able to strand its blobs: the next claim reclaims them. The statement
+// must run through QueryContext — RETURNING rows are dropped by ExecContext.
+// Rows come back in an unspecified order, so they are re-sorted by created_at.
+func (s *Store) ClaimPendingEmbeddings(ctx context.Context, limit int, leaseUntil time.Time) ([]Blob, error) {
 	if limit <= 0 {
 		limit = 64
 	}
+	now := time.Now()
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT hash, size_bytes, content_type, embedding_status, embedding, embedding_error, created_at
-		FROM blobs
-		WHERE embedding_status = ?
-		ORDER BY created_at ASC
-		LIMIT ?`, string(EmbeddingStatusPending), limit)
+		UPDATE blobs
+		SET embedding_status = ?1, embedding_lease_until = ?2
+		WHERE hash IN (
+			SELECT hash FROM blobs
+			WHERE embedding_status = ?3
+			   OR (embedding_status = ?1 AND embedding_lease_until < ?4)
+			ORDER BY created_at ASC
+			LIMIT ?5
+		)
+		RETURNING hash, size_bytes, content_type, created_at`,
+		string(EmbeddingStatusProcessing), leaseUntil.UnixMilli(),
+		string(EmbeddingStatusPending), now.UnixMilli(), limit,
+	)
 	if err != nil {
-		return nil, fmt.Errorf("list blobs awaiting embedding: %w", err)
+		return nil, fmt.Errorf("claim blobs for embedding: %w", err)
 	}
 	defer rows.Close()
 
 	blobs := make([]Blob, 0)
 	for rows.Next() {
 		var blob Blob
-		var status string
-		var vector []byte
 		if err := rows.Scan(
-			&blob.Hash, &blob.SizeBytes, &blob.ContentType, &status, &vector,
-			&blob.EmbeddingError, &blob.CreatedAt,
+			&blob.Hash, &blob.SizeBytes, &blob.ContentType, &blob.CreatedAt,
 		); err != nil {
-			return nil, fmt.Errorf("scan blob: %w", err)
+			return nil, fmt.Errorf("scan claimed blob: %w", err)
 		}
-		blob.EmbeddingStatus = EmbeddingStatus(status)
-		blob.Embedding = DecodeVector(vector)
+		blob.EmbeddingStatus = EmbeddingStatusProcessing
 		blobs = append(blobs, blob)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate blobs: %w", err)
+		return nil, fmt.Errorf("iterate claimed blobs: %w", err)
 	}
+	sort.Slice(blobs, func(i, j int) bool { return blobs[i].CreatedAt < blobs[j].CreatedAt })
 	return blobs, nil
+}
+
+// RenewEmbeddingLeases extends the lease of the named blobs and returns the
+// hashes actually renewed. Only blobs still in the processing state are
+// touched, so the return value tells a worker which of its leases were lost to
+// expiry and re-claim — those results would be rejected anyway, and knowing
+// now beats finding out one write-back later.
+func (s *Store) RenewEmbeddingLeases(ctx context.Context, hashes []string, leaseUntil time.Time) ([]string, error) {
+	return s.updateEmbeddingLeases(ctx, hashes, func(builder *strings.Builder, args []any) []any {
+		builder.WriteString(`
+			UPDATE blobs SET embedding_lease_until = ?
+			WHERE embedding_status = ? AND hash IN (`)
+		args = append(args, leaseUntil.UnixMilli(), string(EmbeddingStatusProcessing))
+		return args
+	})
+}
+
+// ReleaseEmbeddingClaims hands the named blobs back to the pending queue, used
+// when a worker gives up on a batch without recording an outcome (transient
+// failure, shutdown).
+func (s *Store) ReleaseEmbeddingClaims(ctx context.Context, hashes []string) error {
+	_, err := s.updateEmbeddingLeases(ctx, hashes, func(builder *strings.Builder, args []any) []any {
+		builder.WriteString(`
+			UPDATE blobs SET embedding_status = ?, embedding_lease_until = 0
+			WHERE embedding_status = ? AND hash IN (`)
+		args = append(args, string(EmbeddingStatusPending), string(EmbeddingStatusProcessing))
+		return args
+	})
+	return err
+}
+
+// updateEmbeddingLeases runs one of the two lease rewrites above, chunking the
+// hash list so the IN clause stays far below SQLite's parameter limit. The
+// statement RETURNs the hashes it actually touched, so a caller can tell a
+// renewal that landed from one that raced a reclaim. Rows must be drained for
+// RETURNING to run (QueryContext, not ExecContext), and the order is
+// unspecified, so it is sorted for determinism.
+func (s *Store) updateEmbeddingLeases(
+	ctx context.Context,
+	hashes []string,
+	prefix func(*strings.Builder, []any) []any,
+) ([]string, error) {
+	renewed := make([]string, 0, len(hashes))
+	const chunkSize = 500
+	for start := 0; start < len(hashes); start += chunkSize {
+		end := start + chunkSize
+		if end > len(hashes) {
+			end = len(hashes)
+		}
+		chunk := hashes[start:end]
+
+		var builder strings.Builder
+		args := prefix(&builder, nil)
+		for i, hash := range chunk {
+			if i > 0 {
+				builder.WriteString(", ")
+			}
+			builder.WriteString("?")
+			args = append(args, hash)
+		}
+		builder.WriteString(`) RETURNING hash`)
+		rows, err := s.db.QueryContext(ctx, builder.String(), args...)
+		if err != nil {
+			return nil, fmt.Errorf("update embedding leases: %w", err)
+		}
+		for rows.Next() {
+			var hash string
+			if err := rows.Scan(&hash); err != nil {
+				_ = rows.Close()
+				return nil, fmt.Errorf("scan renewed lease: %w", err)
+			}
+			renewed = append(renewed, hash)
+		}
+		err = rows.Err()
+		closeErr := rows.Close()
+		if err != nil {
+			return nil, fmt.Errorf("iterate renewed leases: %w", err)
+		}
+		if closeErr != nil {
+			return nil, fmt.Errorf("close renewed leases: %w", closeErr)
+		}
+	}
+	sort.Strings(renewed)
+	return renewed, nil
+}
+
+// ApplyEmbeddingResults records a batch of worker outcomes in one transaction.
+// A result only lands on a blob still in the processing state: terminal rows
+// (ready/failed) can never be overwritten, and a blob whose lease expired but
+// which nobody re-claimed yet still accepts the late result — the content is
+// hash-identical, so nothing is corrupted. Items that do not land are reported
+// as rejected with a reason; they are informational, not errors.
+func (s *Store) ApplyEmbeddingResults(ctx context.Context, results []EmbeddingResult) ([]string, []RejectedEmbedding, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, nil, fmt.Errorf("begin embedding write-back: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	applied := make([]string, 0, len(results))
+	rejected := make([]RejectedEmbedding, 0)
+	for _, result := range results {
+		hash := strings.TrimSpace(result.Hash)
+		if hash == "" {
+			rejected = append(rejected, RejectedEmbedding{Hash: result.Hash, Reason: EmbeddingRejectInvalidHash})
+			continue
+		}
+		if result.Status != EmbeddingStatusReady && result.Status != EmbeddingStatusFailed {
+			rejected = append(rejected, RejectedEmbedding{Hash: hash, Reason: EmbeddingRejectInvalidState})
+			continue
+		}
+
+		// A ready blob carries no error: keeping a stale message next to a
+		// success would read as a contradiction everywhere the row is shown.
+		errorText := ""
+		var vector []byte
+		if result.Status == EmbeddingStatusReady {
+			vector = EncodeVector(result.Vector)
+		} else {
+			errorText = truncateErrorText(result.Error)
+		}
+
+		update, err := tx.ExecContext(ctx, `
+			UPDATE blobs
+			SET embedding_status = ?, embedding = ?, embedding_error = ?, embedding_lease_until = 0
+			WHERE hash = ? AND embedding_status = ?`,
+			string(result.Status), vector, errorText, hash, string(EmbeddingStatusProcessing),
+		)
+		if err != nil {
+			return nil, nil, fmt.Errorf("apply embedding result for %s: %w", hash, err)
+		}
+		affected, err := update.RowsAffected()
+		if err != nil {
+			return nil, nil, fmt.Errorf("count embedding result for %s: %w", hash, err)
+		}
+		if affected == 1 {
+			applied = append(applied, hash)
+			continue
+		}
+
+		reason := EmbeddingRejectNotClaimed
+		var exists int
+		if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM blobs WHERE hash = ?)`, hash).Scan(&exists); err != nil {
+			return nil, nil, fmt.Errorf("probe blob %s: %w", hash, err)
+		}
+		if exists == 0 {
+			reason = EmbeddingRejectUnknownHash
+		}
+		rejected = append(rejected, RejectedEmbedding{Hash: hash, Reason: reason})
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, nil, fmt.Errorf("commit embedding write-back: %w", err)
+	}
+	return applied, rejected, nil
+}
+
+// maxEmbeddingErrorBytes bounds the error text persisted per blob so one
+// pathological worker cannot bloat the catalog with failure messages.
+const maxEmbeddingErrorBytes = 512
+
+// truncateErrorText cuts error text to maxEmbeddingErrorBytes without tearing
+// a multi-byte rune in half: a torn suffix would come back out of SQLite as
+// U+FFFD garbage in every API response that quotes the failure.
+func truncateErrorText(text string) string {
+	if len(text) <= maxEmbeddingErrorBytes {
+		return text
+	}
+	cut := text[:maxEmbeddingErrorBytes]
+	// Only the final rune can be torn by the cut, so at most utf8.UTFMax
+	// retreats are ever needed.
+	for i := 0; i < utf8.UTFMax && len(cut) > 0 && !utf8.ValidString(cut); i++ {
+		cut = cut[:len(cut)-1]
+	}
+	return cut
 }
 
 // EmbeddingCounts reports embedding coverage across distinct blobs.
@@ -651,12 +901,13 @@ func (s *Store) EmbeddingCounts(ctx context.Context) (EmbeddingCounts, error) {
 		SELECT
 			COUNT(*),
 			COALESCE(SUM(CASE WHEN embedding_status = ? THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN embedding_status = ? THEN 1 ELSE 0 END), 0),
 			COALESCE(SUM(CASE WHEN embedding_status = ? THEN 1 ELSE 0 END), 0)
 		FROM blobs`,
-		string(EmbeddingStatusReady), string(EmbeddingStatusFailed))
+		string(EmbeddingStatusReady), string(EmbeddingStatusFailed), string(EmbeddingStatusProcessing))
 
 	var counts EmbeddingCounts
-	if err := row.Scan(&counts.Total, &counts.Ready, &counts.Failed); err != nil {
+	if err := row.Scan(&counts.Total, &counts.Ready, &counts.Failed, &counts.Processing); err != nil {
 		return EmbeddingCounts{}, fmt.Errorf("embedding counts: %w", err)
 	}
 	counts.Pending = counts.Total - counts.Ready - counts.Failed
@@ -671,13 +922,14 @@ func (s *Store) EmbeddingCountsByAlbum(ctx context.Context, albumID string) (Emb
 		SELECT
 			COUNT(*),
 			COALESCE(SUM(CASE WHEN b.embedding_status = ? THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN b.embedding_status = ? THEN 1 ELSE 0 END), 0),
 			COALESCE(SUM(CASE WHEN b.embedding_status = ? THEN 1 ELSE 0 END), 0)
 		FROM (SELECT DISTINCT hash FROM photos WHERE album_id = ?) p
 		JOIN blobs b ON b.hash = p.hash`,
-		string(EmbeddingStatusReady), string(EmbeddingStatusFailed), albumID)
+		string(EmbeddingStatusReady), string(EmbeddingStatusFailed), string(EmbeddingStatusProcessing), albumID)
 
 	var counts EmbeddingCounts
-	if err := row.Scan(&counts.Total, &counts.Ready, &counts.Failed); err != nil {
+	if err := row.Scan(&counts.Total, &counts.Ready, &counts.Failed, &counts.Processing); err != nil {
 		return EmbeddingCounts{}, fmt.Errorf("album embedding counts: %w", err)
 	}
 	counts.Pending = counts.Total - counts.Ready - counts.Failed

@@ -32,6 +32,9 @@ type memoryS3 struct {
 	mu   sync.Mutex
 	data map[string][]byte
 	puts []string
+	// failPresignGet simulates the object store rejecting a signing request,
+	// to exercise the claim handler's cleanup path.
+	failPresignGet bool
 }
 
 func newMemoryS3() *memoryS3 {
@@ -40,6 +43,15 @@ func newMemoryS3() *memoryS3 {
 
 func (m *memoryS3) PresignPut(_ context.Context, key string, _ time.Duration) (string, map[string]string, error) {
 	return "memory://" + key, map[string]string{}, nil
+}
+
+func (m *memoryS3) PresignGet(_ context.Context, key string, _ time.Duration) (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.failPresignGet {
+		return "", errors.New("presign unavailable")
+	}
+	return "memory://" + key, nil
 }
 
 func (m *memoryS3) GetObject(_ context.Context, key string) (io.ReadCloser, string, error) {
@@ -108,6 +120,12 @@ type flowHarness struct {
 }
 
 func newFlowHarness(t *testing.T) *flowHarness {
+	return newFlowHarnessWithToken(t, "")
+}
+
+// newFlowHarnessWithToken builds the standard harness with a worker token set,
+// so tests can exercise the worker auth path.
+func newFlowHarnessWithToken(t *testing.T, workerToken string) *flowHarness {
 	t.Helper()
 
 	cat, err := catalog.Open(filepath.Join(t.TempDir(), "catalog.db"))
@@ -135,7 +153,7 @@ func newFlowHarness(t *testing.T) *flowHarness {
 	pipelineService.Start(context.Background())
 
 	return &flowHarness{
-		router:   New(albumService, feed.NewService(albumService), imageService, recommendService).Router(),
+		router:   New(albumService, feed.NewService(albumService), imageService, recommendService, workerToken).Router(),
 		albums:   albumService,
 		s3:       s3,
 		catalog:  cat,
@@ -297,8 +315,12 @@ func TestUploadFinalizeServeFlow(t *testing.T) {
 		t.Fatalf("unexpected dimensions: %+v", album.Photos[0])
 	}
 
-	// Images are served from content-addressed blobs.
-	imgRec := harness.do(t, http.MethodGet, "/api/image/"+albumID+"/0", nil)
+	// Images are served from content-addressed blobs, keyed by hash.
+	firstPhoto, err := harness.catalog.PhotoAt(context.Background(), albumID, 0)
+	if err != nil {
+		t.Fatalf("photo at 0: %v", err)
+	}
+	imgRec := harness.do(t, http.MethodGet, "/api/image/"+firstPhoto.Hash, nil)
 	if imgRec.Code != http.StatusOK {
 		t.Fatalf("get image status=%d body=%s", imgRec.Code, imgRec.Body.String())
 	}
@@ -331,8 +353,10 @@ func TestUploadFinalizeServeFlow(t *testing.T) {
 	if searchRec.Code != http.StatusOK || !bytes.Contains(searchRec.Body.Bytes(), []byte(albumID)) {
 		t.Fatalf("search did not return the album: %d %s", searchRec.Code, searchRec.Body.String())
 	}
-	if !bytes.Contains(searchRec.Body.Bytes(), []byte(`"cover":{"i":0,"w":4,"h":2,"ratio":2}`)) {
-		t.Fatalf("search response missing cover: %s", searchRec.Body.String())
+	// The cover carries the blob hash now, so the client can build image URLs
+	// without an album lookup.
+	if !bytes.Contains(searchRec.Body.Bytes(), []byte(`"cover":{"i":0,"hash":"`)) {
+		t.Fatalf("search response missing cover hash: %s", searchRec.Body.String())
 	}
 	feedRec := harness.do(t, http.MethodGet, "/api/feed?limit=10", nil)
 	if feedRec.Code != http.StatusOK || !bytes.Contains(feedRec.Body.Bytes(), []byte(albumID)) {

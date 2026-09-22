@@ -36,6 +36,11 @@ func Run(ctx context.Context) error {
 		"viewer: config loaded on port=%d catalog=%s s3_prefix=%s",
 		cfg.Port, cfg.DBPath(), cfg.DescribePrefix(),
 	)
+	if cfg.WorkerToken != "" {
+		log.Printf("viewer: embedding worker API requires a bearer token")
+	} else {
+		log.Printf("viewer: embedding worker API is UNAUTHENTICATED (set EMBEDDING_WORKER_TOKEN to protect it)")
+	}
 
 	// The store comes up before the catalog: the bucket holds a snapshot of
 	// the catalog, and a newer one replaces the local database file before
@@ -87,7 +92,7 @@ func Run(ctx context.Context) error {
 	feedService := feed.NewService(albumService)
 	pipelineService.Start(ctx)
 
-	h := httpapi.New(albumService, feedService, imageService, recommendService).Router()
+	h := httpapi.New(albumService, feedService, imageService, recommendService, cfg.WorkerToken).Router()
 	srv := &http.Server{
 		Addr:              fmt.Sprintf(":%d", cfg.Port),
 		Handler:           h,

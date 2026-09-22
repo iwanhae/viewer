@@ -3,32 +3,33 @@ package images
 import (
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
 	"image"
 	"image/jpeg"
 	"io"
 	"strings"
+	"time"
 
-	_ "image/gif"  // register the GIF decoder for image.Decode
-	_ "image/png"  // register the PNG decoder for image.Decode
+	_ "image/gif" // register the GIF decoder for image.Decode
+	_ "image/png" // register the PNG decoder for image.Decode
 	_ "golang.org/x/image/webp" // register the WebP decoder for image.Decode
 
 	"golang.org/x/image/draw"
 
-	"viewer/internal/albums"
 	"viewer/internal/catalog"
 	"viewer/internal/pipeline"
 	"viewer/internal/storage"
 )
 
-// blobStore is the S3 surface needed to read image blobs.
+// blobStore is the S3 surface needed to read image blobs and to hand their
+// download URLs to external workers.
 type blobStore interface {
 	GetObject(ctx context.Context, key string) (io.ReadCloser, string, error)
+	PresignGet(ctx context.Context, key string, ttl time.Duration) (string, error)
 }
 
-// Service resolves a (album, index) photo reference to the raw image bytes
-// stored in S3 under its content hash.
+// Service resolves content hashes to the raw image bytes stored in S3 under
+// "blobs/<hash>".
 type Service struct {
 	catalog *catalog.Store
 	store   blobStore
@@ -64,33 +65,6 @@ func NewService(cat *catalog.Store, store blobStore) *Service {
 	}
 }
 
-// OpenImage returns the image at the given index within an album, fetched from
-// S3 for this request.
-func (s *Service) OpenImage(ctx context.Context, albumID string, idx int) (*ImageStream, error) {
-	if strings.TrimSpace(albumID) == "" {
-		return nil, fmt.Errorf("album id is required")
-	}
-	if idx < 0 {
-		return nil, fmt.Errorf("%w: %d", ErrPhotoIndexOutOfRange, idx)
-	}
-
-	if _, err := s.catalog.GetAlbum(ctx, albumID); err != nil {
-		if errors.Is(err, catalog.ErrAlbumNotFound) {
-			return nil, fmt.Errorf("%w: %s", albums.ErrAlbumNotFound, albumID)
-		}
-		return nil, err
-	}
-
-	photo, err := s.catalog.PhotoAt(ctx, albumID, idx)
-	if err != nil {
-		if errors.Is(err, catalog.ErrPhotoNotFound) {
-			return nil, fmt.Errorf("%w: %d", ErrPhotoIndexOutOfRange, idx)
-		}
-		return nil, err
-	}
-	return s.openImageByHash(ctx, photo.Hash)
-}
-
 // WidthLadder lists the scaled widths the image endpoint accepts. The ladder
 // is deliberately short: every entry is a compile-time choice, not config.
 func WidthLadder() []int {
@@ -107,38 +81,32 @@ func IsSupportedWidth(w int) bool {
 	return false
 }
 
-// OpenImageScaled returns the image at the given index scaled to fit within
-// width, preserving aspect ratio. Images already no wider than the request are
-// served with their original bytes; anything larger becomes a JPEG so the
-// scaled response stays small. The content hash doubles as the response
-// validator: scaled variants append their width to the blob hash.
-func (s *Service) OpenImageScaled(ctx context.Context, albumID string, idx, width int) (*ImageStream, error) {
+// OpenImageByHash fetches a content-addressed blob from S3 into memory and
+// wraps it in a seekable reader.
+func (s *Service) OpenImageByHash(ctx context.Context, hash string) (*ImageStream, error) {
+	data, contentType, err := s.fetchBlob(ctx, hash)
+	if err != nil {
+		return nil, err
+	}
+	return &ImageStream{
+		Content:     bytes.NewReader(data),
+		SizeBytes:   int64(len(data)),
+		ContentType: contentType,
+		Hash:        hash,
+	}, nil
+}
+
+// OpenImageByHashScaled returns a blob scaled to fit within width, preserving
+// aspect ratio. Images already no wider than the request are served with their
+// original bytes; anything larger becomes a JPEG so the scaled response stays
+// small. The content hash doubles as the response validator: scaled variants
+// append their width to the blob hash.
+func (s *Service) OpenImageByHashScaled(ctx context.Context, hash string, width int) (*ImageStream, error) {
 	if !IsSupportedWidth(width) {
 		return nil, fmt.Errorf("%w: %d", ErrUnsupportedWidth, width)
 	}
-	if strings.TrimSpace(albumID) == "" {
-		return nil, fmt.Errorf("album id is required")
-	}
-	if idx < 0 {
-		return nil, fmt.Errorf("%w: %d", ErrPhotoIndexOutOfRange, idx)
-	}
 
-	if _, err := s.catalog.GetAlbum(ctx, albumID); err != nil {
-		if errors.Is(err, catalog.ErrAlbumNotFound) {
-			return nil, fmt.Errorf("%w: %s", albums.ErrAlbumNotFound, albumID)
-		}
-		return nil, err
-	}
-
-	photo, err := s.catalog.PhotoAt(ctx, albumID, idx)
-	if err != nil {
-		if errors.Is(err, catalog.ErrPhotoNotFound) {
-			return nil, fmt.Errorf("%w: %d", ErrPhotoIndexOutOfRange, idx)
-		}
-		return nil, err
-	}
-
-	data, contentType, err := s.fetchBlob(ctx, photo.Hash)
+	data, contentType, err := s.fetchBlob(ctx, hash)
 	if err != nil {
 		return nil, err
 	}
@@ -146,14 +114,14 @@ func (s *Service) OpenImageScaled(ctx context.Context, albumID string, idx, widt
 	// with its own content type and hash.
 	config, _, err := image.DecodeConfig(bytes.NewReader(data))
 	if err != nil {
-		return nil, fmt.Errorf("probe image %s: %w", photo.Hash, err)
+		return nil, fmt.Errorf("probe image %s: %w", hash, err)
 	}
 	if config.Width <= width {
 		return &ImageStream{
 			Content:     bytes.NewReader(data),
 			SizeBytes:   int64(len(data)),
 			ContentType: contentType,
-			Hash:        photo.Hash,
+			Hash:        hash,
 		}, nil
 	}
 	encoded, err := encodeScaledJPEG(data, width)
@@ -164,7 +132,7 @@ func (s *Service) OpenImageScaled(ctx context.Context, albumID string, idx, widt
 		Content:     bytes.NewReader(encoded),
 		SizeBytes:   int64(len(encoded)),
 		ContentType: "image/jpeg",
-		Hash:        fmt.Sprintf("%s:w%d", photo.Hash, width),
+		Hash:        fmt.Sprintf("%s:w%d", hash, width),
 	}, nil
 }
 
@@ -199,38 +167,32 @@ func (s *Service) GetImageByHash(ctx context.Context, hash string) (ImageResult,
 	return ImageResult{Bytes: data, ContentType: contentType}, nil
 }
 
-// openImageByHash fetches a content-addressed blob from S3 into memory and
-// wraps it in a seekable reader.
-func (s *Service) openImageByHash(ctx context.Context, hash string) (*ImageStream, error) {
-	data, contentType, err := s.fetchBlob(ctx, hash)
-	if err != nil {
-		return nil, err
+// PresignBlobURL returns a short-lived URL that downloads the blob straight
+// from the bucket, so external workers can fetch image bytes without this
+// process proxying them.
+func (s *Service) PresignBlobURL(ctx context.Context, hash string, ttl time.Duration) (string, error) {
+	hash = strings.TrimSpace(hash)
+	if hash == "" {
+		return "", fmt.Errorf("blob hash is required")
 	}
-	return &ImageStream{
-		Content:     bytes.NewReader(data),
-		SizeBytes:   int64(len(data)),
-		ContentType: contentType,
-		Hash:        hash,
-	}, nil
+	url, err := s.store.PresignGet(ctx, pipeline.BlobKey(hash), ttl)
+	if err != nil {
+		return "", fmt.Errorf("presign blob %s: %w", hash, err)
+	}
+	return url, nil
 }
 
-// fetchBlob downloads a blob from S3 and decides its content type: the type
-// recorded in the catalog wins, and the type advertised by S3 is the fallback.
+// fetchBlob downloads a blob from S3 and decides its content type. S3 is the
+// source of truth for existence and, because extraction always uploads with a
+// real content type, usually for the type too; the catalog is consulted only
+// when S3 advertises nothing useful.
 func (s *Service) fetchBlob(ctx context.Context, hash string) ([]byte, string, error) {
 	hash = strings.TrimSpace(hash)
 	if hash == "" {
 		return nil, "", fmt.Errorf("blob hash is required")
 	}
 
-	blob, err := s.catalog.GetBlob(ctx, hash)
-	if err != nil {
-		if errors.Is(err, catalog.ErrBlobNotFound) {
-			return nil, "", fmt.Errorf("%w: %s", ErrImageEntryNotFound, hash)
-		}
-		return nil, "", err
-	}
-
-	body, remoteContentType, err := s.store.GetObject(ctx, pipeline.BlobKey(hash))
+	body, contentType, err := s.store.GetObject(ctx, pipeline.BlobKey(hash))
 	if err != nil {
 		if storage.IsNotFound(err) {
 			return nil, "", fmt.Errorf("%w: %s", ErrImageEntryNotFound, hash)
@@ -246,9 +208,13 @@ func (s *Service) fetchBlob(ctx context.Context, hash string) ([]byte, string, e
 		return nil, "", fmt.Errorf("close blob %s: %w", hash, closeErr)
 	}
 
-	contentType := contentTypeOrFallback(blob.ContentType)
+	contentType = contentTypeOrFallback(contentType)
 	if contentType == "application/octet-stream" {
-		contentType = contentTypeOrFallback(remoteContentType)
+		// Missing S3 metadata: recover the recorded type, but a blob the
+		// catalog does not know is still servable — the bytes exist.
+		if blob, err := s.catalog.GetBlob(ctx, hash); err == nil {
+			contentType = contentTypeOrFallback(blob.ContentType)
+		}
 	}
 	return data, contentType, nil
 }

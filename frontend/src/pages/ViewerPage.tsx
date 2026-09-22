@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
+import { imageByHashUrl } from '../api/client'
 import { useAlbum } from '../hooks/useAlbum'
 import {
   ALBUM_PAGE_SIZE,
@@ -187,7 +188,7 @@ export function ViewerPage() {
             aria-current={photo.i === anchorVisibleIndex ? 'true' : undefined}
           >
             <img
-              src={`/api/image/${album.albumId}/${photo.i}`}
+              src={imageByHashUrl(photo.hash)}
               alt=""
               loading="lazy"
               style={{ aspectRatio: `${photo.w} / ${photo.h}` }}

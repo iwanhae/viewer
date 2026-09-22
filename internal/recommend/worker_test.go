@@ -35,6 +35,10 @@ func (b *blobStoreStub) GetObject(_ context.Context, key string) (io.ReadCloser,
 	return io.NopCloser(bytes.NewReader(data)), "image/png", nil
 }
 
+func (b *blobStoreStub) PresignGet(_ context.Context, key string, _ time.Duration) (string, error) {
+	return "memory://" + key, nil
+}
+
 // logCapture collects everything written to the standard logger while it is
 // installed. The embedding progress is a log-first feature, so this is the only
 // way to assert on it.

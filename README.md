@@ -60,7 +60,7 @@ is what makes a wiped state volume recoverable from the bucket alone.
 ## Configuration
 
 The viewer is always deployed as the Docker image, so the whole configuration is
-eight environment variables:
+nine environment variables:
 
 - `S3_ENDPOINT`, `S3_BUCKET`, `S3_ACCESS_KEY`, `S3_SECRET_KEY` — required.
 - `S3_PREFIX` — optional key prefix, so several deployments can share one bucket
@@ -70,6 +70,10 @@ eight environment variables:
 - `STATE_DIR` — absolute directory holding the SQLite catalog (default
   `/var/lib/viewer`, the volume the image declares).
 - `PORT` — the port the container listens on (default `8080`).
+- `EMBEDDING_WORKER_TOKEN` — optional shared bearer token the external embedding
+  worker API requires (see "External embedding workers" below; default empty,
+  which turns that check off and is only sensible on a trusted network; a value
+  that is set but blank is rejected at startup).
 
 By default the bucket is the first path segment of the request rather than a
 subdomain — `https://host/bucket/key` instead of `https://bucket.host/key` —
@@ -132,7 +136,10 @@ deferred (the model had not loaded) stays in the `pending` state, and the
 background embedding workers fill it in on a later run once a checkpoint is
 available. Those workers only start when the checkpoint loaded, so a server
 without a model never computes embeddings but still answers recommendation
-requests from the embeddings the catalog already holds. Recommendation responses
+requests from the embeddings the catalog already holds. The same
+claim/write-back path is also open to external embedding workers, so a fleet of
+GPU boxes can drain a large backlog alongside the built-in one (see "External
+embedding workers" below). Recommendation responses
 are cross-album only: photos from the same album as the query are excluded from
 results. If no cross-album neighbors exist for an embedded query photo,
 recommendations return an empty `items` list.
@@ -151,8 +158,12 @@ stages are reported:
   left.
 
 ```json
-{"enabled":true,"active":true,"total":300,"ready":181,"failed":2,"pending":117,"ratio":0.603333}
+{"enabled":true,"active":true,"total":300,"ready":181,"failed":2,"pending":117,"processing":8,"ratio":0.603333}
 ```
+
+`processing` is the subset of `pending` whose lease a worker currently holds —
+it is observability for the worker fleet, and the progress contract only ever
+promised `pending`, which keeps counting in-flight blobs.
 
 `enabled` is false when no checkpoint could be loaded - the fetch failed, or
 the files are missing. Nothing is embedding then and nothing ever will be, so
@@ -162,6 +173,62 @@ the cold-start download window `enabled` is already true while nothing is
 active yet: the workers come up when the checkpoint finishes loading. `failed` images are terminal — the retry worker skips them — so
 `ratio` reaches 1 only when nothing is pending, and a failure is visible as
 `ready + failed == total` instead of a bar that never fills.
+
+### External embedding workers
+
+The built-in worker is a single goroutine, and a first import of tens of
+millions of images is more than one process can chew through. The same
+claim/write-back path it uses is therefore exposed as a small API, so external
+workers can drain the backlog alongside it — and a dead worker cannot strand
+blobs, because leases expire:
+
+1. `POST /api/embedding/claim` with `{"limit":256}` leases a batch of pending
+   blobs:
+
+   ```json
+   {"embeddingDim":768,"leaseUntil":"2026-01-01T00:10:00Z","claimed":[{"hash":"<sha256>","sizeBytes":12345,"contentType":"image/jpeg","blobKey":"blobs/<sha256>","getUrl":"https://…"}]}
+   ```
+
+   `getUrl` is a presigned download valid for the 15 minute presign TTL;
+   workers that hold their own object-store credentials can ignore it and read
+   `blobKey` directly. The limit defaults to 64 and caps at 1024; an empty
+   `claimed` list means there is nothing to do. The endpoint answers even while
+   the server's own checkpoint is still loading — or without one at all — so a
+   backfill never waits on the in-process model.
+2. Embed the images externally. The vector length must equal `embeddingDim`
+   (768 for siglip2-base), and every component must be finite.
+3. `POST /api/embedding/results` writes a batch back in one request and one
+   transaction:
+
+   ```json
+   {"results":[{"hash":"<sha256>","status":"ready","vectorB64":"<base64 little-endian float32>"},{"hash":"<sha256>","status":"failed","error":"decode failed"}]}
+   ```
+
+   The response is
+   `{"updated":2,"rejected":[{"hash":"…","reason":"wrong_dim"}]}`, with one
+   rejection per refused item: `bad_base64`, `wrong_dim`, `bad_vector` (NaN,
+   Inf, or bytes that do not frame whole float32 values), `unknown_hash`,
+   `not_claimed`, `invalid_status` or `invalid_hash` (blank). Rejections are
+   final, not retryable — fix the payload or move on, never loop on one. A
+   result only ever lands on a blob still in the `processing` state, so a late
+   result can never overwrite an existing embedding, and nothing reported can
+   touch a blob nobody claimed. One request carries at most 1024 results; a
+   larger batch is refused whole with a 400, so split it.
+4. A batch that outgrows the 10 minute lease calls `POST /api/embedding/renew`
+   with `{"hashes":[…]}`. The response is
+   `{"leaseUntil":"…","renewed":["…"]}`, and `renewed` lists the hashes whose
+   lease actually moved: anything missing expired and was taken by another
+   worker (or already finished), so stop working on it — its write-back would
+   be rejected as `not_claimed`.
+
+A blob leaves `pending` only through a claim, so the built-in worker and an
+external fleet can run at once without double-embedding: whatever claims first
+wins, and the other sees it in neither of its next batches. Set
+`EMBEDDING_WORKER_TOKEN` to require `Authorization: Bearer <token>` on all
+three endpoints; the rest of the API is unaffected. Startup refuses a
+set-but-blank value — an operator who set something meant to protect the API —
+and logs which way the check resolved, so an open worker API is always visible
+in the log rather than silent.
 
 Docker:
 - `docker build .` produces one image: the Go viewer and the frontend assets.
@@ -235,13 +302,13 @@ difference below `1e-4`, cosine above `0.9995`). The test is skipped unless
 - Startup warmup loads the SQLite catalog into the recommendation index and
   logs `catalog warmup started` / `catalog warmup finished duration=<d>`; the
   upload scan and then the embedding workers start once it finishes.
-- `/metrics` exposes `viewer_embedding_images_total`, `viewer_embedding_images_ready`, `viewer_embedding_images_failed`, `viewer_embedding_images_pending` and `viewer_embedding_progress_ratio`, computed from the blob embedding statuses in the SQLite catalog.
+- `/metrics` exposes `viewer_embedding_images_total`, `viewer_embedding_images_ready`, `viewer_embedding_images_failed`, `viewer_embedding_images_pending`, `viewer_embedding_images_processing` and `viewer_embedding_progress_ratio`, computed from the blob embedding statuses in the SQLite catalog.
 - Requests that end in a 5xx are logged with the method, path, raw query, request ID (Chi request ID middleware), remote address and the internal error message; the JSON error body carries the code and message.
 - Panics are logged with stack traces before the 500 response is returned.
 
 ## Known gaps
-- The wall still serves original-resolution images. Scaled variants exist on the image endpoint for the places that need them — `GET /api/image/{albumId}/{index}?w=<320|640|1024>` resamples the blob to that width as a JPEG (an original already no wider than the request passes through untouched, and the scaled width joins the blob hash in the ETag) — but the wall does not use it yet, so a wall of many large photos still moves a lot of bytes.
-- `GET /api/albums/search` matches the query anywhere in the lowercased original filename (not just as a prefix) and each result carries a `cover` — the photo at index 0 with its dimensions — so the Find Albums page can render cover cards at `w=640` without a second request per album.
+- The wall still serves original-resolution images. Scaled variants exist on the image endpoint for the places that need them — `GET /api/image/{hash}?w=<320|640|1024>` resamples the blob to that width as a JPEG (an original already no wider than the request passes through untouched, and the scaled width joins the blob hash in the ETag) — but the wall does not use it yet, so a wall of many large photos still moves a lot of bytes. The endpoint is keyed by the blob hash alone: no album id, no catalog lookup, and the response carries `Cache-Control: public, max-age=86400, immutable` with the hash as the ETag, so repeat views are settled by the browser.
+- `GET /api/albums/search` matches the query anywhere in the lowercased original filename (not just as a prefix) and each result carries a `cover` — the photo at index 0 with its blob hash and dimensions — so the Find Albums page can render cover cards straight from `GET /api/image/{hash}?w=640` without a second request per album.
 - The upload scan adopts zips but never advertises itself: files dropped into the bucket from outside appear in the library without ever passing through the upload page. It also adopts a zip mid-library the moment it appears, with no way to park one aside.
 - Losing the state volume no longer loses the library — the bucket holds `backups/viewer.db` and startup restores it — but the backup lands only when the extraction queue drains, so anything uploaded since the last drain exists in exactly two places: the bucket's blobs and the local catalog. Backups of a deployment that never drains wait for its first drain.
 

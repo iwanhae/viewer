@@ -86,7 +86,7 @@ func TestJSONBodyRejectsTrailingContent(t *testing.T) {
 }
 
 func TestFeedEndpointRejectsInvalidMode(t *testing.T) {
-	router := New(nil, testFeedService(), nil, nil).Router()
+	router := New(nil, testFeedService(), nil, nil, "").Router()
 	req := httptest.NewRequest(http.MethodGet, "/api/feed?mode=invalid", nil)
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
@@ -100,7 +100,7 @@ func TestFeedEndpointRejectsInvalidMode(t *testing.T) {
 }
 
 func TestFeedEndpointSupportsLatestMode(t *testing.T) {
-	router := New(nil, testFeedService(), nil, nil).Router()
+	router := New(nil, testFeedService(), nil, nil, "").Router()
 	req := httptest.NewRequest(http.MethodGet, "/api/feed?limit=25&mode=latest", nil)
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
@@ -114,7 +114,7 @@ func TestFeedEndpointSupportsLatestMode(t *testing.T) {
 }
 
 func TestFeedEndpointLatestSupportsAfterCursor(t *testing.T) {
-	router := New(nil, testFeedService(), nil, nil).Router()
+	router := New(nil, testFeedService(), nil, nil, "").Router()
 
 	firstReq := httptest.NewRequest(http.MethodGet, "/api/feed?limit=1&mode=latest", nil)
 	firstRec := httptest.NewRecorder()
@@ -196,7 +196,7 @@ func TestEmbeddingEndpointReportsCatalogCoverage(t *testing.T) {
 
 	// The provider is nil, so the counts are real but nothing can ever move
 	// them: a client has to be told that instead of waiting forever.
-	router := New(nil, nil, nil, recommend.NewService(cat, nil, nil)).Router()
+	router := New(nil, nil, nil, recommend.NewService(cat, nil, nil), "").Router()
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/embedding", nil))
 
@@ -219,7 +219,7 @@ func TestEmbeddingEndpointReportsCatalogCoverage(t *testing.T) {
 }
 
 func TestEmbeddingEndpointWithoutRecommendService(t *testing.T) {
-	router := New(nil, nil, nil, nil).Router()
+	router := New(nil, nil, nil, nil, "").Router()
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/embedding", nil))
 
@@ -241,7 +241,7 @@ func TestMetricsEndpointPrometheusPayload(t *testing.T) {
 
 	recommendService := recommend.NewService(cat, nil, nil)
 
-	router := New(nil, nil, nil, recommendService).Router()
+	router := New(nil, nil, nil, recommendService, "").Router()
 	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
@@ -260,6 +260,7 @@ func TestMetricsEndpointPrometheusPayload(t *testing.T) {
 		"viewer_embedding_images_ready",
 		"viewer_embedding_images_failed",
 		"viewer_embedding_images_pending",
+		"viewer_embedding_images_processing",
 		"viewer_embedding_progress_ratio",
 	}
 	for _, metricName := range required {
@@ -272,11 +273,12 @@ func TestMetricsEndpointPrometheusPayload(t *testing.T) {
 	mustMetricIntValue(t, body, "viewer_embedding_images_ready", 1)
 	mustMetricIntValue(t, body, "viewer_embedding_images_failed", 1)
 	mustMetricIntValue(t, body, "viewer_embedding_images_pending", 1)
+	mustMetricIntValue(t, body, "viewer_embedding_images_processing", 0)
 	mustMetricFloatValue(t, body, "viewer_embedding_progress_ratio", 1.0/3.0, 1e-6)
 }
 
 func TestMetricsEndpointWithNilRecommendService(t *testing.T) {
-	router := New(nil, nil, nil, nil).Router()
+	router := New(nil, nil, nil, nil, "").Router()
 	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
@@ -294,7 +296,7 @@ func TestMetricsEndpointWithNilRecommendService(t *testing.T) {
 }
 
 func TestRecommendationsEndpointWithNilRecommendService(t *testing.T) {
-	router := New(nil, nil, nil, nil).Router()
+	router := New(nil, nil, nil, nil, "").Router()
 	req := httptest.NewRequest(http.MethodGet, "/api/recommendations/album-a/0?limit=12", nil)
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)

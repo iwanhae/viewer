@@ -84,7 +84,11 @@ func TestUploadDropZoneAdoptsZip(t *testing.T) {
 	if albumRec.Code != http.StatusOK || !bytes.Contains(albumRec.Body.Bytes(), []byte("only.png")) {
 		t.Fatalf("get album status=%d body=%s", albumRec.Code, albumRec.Body.String())
 	}
-	imgRec := harness.do(t, http.MethodGet, "/api/image/"+album.ID+"/0", nil)
+	photo, err := harness.catalog.PhotoAt(context.Background(), album.ID, 0)
+	if err != nil {
+		t.Fatalf("photo at 0: %v", err)
+	}
+	imgRec := harness.do(t, http.MethodGet, "/api/image/"+photo.Hash, nil)
 	if imgRec.Code != http.StatusOK || !bytes.Equal(imgRec.Body.Bytes(), image) {
 		t.Fatalf("get image status=%d (want the dropped zip's bytes)", imgRec.Code)
 	}
