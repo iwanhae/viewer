@@ -171,7 +171,7 @@ func TestPipelineStoresEveryObjectUnderKeyPrefix(t *testing.T) {
 		OnIdle:  finalizer.Run,
 	})
 	svc.Start(ctx)
-	if err := svc.Enqueue("album-a"); err != nil {
+	if err := svc.Enqueue(ctx, "album-a"); err != nil {
 		t.Fatalf("enqueue album: %v", err)
 	}
 

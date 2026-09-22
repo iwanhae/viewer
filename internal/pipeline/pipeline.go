@@ -42,6 +42,12 @@ import (
 // ErrNoValidImages is returned when a zip contains no decodable image entries.
 var ErrNoValidImages = errors.New("no valid images in zip")
 
+// ErrStopped is returned by Enqueue once the worker has stopped, so a producer
+// that raced a shutdown learns its album was not scheduled. It is not a failure
+// of the album: the row is left QUEUED and the upload scan queues it again on
+// the next process.
+var ErrStopped = errors.New("ingest worker is stopped")
+
 var allowedContentTypes = map[string]string{
 	".jpg":  "image/jpeg",
 	".jpeg": "image/jpeg",
@@ -49,7 +55,7 @@ var allowedContentTypes = map[string]string{
 	".webp": "image/webp",
 }
 
-const defaultQueueSize = 1024
+const defaultQueueSize = 4096
 
 // leftoverZipPattern names a downloaded staged zip in TempDir. It is shared by
 // the download and by the startup sweep so the two cannot drift apart.
@@ -86,6 +92,11 @@ type Service struct {
 
 	queue     chan string
 	startOnce sync.Once
+	stopOnce  sync.Once
+
+	// stopped is closed when the worker returns, so a producer blocked on a full
+	// queue cannot outlive the service.
+	stopped chan struct{}
 
 	mu       sync.Mutex
 	inFlight map[string]struct{}
@@ -103,6 +114,7 @@ func NewService(cat *catalog.Store, store Store, opts Options) *Service {
 		store:    store,
 		opts:     opts,
 		queue:    make(chan string, defaultQueueSize),
+		stopped:  make(chan struct{}),
 		inFlight: make(map[string]struct{}),
 	}
 }
@@ -148,8 +160,17 @@ func (s *Service) Start(ctx context.Context) {
 	}
 	s.startOnce.Do(func() {
 		s.removeLeftoverZips()
-		go s.runWorker(ctx)
+		go func() {
+			defer s.markStopped()
+			s.runWorker(ctx)
+		}()
 	})
+}
+
+// markStopped closes the shutdown signal exactly once, when the worker returns
+// because its context ended.
+func (s *Service) markStopped() {
+	s.stopOnce.Do(func() { close(s.stopped) })
 }
 
 // removeLeftoverZips deletes the staged-zip downloads a crashed run left
@@ -196,12 +217,23 @@ func (s *Service) runWorker(ctx context.Context) {
 	}
 }
 
-// Enqueue schedules an album for extraction. Duplicate enqueues for an album
-// that is already queued or processing are ignored.
-func (s *Service) Enqueue(albumID string) error {
+// Enqueue schedules an album for extraction, waiting for room when the queue is
+// full. Extraction is one album at a time, so a full queue is backpressure and
+// not an error: the caller blocks until a slot frees, ctx ends, or the worker
+// stops. Dropping the album instead would make a transient backlog look like a
+// permanent failure to every producer - the upload scan logs it and the
+// finalize endpoint marks the album FAILED - even though the staged zip is
+// still in the bucket and nothing is wrong with it.
+//
+// Duplicate enqueues for an album that is already queued or processing are
+// ignored.
+func (s *Service) Enqueue(ctx context.Context, albumID string) error {
 	albumID = strings.TrimSpace(albumID)
 	if albumID == "" {
 		return fmt.Errorf("album id is required")
+	}
+	if ctx == nil {
+		ctx = context.Background()
 	}
 	if !s.claim(albumID) {
 		return nil
@@ -209,9 +241,12 @@ func (s *Service) Enqueue(albumID string) error {
 	select {
 	case s.queue <- albumID:
 		return nil
-	default:
+	case <-ctx.Done():
 		s.release(albumID)
-		return fmt.Errorf("ingest queue is full")
+		return ctx.Err()
+	case <-s.stopped:
+		s.release(albumID)
+		return ErrStopped
 	}
 }
 

@@ -172,6 +172,16 @@ A blob that is `failed` is terminal — `ListBlobsAwaitingEmbedding` selects onl
   processes the queue and reads one entry into memory before moving on, so the
   working set is bounded by the largest entry rather than by the archive or the
   queue depth.
+- **A full extraction queue is backpressure, not an error.** `Enqueue` blocks
+  until a slot frees, its context ends, or the worker stops; it never drops an
+  album because the deployment is busy. A non-blocking send turned a large batch
+  of staged zips into `ingest queue is full` scan errors and made the finalize
+  endpoint mark a healthy album `FAILED`, even though nothing was wrong with its
+  zip. The 4096-slot channel is now only a buffer that keeps a producer off the
+  worker's back, so its size is no longer a limit on how much can be ingested at
+  once. A wait cut short by a cancelled caller or a shutdown leaves the album
+  `QUEUED` - never `FAILED` - which is exactly the state the upload scan
+  requeues on its next pass.
 - **Photos carry width, height and ratio directly.** They are denormalized so
   album reads never need to join `blobs`.
 - **Embeddings live on the blob row; the vec0 table is only an index.**

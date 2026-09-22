@@ -44,7 +44,7 @@ type fakeEnqueuer struct {
 	err      error
 }
 
-func (f *fakeEnqueuer) Enqueue(albumID string) error {
+func (f *fakeEnqueuer) Enqueue(_ context.Context, albumID string) error {
 	if f.err != nil {
 		return f.err
 	}

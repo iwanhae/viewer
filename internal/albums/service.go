@@ -25,9 +25,11 @@ type FinalizeState struct {
 	UpdatedAt  string              `json:"updatedAt"`
 }
 
-// Enqueuer schedules an album for background extraction.
+// Enqueuer schedules an album for background extraction. Enqueue blocks while
+// the worker's queue is full, so it returns an error only when ctx ended or the
+// worker stopped - never because the deployment is merely busy.
 type Enqueuer interface {
-	Enqueue(albumID string) error
+	Enqueue(ctx context.Context, albumID string) error
 }
 
 type albumStore interface {
@@ -126,7 +128,7 @@ func (s *Service) RegisterStagedUpload(ctx context.Context, albumID string, file
 	if s.enqueuer == nil {
 		return fmt.Errorf("finalize worker is not initialized")
 	}
-	return s.enqueuer.Enqueue(albumID)
+	return s.enqueuer.Enqueue(ctx, albumID)
 }
 
 // RequestFinalize schedules extraction for an uploaded zip.
@@ -173,7 +175,17 @@ func (s *Service) RequestFinalize(ctx context.Context, albumID string) (Finalize
 		_ = s.catalog.SetAlbumStatus(context.Background(), albumID, catalog.AlbumStatusFailed, err.Error())
 		return FinalizeState{}, err
 	}
-	if err := s.enqueuer.Enqueue(albumID); err != nil {
+	if err := s.enqueuer.Enqueue(ctx, albumID); err != nil {
+		// A caller that gave up while the worker was busy (cancelled request,
+		// deadline, or a shutdown that stopped the worker) has not failed the
+		// album. It is already QUEUED in the catalog and the upload scan queues
+		// any staged zip that is still waiting, so it must stay QUEUED rather
+		// than become a terminal FAILED a client has to retry by hand.
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, pipeline.ErrStopped) {
+			album.Status = catalog.AlbumStatusQueued
+			album.Error = ""
+			return finalizeStateFromAlbum(album), err
+		}
 		_ = s.catalog.SetAlbumStatus(context.Background(), albumID, catalog.AlbumStatusFailed, err.Error())
 		return FinalizeState{}, err
 	}
@@ -239,16 +251,16 @@ func (s *Service) AlbumForStagedObject(ctx context.Context, sourceKey string) (*
 	return nil, false, err
 }
 
-// EnqueueStaged schedules an album whose staged zip is still waiting. It leaves
-// the album status alone: the pipeline sets PROCESSING when it starts and the
-// terminal status when it finishes, so a scan that finds an album already being
-// extracted cannot leave it looking queued. A duplicate enqueue is ignored by
-// the pipeline.
-func (s *Service) EnqueueStaged(_ context.Context, albumID string) error {
+// EnqueueStaged schedules an album whose staged zip is still waiting, waiting
+// for room while the worker's queue is full. It leaves the album status alone:
+// the pipeline sets PROCESSING when it starts and the terminal status when it
+// finishes, so a scan that finds an album already being extracted cannot leave
+// it looking queued. A duplicate enqueue is ignored by the pipeline.
+func (s *Service) EnqueueStaged(ctx context.Context, albumID string) error {
 	if s == nil || s.enqueuer == nil {
 		return fmt.Errorf("finalize worker is not initialized")
 	}
-	return s.enqueuer.Enqueue(albumID)
+	return s.enqueuer.Enqueue(ctx, albumID)
 }
 
 // GetAlbum returns an album and its photos in the legacy API shape.

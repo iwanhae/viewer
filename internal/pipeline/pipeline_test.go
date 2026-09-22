@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"image"
 	"image/color"
 	"image/png"
@@ -413,14 +414,79 @@ func TestProcessAlbumReplacesPhotosOnReprocess(t *testing.T) {
 
 func TestEnqueueDeduplicatesInFlightAlbums(t *testing.T) {
 	svc := NewService(nil, nil, Options{})
-	if err := svc.Enqueue("album-a"); err != nil {
+	if err := svc.Enqueue(context.Background(), "album-a"); err != nil {
 		t.Fatalf("first enqueue: %v", err)
 	}
-	if err := svc.Enqueue("album-a"); err != nil {
+	if err := svc.Enqueue(context.Background(), "album-a"); err != nil {
 		t.Fatalf("duplicate enqueue should be ignored, got %v", err)
 	}
-	if err := svc.Enqueue(""); err == nil {
+	if err := svc.Enqueue(context.Background(), ""); err == nil {
 		t.Fatalf("expected error for empty album id")
+	}
+}
+
+// TestEnqueueBlocksWhileQueueIsFull pins the backpressure: a producer waits for
+// a slot instead of getting a "queue is full" error, and a wait cut short by
+// its context releases the claim so the album can be enqueued again later.
+func TestEnqueueBlocksWhileQueueIsFull(t *testing.T) {
+	svc := NewService(nil, nil, Options{})
+	for i := 0; i < defaultQueueSize; i++ {
+		if err := svc.Enqueue(context.Background(), fmt.Sprintf("album-%d", i)); err != nil {
+			t.Fatalf("enqueue %d: %v", i, err)
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- svc.Enqueue(ctx, "overflow") }()
+
+	select {
+	case err := <-done:
+		t.Fatalf("enqueue returned while the queue was full: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("enqueue error=%v want context.Canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("enqueue stayed blocked after its context ended")
+	}
+
+	// The cancelled wait dropped the claim, so freeing one slot is enough for
+	// the same album to be accepted.
+	<-svc.queue
+	if err := svc.Enqueue(context.Background(), "overflow"); err != nil {
+		t.Fatalf("enqueue after a slot freed: %v", err)
+	}
+}
+
+// TestEnqueueReturnsStoppedOnceTheWorkerIsGone pins that a producer waiting
+// behind a full queue is released, rather than deadlocked, when the worker
+// stops; the caller can then leave the album QUEUED for the next process.
+func TestEnqueueReturnsStoppedOnceTheWorkerIsGone(t *testing.T) {
+	svc := NewService(nil, nil, Options{TempDir: t.TempDir()})
+	for i := 0; i < defaultQueueSize; i++ {
+		if err := svc.Enqueue(context.Background(), fmt.Sprintf("album-%d", i)); err != nil {
+			t.Fatalf("enqueue %d: %v", i, err)
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	svc.Start(ctx)
+
+	select {
+	case <-svc.stopped:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("worker never stopped")
+	}
+
+	if err := svc.Enqueue(context.Background(), "after-stop"); !errors.Is(err, ErrStopped) {
+		t.Fatalf("enqueue error=%v want ErrStopped", err)
 	}
 }
 
@@ -542,7 +608,7 @@ func TestWorkerSignalsIdleAfterDrain(t *testing.T) {
 	})
 	svc.Start(ctx)
 	for _, id := range []string{"album-a", "album-b", "album-c"} {
-		if err := svc.Enqueue(id); err != nil {
+		if err := svc.Enqueue(ctx, id); err != nil {
 			t.Fatalf("enqueue %s: %v", id, err)
 		}
 	}
@@ -569,7 +635,7 @@ func TestWorkerSignalsIdleAfterDrain(t *testing.T) {
 
 	// Work arriving after the drain: the next completion signals idle again.
 	seedAlbum(t, cat, store, "album-d", "d.zip", buildZip(t, zipEntry{name: "a.png", data: pngBytes(t, 2, 2, 2)}))
-	if err := svc.Enqueue("album-d"); err != nil {
+	if err := svc.Enqueue(ctx, "album-d"); err != nil {
 		t.Fatalf("enqueue album-d: %v", err)
 	}
 	waitForIdle()
