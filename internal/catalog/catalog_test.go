@@ -618,6 +618,40 @@ func TestListReadyAlbumPhotosAndPairs(t *testing.T) {
 	}
 }
 
+func TestListReadyAlbumPhotoCounts(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+
+	if err := store.CreateAlbum(ctx, Album{ID: "album-a", OriginalFilename: "a.zip", Status: AlbumStatusReady, PhotoCount: 2}); err != nil {
+		t.Fatalf("create album: %v", err)
+	}
+	if err := store.CreateAlbum(ctx, Album{ID: "album-b", OriginalFilename: "b.zip", Status: AlbumStatusReady}); err != nil {
+		t.Fatalf("create album: %v", err)
+	}
+	if err := store.CreateAlbum(ctx, Album{ID: "album-pending", OriginalFilename: "p.zip", Status: AlbumStatusQueued, PhotoCount: 3}); err != nil {
+		t.Fatalf("create album: %v", err)
+	}
+	if err := store.UpsertBlob(ctx, Blob{Hash: "hash-a", SizeBytes: 5}); err != nil {
+		t.Fatalf("upsert blob: %v", err)
+	}
+	for i := 0; i < 2; i++ {
+		if err := store.InsertPhoto(ctx, Photo{AlbumID: "album-a", Index: i, Name: "a.png", Hash: "hash-a", Width: 1, Height: 1, Ratio: 1}); err != nil {
+			t.Fatalf("insert photo: %v", err)
+		}
+	}
+
+	counts, err := store.ListReadyAlbumPhotoCounts(ctx)
+	if err != nil {
+		t.Fatalf("list ready album photo counts: %v", err)
+	}
+	if len(counts) != 1 {
+		t.Fatalf("expected only the ready album with photos, got %+v", counts)
+	}
+	if counts[0].AlbumID != "album-a" || counts[0].PhotoCount != 2 {
+		t.Fatalf("unexpected count: %+v", counts[0])
+	}
+}
+
 func TestVectorEncodeDecodeRoundTrip(t *testing.T) {
 	if got := DecodeVector(EncodeVector(nil)); got != nil {
 		t.Fatalf("expected nil for empty vector, got %v", got)

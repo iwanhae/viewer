@@ -9,6 +9,14 @@ type PhotoMeta struct {
 	Ratio float64 `json:"ratio"`
 }
 
+// AlbumPhotoCount identifies a ready album together with its photo count. It
+// is the whole album view the random feed needs: enough to sample an album and
+// a photo index, after which the photo row itself is fetched directly.
+type AlbumPhotoCount struct {
+	AlbumID    string
+	PhotoCount int
+}
+
 type AlbumIndex struct {
 	AlbumID          string      `json:"albumId"`
 	OriginalFilename string      `json:"originalFilename"`

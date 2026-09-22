@@ -1,21 +1,51 @@
 package feed
 
 import (
+	"context"
+	"fmt"
 	"reflect"
 	"testing"
 	"time"
 
+	"viewer/internal/albums"
 	"viewer/internal/models"
 )
 
 type stubAlbumSource struct {
-	albums []*models.AlbumIndex
-	calls  int
+	albums     []*models.AlbumIndex
+	calls      int
+	countCalls int
 }
 
 func (s *stubAlbumSource) AllAlbums() []*models.AlbumIndex {
 	s.calls++
 	return s.albums
+}
+
+func (s *stubAlbumSource) ReadyAlbumPhotoCounts(ctx context.Context) ([]models.AlbumPhotoCount, error) {
+	s.countCalls++
+	counts := make([]models.AlbumPhotoCount, 0, len(s.albums))
+	for _, album := range s.albums {
+		if len(album.Photos) == 0 {
+			continue
+		}
+		counts = append(counts, models.AlbumPhotoCount{AlbumID: album.AlbumID, PhotoCount: len(album.Photos)})
+	}
+	return counts, nil
+}
+
+func (s *stubAlbumSource) PhotoMetaAt(ctx context.Context, albumID string, index int) (*models.PhotoMeta, error) {
+	for _, album := range s.albums {
+		if album.AlbumID != albumID {
+			continue
+		}
+		if index < 0 || index >= len(album.Photos) {
+			return nil, fmt.Errorf("%w: %s:%d", albums.ErrPhotoNotFound, albumID, index)
+		}
+		meta := album.Photos[index]
+		return &meta, nil
+	}
+	return nil, fmt.Errorf("%w: %s", albums.ErrAlbumNotFound, albumID)
 }
 
 func TestBuildUsesSnapshotWithinTTL(t *testing.T) {
@@ -34,22 +64,54 @@ func TestBuildUsesSnapshotWithinTTL(t *testing.T) {
 		},
 	}
 
-	if _, err := svc.Build(2, "1", ModeRandom, ""); err != nil {
+	if _, err := svc.Build(context.Background(), 2, "1", ModeRandom, ""); err != nil {
 		t.Fatalf("build failed: %v", err)
 	}
-	if _, err := svc.Build(2, "1", ModeRandom, ""); err != nil {
+	if _, err := svc.Build(context.Background(), 2, "1", ModeRandom, ""); err != nil {
 		t.Fatalf("build failed: %v", err)
 	}
-	if source.calls != 1 {
-		t.Fatalf("expected one albums scan within ttl, got %d", source.calls)
+	if source.countCalls != 1 {
+		t.Fatalf("expected one photo-count scan within ttl, got %d", source.countCalls)
 	}
 
 	now = now.Add(4 * time.Second)
-	if _, err := svc.Build(2, "1", ModeRandom, ""); err != nil {
+	if _, err := svc.Build(context.Background(), 2, "1", ModeRandom, ""); err != nil {
 		t.Fatalf("build failed: %v", err)
 	}
-	if source.calls != 2 {
-		t.Fatalf("expected snapshot refresh after ttl, got %d scans", source.calls)
+	if source.countCalls != 2 {
+		t.Fatalf("expected snapshot refresh after ttl, got %d scans", source.countCalls)
+	}
+}
+
+func TestBuildRandomSkipsFullAlbumScan(t *testing.T) {
+	source := &stubAlbumSource{
+		albums: []*models.AlbumIndex{
+			{
+				AlbumID: "album-a",
+				Photos: []models.PhotoMeta{
+					{I: 0, W: 100, H: 80, Ratio: 1.25},
+					{I: 1, W: 101, H: 80, Ratio: 1.26},
+				},
+			},
+		},
+	}
+	svc := NewService(nil)
+	svc.albums = source
+	svc.snapshotTTL = 10 * time.Minute
+	svc.now = func() time.Time { return time.Unix(150, 0) }
+
+	resp, err := svc.Build(context.Background(), 20, "42", ModeRandom, "")
+	if err != nil {
+		t.Fatalf("build failed: %v", err)
+	}
+	if len(resp.Items) != 20 {
+		t.Fatalf("items=%d want=20", len(resp.Items))
+	}
+	if source.calls != 0 {
+		t.Fatalf("random feed must not load all album photos, AllAlbums calls=%d", source.calls)
+	}
+	if source.countCalls == 0 {
+		t.Fatalf("random feed should sample from photo counts")
 	}
 }
 
@@ -77,11 +139,11 @@ func TestBuildDeterministicForSeed(t *testing.T) {
 	svc.snapshotTTL = 10 * time.Minute
 	svc.now = func() time.Time { return time.Unix(200, 0) }
 
-	first, err := svc.Build(4, "42", ModeRandom, "")
+	first, err := svc.Build(context.Background(), 4, "42", ModeRandom, "")
 	if err != nil {
 		t.Fatalf("first build failed: %v", err)
 	}
-	again, err := svc.Build(4, "42", ModeRandom, "")
+	again, err := svc.Build(context.Background(), 4, "42", ModeRandom, "")
 	if err != nil {
 		t.Fatalf("second build failed: %v", err)
 	}
@@ -108,11 +170,11 @@ func TestBuildVariesForDifferentSeeds(t *testing.T) {
 	svc.snapshotTTL = 10 * time.Minute
 	svc.now = func() time.Time { return time.Unix(300, 0) }
 
-	first, err := svc.Build(24, "7", ModeRandom, "")
+	first, err := svc.Build(context.Background(), 24, "7", ModeRandom, "")
 	if err != nil {
 		t.Fatalf("build first seed failed: %v", err)
 	}
-	second, err := svc.Build(24, "11", ModeRandom, "")
+	second, err := svc.Build(context.Background(), 24, "11", ModeRandom, "")
 	if err != nil {
 		t.Fatalf("build second seed failed: %v", err)
 	}
@@ -142,7 +204,7 @@ func TestBuildSkipsAlbumsWithoutPhotos(t *testing.T) {
 	svc.snapshotTTL = 10 * time.Minute
 	svc.now = func() time.Time { return time.Unix(400, 0) }
 
-	resp, err := svc.Build(20, "123", ModeRandom, "")
+	resp, err := svc.Build(context.Background(), 20, "123", ModeRandom, "")
 	if err != nil {
 		t.Fatalf("build failed: %v", err)
 	}
@@ -185,7 +247,7 @@ func TestBuildSelectsAlbumBeforePhoto(t *testing.T) {
 	svc.snapshotTTL = 10 * time.Minute
 	svc.now = func() time.Time { return time.Unix(500, 0) }
 
-	resp, err := svc.Build(200, "2026", ModeRandom, "")
+	resp, err := svc.Build(context.Background(), 200, "2026", ModeRandom, "")
 	if err != nil {
 		t.Fatalf("build failed: %v", err)
 	}
@@ -241,7 +303,7 @@ func TestBuildLatestUsesDescendingCreatedAtAndFirstPhoto(t *testing.T) {
 	svc.snapshotTTL = 10 * time.Minute
 	svc.now = func() time.Time { return time.Unix(900, 0) }
 
-	resp, err := svc.Build(10, "ignored", ModeLatest, "")
+	resp, err := svc.Build(context.Background(), 10, "ignored", ModeLatest, "")
 	if err != nil {
 		t.Fatalf("build failed: %v", err)
 	}
@@ -286,7 +348,7 @@ func TestBuildLatestBreaksCreatedAtTiesByAlbumID(t *testing.T) {
 	svc.snapshotTTL = 10 * time.Minute
 	svc.now = func() time.Time { return time.Unix(901, 0) }
 
-	resp, err := svc.Build(2, "ignored", ModeLatest, "")
+	resp, err := svc.Build(context.Background(), 2, "ignored", ModeLatest, "")
 	if err != nil {
 		t.Fatalf("build failed: %v", err)
 	}
@@ -329,7 +391,7 @@ func TestBuildLatestTreatsMalformedCreatedAtAsOldest(t *testing.T) {
 	svc.snapshotTTL = 10 * time.Minute
 	svc.now = func() time.Time { return time.Unix(902, 0) }
 
-	resp, err := svc.Build(3, "ignored", ModeLatest, "")
+	resp, err := svc.Build(context.Background(), 3, "ignored", ModeLatest, "")
 	if err != nil {
 		t.Fatalf("build failed: %v", err)
 	}
@@ -376,7 +438,7 @@ func TestBuildLatestPaginationWithCursors(t *testing.T) {
 	svc.snapshotTTL = 10 * time.Minute
 	svc.now = func() time.Time { return time.Unix(1000, 0) }
 
-	first, err := svc.Build(2, "ignored", ModeLatest, "")
+	first, err := svc.Build(context.Background(), 2, "ignored", ModeLatest, "")
 	if err != nil {
 		t.Fatalf("build failed: %v", err)
 	}
@@ -396,7 +458,7 @@ func TestBuildLatestPaginationWithCursors(t *testing.T) {
 		t.Fatalf("unexpected first page cursors: prev=%q cursor=%q", first.PrevCursor, first.Cursor)
 	}
 
-	second, err := svc.Build(2, "ignored", ModeLatest, first.NextCursor)
+	second, err := svc.Build(context.Background(), 2, "ignored", ModeLatest, first.NextCursor)
 	if err != nil {
 		t.Fatalf("build failed: %v", err)
 	}
@@ -416,7 +478,7 @@ func TestBuildLatestPaginationWithCursors(t *testing.T) {
 		t.Fatalf("second page cursor mismatch: got=%q want=%q", second.Cursor, first.NextCursor)
 	}
 
-	third, err := svc.Build(2, "ignored", ModeLatest, second.NextCursor)
+	third, err := svc.Build(context.Background(), 2, "ignored", ModeLatest, second.NextCursor)
 	if err != nil {
 		t.Fatalf("build failed: %v", err)
 	}
@@ -433,7 +495,7 @@ func TestBuildLatestPaginationWithCursors(t *testing.T) {
 		t.Fatalf("expected prev cursor on third page")
 	}
 
-	backToSecond, err := svc.Build(2, "ignored", ModeLatest, third.PrevCursor)
+	backToSecond, err := svc.Build(context.Background(), 2, "ignored", ModeLatest, third.PrevCursor)
 	if err != nil {
 		t.Fatalf("build failed: %v", err)
 	}
@@ -463,7 +525,7 @@ func TestBuildLatestIgnoresInvalidCursorAndFallsBackToFirstPage(t *testing.T) {
 	svc.snapshotTTL = 10 * time.Minute
 	svc.now = func() time.Time { return time.Unix(1001, 0) }
 
-	resp, err := svc.Build(1, "ignored", ModeLatest, "not-a-real-cursor")
+	resp, err := svc.Build(context.Background(), 1, "ignored", ModeLatest, "not-a-real-cursor")
 	if err != nil {
 		t.Fatalf("build failed: %v", err)
 	}

@@ -303,6 +303,42 @@ func (s *Service) SearchAlbumsByName(ctx context.Context, q string, limit int) (
 	return items, nil
 }
 
+// ReadyAlbumPhotoCounts returns every ready album's id with its photo count,
+// without loading any photo rows.
+func (s *Service) ReadyAlbumPhotoCounts(ctx context.Context) ([]models.AlbumPhotoCount, error) {
+	if s == nil || s.catalog == nil {
+		return []models.AlbumPhotoCount{}, nil
+	}
+	counts, err := s.catalog.ListReadyAlbumPhotoCounts(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]models.AlbumPhotoCount, 0, len(counts))
+	for _, count := range counts {
+		out = append(out, models.AlbumPhotoCount{
+			AlbumID:    count.AlbumID,
+			PhotoCount: count.PhotoCount,
+		})
+	}
+	return out, nil
+}
+
+// PhotoMetaAt returns one photo of an album by index.
+func (s *Service) PhotoMetaAt(ctx context.Context, albumID string, index int) (*models.PhotoMeta, error) {
+	if s == nil || s.catalog == nil {
+		return nil, fmt.Errorf("%w: %s:%d", ErrPhotoNotFound, albumID, index)
+	}
+	photo, err := s.catalog.PhotoAt(ctx, albumID, index)
+	if err != nil {
+		if errors.Is(err, catalog.ErrPhotoNotFound) {
+			return nil, fmt.Errorf("%w: %s:%d", ErrPhotoNotFound, albumID, index)
+		}
+		return nil, err
+	}
+	meta := photoMetaFromRow(*photo)
+	return &meta, nil
+}
+
 // AllAlbums returns every ready album with its photos.
 func (s *Service) AllAlbums() []*models.AlbumIndex {
 	if s == nil || s.catalog == nil {

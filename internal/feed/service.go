@@ -1,8 +1,10 @@
 package feed
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"sort"
@@ -25,7 +27,12 @@ const (
 )
 
 type albumSource interface {
+	// AllAlbums loads every ready album with all of its photo rows. Only the
+	// latest feed needs it; the random feed samples from photo counts and
+	// fetches the handful of sampled photos directly.
 	AllAlbums() []*models.AlbumIndex
+	ReadyAlbumPhotoCounts(ctx context.Context) ([]models.AlbumPhotoCount, error)
+	PhotoMetaAt(ctx context.Context, albumID string, index int) (*models.PhotoMeta, error)
 }
 
 type Service struct {
@@ -34,6 +41,8 @@ type Service struct {
 	mu             sync.RWMutex
 	albumsSnapshot []*models.AlbumIndex
 	albumsAt       time.Time
+	photoCounts    []models.AlbumPhotoCount
+	photoCountsAt  time.Time
 	snapshotTTL    time.Duration
 	now            func() time.Time
 }
@@ -58,6 +67,7 @@ func ParseMode(modeParam string) (Mode, error) {
 }
 
 func (s *Service) Build(
+	ctx context.Context,
 	limit int,
 	seedParam string,
 	mode Mode,
@@ -70,25 +80,49 @@ func (s *Service) Build(
 		limit = 200
 	}
 
+	if mode == "" {
+		mode = ModeRandom
+	}
+	if mode == ModeRandom {
+		return s.buildRandomPage(ctx, limit, seedParam)
+	}
+	if mode != ModeLatest {
+		return models.FeedResponse{}, fmt.Errorf("invalid mode")
+	}
+
 	albumsList := s.snapshotAlbums()
 	if len(albumsList) == 0 {
 		return models.FeedResponse{Items: []models.FeedItem{}}, nil
 	}
+	return buildLatestPage(limit, albumsList, afterCursor), nil
+}
 
-	if mode == "" {
-		mode = ModeRandom
+// buildRandomPage samples limit photos without loading the photo catalog.
+// It samples an album and a photo index per position from the (tiny) album
+// pool, then fetches only the sampled photos by key.
+func (s *Service) buildRandomPage(ctx context.Context, limit int, seedParam string) (models.FeedResponse, error) {
+	pool, err := s.readyAlbumPhotoCounts(ctx)
+	if err != nil {
+		return models.FeedResponse{}, err
 	}
-	if mode == ModeLatest {
-		return buildLatestPage(limit, albumsList, afterCursor), nil
-	}
-	if mode != ModeRandom {
-		return models.FeedResponse{}, fmt.Errorf("invalid mode")
+	if len(pool) == 0 {
+		return models.FeedResponse{Items: []models.FeedItem{}}, nil
 	}
 
 	seed := parseSeed(seedParam)
 	items := make([]models.FeedItem, 0, limit)
-	for i := 0; i < limit; i++ {
-		items = append(items, sampleFeedItem(seed, int64(i), albumsList))
+	// Positions beyond limit are only reached when a sampled photo row is
+	// missing (photo_count drift), which the extractor's contiguous indexes
+	// make a never-event; the cap just keeps a broken row from short pages.
+	for position := 0; len(items) < limit && position < 2*limit; position++ {
+		item, err := s.sampleFeedItem(ctx, seed, int64(position), pool)
+		if err != nil {
+			if errors.Is(err, albums.ErrPhotoNotFound) {
+				continue
+			}
+			return models.FeedResponse{}, err
+		}
+		items = append(items, item)
 	}
 	return models.FeedResponse{
 		Items:   items,
@@ -226,6 +260,37 @@ func buildLatestPage(limit int, albumsList []*models.AlbumIndex, afterCursor str
 	}
 }
 
+func (s *Service) readyAlbumPhotoCounts(ctx context.Context) ([]models.AlbumPhotoCount, error) {
+	nowFn := s.now
+	if nowFn == nil {
+		nowFn = time.Now
+	}
+	ttl := s.snapshotTTL
+	if ttl <= 0 {
+		ttl = photoRefsSnapshotTTL
+	}
+	now := nowFn()
+
+	s.mu.RLock()
+	if s.photoCounts != nil && now.Sub(s.photoCountsAt) < ttl {
+		counts := s.photoCounts
+		s.mu.RUnlock()
+		return counts, nil
+	}
+	s.mu.RUnlock()
+
+	counts, err := s.albums.ReadyAlbumPhotoCounts(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	s.mu.Lock()
+	s.photoCounts = counts
+	s.photoCountsAt = now
+	s.mu.Unlock()
+	return counts, nil
+}
+
 func (s *Service) snapshotAlbums() []*models.AlbumIndex {
 	nowFn := s.now
 	if nowFn == nil {
@@ -290,11 +355,14 @@ func deterministicIndex(seed int64, position int64, size int) int {
 	return int(x % uint64(size))
 }
 
-func sampleFeedItem(seed int64, position int64, pool []*models.AlbumIndex) models.FeedItem {
+func (s *Service) sampleFeedItem(ctx context.Context, seed int64, position int64, pool []models.AlbumPhotoCount) (models.FeedItem, error) {
 	albumIdx := deterministicIndex(seed, position*2, len(pool))
 	album := pool[albumIdx]
-	photoIdx := deterministicIndex(seed, position*2+1, len(album.Photos))
-	photo := album.Photos[photoIdx]
+	photoIdx := deterministicIndex(seed, position*2+1, album.PhotoCount)
+	photo, err := s.albums.PhotoMetaAt(ctx, album.AlbumID, photoIdx)
+	if err != nil {
+		return models.FeedItem{}, err
+	}
 	return models.FeedItem{
 		AlbumID: album.AlbumID,
 		I:       photo.I,
@@ -302,7 +370,7 @@ func sampleFeedItem(seed int64, position int64, pool []*models.AlbumIndex) model
 		W:       photo.W,
 		H:       photo.H,
 		Ratio:   photo.Ratio,
-	}
+	}, nil
 }
 
 type rankedAlbum struct {

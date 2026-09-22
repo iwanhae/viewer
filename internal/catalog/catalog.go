@@ -551,6 +551,39 @@ func (s *Store) ListReadyAlbumPhotos(ctx context.Context) ([]Photo, error) {
 	return photos, nil
 }
 
+// AlbumPhotoCount is a ready album's id with its photo count.
+type AlbumPhotoCount struct {
+	AlbumID    string
+	PhotoCount int
+}
+
+// ListReadyAlbumPhotoCounts returns the id and photo count of every ready
+// album that has photos, ordered by id. It feeds the random-feed sampler,
+// which needs only the album pool rather than every photo row.
+func (s *Store) ListReadyAlbumPhotoCounts(ctx context.Context) ([]AlbumPhotoCount, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, photo_count FROM albums
+		WHERE status = ? AND photo_count > 0
+		ORDER BY id ASC`, string(AlbumStatusReady))
+	if err != nil {
+		return nil, fmt.Errorf("list ready album photo counts: %w", err)
+	}
+	defer rows.Close()
+
+	counts := make([]AlbumPhotoCount, 0)
+	for rows.Next() {
+		var count AlbumPhotoCount
+		if err := rows.Scan(&count.AlbumID, &count.PhotoCount); err != nil {
+			return nil, fmt.Errorf("scan ready album photo count: %w", err)
+		}
+		counts = append(counts, count)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate ready album photo counts: %w", err)
+	}
+	return counts, nil
+}
+
 // PhotoAt returns the photo stored at index within an album.
 func (s *Store) PhotoAt(ctx context.Context, albumID string, index int) (*Photo, error) {
 	row := s.db.QueryRowContext(ctx, `
