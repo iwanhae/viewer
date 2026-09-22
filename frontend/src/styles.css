@@ -345,6 +345,11 @@
   max-width: 1200px;
   margin: 0 auto;
   display: grid;
+  /* One explicit minmax(0, 1fr) column: a grid item's automatic minimum size is
+     its min-content width, so a single unbreakable long filename would stretch
+     the panel past the viewport on a phone. The two-column layout below uses
+     the same trick for the same reason. */
+  grid-template-columns: minmax(0, 1fr);
   gap: 14px;
   align-items: start;
 }
@@ -390,6 +395,10 @@
   font-size: clamp(1.1rem, 2vw, 1.5rem);
   line-height: 1.25;
   font-family: inherit;
+  /* Camera filenames are one unbreakable token; anywhere (not just break-word)
+     also shrinks the title's min-content width, so the panel never has to make
+     room for the whole name on one line. */
+  overflow-wrap: anywhere;
 }
 
 .photo-meta-list {
@@ -422,6 +431,10 @@
 
 .photo-meta-item dd {
   margin: 0;
+  /* The value side is a flex item, and min-width: auto would keep it as wide
+     as the longest word - break-word only takes effect once the item is
+     allowed to shrink. */
+  min-width: 0;
   text-align: right;
   word-break: break-word;
   color: var(--ink);
