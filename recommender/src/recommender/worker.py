@@ -80,10 +80,12 @@ class Worker:
     def _process_batch(self, response: api.ClaimResponse, stop: threading.Event) -> None:
         items = response.claimed
         lease_until = response.lease_until
+        total_bytes = sum(blob.size_bytes for blob in items)
         remaining = (lease_until - datetime.now(timezone.utc)).total_seconds()
         log.info(
-            "claimed %d blobs (lease until %s, %ds)",
+            "claimed %d blobs (%.1f MiB, lease until %s, %ds)",
             len(items),
+            total_bytes / (1024 * 1024),
             lease_until.astimezone().strftime("%H:%M:%S"),
             max(int(remaining), 0),
         )
@@ -132,14 +134,17 @@ class Worker:
         pool.shutdown(wait=False, cancel_futures=True)
         elapsed = time.monotonic() - started
         rate = counts["embedded"] / elapsed if elapsed > 0 else 0.0
+        mib_s = total_bytes / elapsed / (1024 * 1024) if elapsed > 0 else 0.0
         log.info(
-            "batch done: claimed=%d embedded=%d failed=%d skipped=%d in %.1fs (%.1f img/s)",
+            "batch done: claimed=%d embedded=%d failed=%d skipped=%d "
+            "in %.1fs (%.1f img/s, %.1f MiB/s)",
             len(items),
             counts["embedded"],
             counts["failed"],
             counts["skipped"],
             elapsed,
             rate,
+            mib_s,
         )
 
     def _download_one(self, blob: api.ClaimedBlob) -> np.ndarray:

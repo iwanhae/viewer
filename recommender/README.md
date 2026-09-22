@@ -37,6 +37,20 @@ The token must match the server's `EMBEDDING_WORKER_TOKEN`. If the repo root
 `.env` already carries it, running from the repo root picks it up —
 `EMBEDDING_WORKER_TOKEN` is accepted as a fallback for `VIEWER_WORKER_TOKEN`.
 
+## Throughput
+
+The GPU is rarely the bottleneck — a round trip spends most of its time on
+claim/results HTTP and pulling bytes from S3. To saturate it:
+
+```sh
+uv run recommender --claim-limit 512 --micro-batch 64 --download-workers 24
+```
+
+The `batch done` log line reports img/s and MiB/s. If raising
+`--download-workers` stops moving MiB/s, the uplink to S3 is the ceiling;
+the remaining levers are running the worker closer to the storage endpoint
+or running several boxes that pull work from the same API.
+
 ## How it behaves
 
 - **Lease lifecycle**: a claim leases blobs for 10 minutes. Long batches are
