@@ -3,12 +3,8 @@ import { useNavigate, useSearchParams } from 'react-router-dom'
 import { imageByHashUrl, type FeedMode } from '../api/client'
 import { useFeed } from '../hooks/useFeed'
 import { useEmbeddingProgress } from '../hooks/useEmbeddingProgress'
-import {
-  COLUMN_OPTIONS,
-  pageForPhotoIndex,
-  parsePositiveInt,
-  wallFocusKey,
-} from '../utils/albumPaging'
+import { COLUMN_OPTIONS, pageForPhotoIndex, wallFocusKey } from '../utils/albumPaging'
+import { materializeWallParams, resolveWallParams } from '../utils/wallParams'
 import {
   readLastWallState,
   readNumberPreference,
@@ -23,7 +19,6 @@ import { ColumnsIcon, ModeIcon, NextIcon, PrevIcon, RefreshIcon, ShortcutIcon } 
 const WALL_COLUMNS_KEY = 'wall_columns'
 const DEFAULT_COLUMNS = 3
 const WALL_FEED_LIMIT = 40
-const defaultMode: FeedMode = 'random'
 const wallModes: FeedMode[] = ['random', 'latest']
 
 function nextTimestampSeed(currentSeed?: string): string {
@@ -35,176 +30,53 @@ function nextTimestampSeed(currentSeed?: string): string {
   return String(now)
 }
 
-function parseExplicitWallMode(modeParam: string | null): FeedMode | null {
-  if (modeParam === 'latest' || modeParam === 'random') return modeParam
-  return null
-}
-
-function normalizeStoredLatestPage(value: number | undefined): number {
-  if (typeof value === 'number' && Number.isInteger(value) && value >= 1) return value
-  return 1
-}
-
-function normalizeStoredLatestCursor(value: string | undefined): string {
-  if (typeof value !== 'string') return ''
-  return value.trim() ? value : ''
-}
-
 export function WallPage() {
+  const navigate = useNavigate()
+  const [searchParams, setSearchParams] = useSearchParams()
   const [columns, setColumns] = useState(() =>
     readNumberPreference(WALL_COLUMNS_KEY, COLUMN_OPTIONS, DEFAULT_COLUMNS),
   )
-
-  const navigate = useNavigate()
-  const [searchParams, setSearchParams] = useSearchParams()
   const lastWallState = useMemo(() => readLastWallState(), [])
-  const rawMode = searchParams.get('mode')
-  const explicitMode = parseExplicitWallMode(rawMode)
-  const hasModeParam = rawMode !== null
-  const restoredMode: FeedMode = lastWallState?.mode === 'latest' ? 'latest' : defaultMode
-  const shouldRestoreFromState = !hasModeParam
-  const shouldRestoreLatestContext = shouldRestoreFromState && restoredMode === 'latest'
-  const mode: FeedMode = explicitMode ?? (shouldRestoreFromState ? restoredMode : defaultMode)
-  const seed = searchParams.get('seed') ?? ''
+  // One shuffle seed per page lifetime, used when the URL has no seed to offer.
+  const mountSeed = useRef(nextTimestampSeed())
+
+  // URL params resolve through one pure function: mode, seed, latest page and
+  // cursor, including the localStorage restore for a bare "/" visit.
+  const wall = useMemo(
+    () => resolveWallParams(searchParams, lastWallState, mountSeed.current),
+    [searchParams, lastWallState],
+  )
+  const { mode, seed, latestPage, latestCursor } = wall
   const focus = searchParams.get('focus')
-  const rawLatestPage = searchParams.get('lp')
-  const rawLatestCursor = searchParams.get('lc')
-  const storedLatestPage = normalizeStoredLatestPage(lastWallState?.latestPage)
-  const storedLatestCursor = normalizeStoredLatestCursor(lastWallState?.latestCursor)
-  const latestPage = parsePositiveInt(rawLatestPage, shouldRestoreLatestContext ? storedLatestPage : 1)
-  const latestCursor = rawLatestCursor ?? (shouldRestoreLatestContext ? storedLatestCursor : '')
 
   const embedding = useEmbeddingProgress()
 
   const { items, loading, error, pageInfo } = useFeed(
-    seed,
+    mode === 'random' ? seed : '',
     mode,
     mode === 'latest' ? latestCursor : '',
   )
   const visibleItems = useMemo(() => items.slice(0, WALL_FEED_LIMIT), [items])
   const tileRefs = useRef(new Map<string, HTMLButtonElement>())
-  const normalizedPageCursor = pageInfo.cursor ?? ''
-  const latestNavigationLocked = mode === 'latest' && (loading || normalizedPageCursor !== latestCursor)
+
+  // The single URL-hygiene effect: when the raw query does not spell out the
+  // resolved params, write them once (replace) and leave navigation alone.
+  // There is deliberately no effect syncing server responses back into the
+  // URL - the requested cursor is the position, so there is nothing to sync,
+  // and an echo-rewriting effect races the in-flight navigation it reacts to.
+  useEffect(() => {
+    if (!wall.dirty) return
+    setSearchParams((prev) => materializeWallParams(prev, wall), { replace: true })
+  }, [wall, setSearchParams])
 
   useEffect(() => {
-    if (explicitMode) return
-    setSearchParams(
-      (prev) => {
-        const next = new URLSearchParams(prev)
-        next.set('mode', mode)
-        if (shouldRestoreLatestContext) {
-          next.set('lp', String(latestPage))
-          if (latestCursor) {
-            next.set('lc', latestCursor)
-          } else {
-            next.delete('lc')
-          }
-          next.delete('seed')
-        }
-        return next
-      },
-      { replace: true },
-    )
-  }, [explicitMode, latestCursor, latestPage, mode, setSearchParams, shouldRestoreLatestContext])
-
-  useEffect(() => {
-    if (mode !== 'random') return
-
-    const needsCleanup = rawLatestPage !== null || latestCursor !== ''
-    if (!seed) {
-      const nextSeed = nextTimestampSeed()
-      setSearchParams(
-        (prev) => {
-          const next = new URLSearchParams(prev)
-          next.set('seed', nextSeed)
-          next.delete('lp')
-          next.delete('lc')
-          return next
-        },
-        { replace: true },
-      )
-      return
-    }
-
-    if (!needsCleanup) return
-    setSearchParams(
-      (prev) => {
-        const next = new URLSearchParams(prev)
-        next.delete('lp')
-        next.delete('lc')
-        return next
-      },
-      { replace: true },
-    )
-  }, [latestCursor, mode, rawLatestPage, seed, setSearchParams])
-
-  useEffect(() => {
-    if (mode !== 'latest') return
-
-    const normalizedPage = String(latestPage)
-    const needsPageParam = rawLatestPage !== normalizedPage
-    const hasSeed = seed !== ''
-    if (!needsPageParam && !hasSeed) return
-
-    setSearchParams(
-      (prev) => {
-        const next = new URLSearchParams(prev)
-        next.set('lp', normalizedPage)
-        next.delete('seed')
-        return next
-      },
-      { replace: true },
-    )
-  }, [latestPage, mode, rawLatestPage, seed, setSearchParams])
-
-  useEffect(() => {
-    if (mode !== 'latest') return
-    if (latestPage <= 1 || latestCursor) return
-    setSearchParams(
-      (prev) => {
-        const next = new URLSearchParams(prev)
-        next.set('lp', '1')
-        return next
-      },
-      { replace: true },
-    )
-  }, [latestCursor, latestPage, mode, setSearchParams])
-
-  useEffect(() => {
-    if (mode === 'random' && seed) {
+    if (mode === 'random') {
       writeLastWallSeed(seed)
       writeLastWallState({ mode: 'random', seed })
       return
     }
-
-    if (mode === 'latest') {
-      writeLastWallState({
-        mode: 'latest',
-        latestPage,
-        latestCursor,
-      })
-    }
+    writeLastWallState({ mode: 'latest', latestPage, latestCursor })
   }, [latestCursor, latestPage, mode, seed])
-
-  useEffect(() => {
-    if (mode !== 'latest' || loading || error) return
-    const normalizedCursor = pageInfo.cursor ?? ''
-    if (normalizedCursor === latestCursor) return
-
-    setSearchParams(
-      (prev) => {
-        const next = new URLSearchParams(prev)
-        next.set('lp', String(latestPage))
-        if (normalizedCursor) {
-          next.set('lc', normalizedCursor)
-        } else {
-          next.delete('lc')
-        }
-        return next
-      },
-      { replace: true },
-    )
-  }, [error, latestCursor, latestPage, loading, mode, pageInfo.cursor, setSearchParams])
 
   useEffect(() => {
     if (!focus || loading || visibleItems.length === 0) return
@@ -238,16 +110,17 @@ export function WallPage() {
   const setWallMode = (nextMode: FeedMode) => {
     setSearchParams((prev) => {
       const next = new URLSearchParams(prev)
-      next.set('mode', nextMode)
       next.delete('focus')
 
       if (nextMode === 'latest') {
+        next.set('mode', 'latest')
         next.set('lp', '1')
         next.delete('lc')
         next.delete('seed')
         return next
       }
 
+      next.set('mode', 'random')
       next.delete('lp')
       next.delete('lc')
       if (!next.get('seed')) {
@@ -257,18 +130,18 @@ export function WallPage() {
     })
   }
 
-  const onChangeLatestPage = (nextPage: number, nextCursor: string | null) => {
-    if (mode !== 'latest' || latestNavigationLocked) return
+  const changeLatestPage = (targetPage: number, cursor: string | null) => {
+    if (mode !== 'latest' || loading) return
 
-    const targetPage = Math.max(1, nextPage)
-    const movingForward = targetPage > latestPage
-    const movingBackward = targetPage < latestPage
-    const normalizedTargetCursor = nextCursor?.trim() ?? ''
+    const target = Math.max(1, targetPage)
+    const targetCursor = cursor?.trim() ?? ''
+    if (target === latestPage && targetCursor === latestCursor) return
 
-    if (movingForward && (!pageInfo.hasNext || !normalizedTargetCursor)) return
-    if (movingBackward && !pageInfo.hasPrev) return
-    if (movingBackward && targetPage > 1 && !normalizedTargetCursor) return
-    if (targetPage === latestPage && normalizedTargetCursor === latestCursor) return
+    if (target > latestPage) {
+      if (!pageInfo.hasNext || !targetCursor) return
+    } else if (target > 1) {
+      if (!pageInfo.hasPrev || !targetCursor) return
+    }
 
     if (typeof window !== 'undefined') {
       window.scrollTo({ top: 0, behavior: 'auto' })
@@ -277,9 +150,10 @@ export function WallPage() {
     setSearchParams((prev) => {
       const next = new URLSearchParams(prev)
       next.set('mode', 'latest')
-      next.set('lp', String(targetPage))
-      if (normalizedTargetCursor) {
-        next.set('lc', normalizedTargetCursor)
+      next.set('lp', String(target))
+      // The first page is cursor-less by definition.
+      if (targetCursor && target > 1) {
+        next.set('lc', targetCursor)
       } else {
         next.delete('lc')
       }
@@ -350,8 +224,8 @@ export function WallPage() {
                   ariaLabel: 'Previous latest page',
                   tooltip: 'Previous page',
                   testId: 'wall-page-prev',
-                  onClick: () => onChangeLatestPage(latestPage - 1, pageInfo.prevCursor),
-                  disabled: latestNavigationLocked || !pageInfo.hasPrev,
+                  onClick: () => changeLatestPage(latestPage - 1, pageInfo.prevCursor),
+                  disabled: loading || !pageInfo.hasPrev,
                 },
               ]
             : []),
@@ -489,8 +363,8 @@ export function WallPage() {
                   ariaLabel: 'Next latest page',
                   tooltip: 'Next page',
                   testId: 'wall-page-next',
-                  onClick: () => onChangeLatestPage(latestPage + 1, pageInfo.nextCursor),
-                  disabled: latestNavigationLocked || !pageInfo.hasNext,
+                  onClick: () => changeLatestPage(latestPage + 1, pageInfo.nextCursor),
+                  disabled: loading || !pageInfo.hasNext,
                 },
               ]
             : []),

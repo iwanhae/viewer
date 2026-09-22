@@ -2,7 +2,6 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { fetchFeed, type FeedItem, type FeedMode } from '../api/client'
 
 type FeedPageInfo = {
-  cursor: string | null
   nextCursor: string | null
   prevCursor: string | null
   hasNext: boolean
@@ -14,11 +13,9 @@ type UseFeedResult = {
   loading: boolean
   error: string | null
   pageInfo: FeedPageInfo
-  refetch: () => Promise<void>
 }
 
 const defaultPageInfo: FeedPageInfo = {
-  cursor: null,
   nextCursor: null,
   prevCursor: null,
   hasNext: false,
@@ -62,7 +59,6 @@ export function useFeed(seed: string, mode: FeedMode, afterCursor: string): UseF
       if (latestRequest.current !== requestID) return
       setItems(data.items)
       setPageInfo({
-        cursor: data.cursor ?? null,
         nextCursor: data.nextCursor ?? null,
         prevCursor: data.prevCursor ?? null,
         hasNext: Boolean(data.hasNext),
@@ -83,9 +79,5 @@ export function useFeed(seed: string, mode: FeedMode, afterCursor: string): UseF
     void load(seed, mode, afterCursor)
   }, [afterCursor, load, mode, seed])
 
-  const refetch = useCallback(async (): Promise<void> => {
-    await load(seed, mode, afterCursor)
-  }, [afterCursor, load, mode, seed])
-
-  return { items, loading, error, pageInfo, refetch }
+  return { items, loading, error, pageInfo }
 }
