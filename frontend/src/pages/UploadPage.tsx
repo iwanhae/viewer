@@ -20,7 +20,16 @@ import './upload.css'
 // poll loop only stays alive afterwards to refresh the embedding counts.
 type UploadStatus = 'queued' | 'uploading' | 'indexing' | 'ready' | 'failed' | 'canceled'
 
+// Upload workers own a slot only while the zip's bytes move to storage. Three
+// concurrent PUTs keep the browser busy; everything after the PUT (finalize and
+// status polling) runs detached, so a slow extraction never decides when the
+// next file may start uploading.
 const uploadWorkerCount = 3
+// Finalize only moves an already-uploaded zip from "waits for the scan" to "in
+// the queue now". The upload scan queues any staged zip within a minute anyway,
+// so the page drops a finalize that is slow (the extraction queue can be full
+// and the request parks there) or failed instead of holding a connection open.
+const finalizeRequestTimeoutMs = 15 * 1000
 const finalizePollIntervalMs = 2000
 const finalizePollTimeoutMs = 30 * 60 * 1000
 const progressTickMs = 200
@@ -172,6 +181,74 @@ export function UploadPage() {
     return true
   }, [])
 
+  const releaseController = useCallback((itemID: string, controller: AbortController) => {
+    // Only drop the entry this run owns: a retried item may already have
+    // installed a fresh controller, and deleting that one would leave the
+    // retry uncancellable.
+    if (controllersRef.current.get(itemID) === controller) {
+      controllersRef.current.delete(itemID)
+    }
+  }, [])
+
+  // watchIndexing follows one uploaded album until it is ready. It runs outside
+  // the upload workers on purpose: the zip is durable in the bucket the moment
+  // the PUT returns and the server indexes it on its own, so extraction speed
+  // must not decide when the next file may start uploading. A worker that used
+  // to sit here made a batch of ten uploads crawl - only the first three ever
+  // moved while the rest waited for someone to finish indexing.
+  const watchIndexing = useCallback(
+    async (itemID: string, albumID: string, controller: AbortController) => {
+      try {
+        // Best effort: the finalize request itself can park on a busy server,
+        // so it gets its own short deadline and nobody awaits it. Polling and
+        // the one-minute upload scan cover the album either way.
+        void finalizeAlbum(albumID, {
+          signal: AbortSignal.any([controller.signal, AbortSignal.timeout(finalizeRequestTimeoutMs)]),
+        }).catch(() => undefined)
+
+        // Indexing runs in the background pipeline: keep polling until the
+        // album succeeds or fails. Success is what makes the album visible, so
+        // the item turns ready right away - embedding is a slower stage that
+        // continues afterwards on the server, and the loop only stays alive to
+        // refresh the embedded counts until nothing is left pending. A deadline
+        // just stops that refresh; the item still reports ready.
+        const deadline = Date.now() + finalizePollTimeoutMs
+        for (;;) {
+          const state = await fetchFinalizeStatus(albumID, { signal: controller.signal })
+          if (state.status === 'FAILED') {
+            updateItem(itemID, { status: 'failed', error: state.error })
+            return
+          }
+          if (state.status === 'SUCCEEDED') {
+            updateItem(itemID, { status: 'ready', embedding: state.embedding, error: undefined })
+            if (!isEmbeddingPending(state.embedding)) {
+              return
+            }
+          } else if (state.embedding) {
+            updateItem(itemID, { embedding: state.embedding })
+          }
+          if (Date.now() >= deadline) {
+            return
+          }
+          await delay(finalizePollIntervalMs, controller.signal)
+        }
+      } catch (err) {
+        if (isAbortError(err)) {
+          updateItem(itemID, { status: 'canceled', error: undefined })
+        } else {
+          updateItem(itemID, { status: 'failed', error: toErrorMessage(err) })
+        }
+      } finally {
+        releaseController(itemID, controller)
+      }
+    },
+    [releaseController, updateItem],
+  )
+
+  // runItemUpload owns a worker slot only while the bytes move: it registers
+  // the album, PUTs the zip to the presigned URL, and hands the album to a
+  // detached watcher. Finalize and the status polls used to run right here,
+  // which pinned every worker to the whole extraction pipeline.
   const runItemUpload = useCallback(
     async (item: UploadItem) => {
       const controller = new AbortController()
@@ -193,46 +270,18 @@ export function UploadPage() {
         progressRef.current.delete(item.id)
         updateItem(item.id, { uploadedBytes: item.sizeBytes, status: 'indexing' })
 
-        await finalizeAlbum(albumID, { signal: controller.signal })
-
-        // Indexing runs in the background pipeline: keep polling until the
-        // album succeeds or fails. Success is what makes the album visible, so
-        // the item turns ready right away - embedding is a slower stage that
-        // continues afterwards on the server, and the loop only stays alive to
-        // refresh the embedded counts until nothing is left pending. A deadline
-        // just stops that refresh; the item still reports ready.
-        const deadline = Date.now() + finalizePollTimeoutMs
-        for (;;) {
-          const state = await fetchFinalizeStatus(albumID, { signal: controller.signal })
-          if (state.status === 'FAILED') {
-            updateItem(item.id, { status: 'failed', error: state.error })
-            return
-          }
-          if (state.status === 'SUCCEEDED') {
-            updateItem(item.id, { status: 'ready', embedding: state.embedding, error: undefined })
-            if (!isEmbeddingPending(state.embedding)) {
-              return
-            }
-          } else if (state.embedding) {
-            updateItem(item.id, { embedding: state.embedding })
-          }
-          if (Date.now() >= deadline) {
-            return
-          }
-          await delay(finalizePollIntervalMs, controller.signal)
-        }
+        void watchIndexing(item.id, albumID, controller)
       } catch (err) {
         progressRef.current.delete(item.id)
+        releaseController(item.id, controller)
         if (isAbortError(err)) {
           updateItem(item.id, { status: 'canceled', error: undefined })
         } else {
           updateItem(item.id, { status: 'failed', error: toErrorMessage(err) })
         }
-      } finally {
-        controllersRef.current.delete(item.id)
       }
     },
-    [updateItem],
+    [releaseController, updateItem, watchIndexing],
   )
 
   const runQueuedUpload = useCallback(
