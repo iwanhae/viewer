@@ -113,7 +113,15 @@ A blob that is `failed` is terminal — `ListBlobsAwaitingEmbedding` selects onl
   volume disposable: wipe it, restart, and the bucket rebuilds the catalog.
   Restoring an older snapshot resurrects albums whose zips have not been
   deleted yet, and the scan re-registers them from those zips — a recovery
-  property, not a bug.
+  property, not a bug. The same asymmetry is guarded on the write side: the
+  finalizer refuses to replace an existing backup with a snapshot that has no
+  readable stamp or that is drastically smaller than the backup — the
+  footprint of a boot whose restore silently did not happen — unless
+  `ALLOW_BACKUP_OVERWRITE=1` says otherwise. A stampless database may be
+  authoritative for serving, but it must not destroy the bucket's copy;
+  restoring downloads are checked against the SQLite magic header for the
+  same reason, and a missing bucket surfaces as an error rather than
+  masquerading as an empty namespace.
 - **One deployment owns one `S3_PREFIX`.** Two replicas sharing a prefix would
   fight over the same zips and overwrite each other's `backups/viewer.db`;
   that was already true for blobs and staging, and the backup makes it

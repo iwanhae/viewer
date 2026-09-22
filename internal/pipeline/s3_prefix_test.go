@@ -165,7 +165,7 @@ func TestPipelineStoresEveryObjectUnderKeyPrefix(t *testing.T) {
 
 	// Drive the real wiring: the worker drains, OnIdle runs the finalizer, and
 	// only after the backup is durable is the staged zip deleted.
-	finalizer := backup.NewFinalizer(store, cat, t.TempDir())
+	finalizer := backup.NewFinalizer(store, cat, t.TempDir(), false)
 	svc := NewService(cat, store, Options{
 		TempDir: t.TempDir(),
 		OnIdle:  finalizer.Run,

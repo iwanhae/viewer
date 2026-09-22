@@ -87,6 +87,14 @@ type Config struct {
 	// directory, because the bucket still holds the original.
 	StateDir string
 
+	// AllowBackupOverwrite lifts the finalizer's guard against replacing the
+	// bucket's catalog backup with a local database that cannot be traced to
+	// a backup (no readable stamp) or that is drastically smaller than the
+	// backup it would replace. It is the explicit opt-out for the legitimate
+	// versions of those states: a hand-replaced catalog, or a deliberate bulk
+	// deletion that really did shrink the catalog tenfold.
+	AllowBackupOverwrite bool
+
 	// ModelURL is the base URL the checkpoint is fetched from when ModelDir
 	// holds no file: one download per <ModelURL>/<filename>.
 	ModelURL string
@@ -108,19 +116,24 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	allowBackupOverwrite, err := getenvBool("ALLOW_BACKUP_OVERWRITE", false)
+	if err != nil {
+		return Config{}, err
+	}
 	workerToken := strings.TrimSpace(os.Getenv("EMBEDDING_WORKER_TOKEN"))
 
 	cfg := Config{
-		Port:           getenvInt("PORT", DefaultPort),
-		S3Endpoint:     os.Getenv("S3_ENDPOINT"),
-		S3Bucket:       os.Getenv("S3_BUCKET"),
-		S3AccessKey:    os.Getenv("S3_ACCESS_KEY"),
-		S3SecretKey:    os.Getenv("S3_SECRET_KEY"),
-		S3Prefix:       normalizePrefix(os.Getenv("S3_PREFIX")),
-		S3UsePathStyle: usePathStyle,
-		StateDir:       normalizeStateDir(os.Getenv("STATE_DIR")),
-		ModelURL:       normalizeModelURL(os.Getenv("SIGLIP2_MODEL_URL")),
-		WorkerToken:    workerToken,
+		Port:                 getenvInt("PORT", DefaultPort),
+		S3Endpoint:           os.Getenv("S3_ENDPOINT"),
+		S3Bucket:             os.Getenv("S3_BUCKET"),
+		S3AccessKey:          os.Getenv("S3_ACCESS_KEY"),
+		S3SecretKey:          os.Getenv("S3_SECRET_KEY"),
+		S3Prefix:             normalizePrefix(os.Getenv("S3_PREFIX")),
+		S3UsePathStyle:       usePathStyle,
+		StateDir:             normalizeStateDir(os.Getenv("STATE_DIR")),
+		AllowBackupOverwrite: allowBackupOverwrite,
+		ModelURL:             normalizeModelURL(os.Getenv("SIGLIP2_MODEL_URL")),
+		WorkerToken:          workerToken,
 	}
 
 	switch {

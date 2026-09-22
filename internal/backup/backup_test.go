@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -31,6 +32,7 @@ type fakeStore struct {
 	objects map[string]fakeObject
 	putErr  error
 	statErr error
+	listErr error
 	puts    int
 
 	// putStarted is closed the first time PutObject begins and putRelease
@@ -93,6 +95,25 @@ func (s *fakeStore) DeleteObjects(_ context.Context, keys []string) error {
 		delete(s.objects, key)
 	}
 	return nil
+}
+
+func (s *fakeStore) ListObjects(_ context.Context, prefix string) ([]storage.Object, error) {
+	if s.listErr != nil {
+		return nil, s.listErr
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	objects := make([]storage.Object, 0)
+	for key, obj := range s.objects {
+		if strings.HasPrefix(key, prefix) {
+			objects = append(objects, storage.Object{
+				Key:          key,
+				LastModified: obj.lastModified,
+				Size:         int64(len(obj.body)),
+			})
+		}
+	}
+	return objects, nil
 }
 
 func (s *fakeStore) has(key string) bool {
@@ -164,9 +185,14 @@ func TestShouldRestore(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := shouldRestore(tc.backup, tc.localExists, tc.stamp, tc.stampSet)
+			got, reason := shouldRestore(tc.backup, tc.localExists, tc.stamp, tc.stampSet)
 			if got != tc.want {
 				t.Errorf("shouldRestore=%v want %v", got, tc.want)
+			}
+			if reason == "" {
+				t.Errorf("shouldRestore returned an empty reason")
+			} else {
+				t.Logf("reason: %s", reason)
 			}
 		})
 	}
@@ -325,6 +351,24 @@ func TestRestoreWithoutBackupObject(t *testing.T) {
 	}
 }
 
+// TestRestoreWithoutBackupObjectHandlesListingFailure pins that the forensic
+// listing behind the missing-backup log line never turns "no backup" into an
+// error or a restore: a listing outage must behave exactly like before.
+func TestRestoreWithoutBackupObjectHandlesListingFailure(t *testing.T) {
+	dir := t.TempDir()
+
+	store := newFakeStore(map[string]fakeObject{})
+	store.listErr = errors.New("list down")
+	restored, err := Restore(context.Background(), store,
+		filepath.Join(dir, "viewer.db"), filepath.Join(dir, "viewer.db.backup-stamp"))
+	if err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+	if restored {
+		t.Fatalf("Restore reported a restore with no backup object")
+	}
+}
+
 // TestFinalizerUploadsThenDeletes walks the full finalize: the backup lands,
 // the stamp records it, and exactly the terminal albums' zips go away.
 func TestFinalizerUploadsThenDeletes(t *testing.T) {
@@ -353,7 +397,7 @@ func TestFinalizerUploadsThenDeletes(t *testing.T) {
 		"uploads/album-new.zip": {body: []byte("new")},
 	})
 
-	finalizer := NewFinalizer(store, cat, dir)
+	finalizer := NewFinalizer(store, cat, dir, false)
 	if err := finalizer.Run(ctx); err != nil {
 		t.Fatalf("Finalizer.Run: %v", err)
 	}
@@ -409,7 +453,7 @@ func TestFinalizerKeepsZipsWhenUploadFails(t *testing.T) {
 	})
 	store.putErr = errors.New("s3 down")
 
-	finalizer := NewFinalizer(store, cat, dir)
+	finalizer := NewFinalizer(store, cat, dir, false)
 	if err := finalizer.Run(ctx); err == nil {
 		t.Fatalf("Finalizer.Run returned nil despite the failed upload")
 	}
@@ -419,6 +463,199 @@ func TestFinalizerKeepsZipsWhenUploadFails(t *testing.T) {
 	}
 	if _, stampSet, err := readStamp(StampPath(dir)); err != nil || stampSet {
 		t.Fatalf("stamp advanced despite the failed upload: set=%v err=%v", stampSet, err)
+	}
+}
+
+// seedGuardFixture opens a catalog holding one SUCCEEDED album whose zip is
+// staged in the store — the minimum state a finalize would normally clean up.
+func seedGuardFixture(t *testing.T, dir string) *catalog.Store {
+	t.Helper()
+	cat, err := catalog.Open(filepath.Join(dir, "viewer.db"))
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() { cat.Close() })
+	if err := cat.CreateAlbum(context.Background(), catalog.Album{
+		ID:               "album-ok",
+		OriginalFilename: "ok.zip",
+		Status:           catalog.AlbumStatusReady,
+		SourceKey:        "uploads/album-ok.zip",
+	}); err != nil {
+		t.Fatalf("seed album: %v", err)
+	}
+	return cat
+}
+
+// TestFinalizerRefusesOverwriteWithoutStamp pins the guard's main case: a
+// local database that never came from a backup (no stamp) must not replace
+// the bucket's copy, because an unverified catalog over a good backup is how
+// a missed restore becomes permanent metadata loss.
+func TestFinalizerRefusesOverwriteWithoutStamp(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+
+	cat := seedGuardFixture(t, dir)
+	store := newFakeStore(map[string]fakeObject{
+		BackupObjectKey:        {body: []byte("an existing backup"), lastModified: backupModified},
+		"uploads/album-ok.zip": {body: []byte("ok")},
+	})
+
+	finalizer := NewFinalizer(store, cat, dir, false)
+	err := finalizer.Run(ctx)
+	if err == nil {
+		t.Fatalf("Finalizer.Run replaced the backup despite the missing stamp")
+	}
+	if !strings.Contains(err.Error(), "refusing to overwrite") {
+		t.Errorf("error should name the refusal, got %v", err)
+	}
+	if got := store.putCount(); got != 0 {
+		t.Errorf("the refused run uploaded %d time(s), want 0", got)
+	}
+	if !store.has("uploads/album-ok.zip") {
+		t.Errorf("zip deleted although the upload was refused")
+	}
+	obj, ok, err := store.StatObject(ctx, BackupObjectKey)
+	if err != nil || !ok || obj.Size != int64(len("an existing backup")) {
+		t.Errorf("existing backup changed: ok=%v size=%d err=%v", ok, obj.Size, err)
+	}
+	if _, stampSet, err := readStamp(StampPath(dir)); err != nil || stampSet {
+		t.Errorf("stamp advanced despite the refusal: set=%v err=%v", stampSet, err)
+	}
+}
+
+// TestFinalizerRefusesDrasticallySmallerSnapshot covers the guard's second
+// condition: the stamp proves a backup lineage, but the fresh snapshot is a
+// tiny fraction of the backup — the footprint of a local catalog that was
+// never restored.
+func TestFinalizerRefusesDrasticallySmallerSnapshot(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+
+	cat := seedGuardFixture(t, dir)
+	const backupSize = 1 << 20
+	store := newFakeStore(map[string]fakeObject{
+		BackupObjectKey:        {body: bytes.Repeat([]byte("x"), backupSize), lastModified: backupModified},
+		"uploads/album-ok.zip": {body: []byte("ok")},
+	})
+	// The stamp ties the local database to an older backup, so only the size
+	// mismatch can refuse this run.
+	if err := writeStamp(StampPath(dir), backupModified.Add(-time.Hour)); err != nil {
+		t.Fatalf("seed stamp: %v", err)
+	}
+
+	finalizer := NewFinalizer(store, cat, dir, false)
+	err := finalizer.Run(ctx)
+	if err == nil {
+		t.Fatalf("Finalizer.Run replaced a large backup with a tiny snapshot")
+	}
+	if !strings.Contains(err.Error(), "drastically smaller") {
+		t.Errorf("error should name the shrinkage, got %v", err)
+	}
+	if got := store.putCount(); got != 0 {
+		t.Errorf("the refused run uploaded %d time(s), want 0", got)
+	}
+	if !store.has("uploads/album-ok.zip") {
+		t.Errorf("zip deleted although the upload was refused")
+	}
+	obj, ok, err := store.StatObject(ctx, BackupObjectKey)
+	if err != nil || !ok || obj.Size != backupSize {
+		t.Errorf("existing backup changed: ok=%v size=%d err=%v", ok, obj.Size, err)
+	}
+}
+
+// TestFinalizerAllowBackupOverwriteForcesTheUpload pins the opt-out: with the
+// override set, the guarded run behaves exactly like an unguarded one.
+func TestFinalizerAllowBackupOverwriteForcesTheUpload(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+
+	cat := seedGuardFixture(t, dir)
+	store := newFakeStore(map[string]fakeObject{
+		BackupObjectKey:        {body: bytes.Repeat([]byte("x"), 1<<20), lastModified: backupModified},
+		"uploads/album-ok.zip": {body: []byte("ok")},
+	})
+	if err := writeStamp(StampPath(dir), backupModified.Add(-time.Hour)); err != nil {
+		t.Fatalf("seed stamp: %v", err)
+	}
+
+	finalizer := NewFinalizer(store, cat, dir, true)
+	if err := finalizer.Run(ctx); err != nil {
+		t.Fatalf("Finalizer.Run with the override set: %v", err)
+	}
+	if got := store.putCount(); got != 1 {
+		t.Errorf("put count=%d want exactly 1", got)
+	}
+	obj, ok, err := store.StatObject(ctx, BackupObjectKey)
+	if err != nil || !ok {
+		t.Fatalf("backup after run: ok=%v err=%v", ok, err)
+	}
+	if obj.Size >= 1<<20 {
+		t.Errorf("the backup was not replaced by the small snapshot (size=%d)", obj.Size)
+	}
+	if store.has("uploads/album-ok.zip") {
+		t.Errorf("zip survived a completed finalize")
+	}
+	stamp, stampSet, err := readStamp(StampPath(dir))
+	if err != nil || !stampSet || !stamp.Equal(obj.LastModified) {
+		t.Errorf("stamp=%s set=%v err=%v, want the new backup's last-modified %s", stamp, stampSet, err, obj.LastModified)
+	}
+}
+
+// TestRestoreRejectsNonSQLiteBackup pins the header check: a backup object
+// that is not a SQLite database fails the restore instead of replacing the
+// local catalog with garbage, and neither the catalog nor the stamp moves.
+func TestRestoreRejectsNonSQLiteBackup(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+
+	dbPath := filepath.Join(dir, "viewer.db")
+	local, err := catalog.Open(dbPath)
+	if err != nil {
+		t.Fatalf("open local catalog: %v", err)
+	}
+	if err := local.CreateAlbum(ctx, catalog.Album{
+		ID:               "album-local",
+		OriginalFilename: "local.zip",
+		Status:           catalog.AlbumStatusReady,
+	}); err != nil {
+		t.Fatalf("seed local catalog: %v", err)
+	}
+	if err := local.Close(); err != nil {
+		t.Fatalf("close local catalog: %v", err)
+	}
+	before, err := os.ReadFile(dbPath)
+	if err != nil {
+		t.Fatalf("read local catalog: %v", err)
+	}
+
+	store := newFakeStore(map[string]fakeObject{
+		BackupObjectKey: {body: []byte("this is not a sqlite database at all"), lastModified: backupModified},
+	})
+	stampPath := filepath.Join(dir, "viewer.db.backup-stamp")
+	if err := writeStamp(stampPath, backupModified.Add(-time.Hour)); err != nil {
+		t.Fatalf("seed stamp: %v", err)
+	}
+
+	restored, err := Restore(ctx, store, dbPath, stampPath)
+	if err == nil {
+		t.Fatalf("Restore replaced the catalog with a non-SQLite object")
+	}
+	if !strings.Contains(err.Error(), "SQLite") {
+		t.Errorf("error should name the SQLite header, got %v", err)
+	}
+	if restored {
+		t.Errorf("Restore reported success for a rejected backup")
+	}
+	after, err := os.ReadFile(dbPath)
+	if err != nil {
+		t.Fatalf("reread local catalog: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatalf("local database changed despite the failed restore")
+	}
+	stamp, stampSet, err := readStamp(stampPath)
+	if err != nil || !stampSet || !stamp.Equal(backupModified.Add(-time.Hour)) {
+		t.Fatalf("stamp moved despite the failed restore: set=%v stamp=%s err=%v", stampSet, stamp, err)
 	}
 }
 
@@ -438,7 +675,7 @@ func TestFinalizerSkipsOverlappingRun(t *testing.T) {
 	store.putStarted = make(chan struct{})
 	store.putRelease = make(chan struct{})
 
-	finalizer := NewFinalizer(store, cat, dir)
+	finalizer := NewFinalizer(store, cat, dir, false)
 
 	done := make(chan error, 1)
 	go func() { done <- finalizer.Run(ctx) }()

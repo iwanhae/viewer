@@ -304,8 +304,13 @@ func isS3NotFound(err error) bool {
 	}
 	var apiErr smithy.APIError
 	if errors.As(err, &apiErr) {
+		// NoSuchBucket is deliberately absent: a missing bucket is a
+		// misconfiguration, not a missing object. Letting it masquerade as
+		// "not found" makes a wrong bucket or endpoint look like an empty
+		// namespace, and the catalog backup would then be silently skipped at
+		// restore and overwritten at the next finalize.
 		switch apiErr.ErrorCode() {
-		case "NoSuchKey", "NotFound", "NoSuchBucket":
+		case "NoSuchKey", "NotFound":
 			return true
 		}
 	}

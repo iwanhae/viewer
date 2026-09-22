@@ -78,7 +78,7 @@ func Run(ctx context.Context) error {
 	// album ready, and the recommendation service's background workers embed
 	// the blobs it leaves pending. When the extraction queue drains, the
 	// finalizer backs the catalog up and deletes the staged zips it covers.
-	finalizer := backup.NewFinalizer(store, cat, cfg.StateDir)
+	finalizer := backup.NewFinalizer(store, cat, cfg.StateDir, cfg.AllowBackupOverwrite)
 	pipelineService := pipeline.NewService(cat, store, pipeline.Options{
 		OnAlbumReady: func(albumID string) {
 			if err := recommendService.ReloadAlbum(context.Background(), albumID); err != nil {

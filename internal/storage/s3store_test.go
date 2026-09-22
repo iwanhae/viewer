@@ -11,6 +11,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+
 	cfgpkg "viewer/internal/config"
 )
 
@@ -476,5 +478,20 @@ func TestS3StoreDeleteObjectsSurfacesLogicalKeysOnError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "uploads/album-1.zip") || strings.Contains(err.Error(), "viewer/uploads") {
 		t.Errorf("error=%v want the logical key without the store prefix", err)
+	}
+}
+
+// TestIsS3NotFoundTreatsMissingBucketAsAnError pins the distinction the
+// backup restore relies on: a missing object is a normal empty answer, while
+// a missing bucket is a misconfiguration that has to surface as an error.
+func TestIsS3NotFoundTreatsMissingBucketAsAnError(t *testing.T) {
+	if !isS3NotFound(&types.NoSuchKey{}) {
+		t.Errorf("NoSuchKey should count as not-found")
+	}
+	if !isS3NotFound(&types.NotFound{}) {
+		t.Errorf("NotFound should count as not-found")
+	}
+	if isS3NotFound(&types.NoSuchBucket{}) {
+		t.Errorf("NoSuchBucket is a misconfiguration and must not count as not-found")
 	}
 }
