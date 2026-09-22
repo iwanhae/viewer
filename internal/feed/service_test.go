@@ -17,9 +17,20 @@ type stubAlbumSource struct {
 	countCalls int
 }
 
-func (s *stubAlbumSource) AllAlbums() []*models.AlbumIndex {
+func (s *stubAlbumSource) ReadyAlbumCovers(_ context.Context) ([]models.AlbumCoverEntry, error) {
 	s.calls++
-	return s.albums
+	entries := make([]models.AlbumCoverEntry, 0, len(s.albums))
+	for _, album := range s.albums {
+		if len(album.Photos) == 0 {
+			continue
+		}
+		entries = append(entries, models.AlbumCoverEntry{
+			AlbumID:   album.AlbumID,
+			CreatedAt: album.CreatedAt,
+			Cover:     album.Photos[0],
+		})
+	}
+	return entries, nil
 }
 
 func (s *stubAlbumSource) ReadyAlbumPhotoCounts(ctx context.Context) ([]models.AlbumPhotoCount, error) {
@@ -108,7 +119,7 @@ func TestBuildRandomSkipsFullAlbumScan(t *testing.T) {
 		t.Fatalf("items=%d want=20", len(resp.Items))
 	}
 	if source.calls != 0 {
-		t.Fatalf("random feed must not load all album photos, AllAlbums calls=%d", source.calls)
+		t.Fatalf("random feed must not load album covers, cover loads=%d", source.calls)
 	}
 	if source.countCalls == 0 {
 		t.Fatalf("random feed should sample from photo counts")

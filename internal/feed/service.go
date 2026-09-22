@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"log"
 	"sort"
 	"strconv"
 	"strings"
@@ -19,6 +20,11 @@ import (
 
 const photoRefsSnapshotTTL = 3 * time.Second
 
+// coversLoadTimeout bounds one cover snapshot load. The covers query is a
+// couple of indexed reads over the album table plus one cover per album, so a
+// healthy catalog answers in well under a second even on a large library.
+const coversLoadTimeout = 10 * time.Second
+
 type Mode string
 
 const (
@@ -27,10 +33,13 @@ const (
 )
 
 type albumSource interface {
-	// AllAlbums loads every ready album with all of its photo rows. Only the
-	// latest feed needs it; the random feed samples from photo counts and
-	// fetches the handful of sampled photos directly.
-	AllAlbums() []*models.AlbumIndex
+	// ReadyAlbumCovers loads every ready album with its cover photo (index 0).
+	// The latest feed ranks and pages over albums, so one photo per album is
+	// all it needs; loading every photo row per snapshot meant hundreds of
+	// thousands of rows and seconds of latency on a large library.
+	ReadyAlbumCovers(ctx context.Context) ([]models.AlbumCoverEntry, error)
+	// ReadyAlbumPhotoCounts feeds the random sampler, which needs the album
+	// pool without any photo rows.
 	ReadyAlbumPhotoCounts(ctx context.Context) ([]models.AlbumPhotoCount, error)
 	PhotoMetaAt(ctx context.Context, albumID string, index int) (*models.PhotoMeta, error)
 }
@@ -39,8 +48,8 @@ type Service struct {
 	albums albumSource
 
 	mu             sync.RWMutex
-	albumsSnapshot []*models.AlbumIndex
-	albumsAt       time.Time
+	coversSnapshot []models.AlbumCoverEntry
+	coversAt       time.Time
 	photoCounts    []models.AlbumPhotoCount
 	photoCountsAt  time.Time
 	snapshotTTL    time.Duration
@@ -90,7 +99,7 @@ func (s *Service) Build(
 		return models.FeedResponse{}, fmt.Errorf("invalid mode")
 	}
 
-	albumsList := s.snapshotAlbums()
+	albumsList := s.snapshotCovers()
 	if len(albumsList) == 0 {
 		return models.FeedResponse{Items: []models.FeedItem{}}, nil
 	}
@@ -158,7 +167,7 @@ func decodeLatestCursor(raw string) (latestCursor, bool) {
 func encodeLatestCursor(item rankedAlbum) string {
 	payload, err := json.Marshal(latestCursor{
 		CreatedAtUnixNano: item.createdAt.UnixNano(),
-		AlbumID:           item.album.AlbumID,
+		AlbumID:           item.entry.AlbumID,
 	})
 	if err != nil {
 		return ""
@@ -179,12 +188,12 @@ func seekPastCursor(ranked []rankedAlbum, cursor latestCursor) int {
 		if itemNano != cursor.CreatedAtUnixNano {
 			return itemNano < cursor.CreatedAtUnixNano
 		}
-		return ranked[i].album.AlbumID > cursor.AlbumID
+		return ranked[i].entry.AlbumID > cursor.AlbumID
 	})
 }
 
-func buildLatestPage(limit int, albumsList []*models.AlbumIndex, afterCursor string) models.FeedResponse {
-	ranked := rankAlbumsByCreatedAt(albumsList)
+func buildLatestPage(limit int, covers []models.AlbumCoverEntry, afterCursor string) models.FeedResponse {
+	ranked := rankAlbumsByCreatedAt(covers)
 	if len(ranked) == 0 {
 		return models.FeedResponse{
 			Items:   []models.FeedItem{},
@@ -216,15 +225,14 @@ func buildLatestPage(limit int, albumsList []*models.AlbumIndex, afterCursor str
 
 	items := make([]models.FeedItem, 0, end-start)
 	for i := start; i < end; i++ {
-		album := ranked[i].album
-		photo := album.Photos[0]
+		entry := ranked[i].entry
 		items = append(items, models.FeedItem{
-			AlbumID: album.AlbumID,
-			I:       photo.I,
-			Hash:    photo.Hash,
-			W:       photo.W,
-			H:       photo.H,
-			Ratio:   photo.Ratio,
+			AlbumID: entry.AlbumID,
+			I:       entry.Cover.I,
+			Hash:    entry.Cover.Hash,
+			W:       entry.Cover.W,
+			H:       entry.Cover.H,
+			Ratio:   entry.Cover.Ratio,
 		})
 	}
 
@@ -293,7 +301,10 @@ func (s *Service) readyAlbumPhotoCounts(ctx context.Context) ([]models.AlbumPhot
 	return counts, nil
 }
 
-func (s *Service) snapshotAlbums() []*models.AlbumIndex {
+// snapshotCovers returns the feed's view of the ready albums, cached for the
+// snapshot TTL so paging through the feed costs no catalog queries. A failed
+// load is logged and answered with an empty snapshot: the next request retries.
+func (s *Service) snapshotCovers() []models.AlbumCoverEntry {
 	nowFn := s.now
 	if nowFn == nil {
 		nowFn = time.Now
@@ -305,30 +316,26 @@ func (s *Service) snapshotAlbums() []*models.AlbumIndex {
 	now := nowFn()
 
 	s.mu.RLock()
-	if s.albumsSnapshot != nil && now.Sub(s.albumsAt) < ttl {
-		albumsList := s.albumsSnapshot
+	if s.coversSnapshot != nil && now.Sub(s.coversAt) < ttl {
+		covers := s.coversSnapshot
 		s.mu.RUnlock()
-		return albumsList
+		return covers
 	}
 	s.mu.RUnlock()
 
-	if s.albums == nil {
+	ctx, cancel := context.WithTimeout(context.Background(), coversLoadTimeout)
+	defer cancel()
+	covers, err := s.albums.ReadyAlbumCovers(ctx)
+	if err != nil {
+		log.Printf("feed: loading album covers failed: %v", err)
 		return nil
-	}
-	albumsIndex := s.albums.AllAlbums()
-	albumsList := make([]*models.AlbumIndex, 0, len(albumsIndex))
-	for _, album := range albumsIndex {
-		if album == nil || len(album.Photos) == 0 {
-			continue
-		}
-		albumsList = append(albumsList, album)
 	}
 
 	s.mu.Lock()
-	s.albumsSnapshot = albumsList
-	s.albumsAt = now
+	s.coversSnapshot = covers
+	s.coversAt = now
 	s.mu.Unlock()
-	return albumsList
+	return covers
 }
 
 func parseSeed(seed string) int64 {
@@ -376,16 +383,16 @@ func (s *Service) sampleFeedItem(ctx context.Context, seed int64, position int64
 }
 
 type rankedAlbum struct {
-	album     *models.AlbumIndex
+	entry     models.AlbumCoverEntry
 	createdAt time.Time
 }
 
-func rankAlbumsByCreatedAt(albumsList []*models.AlbumIndex) []rankedAlbum {
-	ranked := make([]rankedAlbum, 0, len(albumsList))
-	for _, album := range albumsList {
+func rankAlbumsByCreatedAt(covers []models.AlbumCoverEntry) []rankedAlbum {
+	ranked := make([]rankedAlbum, 0, len(covers))
+	for _, entry := range covers {
 		ranked = append(ranked, rankedAlbum{
-			album:     album,
-			createdAt: parseAlbumCreatedAt(album.CreatedAt),
+			entry:     entry,
+			createdAt: parseAlbumCreatedAt(entry.CreatedAt),
 		})
 	}
 
@@ -393,7 +400,7 @@ func rankAlbumsByCreatedAt(albumsList []*models.AlbumIndex) []rankedAlbum {
 		if !ranked[i].createdAt.Equal(ranked[j].createdAt) {
 			return ranked[i].createdAt.After(ranked[j].createdAt)
 		}
-		return ranked[i].album.AlbumID < ranked[j].album.AlbumID
+		return ranked[i].entry.AlbumID < ranked[j].entry.AlbumID
 	})
 
 	return ranked

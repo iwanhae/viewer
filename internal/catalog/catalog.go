@@ -549,6 +549,44 @@ func (s *Store) ListReadyAlbumPhotos(ctx context.Context) ([]Photo, error) {
 	return photos, nil
 }
 
+// AlbumCover is a ready album with its cover photo (the image at index 0).
+type AlbumCover struct {
+	AlbumID   string
+	CreatedAt string
+	Cover     Photo
+}
+
+// ListReadyAlbumCovers returns every ready album together with its cover
+// photo, ordered by album id. The latest feed ranks and pages over albums, so
+// one photo per album is all it needs; a full photo scan here would load
+// hundreds of thousands of rows on a large library every time the feed's
+// snapshot expires.
+func (s *Store) ListReadyAlbumCovers(ctx context.Context) ([]AlbumCover, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT a.id, a.created_at, p.album_id, p.idx, p.name, p.hash, p.width, p.height, p.ratio
+		FROM albums a
+		JOIN photos p ON p.album_id = a.id AND p.idx = 0
+		WHERE a.status = ?
+		ORDER BY a.id ASC`, string(AlbumStatusReady))
+	if err != nil {
+		return nil, fmt.Errorf("list ready album covers: %w", err)
+	}
+	defer rows.Close()
+
+	covers := make([]AlbumCover, 0)
+	for rows.Next() {
+		var cover AlbumCover
+		if err := rows.Scan(&cover.AlbumID, &cover.CreatedAt, &cover.Cover.AlbumID, &cover.Cover.Index, &cover.Cover.Name, &cover.Cover.Hash, &cover.Cover.Width, &cover.Cover.Height, &cover.Cover.Ratio); err != nil {
+			return nil, fmt.Errorf("scan ready album cover: %w", err)
+		}
+		covers = append(covers, cover)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate ready album covers: %w", err)
+	}
+	return covers, nil
+}
+
 // AlbumPhotoCount is a ready album's id with its photo count.
 type AlbumPhotoCount struct {
 	AlbumID    string

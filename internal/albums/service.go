@@ -351,6 +351,30 @@ func (s *Service) PhotoMetaAt(ctx context.Context, albumID string, index int) (*
 	return &meta, nil
 }
 
+// ReadyAlbumCovers returns every ready album's id, createdAt and cover photo
+// (the image at index 0) without touching the other photo rows. The latest
+// feed ranks and pages over albums, so one photo per album is all it needs; a
+// full photo load per feed snapshot meant hundreds of thousands of rows and
+// seconds of latency on a large library.
+func (s *Service) ReadyAlbumCovers(ctx context.Context) ([]models.AlbumCoverEntry, error) {
+	if s == nil || s.catalog == nil {
+		return []models.AlbumCoverEntry{}, nil
+	}
+	covers, err := s.catalog.ListReadyAlbumCovers(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]models.AlbumCoverEntry, 0, len(covers))
+	for _, cover := range covers {
+		out = append(out, models.AlbumCoverEntry{
+			AlbumID:   cover.AlbumID,
+			CreatedAt: cover.CreatedAt,
+			Cover:     photoMetaFromRow(cover.Cover),
+		})
+	}
+	return out, nil
+}
+
 // AllAlbums returns every ready album with its photos.
 func (s *Service) AllAlbums() []*models.AlbumIndex {
 	if s == nil || s.catalog == nil {

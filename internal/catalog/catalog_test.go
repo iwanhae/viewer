@@ -575,6 +575,52 @@ func TestSearchAlbumsByNameAttachesCoverFromFirstPhoto(t *testing.T) {
 	}
 }
 
+func TestListReadyAlbumCovers(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+	seedReadyAlbum(t, store, "album-a")
+	seedReadyAlbum(t, store, "album-b")
+	if err := store.CreateAlbum(ctx, Album{ID: "album-queued", OriginalFilename: "q.zip", Status: AlbumStatusQueued}); err != nil {
+		t.Fatalf("create album: %v", err)
+	}
+
+	for _, albumID := range []string{"album-a", "album-b", "album-queued"} {
+		if err := store.UpsertBlob(ctx, Blob{Hash: "hash-" + albumID, SizeBytes: 5}); err != nil {
+			t.Fatalf("upsert blob: %v", err)
+		}
+		if err := store.InsertPhoto(ctx, Photo{AlbumID: albumID, Index: 0, Name: "cover.png", Hash: "hash-" + albumID, Width: 1, Height: 1, Ratio: 1}); err != nil {
+			t.Fatalf("insert cover: %v", err)
+		}
+	}
+	if err := store.InsertPhoto(ctx, Photo{AlbumID: "album-a", Index: 1, Name: "second.png", Hash: "hash-album-a", Width: 2, Height: 2, Ratio: 1}); err != nil {
+		t.Fatalf("insert second photo: %v", err)
+	}
+
+	covers, err := store.ListReadyAlbumCovers(ctx)
+	if err != nil {
+		t.Fatalf("list ready album covers: %v", err)
+	}
+	if len(covers) != 2 {
+		t.Fatalf("expected only ready albums with photos, got %d: %+v", len(covers), covers)
+	}
+	byID := make(map[string]AlbumCover, len(covers))
+	for _, cover := range covers {
+		byID[cover.AlbumID] = cover
+	}
+	for _, albumID := range []string{"album-a", "album-b"} {
+		cover, ok := byID[albumID]
+		if !ok {
+			t.Fatalf("missing cover for %s", albumID)
+		}
+		if cover.Cover.Index != 0 || cover.Cover.Name != "cover.png" {
+			t.Fatalf("expected the index-0 cover for %s, got %+v", albumID, cover.Cover)
+		}
+		if cover.CreatedAt == "" {
+			t.Fatalf("expected createdAt on the cover row for %s", albumID)
+		}
+	}
+}
+
 func TestListReadyAlbumPhotosAndPairs(t *testing.T) {
 	store := openTestStore(t)
 	ctx := context.Background()

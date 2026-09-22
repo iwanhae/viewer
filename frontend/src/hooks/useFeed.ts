@@ -31,6 +31,7 @@ export function useFeed(seed: string, mode: FeedMode, afterCursor: string): UseF
   const [error, setError] = useState<string | null>(null)
   const [pageInfo, setPageInfo] = useState<FeedPageInfo>(defaultPageInfo)
   const latestRequest = useRef(0)
+  const inflightRef = useRef<AbortController | null>(null)
 
   const load = useCallback(async (seedValue: string, modeValue: FeedMode, latestAfter: string): Promise<void> => {
     if (modeValue === 'random' && !seedValue.trim()) {
@@ -44,6 +45,13 @@ export function useFeed(seed: string, mode: FeedMode, afterCursor: string): UseF
     const requestID = latestRequest.current + 1
     latestRequest.current = requestID
 
+    // The request id already ignores stale responses; aborting the previous
+    // request also stops its download instead of letting superseded pages
+    // finish streaming in the background.
+    inflightRef.current?.abort()
+    const controller = new AbortController()
+    inflightRef.current = controller
+
     setLoading(true)
     setError(null)
 
@@ -52,6 +60,7 @@ export function useFeed(seed: string, mode: FeedMode, afterCursor: string): UseF
         mode: modeValue,
         seed: modeValue === 'random' ? seedValue : undefined,
         after: modeValue === 'latest' ? latestAfter : undefined,
+        signal: controller.signal,
       })
       if (latestRequest.current !== requestID) return
       setItems(data.items)
@@ -70,6 +79,12 @@ export function useFeed(seed: string, mode: FeedMode, afterCursor: string): UseF
       if (latestRequest.current === requestID) {
         setLoading(false)
       }
+    }
+  }, [])
+
+  useEffect(() => {
+    return () => {
+      inflightRef.current?.abort()
     }
   }, [])
 

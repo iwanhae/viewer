@@ -191,6 +191,14 @@ A blob that is `failed` is terminal — `ListBlobsAwaitingEmbedding` selects onl
   repeating items the reader had already seen. Seeking by key degrades
   gracefully: a stale or mid-re-ingest cursor lands on the right position, and
   only a cursor that cannot be decoded at all falls back to the first page.
+- **The latest feed pages over covers, not photo rows.** Its in-memory
+  snapshot holds one photo per album (the index-0 cover, `ReadyAlbumCovers`),
+  not every photo of every album. A wall request against a 280k-photo library
+  used to reload the whole photo catalog whenever the 3-second snapshot
+  expired - about a second of catalog scanning per page view - where the cover
+  query touches a few thousand rows. The random feed already sampled from
+  photo counts and fetched only the photos it picked; the latest feed now
+  lives by the same rule.
 - **Photos carry width, height and ratio directly.** They are denormalized so
   album reads never need to join `blobs`.
 - **Embeddings live on the blob row; the vec0 table is only an index.**

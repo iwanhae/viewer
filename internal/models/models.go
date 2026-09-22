@@ -53,6 +53,15 @@ type FeedItem struct {
 	Ratio   float64 `json:"ratio"`
 }
 
+// AlbumCoverEntry is a ready album with its cover photo. The latest feed ranks
+// and pages over albums, so it only ever needs one photo per album - never the
+// other rows.
+type AlbumCoverEntry struct {
+	AlbumID   string    `json:"albumId"`
+	CreatedAt string    `json:"createdAt"`
+	Cover     PhotoMeta `json:"cover"`
+}
+
 type FeedResponse struct {
 	Items      []FeedItem `json:"items"`
 	Cursor     string     `json:"cursor,omitempty"`
