@@ -166,17 +166,21 @@ func encodeLatestCursor(item rankedAlbum) string {
 	return base64.RawURLEncoding.EncodeToString(payload)
 }
 
-func findRankedAlbumIndex(ranked []rankedAlbum, cursor latestCursor) int {
-	for idx, item := range ranked {
-		if item.album.AlbumID != cursor.AlbumID {
-			continue
+// seekPastCursor returns the index the page after the cursor starts at. The
+// ranked list is sorted newest first with the album id breaking ties, so the
+// entry following the cursor is the first one sorting strictly older than the
+// cursor's (createdAt, albumID) key. Seeking by key rather than looking the
+// cursor album up means a cursor whose album has since left the ready set -
+// re-ingest drops an album from the list while it re-extracts - resumes where
+// the reader was instead of silently restarting the feed from its first page.
+func seekPastCursor(ranked []rankedAlbum, cursor latestCursor) int {
+	return sort.Search(len(ranked), func(i int) bool {
+		itemNano := ranked[i].createdAt.UnixNano()
+		if itemNano != cursor.CreatedAtUnixNano {
+			return itemNano < cursor.CreatedAtUnixNano
 		}
-		if item.createdAt.UnixNano() != cursor.CreatedAtUnixNano {
-			continue
-		}
-		return idx
-	}
-	return -1
+		return ranked[i].album.AlbumID > cursor.AlbumID
+	})
 }
 
 func buildLatestPage(limit int, albumsList []*models.AlbumIndex, afterCursor string) models.FeedResponse {
@@ -197,9 +201,7 @@ func buildLatestPage(limit int, albumsList []*models.AlbumIndex, afterCursor str
 
 	start := 0
 	if decoded, ok := decodeLatestCursor(afterCursor); ok {
-		if idx := findRankedAlbumIndex(ranked, decoded); idx >= 0 {
-			start = idx + 1
-		}
+		start = seekPastCursor(ranked, decoded)
 	}
 	if start < 0 {
 		start = 0

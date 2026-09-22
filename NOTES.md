@@ -182,6 +182,15 @@ A blob that is `failed` is terminal — `ListBlobsAwaitingEmbedding` selects onl
   once. A wait cut short by a cancelled caller or a shutdown leaves the album
   `QUEUED` - never `FAILED` - which is exactly the state the upload scan
   requeues on its next pass.
+- **A latest-feed cursor is a position, not a membership card.** The cursor
+  carries `(createdAt, albumID)` and the page starts at the first ranked album
+  sorting strictly older than that key. Resolving the cursor by looking its
+  album up in the ready list instead made pagination self-destruct whenever the
+  ready set churned - an album being re-extracted leaves `AllAlbums()`, so its
+  cursor stopped resolving and the feed silently restarted from page one,
+  repeating items the reader had already seen. Seeking by key degrades
+  gracefully: a stale or mid-re-ingest cursor lands on the right position, and
+  only a cursor that cannot be decoded at all falls back to the first page.
 - **Photos carry width, height and ratio directly.** They are denormalized so
   album reads never need to join `blobs`.
 - **Embeddings live on the blob row; the vec0 table is only an index.**

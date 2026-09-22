@@ -505,6 +505,72 @@ func TestBuildLatestPaginationWithCursors(t *testing.T) {
 	}
 }
 
+// TestBuildLatestResumesWhenCursorAlbumLeftTheReadySet pins the seek-by-key
+// behavior: a cursor marks a position, not a membership card. The album a
+// cursor points at can vanish between pages - re-ingest drops an album from
+// the ready set while it re-extracts - and the feed must continue from where
+// the reader was instead of silently restarting from its first page.
+func TestBuildLatestResumesWhenCursorAlbumLeftTheReadySet(t *testing.T) {
+	source := &stubAlbumSource{
+		albums: []*models.AlbumIndex{
+			{
+				AlbumID:   "album-1",
+				CreatedAt: "2026-01-05T00:00:00Z",
+				Photos:    []models.PhotoMeta{{I: 1, W: 100, H: 80, Ratio: 1.25}},
+			},
+			{
+				AlbumID:   "album-2",
+				CreatedAt: "2026-01-04T00:00:00Z",
+				Photos:    []models.PhotoMeta{{I: 2, W: 100, H: 80, Ratio: 1.25}},
+			},
+			{
+				AlbumID:   "album-3",
+				CreatedAt: "2026-01-03T00:00:00Z",
+				Photos:    []models.PhotoMeta{{I: 3, W: 100, H: 80, Ratio: 1.25}},
+			},
+			{
+				AlbumID:   "album-4",
+				CreatedAt: "2026-01-02T00:00:00Z",
+				Photos:    []models.PhotoMeta{{I: 4, W: 100, H: 80, Ratio: 1.25}},
+			},
+			{
+				AlbumID:   "album-5",
+				CreatedAt: "2026-01-01T00:00:00Z",
+				Photos:    []models.PhotoMeta{{I: 5, W: 100, H: 80, Ratio: 1.25}},
+			},
+		},
+	}
+	svc := NewService(nil)
+	svc.albums = source
+	svc.snapshotTTL = 10 * time.Minute
+	clock := time.Unix(1000, 0)
+	svc.now = func() time.Time { return clock }
+
+	first, err := svc.Build(context.Background(), 2, "ignored", ModeLatest, "")
+	if err != nil {
+		t.Fatalf("build failed: %v", err)
+	}
+	if first.Items[0].AlbumID != "album-1" || first.Items[1].AlbumID != "album-2" {
+		t.Fatalf("unexpected first page order: %+v", first.Items)
+	}
+
+	// The album the cursor points at leaves the ready set, the way an album
+	// being re-extracted does.
+	source.albums = append(source.albums[:1], source.albums[2:]...)
+	clock = clock.Add(10 * time.Minute)
+
+	second, err := svc.Build(context.Background(), 2, "ignored", ModeLatest, first.NextCursor)
+	if err != nil {
+		t.Fatalf("build failed: %v", err)
+	}
+	if second.Items[0].AlbumID != "album-3" || second.Items[1].AlbumID != "album-4" {
+		t.Fatalf("cursor album gone: feed must resume past it, got=%+v", second.Items)
+	}
+	if !second.HasNext || !second.HasPrev {
+		t.Fatalf("unexpected nav flags: hasNext=%v hasPrev=%v", second.HasNext, second.HasPrev)
+	}
+}
+
 func TestBuildLatestIgnoresInvalidCursorAndFallsBackToFirstPage(t *testing.T) {
 	source := &stubAlbumSource{
 		albums: []*models.AlbumIndex{
