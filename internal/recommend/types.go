@@ -24,14 +24,6 @@ const (
 	MaxClaimLimit = 1024
 )
 
-// Rejection reasons ApplyEmbeddingResults reports for results that fail
-// validation before they ever reach the catalog. They are informational: a
-// worker must fix its payload, not retry it.
-const (
-	RejectWrongDim  = "wrong_dim"
-	RejectBadVector = "bad_vector"
-)
-
 // photoRef is one album photo that references a content-addressed blob.
 type photoRef struct {
 	AlbumID string

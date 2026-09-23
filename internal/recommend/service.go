@@ -516,11 +516,11 @@ func (s *Service) ApplyEmbeddingResults(ctx context.Context, results []catalog.E
 		}
 		if result.Status == catalog.EmbeddingStatusReady {
 			if len(result.Vector) != catalog.EmbeddingDim {
-				rejected = append(rejected, catalog.RejectedEmbedding{Hash: result.Hash, Reason: RejectWrongDim})
+				rejected = append(rejected, catalog.RejectedEmbedding{Hash: result.Hash, Reason: catalog.EmbeddingRejectWrongDim})
 				continue
 			}
 			if !allFinite(result.Vector) || isZeroNorm(result.Vector) {
-				rejected = append(rejected, catalog.RejectedEmbedding{Hash: result.Hash, Reason: RejectBadVector})
+				rejected = append(rejected, catalog.RejectedEmbedding{Hash: result.Hash, Reason: catalog.EmbeddingRejectBadVector})
 				continue
 			}
 		}

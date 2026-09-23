@@ -205,9 +205,9 @@ var (
 
 func rejectionReason(err error) string {
 	if errors.Is(err, errBadBase64) {
-		return "bad_base64"
+		return catalog.EmbeddingRejectBadBase64
 	}
-	return "bad_vector"
+	return catalog.EmbeddingRejectBadVector
 }
 
 // decodeVector turns the base64 little-endian float32 wire format into a

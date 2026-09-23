@@ -782,7 +782,7 @@ func TestExternalWorkerClaimAndApplyRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("apply bad vectors: %v", err)
 	}
-	if len(rejected) != 2 || rejected[0].Reason != RejectWrongDim || rejected[1].Reason != RejectBadVector {
+	if len(rejected) != 2 || rejected[0].Reason != catalog.EmbeddingRejectWrongDim || rejected[1].Reason != catalog.EmbeddingRejectBadVector {
 		t.Fatalf("expected wrong_dim then bad_vector rejections, got %+v", rejected)
 	}
 

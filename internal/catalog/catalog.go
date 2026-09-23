@@ -839,6 +839,18 @@ const (
 	// results. The recommend layer pre-validates the same rule, so this is the
 	// backstop for direct catalog callers.
 	EmbeddingRejectWrongDim = "wrong_dim"
+	// EmbeddingRejectBadVector marks a ready result whose vector is numerically
+	// unusable even at the right width: a non-finite entry or a zero norm ranks
+	// as NaN and drags the whole neighbor ranking down with it. The recommend
+	// layer rejects these before the catalog sees the result, so catalog itself
+	// never produces this reason; the constant is here so the wire value has
+	// one owner.
+	EmbeddingRejectBadVector = "bad_vector"
+	// EmbeddingRejectBadBase64 marks a results payload whose vector is not
+	// valid base64. The worker API's decoder catches it before the catalog
+	// sees the result, so catalog itself never produces this reason; the
+	// constant is here so the wire value has one owner.
+	EmbeddingRejectBadBase64 = "bad_base64"
 )
 
 // RejectedEmbedding is one result a write-back refused, with the reason.
