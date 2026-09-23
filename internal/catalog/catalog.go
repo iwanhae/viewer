@@ -246,7 +246,9 @@ func nowRFC3339() string {
 
 // CreateAlbum inserts a new album row. It is idempotent: an existing album with
 // the same id is left untouched.
-func (s *Store) CreateAlbum(ctx context.Context, album Album) error {
+// writeAlbum validates and stamps album, inserts it, applies onConflict as the
+// statement's ON CONFLICT clause, and names the operation errVerb in any error.
+func (s *Store) writeAlbum(ctx context.Context, album Album, onConflict string, errVerb string) error {
 	if strings.TrimSpace(album.ID) == "" {
 		return fmt.Errorf("album id is required")
 	}
@@ -263,49 +265,32 @@ func (s *Store) CreateAlbum(ctx context.Context, album Album) error {
 
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO albums (id, original_filename, size_bytes, status, source_key, photo_count, error, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(id) DO NOTHING`,
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`+onConflict,
 		album.ID, album.OriginalFilename, album.SizeBytes, string(album.Status),
 		album.SourceKey, album.PhotoCount, album.Error, album.CreatedAt, album.UpdatedAt,
 	)
 	if err != nil {
-		return fmt.Errorf("create album %s: %w", album.ID, err)
+		return fmt.Errorf("%s album %s: %w", errVerb, album.ID, err)
 	}
 	return nil
+}
+
+// CreateAlbum inserts a new album row. It is idempotent: an existing album with
+// the same id is left untouched.
+func (s *Store) CreateAlbum(ctx context.Context, album Album) error {
+	return s.writeAlbum(ctx, album, `
+		ON CONFLICT(id) DO NOTHING`, "create")
 }
 
 // UpsertAlbum creates the album when missing, otherwise refreshes the mutable
 // upload fields while keeping existing progress untouched.
 func (s *Store) UpsertAlbum(ctx context.Context, album Album) error {
-	if strings.TrimSpace(album.ID) == "" {
-		return fmt.Errorf("album id is required")
-	}
-	if album.Status == "" {
-		album.Status = AlbumStatusQueued
-	}
-	now := nowRFC3339()
-	if album.CreatedAt == "" {
-		album.CreatedAt = now
-	}
-	if album.UpdatedAt == "" {
-		album.UpdatedAt = now
-	}
-
-	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO albums (id, original_filename, size_bytes, status, source_key, photo_count, error, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+	return s.writeAlbum(ctx, album, `
 		ON CONFLICT(id) DO UPDATE SET
 			original_filename = excluded.original_filename,
 			size_bytes        = excluded.size_bytes,
 			source_key        = excluded.source_key,
-			updated_at        = excluded.updated_at`,
-		album.ID, album.OriginalFilename, album.SizeBytes, string(album.Status),
-		album.SourceKey, album.PhotoCount, album.Error, album.CreatedAt, album.UpdatedAt,
-	)
-	if err != nil {
-		return fmt.Errorf("upsert album %s: %w", album.ID, err)
-	}
-	return nil
+			updated_at        = excluded.updated_at`, "upsert")
 }
 
 func (s *Store) GetAlbum(ctx context.Context, albumID string) (*Album, error) {
