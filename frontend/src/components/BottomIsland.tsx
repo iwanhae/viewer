@@ -26,12 +26,7 @@ type BottomIslandIndicator = {
   ariaLabel?: string
 }
 
-type BottomIslandDivider = {
-  kind: 'divider'
-  id: string
-}
-
-type BottomIslandAction = BottomIslandButtonAction | BottomIslandIndicator | BottomIslandDivider
+type BottomIslandAction = BottomIslandButtonAction | BottomIslandIndicator
 
 type BottomIslandProps = {
   actions: BottomIslandAction[]
@@ -67,10 +62,6 @@ export function BottomIsland({ actions, className }: BottomIslandProps): ReactNo
   return (
     <div className={`bottom-island ${className ?? ''}`.trim()} ref={rootRef}>
       {actions.map((action) => {
-        if (action.kind === 'divider') {
-          return <div className="bottom-island-divider" key={action.id} />
-        }
-
         if (action.kind === 'indicator') {
           return (
             <div

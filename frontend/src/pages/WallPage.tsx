@@ -13,8 +13,7 @@ import {
 } from '../utils/storage'
 import { MasonryWall } from '../components/MasonryWall'
 import { BottomIsland } from '../components/BottomIsland'
-import { ColumnsIcon, ModeIcon, NextIcon, PrevIcon, RefreshIcon } from '../components/IslandIcons'
-import { AlbumsIcon, MoreIcon, SearchIcon, UploadIcon } from '../components/IslandIcons'
+import { ColumnsIcon, ModeIcon, NextIcon, PrevIcon, RefreshIcon, ShortcutIcon } from '../components/IslandIcons'
 
 const WALL_COLUMNS_KEY = 'wall_columns'
 const DEFAULT_COLUMNS = 3
@@ -313,57 +312,50 @@ export function WallPage() {
                 },
               ]
             : []),
-          // Every destination lives here now — the sub-pages only know the way
-          // back to the wall. They share one popover so the island stays narrow
-          // on phones, and Admin stays out of it on purpose: the only way to
+          // Every destination lives here — the sub-pages only know the way back
+          // to the wall. They share one popover so the island stays narrow on
+          // phones, and Admin stays out of it on purpose: the only way to
           // detect it is probing /admin/api/stats, an admin-only query that
           // takes seconds, and that probe would fire on every wall load.
           {
-            kind: 'divider' as const,
-            id: 'wall-nav-divider',
-          },
-          {
             id: 'wall-nav',
-            icon: <MoreIcon />,
-            ariaLabel: 'Open navigation menu',
-            tooltip: 'Menu',
+            icon: <ShortcutIcon />,
+            ariaLabel: 'Open shortcuts',
+            tooltip: 'Shortcut',
             testId: 'wall-nav',
             renderPopup: ({ close }) => (
               <div className="bottom-island-popup-stack" data-testid="wall-nav-popup">
                 <button
                   type="button"
-                  className="bottom-island-popup-option bottom-island-popup-row"
+                  className="bottom-island-popup-option"
                   data-testid="wall-nav-albums"
                   onClick={() => {
                     navigate('/albums/find')
                     close()
                   }}
                 >
-                  <AlbumsIcon />
                   Find albums
                 </button>
                 <button
                   type="button"
-                  className="bottom-island-popup-option bottom-island-popup-row"
+                  className="bottom-island-popup-option"
                   data-testid="wall-nav-search"
                   onClick={() => {
                     navigate('/search')
                     close()
                   }}
                 >
-                  <SearchIcon />
                   Search photos
                 </button>
                 <button
                   type="button"
-                  className="bottom-island-popup-option bottom-island-popup-row"
+                  className="bottom-island-popup-option"
                   data-testid="wall-nav-upload"
                   onClick={() => {
                     navigate('/upload')
                     close()
                   }}
                 >
-                  <UploadIcon />
                   Upload
                 </button>
               </div>

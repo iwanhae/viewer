@@ -71,6 +71,22 @@ export function RefreshIcon({ title }: IconProps) {
   )
 }
 
+export function ShortcutIcon({ title }: IconProps) {
+  return (
+    <SvgIcon title={title}>
+      <circle cx="6.5" cy="6.5" r="2.4" stroke="currentColor" strokeWidth="1.8" />
+      <circle cx="17.5" cy="6.5" r="2.4" stroke="currentColor" strokeWidth="1.8" />
+      <circle cx="12" cy="17.5" r="2.4" stroke="currentColor" strokeWidth="1.8" />
+      <path
+        d="M8.5 8.1 10.8 15M15.5 8.1 13.2 15M8.8 6.5h6.4"
+        stroke="currentColor"
+        strokeWidth="1.8"
+        strokeLinecap="round"
+      />
+    </SvgIcon>
+  )
+}
+
 export function BackToAlbumIcon({ title }: IconProps) {
   return (
     <SvgIcon title={title}>
@@ -123,60 +139,6 @@ export function UpIcon({ title }: IconProps) {
         strokeLinecap="round"
         strokeLinejoin="round"
       />
-    </SvgIcon>
-  )
-}
-
-export function AlbumsIcon({ title }: IconProps) {
-  return (
-    <SvgIcon title={title}>
-      <rect x="8" y="4.5" width="11.5" height="8.5" rx="1.5" stroke="currentColor" strokeWidth="1.8" />
-      <rect x="4.5" y="10.5" width="11.5" height="9" rx="1.5" stroke="currentColor" strokeWidth="1.8" />
-    </SvgIcon>
-  )
-}
-
-export function SearchIcon({ title }: IconProps) {
-  return (
-    <SvgIcon title={title}>
-      <circle cx="11" cy="11" r="6.5" stroke="currentColor" strokeWidth="1.8" />
-      <path
-        d="m16 16 4.5 4.5"
-        stroke="currentColor"
-        strokeWidth="1.8"
-        strokeLinecap="round"
-      />
-    </SvgIcon>
-  )
-}
-
-export function UploadIcon({ title }: IconProps) {
-  return (
-    <SvgIcon title={title}>
-      <path d="M12 15V4.5" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
-      <path
-        d="m7.5 8.5 4.5-4 4.5 4"
-        stroke="currentColor"
-        strokeWidth="1.8"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-      />
-      <path
-        d="M4.5 15.5v2A2.5 2.5 0 0 0 7 20h10a2.5 2.5 0 0 0 2.5-2.5v-2"
-        stroke="currentColor"
-        strokeWidth="1.8"
-        strokeLinecap="round"
-      />
-    </SvgIcon>
-  )
-}
-
-export function MoreIcon({ title }: IconProps) {
-  return (
-    <SvgIcon title={title}>
-      <circle cx="5" cy="12" r="1.7" fill="currentColor" stroke="none" />
-      <circle cx="12" cy="12" r="1.7" fill="currentColor" stroke="none" />
-      <circle cx="19" cy="12" r="1.7" fill="currentColor" stroke="none" />
     </SvgIcon>
   )
 }

@@ -83,15 +83,6 @@
   justify-content: center;
 }
 
-/* Separates the view controls from the navigation group inside the island. */
-.bottom-island-divider {
-  flex: 0 0 auto;
-  width: 1px;
-  height: 22px;
-  margin: 0 2px;
-  background: rgba(15, 23, 42, 0.18);
-}
-
 .bottom-island-action {
   border-radius: var(--radius-pill);
   width: 38px;
@@ -216,14 +207,6 @@
 .bottom-island-popup-option.active {
   background: var(--ink);
   color: var(--paper);
-}
-
-/* Nav entries inside the wall's popover: icon + label in one row. */
-.bottom-island-popup-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  text-align: left;
 }
 
 .status {
@@ -542,19 +525,5 @@
   .bottom-island {
     width: calc(100vw - 20px);
     justify-content: space-between;
-    /* The island now also carries the navigation group, so on narrow screens
-       the buttons and gaps shrink to keep all of it on one row. */
-    padding: 4px;
-    gap: 2px;
-  }
-
-  .bottom-island-action {
-    width: 32px;
-    height: 32px;
-  }
-
-  .bottom-island-divider {
-    height: 18px;
-    margin: 0 1px;
   }
 }
