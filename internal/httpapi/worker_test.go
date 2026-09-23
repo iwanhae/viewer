@@ -202,7 +202,13 @@ func TestWorkerResultsRoundTripReachesSearchAndRecommendations(t *testing.T) {
 		t.Fatalf("counts=%+v want fully ready", counts)
 	}
 
-	// The vectors are in the in-memory index: the query photo's best match is
+	// The write-back also landed both points in the vector store — the search
+	// reads from there, not from the catalog.
+	if got := harness.vectors.pointCount(); got != 2 {
+		t.Fatalf("vector store points=%d want=2", got)
+	}
+
+	// The vectors are searchable right away: the query photo's best match is
 	// the other album's photo, and the item carries its hash for the client's
 	// image URLs.
 	recItems := harness.do(t, http.MethodGet, "/api/recommendations/"+first.AlbumID+"/0?limit=5", nil)

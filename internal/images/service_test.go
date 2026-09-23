@@ -77,7 +77,7 @@ func (r *failingReader) Read(p []byte) (int, error) {
 
 func openTestCatalog(t *testing.T) *catalog.Store {
 	t.Helper()
-	cat, err := catalog.Open(filepath.Join(t.TempDir(), "catalog.db"))
+	cat, err := catalog.Open(filepath.Join(t.TempDir(), "catalog.db"), nil)
 	if err != nil {
 		t.Fatalf("open catalog: %v", err)
 	}

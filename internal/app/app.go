@@ -17,6 +17,7 @@ import (
 	"viewer/internal/images"
 	"viewer/internal/ingest"
 	"viewer/internal/pipeline"
+	"viewer/internal/qdrant"
 	"viewer/internal/recommend"
 	"viewer/internal/storage"
 	"viewer/internal/vision"
@@ -40,8 +41,8 @@ func Run(ctx context.Context) error {
 		return err
 	}
 	log.Printf(
-		"viewer: config loaded on port=%d catalog=%s s3_prefix=%s",
-		cfg.Port, cfg.DBPath(), cfg.DescribePrefix(),
+		"viewer: config loaded on port=%d catalog=%s s3_prefix=%s qdrant=%s",
+		cfg.Port, cfg.DBPath(), cfg.DescribePrefix(), cfg.QdrantURL,
 	)
 	if cfg.WorkerToken != "" {
 		log.Printf("viewer: embedding worker API requires a bearer token")
@@ -65,11 +66,38 @@ func Run(ctx context.Context) error {
 		log.Printf("viewer: serving the catalog restored from %s", backup.BackupObjectKey)
 	}
 
-	cat, err := catalog.Open(cfg.DBPath())
+	// Vectors live in the external Qdrant collection, not in SQLite (since
+	// migration 0003 the catalog stores only their status). The client is the
+	// upload target the migration needs while it moves any still-stored vectors
+	// over, so it must exist before the catalog opens.
+	vectorStore := qdrant.New(cfg.QdrantURL, cfg.QdrantAPIKey, qdrant.DefaultCollection, catalog.EmbeddingDim)
+	cat, err := catalog.Open(cfg.DBPath(), vectorStore)
 	if err != nil {
 		return fmt.Errorf("open metadata catalog: %w", err)
 	}
 	defer cat.Close()
+
+	// The migration only guarantees the collection exists when it had vectors
+	// to move. Ensure it on every boot so a fresh or already-migrated catalog
+	// is searchable too; a mismatched collection config fails the start here
+	// rather than surfacing as errors on the first search.
+	if err := vectorStore.EnsureCollection(ctx); err != nil {
+		return fmt.Errorf("ensure vector collection: %w", err)
+	}
+
+	// The store and the catalog are written by different paths (worker
+	// write-backs, migrations, album reloads), so they can drift apart — most
+	// commonly after a catalog backup was restored over a store that kept its
+	// old points, or the other way around. Nothing here repairs that
+	// automatically; the mismatch is logged so the operator can re-embed or
+	// wipe whichever side is stale.
+	if readyPairs, err := cat.ReadyPairCount(ctx); err != nil {
+		log.Printf("viewer: counting ready embeddings failed: %v", err)
+	} else if points, err := vectorStore.CountVectors(ctx); err != nil {
+		log.Printf("viewer: counting vector store points failed: %v", err)
+	} else if points != int(readyPairs) {
+		log.Printf("viewer: WARNING vector store holds %d point(s) but the catalog has %d ready photo pair(s); recommendations may be incomplete until the two are re-synced", points, readyPairs)
+	}
 
 	imageService := images.NewService(cat, store)
 
@@ -84,7 +112,7 @@ func Run(ctx context.Context) error {
 	// below, on the embedding drain, hourly, and once at boot — the boot sweep
 	// also cleans up a run that crashed between its backup and its deletes.
 	finalizer := backup.NewFinalizer(store, cat, cfg.StateDir, cfg.AllowBackupOverwrite)
-	recommendService := recommend.NewService(cat, imageService, recommend.NewVisionEmbedder(vision.Config{
+	recommendService := recommend.NewService(cat, vectorStore, imageService, recommend.NewVisionEmbedder(vision.Config{
 		ModelID: cfgpkg.ModelDir,
 	}), finalizer.Run)
 	pipelineService := pipeline.NewService(cat, store, pipeline.Options{
@@ -153,10 +181,8 @@ func Run(ctx context.Context) error {
 		log.Printf("viewer: embedding background workers started")
 	}()
 
-	log.Printf("viewer: startup warmup running in background")
+	log.Printf("viewer: startup tasks running in background")
 	go func() {
-		warmupRecommendations(ctx, recommendService)
-
 		// A previous run can have crashed between the catalog backup and the
 		// zip deletes. Finalizing once here refreshes the backup and clears
 		// those leftovers; a scan that ran first could only skip them.
@@ -165,26 +191,12 @@ func Run(ctx context.Context) error {
 		}
 
 		// The upload prefix is the drop zone for the zips that did not come
-		// through POST /api/albums. It scans once here, after the index is
-		// loaded, and then keeps watching, so a zip dropped while the server is
-		// running needs no restart.
+		// through POST /api/albums. It scans once here and then keeps watching,
+		// so a zip dropped while the server is running needs no restart.
 		go ingest.NewWatcher(store, albumService).Run(ctx)
 
-		log.Printf("viewer: warmup completed")
+		log.Printf("viewer: startup tasks completed")
 	}()
 
 	return srv.ListenAndServe()
-}
-
-// warmupRecommendations rebuilds the in-memory recommendation index from the
-// catalog. It runs before the upload scan on purpose: the scan queues albums,
-// and refreshing one album's slice of the index after an extraction costs less
-// than reloading the whole thing afterwards.
-func warmupRecommendations(ctx context.Context, recommendService *recommend.Service) {
-	startedAt := time.Now()
-	log.Printf("catalog warmup started")
-	if err := recommendService.LoadAll(ctx); err != nil {
-		log.Printf("recommendation index warmup failed: %v", err)
-	}
-	log.Printf("catalog warmup finished duration=%s", time.Since(startedAt).Round(time.Millisecond))
 }

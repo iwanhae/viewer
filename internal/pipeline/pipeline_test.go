@@ -79,7 +79,7 @@ func (f *fakeStore) has(key string) bool {
 
 func openTestCatalog(t *testing.T) *catalog.Store {
 	t.Helper()
-	cat, err := catalog.Open(filepath.Join(t.TempDir(), "catalog.db"))
+	cat, err := catalog.Open(filepath.Join(t.TempDir(), "catalog.db"), nil)
 	if err != nil {
 		t.Fatalf("open catalog: %v", err)
 	}
@@ -225,7 +225,7 @@ func TestProcessAlbumExtractsImagesAndDedupesBlobs(t *testing.T) {
 		if err != nil {
 			t.Fatalf("get blob %s: %v", hash, err)
 		}
-		if blob.EmbeddingStatus != catalog.EmbeddingStatusPending || len(blob.Embedding) != 0 {
+		if blob.EmbeddingStatus != catalog.EmbeddingStatusPending {
 			t.Fatalf("blob %s should stay pending after extraction: %+v", hash, blob)
 		}
 		if blob.ContentType != "image/png" {

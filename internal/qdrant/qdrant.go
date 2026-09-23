@@ -384,9 +384,9 @@ func (c *Client) DeleteByAlbum(ctx context.Context, albumID string) error {
 	return out.checkCompleted(fmt.Sprintf("delete album %q points", albumID))
 }
 
-// Count returns the exact number of points currently stored in the
+// CountVectors returns the exact number of points currently stored in the
 // collection, used to notice a wiped collection and refill it.
-func (c *Client) Count(ctx context.Context) (int, error) {
+func (c *Client) CountVectors(ctx context.Context) (int, error) {
 	var out struct {
 		Result struct {
 			Count int `json:"count"`

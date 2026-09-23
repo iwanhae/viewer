@@ -594,7 +594,7 @@ func TestDeleteByAlbum(t *testing.T) {
 	}
 }
 
-func TestCount(t *testing.T) {
+func TestCountVectors(t *testing.T) {
 	var reqBody map[string]any
 	var query string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -613,12 +613,12 @@ func TestCount(t *testing.T) {
 	defer srv.Close()
 
 	c := newTestClient(srv, "")
-	got, err := c.Count(context.Background())
+	got, err := c.CountVectors(context.Background())
 	if err != nil {
-		t.Fatalf("Count: %v", err)
+		t.Fatalf("CountVectors: %v", err)
 	}
 	if got != 42 {
-		t.Errorf("Count = %d, want 42", got)
+		t.Errorf("CountVectors = %d, want 42", got)
 	}
 	if reqBody["exact"] != true {
 		t.Errorf("body = %v, want exact:true", reqBody)
@@ -640,8 +640,8 @@ func TestAPIKeyHeaderOnlyWhenConfigured(t *testing.T) {
 			defer srv.Close()
 
 			c := New(srv.URL, key, DefaultCollection, testDim)
-			if _, err := c.Count(context.Background()); err != nil {
-				t.Fatalf("Count: %v", err)
+			if _, err := c.CountVectors(context.Background()); err != nil {
+				t.Fatalf("CountVectors: %v", err)
 			}
 			sent, present := got["Api-Key"]
 			if key == "" {
@@ -667,9 +667,9 @@ func TestNon2xxErrorCarriesStatusAndBodySnippet(t *testing.T) {
 	defer srv.Close()
 
 	c := newTestClient(srv, "")
-	_, err := c.Count(context.Background())
+	_, err := c.CountVectors(context.Background())
 	if err == nil {
-		t.Fatal("Count succeeded against a 500, want error")
+		t.Fatal("CountVectors succeeded against a 500, want error")
 	}
 	if !strings.Contains(err.Error(), "500") {
 		t.Errorf("error %q does not mention the HTTP status", err)
@@ -691,7 +691,7 @@ func TestCanceledContextAbortsRequest(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	c := newTestClient(srv, "")
-	if _, err := c.Count(ctx); err == nil {
-		t.Fatal("Count succeeded on a canceled context, want error")
+	if _, err := c.CountVectors(ctx); err == nil {
+		t.Fatal("CountVectors succeeded on a canceled context, want error")
 	}
 }

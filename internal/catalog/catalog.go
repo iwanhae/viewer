@@ -1,15 +1,16 @@
 // Package catalog persists album, photo and image-blob metadata in a local
 // SQLite database. S3 only holds the binary payloads (the staged upload zip and
-// content-addressed image blobs); everything else lives here.
+// content-addressed image blobs); everything else lives here. Embedding
+// vectors are the one exception: since migration 0003 they live in the
+// external Qdrant collection, one point per photo, and SQLite keeps only the
+// per-blob embedding bookkeeping (status, error, lease).
 package catalog
 
 import (
 	"context"
 	"database/sql"
-	"encoding/binary"
 	"errors"
 	"fmt"
-	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -20,10 +21,11 @@ import (
 	"viewer/internal/models"
 
 	_ "modernc.org/sqlite"
-	// The catalog also owns the vector index (blob_embeddings), so the
-	// sqlite-vec extension is registered here for every connection this
-	// package opens — including the read-only ones the backup package uses to
-	// inspect snapshots.
+	// The catalog no longer stores vectors, but a database restored from a
+	// pre-0003 backup still contains the blob_embeddings vec0 virtual table,
+	// and migration 0003's DROP TABLE only works while the sqlite-vec module
+	// is registered on the connection. Keep this import for as long as
+	// migration 0002 is in the chain.
 	_ "modernc.org/sqlite/vec"
 )
 
@@ -80,21 +82,20 @@ type Photo struct {
 
 // Blob is one content-addressed image payload stored in S3 under
 // "blobs/<hash>". Identical image bytes share a single blob row (and a single
-// S3 object) no matter how many albums contain them.
+// S3 object) no matter how many albums contain them. The embedding vector
+// itself lives in the Qdrant collection; the row carries only its state.
 type Blob struct {
 	Hash            string
 	SizeBytes       int64
 	ContentType     string
 	EmbeddingStatus EmbeddingStatus
-	Embedding       []float32
 	EmbeddingError  string
 	CreatedAt       string
 }
 
-// PhotoWithBlob is a photo joined with its blob row, used to rebuild the
-// recommendation photo-ref index at startup. The embedding itself is not
-// selected: vectors live in the blob_embeddings vec0 table and are only ever
-// read through vector queries or GetBlob.
+// PhotoWithBlob is a photo joined with its blob row — the shape the vector
+// store sync paths need: the photo's (album, idx) identity and dimensions plus
+// the blob's embedding status.
 type PhotoWithBlob struct {
 	Photo Photo
 	Blob  Blob
@@ -117,8 +118,12 @@ type Store struct {
 }
 
 // Open opens (creating if needed) the SQLite catalog at path, applying the
-// versioned schema migrations up to this build's newest schema.
-func Open(path string) (*Store, error) {
+// versioned schema migrations up to this build's newest schema. Migration 0003
+// moves every stored vector into sink before dropping SQLite's vector storage,
+// so it can be nil only when there is nothing to upload; see
+// migrateVectorsToQdrant. Open must block startup until it returns: the
+// migration has to finish before the server accepts traffic.
+func Open(path string, sink VectorSink) (*Store, error) {
 	clean := strings.TrimSpace(path)
 	if clean == "" {
 		return nil, fmt.Errorf("catalog path is required")
@@ -148,7 +153,7 @@ func Open(path string) (*Store, error) {
 	db.SetMaxIdleConns(1)
 	db.SetConnMaxLifetime(0)
 
-	if err := runMigrations(db); err != nil {
+	if err := runMigrations(db, sink); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("migrate catalog: %w", err)
 	}
@@ -634,7 +639,8 @@ func scanPhoto(row scanner) (Photo, error) {
 }
 
 // UpsertBlob records the existence of a content-addressed blob. It never
-// clobbers an existing embedding.
+// clobbers an existing embedding state: the conflict update touches only the
+// upload fields, and a fresh row starts out pending.
 func (s *Store) UpsertBlob(ctx context.Context, blob Blob) error {
 	if strings.TrimSpace(blob.Hash) == "" {
 		return fmt.Errorf("blob hash is required")
@@ -644,8 +650,8 @@ func (s *Store) UpsertBlob(ctx context.Context, blob Blob) error {
 	}
 	now := nowRFC3339()
 	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO blobs (hash, size_bytes, content_type, embedding_status, embedding, embedding_error, created_at)
-		VALUES (?, ?, ?, ?, NULL, '', ?)
+		INSERT INTO blobs (hash, size_bytes, content_type, embedding_status, embedding_error, created_at)
+		VALUES (?, ?, ?, ?, '', ?)
 		ON CONFLICT(hash) DO UPDATE SET
 			size_bytes   = excluded.size_bytes,
 			content_type = excluded.content_type`,
@@ -659,13 +665,12 @@ func (s *Store) UpsertBlob(ctx context.Context, blob Blob) error {
 
 func (s *Store) GetBlob(ctx context.Context, hash string) (*Blob, error) {
 	row := s.db.QueryRowContext(ctx, `
-		SELECT hash, size_bytes, content_type, embedding_status, embedding, embedding_error, created_at
+		SELECT hash, size_bytes, content_type, embedding_status, embedding_error, created_at
 		FROM blobs WHERE hash = ?`, hash)
 	var blob Blob
 	var status string
-	var vector []byte
 	err := row.Scan(
-		&blob.Hash, &blob.SizeBytes, &blob.ContentType, &status, &vector,
+		&blob.Hash, &blob.SizeBytes, &blob.ContentType, &status,
 		&blob.EmbeddingError, &blob.CreatedAt,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -675,118 +680,7 @@ func (s *Store) GetBlob(ctx context.Context, hash string) (*Blob, error) {
 		return nil, fmt.Errorf("get blob %s: %w", hash, err)
 	}
 	blob.EmbeddingStatus = EmbeddingStatus(status)
-	blob.Embedding = DecodeVector(vector)
 	return &blob, nil
-}
-
-// setBlobEmbedding is the unconditional low-level write for a blob's embedding
-// outcome: it overwrites whichever status the blob currently has, and keeps the
-// vec0 index in lockstep — a ready vector is (re-)indexed, any other status
-// un-indexes the blob. Production workers must go through
-// ClaimPendingEmbeddings + ApplyEmbeddingResults so a terminal result can never
-// be clobbered; this stays for tests and one-off administrative fixes.
-func (s *Store) setBlobEmbedding(ctx context.Context, hash string, status EmbeddingStatus, vector []float32, errorText string) error {
-	// The vec0 column is typed float[EmbeddingDim]: a wrong-length vector
-	// would fail the index insert mid-transaction, so refuse it up front.
-	if status == EmbeddingStatusReady && len(vector) != EmbeddingDim {
-		return fmt.Errorf("set blob %s embedding: %d-dim vector, want %d", hash, len(vector), EmbeddingDim)
-	}
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("set blob %s embedding: %w", hash, err)
-	}
-	defer func() { _ = tx.Rollback() }()
-
-	update, err := tx.ExecContext(ctx, `
-		UPDATE blobs
-		SET embedding_status = ?, embedding = ?, embedding_error = ?
-		WHERE hash = ?`,
-		string(status), EncodeVector(vector), errorText, hash)
-	if err != nil {
-		return fmt.Errorf("set blob %s embedding: %w", hash, err)
-	}
-	// The vec0 insert below is keyed by hash alone, so setting an embedding for
-	// a hash with no blob row would orphan an index entry that KNN returns but
-	// GetBlob cannot. Refuse instead of leaving the index pointing at nothing.
-	if affected, err := update.RowsAffected(); err != nil {
-		return fmt.Errorf("count blob %s: %w", hash, err)
-	} else if affected == 0 {
-		return fmt.Errorf("set blob %s embedding: %w", hash, ErrBlobNotFound)
-	}
-	// Delete before insert so an administrative overwrite replaces the stored
-	// vector instead of colliding with it; on a non-ready outcome it is the
-	// un-indexing itself.
-	if _, err := tx.ExecContext(ctx, `DELETE FROM blob_embeddings WHERE hash = ?`, hash); err != nil {
-		return fmt.Errorf("unindex blob %s: %w", hash, err)
-	}
-	if status == EmbeddingStatusReady {
-		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO blob_embeddings(hash, embedding) VALUES (?, ?)`,
-			hash, EncodeVector(vector)); err != nil {
-			return fmt.Errorf("index blob %s: %w", hash, err)
-		}
-	}
-	return tx.Commit()
-}
-
-// MaxNeighborK is the largest k a vector KNN query may ask for. The bundled
-// sqlite-vec caps k at 4096 and errors above it. The vec0 KNN is an exhaustive
-// scan, so top-4096 is the exact global top-4096 — clamping here never drops a
-// neighbor the scan itself would have found.
-const MaxNeighborK = 4096
-
-// EmbeddingNeighbor is one vector-space neighbor: a blob hash and its cosine
-// distance to the query vector (smaller means more similar).
-type EmbeddingNeighbor struct {
-	Hash     string
-	Distance float64
-}
-
-// FindNeighborEmbeddings returns the blob hashes whose indexed embeddings are
-// nearest to query under cosine distance, at most k of them, ranked by
-// distance ascending with ties broken by hash ascending. The vec0 index does
-// the scanning (there is no ANN in sqlite-vec yet), so complexity matches the
-// in-memory scan it replaced without keeping a single vector resident.
-func (s *Store) FindNeighborEmbeddings(ctx context.Context, query []float32, k int) ([]EmbeddingNeighbor, error) {
-	if len(query) != EmbeddingDim {
-		return nil, fmt.Errorf("query vector has %d dimensions, want %d", len(query), EmbeddingDim)
-	}
-	if k <= 0 {
-		return []EmbeddingNeighbor{}, nil
-	}
-	if k > MaxNeighborK {
-		k = MaxNeighborK
-	}
-	rows, err := s.db.QueryContext(ctx, fmt.Sprintf(`
-		SELECT hash, distance FROM blob_embeddings
-		WHERE embedding MATCH ? AND k = %d
-		ORDER BY distance`, k), EncodeVector(query))
-	if err != nil {
-		return nil, fmt.Errorf("query vector neighbors: %w", err)
-	}
-	defer rows.Close()
-
-	neighbors := make([]EmbeddingNeighbor, 0, k)
-	for rows.Next() {
-		var neighbor EmbeddingNeighbor
-		if err := rows.Scan(&neighbor.Hash, &neighbor.Distance); err != nil {
-			return nil, fmt.Errorf("scan vector neighbor: %w", err)
-		}
-		neighbors = append(neighbors, neighbor)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate vector neighbors: %w", err)
-	}
-	// vec0 only permits a bare "ORDER BY distance" on KNN queries, so the
-	// deterministic (distance, hash) ranking the recommend API promises is
-	// applied here instead.
-	sort.SliceStable(neighbors, func(i, j int) bool {
-		if neighbors[i].Distance != neighbors[j].Distance {
-			return neighbors[i].Distance < neighbors[j].Distance
-		}
-		return neighbors[i].Hash < neighbors[j].Hash
-	})
-	return neighbors, nil
 }
 
 // EmbeddingResult is one blob's embedding outcome as reported by a worker —
@@ -811,11 +705,11 @@ const (
 	// worker counting results that went nowhere.
 	EmbeddingRejectInvalidHash = "invalid_hash"
 	// EmbeddingRejectWrongDim marks a ready result whose vector does not fill
-	// the blob_embeddings column's fixed width. It is rejected per item rather
-	// than allowed to fail the vec0 insert, which would abort the whole batch:
-	// one worker shipping a wrong-sized checkpoint must not sink its peers'
-	// results. The recommend layer pre-validates the same rule, so this is the
-	// backstop for direct catalog callers.
+	// the model's fixed width. It is rejected per item rather than allowed to
+	// fail the whole batch: one worker shipping a wrong-sized checkpoint must
+	// not sink its peers' results. The recommend layer pre-validates the same
+	// rule before uploading the vector, so this is the backstop for direct
+	// catalog callers.
 	EmbeddingRejectWrongDim = "wrong_dim"
 	// EmbeddingRejectBadVector marks a ready result whose vector is numerically
 	// unusable even at the right width: a non-finite entry or a zero norm ranks
@@ -967,11 +861,14 @@ func (s *Store) updateEmbeddingLeases(
 }
 
 // ApplyEmbeddingResults records a batch of worker outcomes in one transaction.
-// A result only lands on a blob still in the processing state: terminal rows
-// (ready/failed) can never be overwritten, and a blob whose lease expired but
-// which nobody re-claimed yet still accepts the late result — the content is
-// hash-identical, so nothing is corrupted. Items that do not land are reported
-// as rejected with a reason; they are informational, not errors.
+// The vector itself is not stored here: the caller writes it to the vector
+// store before calling this, and what lands in SQLite is the bookkeeping only —
+// status, error text, and the cleared lease. A result only lands on a blob
+// still in the processing state: terminal rows (ready/failed) can never be
+// overwritten, and a blob whose lease expired but which nobody re-claimed yet
+// still accepts the late result — the content is hash-identical, so nothing is
+// corrupted. Items that do not land are reported as rejected with a reason;
+// they are informational, not errors.
 func (s *Store) ApplyEmbeddingResults(ctx context.Context, results []EmbeddingResult) ([]string, []RejectedEmbedding, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -999,18 +896,15 @@ func (s *Store) ApplyEmbeddingResults(ctx context.Context, results []EmbeddingRe
 		// A ready blob carries no error: keeping a stale message next to a
 		// success would read as a contradiction everywhere the row is shown.
 		errorText := ""
-		var vector []byte
-		if result.Status == EmbeddingStatusReady {
-			vector = EncodeVector(result.Vector)
-		} else {
+		if result.Status != EmbeddingStatusReady {
 			errorText = truncateErrorText(result.Error)
 		}
 
 		update, err := tx.ExecContext(ctx, `
 			UPDATE blobs
-			SET embedding_status = ?, embedding = ?, embedding_error = ?, embedding_lease_until = 0
+			SET embedding_status = ?, embedding_error = ?, embedding_lease_until = 0
 			WHERE hash = ? AND embedding_status = ?`,
-			string(result.Status), vector, errorText, hash, string(EmbeddingStatusProcessing),
+			string(result.Status), errorText, hash, string(EmbeddingStatusProcessing),
 		)
 		if err != nil {
 			return nil, nil, fmt.Errorf("apply embedding result for %s: %w", hash, err)
@@ -1020,17 +914,6 @@ func (s *Store) ApplyEmbeddingResults(ctx context.Context, results []EmbeddingRe
 			return nil, nil, fmt.Errorf("count embedding result for %s: %w", hash, err)
 		}
 		if affected == 1 {
-			// Mirror a ready result into the vec0 index inside the same
-			// transaction: the vector becomes queryable the moment this call
-			// returns, and a committed row can never say ready while the
-			// index is missing it. Failed results never enter the index.
-			if result.Status == EmbeddingStatusReady {
-				if _, err := tx.ExecContext(ctx,
-					`INSERT INTO blob_embeddings(hash, embedding) VALUES (?, ?)`,
-					hash, vector); err != nil {
-					return nil, nil, fmt.Errorf("index embedding for %s: %w", hash, err)
-				}
-			}
 			applied = append(applied, hash)
 			continue
 		}
@@ -1112,32 +995,71 @@ func (s *Store) EmbeddingCountsByAlbum(ctx context.Context, albumID string) (Emb
 	return counts, nil
 }
 
-// ListPhotoBlobPairs returns every photo joined with its blob. It is used to
-// rebuild the recommendation photo-ref index at startup; embeddings are not
-// selected, so the scan never materializes ~3KB vectors per row.
-func (s *Store) ListPhotoBlobPairs(ctx context.Context) ([]PhotoWithBlob, error) {
-	return s.queryPhotoBlobPairs(ctx, `
-		SELECT p.album_id, p.idx, p.name, p.hash, p.width, p.height, p.ratio,
-		       b.hash, b.size_bytes, b.content_type, b.embedding_status, b.embedding_error, b.created_at
-		FROM photos p JOIN blobs b ON b.hash = p.hash
-		ORDER BY p.album_id ASC, p.idx ASC`)
+// ListPhotoBlobPairsByHashes returns the photo/blob pairs whose blob hash is
+// in hashes, ordered by album and index. The recommend write-back uses it to
+// turn ready hashes into the photo points the vector store needs, so an empty
+// input returns an empty result without touching the database.
+func (s *Store) ListPhotoBlobPairsByHashes(ctx context.Context, hashes []string) ([]PhotoWithBlob, error) {
+	pairs := make([]PhotoWithBlob, 0)
+	// Chunked like the lease updates so the IN list stays far below SQLite's
+	// parameter limit; duplicate hashes simply come back once per referencing
+	// photo row.
+	const chunkSize = 500
+	for start := 0; start < len(hashes); start += chunkSize {
+		end := min(start+chunkSize, len(hashes))
+		chunk := hashes[start:end]
+		placeholders := strings.TrimSuffix(strings.Repeat("?, ", len(chunk)), ", ")
+		args := make([]any, len(chunk))
+		for i, hash := range chunk {
+			args[i] = hash
+		}
+		rows, err := s.db.QueryContext(ctx, `
+			SELECT p.album_id, p.idx, p.name, p.hash, p.width, p.height, p.ratio,
+			       b.hash, b.size_bytes, b.content_type, b.embedding_status, b.embedding_error, b.created_at
+			FROM photos p JOIN blobs b ON b.hash = p.hash
+			WHERE b.hash IN (`+placeholders+`)
+			ORDER BY p.album_id ASC, p.idx ASC`, args...)
+		if err != nil {
+			return nil, fmt.Errorf("list photo blobs by hashes: %w", err)
+		}
+		chunkPairs, err := scanPhotoBlobPairs(rows)
+		if err != nil {
+			return nil, err
+		}
+		pairs = append(pairs, chunkPairs...)
+	}
+	return pairs, nil
 }
 
 // ListPhotoBlobPairsByAlbum returns one album's photos joined with their blobs.
 func (s *Store) ListPhotoBlobPairsByAlbum(ctx context.Context, albumID string) ([]PhotoWithBlob, error) {
-	return s.queryPhotoBlobPairs(ctx, `
+	rows, err := s.db.QueryContext(ctx, `
 		SELECT p.album_id, p.idx, p.name, p.hash, p.width, p.height, p.ratio,
 		       b.hash, b.size_bytes, b.content_type, b.embedding_status, b.embedding_error, b.created_at
 		FROM photos p JOIN blobs b ON b.hash = p.hash
 		WHERE p.album_id = ?
 		ORDER BY p.idx ASC`, albumID)
-}
-
-func (s *Store) queryPhotoBlobPairs(ctx context.Context, query string, args ...any) ([]PhotoWithBlob, error) {
-	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list photo blobs: %w", err)
 	}
+	return scanPhotoBlobPairs(rows)
+}
+
+// ReadyPairCount counts the photo/blob pairs whose blob embedding is ready —
+// the number of points the vector store is expected to hold, one per photo.
+func (s *Store) ReadyPairCount(ctx context.Context) (int64, error) {
+	var count int64
+	if err := s.db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM photos p JOIN blobs b ON b.hash = p.hash
+		WHERE b.embedding_status = ?`, string(EmbeddingStatusReady)).Scan(&count); err != nil {
+		return 0, fmt.Errorf("count ready photo pairs: %w", err)
+	}
+	return count, nil
+}
+
+// scanPhotoBlobPairs drains a photo/blob join query, converting the raw
+// embedding status string on the way.
+func scanPhotoBlobPairs(rows *sql.Rows) ([]PhotoWithBlob, error) {
 	defer rows.Close()
 
 	pairs := make([]PhotoWithBlob, 0)
@@ -1159,29 +1081,4 @@ func (s *Store) queryPhotoBlobPairs(ctx context.Context, query string, args ...a
 		return nil, fmt.Errorf("iterate photo blobs: %w", err)
 	}
 	return pairs, nil
-}
-
-// EncodeVector serializes a float32 embedding as little-endian bytes.
-func EncodeVector(vector []float32) []byte {
-	if len(vector) == 0 {
-		return nil
-	}
-	out := make([]byte, 4*len(vector))
-	for i, value := range vector {
-		binary.LittleEndian.PutUint32(out[i*4:], math.Float32bits(value))
-	}
-	return out
-}
-
-// DecodeVector deserializes a little-endian float32 embedding.
-func DecodeVector(raw []byte) []float32 {
-	if len(raw) < 4 {
-		return nil
-	}
-	count := len(raw) / 4
-	vector := make([]float32, count)
-	for i := 0; i < count; i++ {
-		vector[i] = math.Float32frombits(binary.LittleEndian.Uint32(raw[i*4:]))
-	}
-	return vector
 }

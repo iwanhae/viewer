@@ -3,16 +3,29 @@ package catalog
 import (
 	"context"
 	"database/sql"
+	"encoding/binary"
 	"fmt"
 	"log"
+	"math"
+
+	"viewer/internal/qdrant"
 )
 
 // EmbeddingDim is the vector length every ready embedding must have. The
-// schema owns this number — it is baked into the blob_embeddings vec0 table's
-// column definition — so it lives in the catalog, and recommend plus the
-// worker API wire contract mirror it. Moving to a differently-sized model
-// means a new migration that rebuilds the index and re-embeds the catalog.
+// dimension itself is owned by the Qdrant collection (the vec0 column that
+// used to bake it into the schema was dropped in migration 0003); the catalog
+// keeps the constant so recommend and the worker API wire contract have one
+// place to mirror it from. Moving to a differently-sized model means pointing
+// the collection at a new size and re-embedding the catalog.
 const EmbeddingDim = 768
+
+// VectorSink is the upload target migration 0003 moves the catalog's stored
+// vectors to before it drops them from SQLite. It is satisfied structurally by
+// *qdrant.Client. A nil sink is allowed only when there is nothing to upload.
+type VectorSink interface {
+	EnsureCollection(ctx context.Context) error
+	UpsertPhotos(ctx context.Context, records []qdrant.PhotoRecord) error
+}
 
 // schema creates the catalog's baseline tables and indexes. Every statement is
 // IF NOT EXISTS so migration 0001 can apply it to databases that already have
@@ -94,13 +107,22 @@ var migrations = []migration{
 		stmts:   []string{blobEmbeddingsDDL()},
 		fn:      backfillBlobEmbeddings,
 	},
+	{
+		// stmts stays deliberately empty: the runner executes stmts before fn,
+		// and the vector storage must only be dropped after the upload inside
+		// fn has fully succeeded — not before.
+		version: 3,
+		name:    "qdrant_vectors",
+		stmts:   nil,
+		fn:      migrateVectorsToQdrant,
+	},
 }
 
 // addBlobLeaseColumnIfMissing adds the external-worker lease column to blobs.
 // It keeps the pragma probe the inline version used instead of matching driver
 // error strings: databases that already got the column from an earlier release
 // must skip the ALTER, not fail on it.
-func addBlobLeaseColumnIfMissing(ctx context.Context, tx *sql.Tx) error {
+func addBlobLeaseColumnIfMissing(ctx context.Context, tx *sql.Tx, _ VectorSink) error {
 	var leaseColumn int
 	if err := tx.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM pragma_table_info('blobs') WHERE name = 'embedding_lease_until'`,
@@ -121,7 +143,7 @@ func addBlobLeaseColumnIfMissing(ctx context.Context, tx *sql.Tx) error {
 // a count in the log: they predate the write-path dimension check, cannot be
 // queried by a float[768] column, and rank garbage in the old index's silent
 // prefix-truncation anyway.
-func backfillBlobEmbeddings(ctx context.Context, tx *sql.Tx) error {
+func backfillBlobEmbeddings(ctx context.Context, tx *sql.Tx, _ VectorSink) error {
 	var skipped int
 	if err := tx.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM blobs WHERE embedding IS NOT NULL AND length(embedding) != ?`,
@@ -155,4 +177,156 @@ func execCount(ctx context.Context, tx *sql.Tx, query string, args ...any) (int6
 		return 0, fmt.Errorf("count affected rows: %w", err)
 	}
 	return count, nil
+}
+
+// vectorUploadBatchSize is how many photo rows one upload batch carries. It
+// mirrors the Qdrant client's own chunking, so one batch usually costs one
+// request.
+const vectorUploadBatchSize = 256
+
+// vectorUploadProgressEvery is how many batches pass between two progress
+// lines. The initial migration of a large library uploads for a while, and a
+// silent upload looks like a hung start.
+const vectorUploadProgressEvery = 50
+
+// migrateVectorsToQdrant uploads every photo's embedding to the vector sink
+// and only then drops all vector storage from SQLite. The whole migration —
+// upload plus drops plus the user_version bump — commits or rolls back as one
+// transaction, so a failed upload leaves the file exactly as it was and the
+// next boot retries from scratch; the upserts are idempotent, so retrying
+// converges. A nil sink is refused while any uploadable vector remains:
+// destroying the only copy of the vectors with nowhere to send them would turn
+// every recommendation permanently empty. A nil sink with nothing to upload is
+// fine — test databases and vectorless catalogs just get the drops.
+func migrateVectorsToQdrant(ctx context.Context, tx *sql.Tx, sink VectorSink) error {
+	// Only photos count: a blob no photo references has no (album, idx) to
+	// become a point, so its vector was unreachable by search anyway.
+	var uploadable int
+	if err := tx.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM photos p JOIN blobs b ON b.hash = p.hash
+		WHERE b.embedding IS NOT NULL AND length(b.embedding) = ?`,
+		4*EmbeddingDim).Scan(&uploadable); err != nil {
+		return fmt.Errorf("count uploadable embeddings: %w", err)
+	}
+
+	if sink != nil {
+		if err := sink.EnsureCollection(ctx); err != nil {
+			return fmt.Errorf("ensure vector collection: %w", err)
+		}
+		uploaded, err := uploadVectors(ctx, tx, sink, uploadable)
+		if err != nil {
+			return err
+		}
+		log.Printf("catalog: uploaded %d photo embedding(s) to the vector store", uploaded)
+	} else if uploadable > 0 {
+		return fmt.Errorf("refusing to drop %d photo embedding(s): no vector store is configured to receive them", uploadable)
+	}
+
+	// Blobs whose stored vector does not fit the column were never queryable —
+	// the v2 backfill skipped them for the same reason. They keep their
+	// embedding_status='ready' rows after the column is gone and become
+	// permanent "ready but never indexed" entries, which the v2 backfill set
+	// the precedent for tolerating.
+	var malformed int
+	if err := tx.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM photos p JOIN blobs b ON b.hash = p.hash
+		WHERE b.embedding IS NOT NULL AND length(b.embedding) != ?`,
+		4*EmbeddingDim).Scan(&malformed); err != nil {
+		return fmt.Errorf("count malformed embeddings: %w", err)
+	}
+	if malformed > 0 {
+		log.Printf("catalog: skipping %d photo embedding(s) whose blob embedding is not %d bytes", malformed, 4*EmbeddingDim)
+	}
+
+	// Both drops run only after every uploadable vector made it to the sink.
+	// The vec0 virtual table is dropped by name: the sqlite-vec module must be
+	// registered on this connection for that to work, which is why the catalog
+	// package keeps its blank vec import even though it no longer stores
+	// vectors.
+	if _, err := tx.ExecContext(ctx, `DROP TABLE IF EXISTS blob_embeddings`); err != nil {
+		return fmt.Errorf("drop vector index: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `ALTER TABLE blobs DROP COLUMN embedding`); err != nil {
+		return fmt.Errorf("drop blob embedding column: %w", err)
+	}
+	return nil
+}
+
+// uploadVectors streams every photo-with-embedding pair to the sink in
+// (album_id, idx) order, vectorUploadBatchSize rows at a time. Each batch is a
+// fresh query whose cursor starts after the last row of the previous one, so
+// the cursor never has to survive a network call — the transaction owns the
+// pool's single connection, and nothing else runs before ListenAndServe, but
+// holding a SQLite read open across an HTTP round trip would still be the
+// wrong shape. The initial cursor (empty album, index 0) precedes every real
+// row because album ids are never empty and photo indexes start at 0.
+func uploadVectors(ctx context.Context, tx *sql.Tx, sink VectorSink, total int) (int, error) {
+	var (
+		uploaded  int
+		batches   int
+		lastAlbum string
+		lastIdx   int
+	)
+	for {
+		rows, err := tx.QueryContext(ctx, `
+			SELECT p.album_id, p.idx, p.hash, p.width, p.height, b.embedding
+			FROM photos p JOIN blobs b ON b.hash = p.hash
+			WHERE b.embedding IS NOT NULL AND length(b.embedding) = ?
+			  AND (p.album_id > ? OR (p.album_id = ? AND p.idx > ?))
+			ORDER BY p.album_id, p.idx
+			LIMIT ?`,
+			4*EmbeddingDim, lastAlbum, lastAlbum, lastIdx, vectorUploadBatchSize)
+		if err != nil {
+			return 0, fmt.Errorf("read embedding batch: %w", err)
+		}
+		records := make([]qdrant.PhotoRecord, 0, vectorUploadBatchSize)
+		var batchAlbum string
+		var batchIdx int
+		for rows.Next() {
+			var raw []byte
+			var record qdrant.PhotoRecord
+			if err := rows.Scan(&record.AlbumID, &record.Idx, &record.Hash, &record.W, &record.H, &raw); err != nil {
+				rows.Close()
+				return 0, fmt.Errorf("scan embedding batch row: %w", err)
+			}
+			record.Vector = decodeVectorLE(raw)
+			batchAlbum = record.AlbumID
+			batchIdx = record.Idx
+			records = append(records, record)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return 0, fmt.Errorf("iterate embedding batch: %w", err)
+		}
+		rows.Close()
+
+		if len(records) == 0 {
+			break
+		}
+		if err := sink.UpsertPhotos(ctx, records); err != nil {
+			return 0, fmt.Errorf("upload embedding batch %d: %w", batches+1, err)
+		}
+		uploaded += len(records)
+		batches++
+		if batches%vectorUploadProgressEvery == 0 {
+			log.Printf("catalog: vector upload progress %d/%d", uploaded, total)
+		}
+		lastAlbum = batchAlbum
+		lastIdx = batchIdx
+	}
+	return uploaded, nil
+}
+
+// decodeVectorLE deserializes a little-endian float32 embedding, the wire
+// format embeddings have always been stored and reported in.
+func decodeVectorLE(raw []byte) []float32 {
+	if len(raw) < 4 {
+		return nil
+	}
+	count := len(raw) / 4
+	vector := make([]float32, count)
+	for i := 0; i < count; i++ {
+		vector[i] = math.Float32frombits(binary.LittleEndian.Uint32(raw[i*4:]))
+	}
+	return vector
 }

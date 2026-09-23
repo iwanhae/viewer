@@ -107,7 +107,8 @@ func TestEmbeddingWorkerReportsProgressWithRealModel(t *testing.T) {
 	}
 
 	imageService := images.NewService(cat, store)
-	svc := NewService(cat, imageService, NewVisionEmbedder(vision.Config{ModelID: filepath.Join(dir, "model"), Backend: "go"}), nil)
+	vectors := newFakeVectorStore()
+	svc := NewService(cat, vectors, imageService, NewVisionEmbedder(vision.Config{ModelID: filepath.Join(dir, "model"), Backend: "go"}), nil)
 	t.Cleanup(func() { _ = svc.close() })
 	if err := svc.LoadModel(ctx); err != nil {
 		t.Fatalf("LoadModel: %v", err)
@@ -142,6 +143,13 @@ func TestEmbeddingWorkerReportsProgressWithRealModel(t *testing.T) {
 	}
 	if progress := svc.EmbeddingProgress(); progress.Ratio != 1 {
 		t.Fatalf("progress after the run=%+v want ratio 1", progress)
+	}
+
+	// Every write-back also landed its point in the vector store: one per
+	// photo, searchable without any reload step.
+	points, _ := vectors.snapshot()
+	if len(points) != 3 {
+		t.Fatalf("vector store points=%d want=3: %+v", len(points), points)
 	}
 
 	for _, want := range []string{
@@ -183,7 +191,8 @@ func TestEmbeddingDrainHookFiresAfterTheQueueDrains(t *testing.T) {
 	imageService := images.NewService(cat, store)
 
 	drains := make(chan struct{}, 4)
-	svc := NewService(cat, imageService, okEmbedder{}, func(_ context.Context) error {
+	vectors := newFakeVectorStore()
+	svc := NewService(cat, vectors, imageService, okEmbedder{}, func(_ context.Context) error {
 		drains <- struct{}{}
 		return nil
 	})
@@ -197,6 +206,12 @@ func TestEmbeddingDrainHookFiresAfterTheQueueDrains(t *testing.T) {
 	case <-drains:
 	case <-time.After(10 * time.Second):
 		t.Fatalf("the embedding drain hook never fired")
+	}
+
+	// The drain is what a backup keys on, so by the time it fires the store
+	// write of the same result must already be visible.
+	if points, _ := vectors.snapshot(); len(points) != 1 {
+		t.Fatalf("vector store points=%d want=1 by drain time: %+v", len(points), points)
 	}
 
 	// The idle ticks after the drain must not re-trigger the hook: without a

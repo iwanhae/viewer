@@ -22,9 +22,11 @@ content-addressed blob:
    - reads the image dimensions and computes the SHA-256 of the raw bytes,
    - stores the original bytes in S3 at `blobs/<sha256>` (uploaded only once per
      distinct content hash, so identical images never occupy storage twice),
-   - records the zip entry name, hash, width, height and ratio in SQLite,
-   - computes an embedding and writes it to the blob row, unless that blob is
-     already embedded.
+   - records the zip entry name, hash, width, height and ratio in SQLite.
+
+   Extraction never computes embeddings: it leaves every blob in the `pending`
+   state for the embedding workers, which is what keeps a slow model download
+   from holding up album ingestion (see "Vector store" below).
 5. Once the worker has emptied its queue, the backup finalizer snapshots the
    SQLite catalog to S3 (`backups/viewer.db`) and only then batch-deletes the
    staged zips that snapshot covers — a failed extraction's zip included, since
@@ -60,7 +62,7 @@ is what makes a wiped state volume recoverable from the bucket alone.
 ## Configuration
 
 The viewer is always deployed as the Docker image, so the whole configuration is
-nine environment variables:
+eleven environment variables:
 
 - `S3_ENDPOINT`, `S3_BUCKET`, `S3_ACCESS_KEY`, `S3_SECRET_KEY` — required.
 - `S3_PREFIX` — optional key prefix, so several deployments can share one bucket
@@ -70,6 +72,10 @@ nine environment variables:
 - `STATE_DIR` — absolute directory holding the SQLite catalog (default
   `/var/lib/viewer`, the volume the image declares).
 - `PORT` — the port the container listens on (default `8080`).
+- `QDRANT_URL` — required; base URL of the external Qdrant server's REST API
+  that holds the recommendation vectors (see "Vector store" below).
+- `QDRANT_API_KEY` — required; sent as the `api-key` header on every Qdrant
+  request.
 - `EMBEDDING_WORKER_TOKEN` — optional shared bearer token the external embedding
   worker API requires (see "External embedding workers" below; default empty,
   which turns that check off and is only sensible on a trusted network; a value
@@ -121,28 +127,88 @@ listening right away, and the checkpoint resolves in a background goroutine: a
 cold start fetches it into that directory from `SIGLIP2_MODEL_URL`, a
 public-read mirror of the upstream Hugging Face files, logging position and
 rate every 5 seconds while the download runs. Until the model is in, the API
-answers recommendations from whatever embeddings the catalog already holds and
+answers recommendations from whatever points the vector store already holds and
 new blobs stay `pending`. A directory that already holds a checkpoint - a
 previous download or a mount - is never re-fetched. A checkpoint that fails to
 load or download only degrades: the container logs the failure, keeps serving,
-and returns recommendations from whatever embeddings the catalog already holds.
+and returns recommendations from whatever points the vector store already holds.
 Mount a directory at `/app/siglip2` (holding `config.json` and
 `model.safetensors`) to supply a checkpoint by hand and skip the download
 entirely.
 
-Embeddings are stored as little-endian `float32` blobs on each image blob row in
-SQLite. The ingest pipeline embeds new blobs inline; a blob whose embedding was
-deferred (the model had not loaded) stays in the `pending` state, and the
-background embedding workers fill it in on a later run once a checkpoint is
-available. Those workers only start when the checkpoint loaded, so a server
-without a model never computes embeddings but still answers recommendation
-requests from the embeddings the catalog already holds. The same
+Embeddings live in an external Qdrant collection, not in SQLite: since catalog
+migration 0003 the database keeps only each blob's embedding status, and every
+vector is a point in the `photo_embeddings` collection (see "Vector store"
+below). The ingest pipeline never embeds anything itself; a blob whose
+embedding was deferred (the model had not loaded) stays in the `pending` state,
+and the background embedding workers fill it in on a later run once a
+checkpoint is available. Those workers only start when the checkpoint loaded,
+so a server without a model never computes embeddings but still answers
+recommendation requests from the points the collection already holds. The same
 claim/write-back path is also open to external embedding workers, so a fleet of
 GPU boxes can drain a large backlog alongside the built-in one (see "External
 embedding workers" below). Recommendation responses
 are cross-album only: photos from the same album as the query are excluded from
-results. If no cross-album neighbors exist for an embedded query photo,
-recommendations return an empty `items` list.
+results on the store side. If no cross-album neighbors exist for an embedded
+query photo, recommendations return an empty `items` list.
+
+### Vector store
+
+Recommendation vectors live in a Qdrant collection the viewer owns:
+`photo_embeddings`, 768 float32 dimensions, cosine distance, one point per
+photo. The point ID is derived deterministically from `(albumId, index)`, so
+re-writing a photo's vector overwrites that point in place instead of
+duplicating it. Each point carries the photo's album id, index, blob hash and
+dimensions as payload, the group search filters the query's own album and hash
+on the store side, and it returns at most one photo per album.
+
+The connection is configured with the two required variables `QDRANT_URL` (base
+URL of the server's REST API) and `QDRANT_API_KEY` (sent as the `api-key`
+header on every request).
+
+Writes go to the two stores in a fixed order — vector store first, SQLite
+bookkeeping second — so a crash between the two leaves the blob still
+`processing`: its claim is re-leased, the blob is re-embedded, and the
+write-back upserts the very same point IDs, converging without duplicates. The
+reverse order could produce points the catalog does not know about.
+
+Boot order:
+
+- Migrations run while the catalog opens, before the HTTP server binds.
+  Migration 0003 moves any vectors still stored in SQLite into the collection.
+  It needs Qdrant to be reachable: uploads go out in batches of 256 with a
+  `catalog: vector upload progress <n>/<total>` line every 50 batches, and a
+  failed batch rolls the whole migration back so the next boot retries it from
+  scratch — idempotent upserts make that safe. Only after every vector is
+  uploaded does the migration drop the `embedding` column and the
+  `blob_embeddings` table, which is also why **downgrading to a pre-0003
+  binary is not supported**: those binaries read the vectors from SQLite, and
+  that schema is gone once the migration commits.
+- On every boot the viewer ensures the collection exists with the right
+  geometry before serving, so a wiped collection is recreated at startup
+  instead of turning every search into an error.
+
+Drift: the two stores are written by different paths (worker write-backs,
+migration, album reloads), so they can disagree — most commonly after a
+catalog backup was restored over a collection that kept its old points, or the
+other way around. Nothing repairs that automatically. At startup the viewer
+counts both sides and logs a WARNING when the point count differs from the
+catalog's ready photo count; recommendations stay up but may miss neighbors or
+serve stale ones until the sides are re-synced by re-embedding (which re-upserts)
+or by wiping whichever side is stale.
+
+Backups change meaning with 0003: `backups/viewer.db` no longer carries
+vectors, so the collection is not reconstructable from the bucket alone.
+Restoring a catalog backup over a live collection only triggers the drift
+warning — but losing the Qdrant data itself means re-embedding the library
+from the S3 originals.
+
+Search follows Qdrant's collection defaults: approximate HNSW once the
+collection outgrows `full_scan_threshold` (10000 points by default). The
+recommendation contract needs enough distinct cross-album albums, not an exact
+top-K, so the viewer sends no `search_params` and inherits those defaults; a
+deployment that needs bit-exact rankings can lower that threshold on the
+collection or query Qdrant directly with `params: {"exact": true}`.
 
 ### Embedding progress
 
@@ -187,8 +253,9 @@ blobs, because leases expire:
    backfill never waits on the in-process model.
 2. Embed the images externally. The vector length must equal `embeddingDim`
    (768 for siglip2-base), and every component must be finite.
-3. `POST /api/embedding/results` writes a batch back in one request and one
-   transaction:
+3. `POST /api/embedding/results` writes a batch back in one request: ready
+   vectors are upserted into the `photo_embeddings` collection first, then the
+   status bookkeeping lands in SQLite in one transaction:
 
    ```json
    {"results":[{"hash":"<sha256>","status":"ready","vectorB64":"<base64 little-endian float32>"},{"hash":"<sha256>","status":"failed","error":"decode failed"}]}
@@ -201,9 +268,11 @@ blobs, because leases expire:
    `not_claimed`, `invalid_status` or `invalid_hash` (blank). Rejections are
    final, not retryable — fix the payload or move on, never loop on one. A
    result only ever lands on a blob still in the `processing` state, so a late
-   result can never overwrite an existing embedding, and nothing reported can
-   touch a blob nobody claimed. One request carries at most 1024 results; a
-   larger batch is refused whole with a 400, so split it.
+   result can never overwrite another worker's bookkeeping, and nothing
+   reported can touch a blob nobody claimed; its vector may still be re-upserted
+   onto the same deterministic point IDs, which is harmless — same hash, same
+   image, so the duplicate write converges. One request carries at most 1024
+   results; a larger batch is refused whole with a 400, so split it.
 4. A batch that outgrows the 10 minute lease calls `POST /api/embedding/renew`
    with `{"hashes":[…]}`. The response is
    `{"leaseUntil":"…","renewed":["…"]}`, and `renewed` lists the hashes whose
@@ -285,21 +354,28 @@ difference below `1e-4`, cosine above `0.9995`). The test is skipped unless
   `recommend: embedding run finished embedded=<n> ready=<n>/<n> pending=<n> failed=<n> duration=<d> avg=<d>`.
   A drain that keeps finding work stays one run, so the summaries mark real
   start and end points rather than one per batch.
-- Ingest-time embeddings, which the pipeline computes inline, log
-  `pipeline: album=<id> extracting entries=<n>`, then
-  `pipeline: album=<id> blob=<sha256> embedded bytes=<n> dim=768 elapsed=<d>`
-  per image, and end with
-  `pipeline: album=<id> ready photos=<n> embedded=<n> pending=<n> failed=<n>`, so
-  an album that could not be embedded says so on its own line.
+- Extraction and embedding are separate stages, and each logs its own: the
+  pipeline logs `pipeline: album=<id> extracting entries=<n>` and ends with
+  `pipeline: album=<id> ready photos=<n> embedded=<n> pending=<n> failed=<n>`,
+  where those last three counts are the catalog's embedding state at that
+  moment — extraction never embeds itself, so `pending` is the work the album
+  just queued for the embedding workers.
 - The upload prefix is scanned at startup and then once a minute. Each scan logs
   `upload ingest: prefix=uploads/ listed=<n> candidates=<n>`, one line per zip it
   registers or requeues, and
   `upload ingest: scan finished discovered=<n> registered=<n> requeued=<n> skipped=<n> errors=<n> duration=<d>`.
   A failed scan is logged and retried on the next tick instead of ending the
   watch.
-- Startup warmup loads the SQLite catalog into the recommendation index and
-  logs `catalog warmup started` / `catalog warmup finished duration=<d>`; the
-  upload scan and then the embedding workers start once it finishes.
+- Migrations run while the catalog opens, before the HTTP server binds. The
+  0003 migration logs `catalog: applied migration 0003_qdrant_vectors` when it
+  finishes and, while vectors are still moving, a
+  `catalog: vector upload progress <uploaded>/<total>` line every 50 batches —
+  a first boot over a large pre-0003 catalog stays on this step, talking to
+  Qdrant, until every vector is uploaded. Once the collection is ensured, a
+  point count that disagrees with the catalog logs
+  `viewer: WARNING vector store holds <n> point(s) but the catalog has <m> ready photo pair(s) …`
+  (see "Vector store" above for what it means and what does not fix it
+  automatically).
 - `/metrics` exposes `viewer_embedding_images_total`, `viewer_embedding_images_ready`, `viewer_embedding_images_failed`, `viewer_embedding_images_pending`, `viewer_embedding_images_processing` and `viewer_embedding_progress_ratio`, computed from the blob embedding statuses in the SQLite catalog.
 - Requests that end in a 5xx are logged with the method, path, raw query, request ID (Chi request ID middleware), remote address and the internal error message; the JSON error body carries the code and message.
 - Panics are logged with stack traces before the 500 response is returned.

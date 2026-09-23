@@ -9,13 +9,15 @@ import (
 
 // migration is one forward-only step in the catalog schema's history. stmts
 // run first, each through its own Exec so a failure names the exact statement;
-// fn (optional) then moves data with full Go at its disposal. Everything —
-// including the user_version bump — commits or rolls back as one transaction.
+// fn (optional) then moves data with full Go at its disposal — including the
+// external vector sink, which is why migrations 0001 and 0002 take it as an
+// ignored parameter. Everything — including the user_version bump — commits or
+// rolls back as one transaction.
 type migration struct {
 	version int
 	name    string
 	stmts   []string
-	fn      func(ctx context.Context, tx *sql.Tx) error
+	fn      func(ctx context.Context, tx *sql.Tx, sink VectorSink) error
 }
 
 // runMigrations brings an opened catalog up to the newest schema this build
@@ -26,8 +28,9 @@ type migration struct {
 // A file whose user_version is newer than this build's chain — a binary
 // downgrade after a restore from a newer backup — is left untouched: schema
 // changes so far have been additive, so the older binary's named queries keep
-// working.
-func runMigrations(db *sql.DB) error {
+// working. (Migration 0003 is the first exception: it drops vector storage, so
+// a downgrade below it is unsupported.)
+func runMigrations(db *sql.DB, sink VectorSink) error {
 	var current int
 	if err := db.QueryRow(`PRAGMA user_version`).Scan(&current); err != nil {
 		return fmt.Errorf("read schema version: %w", err)
@@ -40,7 +43,7 @@ func runMigrations(db *sql.DB) error {
 		if m.version <= current {
 			continue
 		}
-		if err := applyMigration(db, m); err != nil {
+		if err := applyMigration(db, m, sink); err != nil {
 			return fmt.Errorf("migration %04d_%s: %w", m.version, m.name, err)
 		}
 		log.Printf("catalog: applied migration %04d_%s", m.version, m.name)
@@ -48,7 +51,7 @@ func runMigrations(db *sql.DB) error {
 	return nil
 }
 
-func applyMigration(db *sql.DB, m migration) error {
+func applyMigration(db *sql.DB, m migration, sink VectorSink) error {
 	tx, err := db.Begin()
 	if err != nil {
 		return fmt.Errorf("begin: %w", err)
@@ -61,7 +64,7 @@ func applyMigration(db *sql.DB, m migration) error {
 		}
 	}
 	if m.fn != nil {
-		if err := m.fn(context.Background(), tx); err != nil {
+		if err := m.fn(context.Background(), tx, sink); err != nil {
 			return err
 		}
 	}

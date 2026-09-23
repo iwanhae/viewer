@@ -213,14 +213,14 @@ func seedEmbeddingFixture(t *testing.T, cat *catalog.Store) {
 }
 
 func TestMetricsEndpointPrometheusPayload(t *testing.T) {
-	cat, err := catalog.Open(filepath.Join(t.TempDir(), "test.db"))
+	cat, err := catalog.Open(filepath.Join(t.TempDir(), "test.db"), nil)
 	if err != nil {
 		t.Fatalf("open catalog: %v", err)
 	}
 	defer cat.Close()
 	seedEmbeddingFixture(t, cat)
 
-	recommendService := recommend.NewService(cat, nil, nil, nil)
+	recommendService := recommend.NewService(cat, nil, nil, nil, nil)
 
 	router := New(nil, nil, nil, recommendService, "").Router()
 	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)

@@ -10,9 +10,11 @@ import (
 	"image/color"
 	"image/png"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"sort"
 	"sync"
 	"testing"
 	"time"
@@ -22,6 +24,7 @@ import (
 	"viewer/internal/feed"
 	"viewer/internal/images"
 	"viewer/internal/pipeline"
+	"viewer/internal/qdrant"
 	"viewer/internal/recommend"
 	"viewer/internal/storage"
 )
@@ -111,12 +114,146 @@ func (stubEmbedder) Embed(context.Context, []byte) ([]float32, error) {
 
 func (stubEmbedder) Close() error { return nil }
 
+// fakeVectorStore is the harness's stand-in for the Qdrant client: points are
+// keyed by the deterministic point IDs, search ranks honestly by cosine
+// similarity with the query's album and hash excluded and one photo per album
+// returned, and album points can be wiped the way a re-extraction does.
+type fakeVectorStore struct {
+	mu     sync.Mutex
+	points map[string]qdrant.PhotoRecord
+}
+
+func newFakeVectorStore() *fakeVectorStore {
+	return &fakeVectorStore{points: make(map[string]qdrant.PhotoRecord)}
+}
+
+func (f *fakeVectorStore) EnsureCollection(context.Context) error { return nil }
+
+func (f *fakeVectorStore) UpsertPhotos(_ context.Context, records []qdrant.PhotoRecord) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, record := range records {
+		f.points[qdrant.PointID(record.AlbumID, record.Idx)] = record
+	}
+	return nil
+}
+
+func (f *fakeVectorStore) GroupSearch(_ context.Context, queryPointID, excludeAlbumID, excludeHash string, limit int) ([]qdrant.PhotoHit, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	query, ok := f.points[queryPointID]
+	if !ok {
+		// The live client answers a missing query point with empty results.
+		return nil, nil
+	}
+	type scored struct {
+		record qdrant.PhotoRecord
+		score  float64
+	}
+	var matches []scored
+	for id, record := range f.points {
+		if id == queryPointID || record.AlbumID == excludeAlbumID || record.Hash == excludeHash {
+			continue
+		}
+		matches = append(matches, scored{record: record, score: cosineSimilarity(query.Vector, record.Vector)})
+	}
+	sort.Slice(matches, func(i, j int) bool {
+		if matches[i].score != matches[j].score {
+			return matches[i].score > matches[j].score
+		}
+		if matches[i].record.AlbumID != matches[j].record.AlbumID {
+			return matches[i].record.AlbumID < matches[j].record.AlbumID
+		}
+		return matches[i].record.Idx < matches[j].record.Idx
+	})
+	hits := make([]qdrant.PhotoHit, 0, limit)
+	seenAlbum := make(map[string]struct{}, len(matches))
+	for _, match := range matches {
+		if _, dup := seenAlbum[match.record.AlbumID]; dup {
+			continue
+		}
+		seenAlbum[match.record.AlbumID] = struct{}{}
+		hits = append(hits, qdrant.PhotoHit{
+			AlbumID: match.record.AlbumID,
+			Idx:     match.record.Idx,
+			Hash:    match.record.Hash,
+			W:       match.record.W,
+			H:       match.record.H,
+			Score:   match.score,
+		})
+		if len(hits) == limit {
+			break
+		}
+	}
+	return hits, nil
+}
+
+func (f *fakeVectorStore) RetrieveVectorsByHashes(_ context.Context, hashes []string) (map[string][]float32, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	vectors := make(map[string][]float32, len(hashes))
+	for _, record := range f.points {
+		if _, seen := vectors[record.Hash]; seen {
+			continue
+		}
+		for _, hash := range hashes {
+			if hash == record.Hash {
+				vectors[record.Hash] = append([]float32(nil), record.Vector...)
+				break
+			}
+		}
+	}
+	return vectors, nil
+}
+
+func (f *fakeVectorStore) DeleteByAlbum(_ context.Context, albumID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for id, record := range f.points {
+		if record.AlbumID == albumID {
+			delete(f.points, id)
+		}
+	}
+	return nil
+}
+
+func (f *fakeVectorStore) CountVectors(context.Context) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.points), nil
+}
+
+func (f *fakeVectorStore) pointCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.points)
+}
+
+// cosineSimilarity is the ranking the fake promises: scale-invariant similarity
+// in [-1, 1], with a zero vector defined as matching nothing.
+func cosineSimilarity(a, b []float32) float64 {
+	if len(a) != len(b) {
+		return 0
+	}
+	var dot, normA, normB float64
+	for i := range a {
+		dot += float64(a[i]) * float64(b[i])
+		normA += float64(a[i]) * float64(a[i])
+		normB += float64(b[i]) * float64(b[i])
+	}
+	if normA == 0 || normB == 0 {
+		return 0
+	}
+	return dot / math.Sqrt(normA*normB)
+}
+
 type flowHarness struct {
 	router   http.Handler
 	albums   *albums.Service
 	s3       *memoryS3
 	catalog  *catalog.Store
 	pipeline *pipeline.Service
+	vectors  *fakeVectorStore
 }
 
 func newFlowHarness(t *testing.T) *flowHarness {
@@ -128,7 +265,7 @@ func newFlowHarness(t *testing.T) *flowHarness {
 func newFlowHarnessWithToken(t *testing.T, workerToken string) *flowHarness {
 	t.Helper()
 
-	cat, err := catalog.Open(filepath.Join(t.TempDir(), "catalog.db"))
+	cat, err := catalog.Open(filepath.Join(t.TempDir(), "catalog.db"), nil)
 	if err != nil {
 		t.Fatalf("open catalog: %v", err)
 	}
@@ -141,8 +278,10 @@ func newFlowHarnessWithToken(t *testing.T, workerToken string) *flowHarness {
 	// A stub embedder keeps the recommendation endpoints available without a
 	// checkpoint. It is never asked to embed anything: the pipeline does not
 	// embed at all and the embedding workers are not started here, so blobs
-	// stay pending.
-	recommendService := recommend.NewService(cat, imageService, stubEmbedder{}, nil)
+	// stay pending. The in-memory vector store gives the worker write-back and
+	// the recommendation search somewhere real to land.
+	vectors := newFakeVectorStore()
+	recommendService := recommend.NewService(cat, vectors, imageService, stubEmbedder{}, nil)
 	pipelineService := pipeline.NewService(cat, s3, pipeline.Options{
 		TempDir: zipCacheDir,
 		OnAlbumReady: func(albumID string) {
@@ -158,6 +297,7 @@ func newFlowHarnessWithToken(t *testing.T, workerToken string) *flowHarness {
 		s3:       s3,
 		catalog:  cat,
 		pipeline: pipelineService,
+		vectors:  vectors,
 	}
 }
 

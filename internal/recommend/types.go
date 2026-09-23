@@ -1,7 +1,10 @@
 package recommend
 
 import (
+	"context"
 	"time"
+
+	"viewer/internal/qdrant"
 )
 
 // defaultWorkerBatchSize is how many blobs the in-process worker claims per
@@ -24,13 +27,18 @@ const (
 	MaxClaimLimit = 1024
 )
 
-// photoRef is one album photo that references a content-addressed blob.
-type photoRef struct {
-	AlbumID string
-	Index   int
-	Hash    string
-	Width   int
-	Height  int
+// VectorStore is the remote vector index recommendations are searched in and
+// embedding results are written to. It is satisfied structurally by
+// *qdrant.Client. A nil store degrades the service: writes skip the index and
+// go to SQLite only, and Recommend reports the store as unavailable instead of
+// answering with results it cannot compute.
+type VectorStore interface {
+	EnsureCollection(ctx context.Context) error
+	UpsertPhotos(ctx context.Context, records []qdrant.PhotoRecord) error
+	GroupSearch(ctx context.Context, queryPointID, excludeAlbumID, excludeHash string, limit int) ([]qdrant.PhotoHit, error)
+	RetrieveVectorsByHashes(ctx context.Context, hashes []string) (map[string][]float32, error)
+	DeleteByAlbum(ctx context.Context, albumID string) error
+	CountVectors(ctx context.Context) (int, error)
 }
 
 type RecommendationItem struct {

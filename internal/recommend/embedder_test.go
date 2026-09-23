@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"viewer/internal/catalog"
+	"viewer/internal/qdrant"
 	"viewer/internal/vision"
 )
 
@@ -45,7 +46,7 @@ func TestEmbeddingTimeoutIsFiveMinutes(t *testing.T) {
 // blobs simply stay pending.
 func TestServiceWithoutEmbedderReportsDisabled(t *testing.T) {
 	cat := newTestCatalog(t)
-	svc := NewService(cat, nil, nil, nil)
+	svc := NewService(cat, nil, nil, nil, nil)
 
 	if svc.embedder != nil {
 		t.Fatalf("embedder=%T want nil when embedding is off", svc.embedder)
@@ -122,7 +123,7 @@ func TestServiceDisabledAfterModelLoadFailure(t *testing.T) {
 		ModelID: filepath.Join(t.TempDir(), "missing-model"),
 		Backend: "go",
 	})
-	svc := NewService(cat, nil, embedder, nil)
+	svc := NewService(cat, nil, nil, embedder, nil)
 
 	if err := svc.LoadModel(context.Background()); err == nil {
 		t.Fatalf("LoadModel expected an error for a missing model directory")
@@ -140,9 +141,9 @@ func TestServiceDisabledAfterModelLoadFailure(t *testing.T) {
 }
 
 // TestServiceEmbedsAndPersistsWithRealModel drives the whole local embedding
-// path: the service's embedder, its preprocessing, and the float32 round trip
-// through SQLite. It is skipped without VISION_REFERENCE_DIR because it needs
-// the real checkpoint.
+// path: the service's embedder, its preprocessing, and the verbatim float32
+// round trip through the single write-back into the vector store and SQLite. It
+// is skipped without VISION_REFERENCE_DIR because it needs the real checkpoint.
 func TestServiceEmbedsAndPersistsWithRealModel(t *testing.T) {
 	dir := os.Getenv("VISION_REFERENCE_DIR")
 	if dir == "" {
@@ -155,7 +156,8 @@ func TestServiceEmbedsAndPersistsWithRealModel(t *testing.T) {
 
 	cat := newTestCatalog(t)
 	ctx := context.Background()
-	svc := NewService(cat, nil, NewVisionEmbedder(vision.Config{ModelID: dir + "/model", Backend: "go"}), nil)
+	store := newFakeVectorStore()
+	svc := NewService(cat, store, nil, NewVisionEmbedder(vision.Config{ModelID: dir + "/model", Backend: "go"}), nil)
 	if !svc.Enabled() {
 		t.Fatalf("Enabled()=false want=true")
 	}
@@ -167,6 +169,12 @@ func TestServiceEmbedsAndPersistsWithRealModel(t *testing.T) {
 	if err := cat.UpsertBlob(ctx, catalog.Blob{Hash: "hash-a", SizeBytes: 1}); err != nil {
 		t.Fatalf("upsert blob: %v", err)
 	}
+	if err := cat.CreateAlbum(ctx, catalog.Album{ID: "album-a", OriginalFilename: "a.zip"}); err != nil {
+		t.Fatalf("create album: %v", err)
+	}
+	if err := cat.InsertPhoto(ctx, catalog.Photo{AlbumID: "album-a", Index: 0, Name: "a.png", Hash: "hash-a", Width: 1000, Height: 300, Ratio: 1000.0 / 300.0}); err != nil {
+		t.Fatalf("insert photo: %v", err)
+	}
 
 	vector, err := svc.computeEmbedding(ctx, source)
 	if err != nil {
@@ -175,7 +183,7 @@ func TestServiceEmbedsAndPersistsWithRealModel(t *testing.T) {
 	if got, want := len(vector), 768; got != want {
 		t.Fatalf("embedding length=%d want=%d", got, want)
 	}
-	seedEmbeddingOutcome(t, cat, "hash-a", catalog.EmbeddingStatusReady, vector, "")
+	seedEmbeddingOutcome(t, svc, "hash-a", catalog.EmbeddingStatusReady, vector, "")
 
 	blob, err := cat.GetBlob(ctx, "hash-a")
 	if err != nil {
@@ -184,21 +192,26 @@ func TestServiceEmbedsAndPersistsWithRealModel(t *testing.T) {
 	if blob.EmbeddingStatus != catalog.EmbeddingStatusReady {
 		t.Fatalf("EmbeddingStatus=%q want=%q", blob.EmbeddingStatus, catalog.EmbeddingStatusReady)
 	}
-	if len(blob.Embedding) != len(vector) {
-		t.Fatalf("stored embedding length=%d want=%d", len(blob.Embedding), len(vector))
+
+	// The computed vector reached the store verbatim, attached to the photo
+	// point the catalog resolved.
+	points, _ := store.snapshot()
+	if len(points) != 1 {
+		t.Fatalf("store points=%d want=1: %+v", len(points), points)
+	}
+	stored := points[qdrant.PointID("album-a", 0)]
+	if stored.Hash != "hash-a" || stored.W != 1000 || stored.H != 300 {
+		t.Fatalf("stored point payload=%+v", stored)
+	}
+	if len(stored.Vector) != len(vector) {
+		t.Fatalf("stored vector length=%d want=%d", len(stored.Vector), len(vector))
 	}
 	for i := range vector {
-		if blob.Embedding[i] != vector[i] {
-			t.Fatalf("stored embedding[%d]=%v want=%v", i, blob.Embedding[i], vector[i])
+		if stored.Vector[i] != vector[i] {
+			t.Fatalf("stored vector[%d]=%v want=%v", i, stored.Vector[i], vector[i])
 		}
 	}
 
-	// The service must now serve the persisted vector from the catalog, and
-	// report it as ready progress.
-	loaded, failed := svc.queryVector(ctx, "hash-a")
-	if failed || len(loaded) == 0 {
-		t.Fatalf("queryVector failed=%t len=%d", failed, len(loaded))
-	}
 	counts, err := cat.EmbeddingCounts(ctx)
 	if err != nil {
 		t.Fatalf("EmbeddingCounts: %v", err)

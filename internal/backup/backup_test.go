@@ -206,7 +206,7 @@ func TestRestoreReplacesLocalCatalogAndWritesStamp(t *testing.T) {
 	ctx := context.Background()
 
 	snapshotPath := filepath.Join(dir, "snapshot-source.db")
-	source, err := catalog.Open(snapshotPath)
+	source, err := catalog.Open(snapshotPath, nil)
 	if err != nil {
 		t.Fatalf("open source catalog: %v", err)
 	}
@@ -235,7 +235,7 @@ func TestRestoreReplacesLocalCatalogAndWritesStamp(t *testing.T) {
 
 	// The local database holds different data and an older stamp.
 	dbPath := filepath.Join(dir, "viewer.db")
-	local, err := catalog.Open(dbPath)
+	local, err := catalog.Open(dbPath, nil)
 	if err != nil {
 		t.Fatalf("open local catalog: %v", err)
 	}
@@ -262,7 +262,7 @@ func TestRestoreReplacesLocalCatalogAndWritesStamp(t *testing.T) {
 		t.Fatalf("Restore reported false, wanted a restore")
 	}
 
-	reopened, err := catalog.Open(dbPath)
+	reopened, err := catalog.Open(dbPath, nil)
 	if err != nil {
 		t.Fatalf("reopen restored catalog: %v", err)
 	}
@@ -299,7 +299,7 @@ func TestRestoreLeavesLocalDatabaseWithoutStampBehind(t *testing.T) {
 	ctx := context.Background()
 
 	dbPath := filepath.Join(dir, "viewer.db")
-	local, err := catalog.Open(dbPath)
+	local, err := catalog.Open(dbPath, nil)
 	if err != nil {
 		t.Fatalf("open local catalog: %v", err)
 	}
@@ -375,7 +375,7 @@ func TestFinalizerUploadsThenDeletes(t *testing.T) {
 	dir := t.TempDir()
 	ctx := context.Background()
 
-	cat, err := catalog.Open(filepath.Join(dir, "viewer.db"))
+	cat, err := catalog.Open(filepath.Join(dir, "viewer.db"), nil)
 	if err != nil {
 		t.Fatalf("open catalog: %v", err)
 	}
@@ -434,7 +434,7 @@ func TestFinalizerKeepsZipsWhenUploadFails(t *testing.T) {
 	dir := t.TempDir()
 	ctx := context.Background()
 
-	cat, err := catalog.Open(filepath.Join(dir, "viewer.db"))
+	cat, err := catalog.Open(filepath.Join(dir, "viewer.db"), nil)
 	if err != nil {
 		t.Fatalf("open catalog: %v", err)
 	}
@@ -470,7 +470,7 @@ func TestFinalizerKeepsZipsWhenUploadFails(t *testing.T) {
 // staged in the store — the minimum state a finalize would normally clean up.
 func seedGuardFixture(t *testing.T, dir string) *catalog.Store {
 	t.Helper()
-	cat, err := catalog.Open(filepath.Join(dir, "viewer.db"))
+	cat, err := catalog.Open(filepath.Join(dir, "viewer.db"), nil)
 	if err != nil {
 		t.Fatalf("open catalog: %v", err)
 	}
@@ -609,7 +609,7 @@ func TestRestoreRejectsNonSQLiteBackup(t *testing.T) {
 	ctx := context.Background()
 
 	dbPath := filepath.Join(dir, "viewer.db")
-	local, err := catalog.Open(dbPath)
+	local, err := catalog.Open(dbPath, nil)
 	if err != nil {
 		t.Fatalf("open local catalog: %v", err)
 	}
@@ -666,7 +666,7 @@ func TestFinalizerSkipsUnchangedCatalog(t *testing.T) {
 	dir := t.TempDir()
 	ctx := context.Background()
 
-	cat, err := catalog.Open(filepath.Join(dir, "viewer.db"))
+	cat, err := catalog.Open(filepath.Join(dir, "viewer.db"), nil)
 	if err != nil {
 		t.Fatalf("open catalog: %v", err)
 	}
@@ -727,7 +727,7 @@ func TestSnapshotAlbumsFreezeTheDeleteList(t *testing.T) {
 	dir := t.TempDir()
 	ctx := context.Background()
 
-	cat, err := catalog.Open(filepath.Join(dir, "viewer.db"))
+	cat, err := catalog.Open(filepath.Join(dir, "viewer.db"), nil)
 	if err != nil {
 		t.Fatalf("open catalog: %v", err)
 	}
@@ -773,7 +773,7 @@ func TestFinalizerSkipsOverlappingRun(t *testing.T) {
 	dir := t.TempDir()
 	ctx := context.Background()
 
-	cat, err := catalog.Open(filepath.Join(dir, "viewer.db"))
+	cat, err := catalog.Open(filepath.Join(dir, "viewer.db"), nil)
 	if err != nil {
 		t.Fatalf("open catalog: %v", err)
 	}

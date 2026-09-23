@@ -12,6 +12,7 @@ import (
 
 	"viewer/internal/catalog"
 	"viewer/internal/images"
+	"viewer/internal/qdrant"
 )
 
 const (
@@ -35,16 +36,25 @@ const (
 	maxTopK     = 48
 )
 
-// Service maps photos to the blob hashes they appear under and runs the
-// background workers that compute embeddings for the catalog's pending blobs.
-// The similarity index itself lives in the catalog's blob_embeddings vec0
-// table: embeddings are queried through SQL and never held here. Extraction
+// Service runs the background workers that compute embeddings for the
+// catalog's pending blobs and serves cross-album recommendations out of the
+// external vector store. The service owns no vector state itself: SQLite keeps
+// the bookkeeping (which blob is embedded, by which status) and the vector
+// store keeps the vectors, so the two are written in that order — index first,
+// bookkeeping second — by the single ApplyEmbeddingResults path. Extraction
 // never embeds anything itself: the in-process workers and external workers
 // leasing batches through ClaimEmbeddings are the only producers of
 // embeddings, and both write through ApplyEmbeddingResults.
 type Service struct {
 	catalog *catalog.Store
-	images  *images.Service
+
+	// vectors is nil when no vector store is wired up (some tests). Writes then
+	// degrade to SQLite-only bookkeeping and Recommend reports the store as
+	// unavailable rather than answering with an empty list that looks like
+	// "no similar photos".
+	vectors VectorStore
+
+	images *images.Service
 
 	// embedder is nil when the recommendation feature is switched off, which is
 	// how tests run without a checkpoint.
@@ -73,27 +83,22 @@ type Service struct {
 	runActive    bool
 	runStartedAt time.Time
 	runEmbedded  int
-
-	// mu guards the photo-ref maps that fan a neighbor blob hash out to the
-	// photos (across albums) showing it.
-	mu            sync.RWMutex
-	photosByHash  map[string][]photoRef
-	hashesByAlbum map[string]map[string]struct{}
 }
 
 // NewService builds a recommendation service. A nil embedder switches the
 // feature off: the API keeps serving empty recommendation lists, no worker
-// starts, and every blob stays pending. onEmbeddingDrain, when non-nil, is
-// invoked on the worker goroutine after the embedding queue drains; a backup
-// hook there is allowed to block, because there is no pending work to delay.
-func NewService(cat *catalog.Store, imagesService *images.Service, embedder EmbeddingProvider, onEmbeddingDrain func(ctx context.Context) error) *Service {
+// starts, and every blob stays pending. A nil vectors store leaves the service
+// usable for embedding work but without searchable recommendations.
+// onEmbeddingDrain, when non-nil, is invoked on the worker goroutine after the
+// embedding queue drains; a backup hook there is allowed to block, because
+// there is no pending work to delay.
+func NewService(cat *catalog.Store, vectors VectorStore, imagesService *images.Service, embedder EmbeddingProvider, onEmbeddingDrain func(ctx context.Context) error) *Service {
 	return &Service{
 		catalog:          cat,
+		vectors:          vectors,
 		images:           imagesService,
 		embedder:         embedder,
 		onEmbeddingDrain: onEmbeddingDrain,
-		photosByHash:     make(map[string][]photoRef),
-		hashesByAlbum:    make(map[string]map[string]struct{}),
 	}
 }
 
@@ -153,92 +158,6 @@ func (s *Service) computeEmbedding(ctx context.Context, imageBytes []byte) ([]fl
 		s.runMu.Unlock()
 	}()
 	return s.embedder.Embed(embedCtx, imageBytes)
-}
-
-// LoadAll rebuilds the photo-ref maps from the SQLite catalog. Embeddings are
-// not read: they live in the catalog's vec0 index and are queried there. The
-// rebuild reads its snapshot of the catalog outside the map lock, so an album
-// extraction landing between the read and the swap can leave the refs stale
-// until the next reload — the same transient gap as before, but it can no
-// longer drop vectors, which never enter memory.
-func (s *Service) LoadAll(ctx context.Context) error {
-	if s == nil || s.catalog == nil {
-		return nil
-	}
-	pairs, err := s.catalog.ListPhotoBlobPairs(ctx)
-	if err != nil {
-		return err
-	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.resetLocked()
-	for _, pair := range pairs {
-		s.addPairLocked(pair)
-	}
-	return nil
-}
-
-// ReloadAlbum refreshes one album's photos and blob states in memory.
-func (s *Service) ReloadAlbum(ctx context.Context, albumID string) error {
-	if s == nil || s.catalog == nil || strings.TrimSpace(albumID) == "" {
-		return nil
-	}
-	pairs, err := s.catalog.ListPhotoBlobPairsByAlbum(ctx, albumID)
-	if err != nil {
-		return err
-	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	previous := s.hashesByAlbum[albumID]
-	delete(s.hashesByAlbum, albumID)
-	for hash := range previous {
-		s.removeHashForAlbumLocked(hash, albumID)
-	}
-	for _, pair := range pairs {
-		s.addPairLocked(pair)
-	}
-	return nil
-}
-
-func (s *Service) resetLocked() {
-	s.photosByHash = make(map[string][]photoRef)
-	s.hashesByAlbum = make(map[string]map[string]struct{})
-}
-
-func (s *Service) addPairLocked(pair catalog.PhotoWithBlob) {
-	hash := pair.Photo.Hash
-	if hash == "" {
-		return
-	}
-	s.photosByHash[hash] = append(s.photosByHash[hash], photoRef{
-		AlbumID: pair.Photo.AlbumID,
-		Index:   pair.Photo.Index,
-		Hash:    hash,
-		Width:   pair.Photo.Width,
-		Height:  pair.Photo.Height,
-	})
-	if s.hashesByAlbum[pair.Photo.AlbumID] == nil {
-		s.hashesByAlbum[pair.Photo.AlbumID] = make(map[string]struct{})
-	}
-	s.hashesByAlbum[pair.Photo.AlbumID][hash] = struct{}{}
-}
-
-func (s *Service) removeHashForAlbumLocked(hash string, albumID string) {
-	refs := s.photosByHash[hash]
-	kept := refs[:0]
-	for _, ref := range refs {
-		if ref.AlbumID == albumID {
-			continue
-		}
-		kept = append(kept, ref)
-	}
-	if len(kept) == 0 {
-		delete(s.photosByHash, hash)
-		return
-	}
-	s.photosByHash[hash] = kept
 }
 
 // Start launches the background embedding workers.
@@ -489,18 +408,30 @@ func (s *Service) ReleaseClaims(ctx context.Context, hashes []string) error {
 }
 
 // ApplyEmbeddingResults validates a batch of worker outcomes and persists the
-// acceptable ones in one transaction. It is the single write path for the
-// in-process worker and external workers alike, and the catalog mirrors each
-// landed ready vector into the vec0 index inside that same transaction — which
-// is what keeps the index and the catalog in lockstep and makes results
-// queryable the moment this returns.
+// acceptable ones. It is the single write path for the in-process worker and
+// external workers alike, and it writes the two stores in a fixed order:
+//
+//  1. The vector store first. Every accepted ready vector is turned into its
+//     photo points — one per (album, idx) the hash appears under, resolved
+//     from the catalog — and upserted. A store failure returns an error and
+//     leaves SQLite completely untouched, so the blobs stay "processing" and
+//     the worker hands its claims back for a clean retry.
+//  2. SQLite bookkeeping second, in one transaction.
+//
+// The ordering makes both crash windows recoverable. A crash between the two
+// leaves Qdrant written but SQLite still saying "processing": the claim is
+// re-leased, the blob is re-embedded, and the write-back upserts the very same
+// deterministic point IDs, overwriting the first copy in place. A crash inside
+// the SQLite transaction loses only the bookkeeping and recovers the same way.
+// Neither window can produce a duplicate or a vector the catalog does not know
+// about — the reverse order could.
 func (s *Service) ApplyEmbeddingResults(ctx context.Context, results []catalog.EmbeddingResult) (applied int, rejected []catalog.RejectedEmbedding, err error) {
 	if s == nil || s.catalog == nil {
 		return 0, nil, fmt.Errorf("catalog is not available")
 	}
 
-	// Validate before the catalog sees anything: a vector of the wrong length,
-	// with non-finite entries, or with zero length would poison the index —
+	// Validate before either store sees anything: a vector of the wrong length,
+	// with non-finite entries, or with zero length would poison search —
 	// cosine distance divides by the norm, so a zero vector ranks as NaN and
 	// NaN drags the whole neighbor ranking down with it.
 	valid := make([]catalog.EmbeddingResult, 0, len(results))
@@ -527,15 +458,74 @@ func (s *Service) ApplyEmbeddingResults(ctx context.Context, results []catalog.E
 		valid = append(valid, result)
 	}
 
+	// Ready vectors go to the store before the catalog claims them. First wins
+	// per hash, matching the catalog's own first-wins UPDATE: a duplicate
+	// report of the same hash re-upserts the identical point IDs, so it is
+	// harmless rather than corrupting.
+	if s.vectors != nil {
+		if err := s.uploadReadyVectors(ctx, valid); err != nil {
+			return 0, nil, err
+		}
+	}
+
 	appliedHashes, catalogRejected, err := s.catalog.ApplyEmbeddingResults(ctx, valid)
 	if err != nil {
 		return 0, nil, err
 	}
 	rejected = append(rejected, catalogRejected...)
 	// First-wins per hash falls out of the catalog: only the first UPDATE per
-	// hash still sees the processing state, and the index row lands in that
-	// same transaction.
+	// hash still sees the processing state.
 	return len(appliedHashes), rejected, nil
+}
+
+// uploadReadyVectors pushes every ready vector in an already-validated batch
+// into the vector store, one point per photo the hash appears under. Blobs no
+// photo references have no (album, idx) to become a point and are skipped —
+// their bookkeeping still lands, they just never become searchable, which is
+// the same treatment unreferenced blobs always had.
+func (s *Service) uploadReadyVectors(ctx context.Context, valid []catalog.EmbeddingResult) error {
+	vectorsByHash := make(map[string][]float32)
+	readyHashes := make([]string, 0, len(valid))
+	for _, result := range valid {
+		if result.Status != catalog.EmbeddingStatusReady {
+			continue
+		}
+		if _, dup := vectorsByHash[result.Hash]; dup {
+			continue
+		}
+		vectorsByHash[result.Hash] = result.Vector
+		readyHashes = append(readyHashes, result.Hash)
+	}
+	if len(readyHashes) == 0 {
+		return nil
+	}
+
+	pairs, err := s.catalog.ListPhotoBlobPairsByHashes(ctx, readyHashes)
+	if err != nil {
+		return fmt.Errorf("resolve photos for %d embedded blob(s): %w", len(readyHashes), err)
+	}
+	records := make([]qdrant.PhotoRecord, 0, len(pairs))
+	for _, pair := range pairs {
+		vector, ok := vectorsByHash[pair.Photo.Hash]
+		if !ok {
+			continue
+		}
+		records = append(records, qdrant.PhotoRecord{
+			AlbumID: pair.Photo.AlbumID,
+			Idx:     pair.Photo.Index,
+			Hash:    pair.Photo.Hash,
+			W:       pair.Photo.Width,
+			H:       pair.Photo.Height,
+			Vector:  vector,
+		})
+	}
+	if len(records) == 0 {
+		return nil
+	}
+	if err := s.vectors.UpsertPhotos(ctx, records); err != nil {
+		return fmt.Errorf("upload %d photo vector(s): %w", len(records), err)
+	}
+	return nil
 }
 
 // clampClaimLimit bounds a worker-requested claim size.
@@ -659,9 +649,11 @@ func rejectionSummary(rejected []catalog.RejectedEmbedding) string {
 	return strings.Join(parts, ",")
 }
 
-// Recommend returns cross-album neighbors of a query photo. Neighbors come
-// from the catalog's vec0 index (distance-ascending, hash tie-broken); this
-// only resolves which photos those blob hashes surface as.
+// Recommend returns cross-album neighbors of a query photo: the vector store
+// searches for points similar to the query photo's own point, already grouped
+// so only the best photo per album comes back, with the query's own album and
+// hash excluded on the store side. This only maps the ranked hits onto the API
+// response.
 func (s *Service) Recommend(ctx context.Context, albumID string, photoIndex int, limit int) (RecommendationResponse, error) {
 	if limit <= 0 {
 		limit = defaultTopK
@@ -673,6 +665,10 @@ func (s *Service) Recommend(ctx context.Context, albumID string, photoIndex int,
 	if s.catalog == nil {
 		return RecommendationResponse{}, fmt.Errorf("catalog is not available")
 	}
+	if s.vectors == nil {
+		return RecommendationResponse{}, fmt.Errorf("vector store is not available")
+	}
+
 	photo, err := s.catalog.PhotoAt(ctx, albumID, photoIndex)
 	if err != nil {
 		if errors.Is(err, catalog.ErrPhotoNotFound) {
@@ -681,74 +677,97 @@ func (s *Service) Recommend(ctx context.Context, albumID string, photoIndex int,
 		return RecommendationResponse{}, err
 	}
 
-	query, failed := s.queryVector(ctx, photo.Hash)
-	if failed || len(query) == 0 {
+	// A blob the embedding pipeline has not delivered for — still pending,
+	// currently processing, or terminally failed — has no point to search
+	// from, so such a query answers with an empty list rather than neighbors
+	// ranked against nothing.
+	blob, err := s.catalog.GetBlob(ctx, photo.Hash)
+	if err != nil || blob.EmbeddingStatus != catalog.EmbeddingStatusReady {
 		return RecommendationResponse{Items: []RecommendationItem{}}, nil
 	}
 
-	neighbors, err := s.catalog.FindNeighborEmbeddings(ctx, query, catalog.MaxNeighborK)
+	hits, err := s.vectors.GroupSearch(ctx, qdrant.PointID(albumID, photoIndex), albumID, photo.Hash, limit)
 	if err != nil {
-		return RecommendationResponse{}, fmt.Errorf("rank neighbors: %w", err)
+		return RecommendationResponse{}, fmt.Errorf("group search: %w", err)
+	}
+	if len(hits) == 0 {
+		return RecommendationResponse{Items: []RecommendationItem{}}, nil
 	}
 
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	items := make([]RecommendationItem, 0, limit)
-	seenAlbumIDs := make(map[string]struct{}, limit)
-	for _, neighbor := range neighbors {
-		// Same rule the index-side exclusion used to implement: the query
-		// blob never surfaces as its own neighbor, in any album.
-		if neighbor.Hash == photo.Hash {
-			continue
-		}
-		for _, ref := range s.photosByHash[neighbor.Hash] {
-			// Recommendations are cross-album only.
-			if ref.AlbumID == albumID {
-				continue
-			}
-			if _, seen := seenAlbumIDs[ref.AlbumID]; seen {
-				continue
-			}
-			seenAlbumIDs[ref.AlbumID] = struct{}{}
-			items = append(items, RecommendationItem{
-				AlbumID: ref.AlbumID,
-				I:       ref.Index,
-				Hash:    ref.Hash,
-				W:       ref.Width,
-				H:       ref.Height,
-				Score:   1 - neighbor.Distance,
-			})
-			break
-		}
-		if len(items) >= limit {
-			break
-		}
+	items := make([]RecommendationItem, 0, len(hits))
+	for _, hit := range hits {
+		items = append(items, RecommendationItem{
+			AlbumID: hit.AlbumID,
+			I:       hit.Idx,
+			Hash:    hit.Hash,
+			W:       hit.W,
+			H:       hit.H,
+			Score:   hit.Score,
+		})
 	}
 
 	return RecommendationResponse{Items: items}, nil
 }
 
-// queryVector reads the query blob's own embedding from the catalog. It
-// reports failed=true for a blob whose embedding failed terminally, so such a
-// query answers with an empty list instead of neighbors ranked against
-// nothing.
-func (s *Service) queryVector(ctx context.Context, hash string) ([]float32, bool) {
-	blob, err := s.catalog.GetBlob(ctx, hash)
+// ReloadAlbum re-syncs one album's points in the vector store with the
+// catalog's current photo rows: the album's existing points are deleted, the
+// album's photos with ready embeddings are read back from the catalog, their
+// vectors are retrieved from the store, and the points are written again. A
+// photo whose blob is not ready — or whose vector the store does not have —
+// is simply absent afterwards, which is exactly right for an album whose
+// photos were replaced by a re-upload.
+func (s *Service) ReloadAlbum(ctx context.Context, albumID string) error {
+	if s == nil || s.catalog == nil || s.vectors == nil || strings.TrimSpace(albumID) == "" {
+		return nil
+	}
+
+	// Delete first: points for (album, idx) combinations that no longer exist
+	// must go even when the replacement photo set ends up empty.
+	if err := s.vectors.DeleteByAlbum(ctx, albumID); err != nil {
+		return fmt.Errorf("delete album %q vectors: %w", albumID, err)
+	}
+
+	pairs, err := s.catalog.ListPhotoBlobPairsByAlbum(ctx, albumID)
 	if err != nil {
-		return nil, false
+		return err
 	}
-	switch blob.EmbeddingStatus {
-	case catalog.EmbeddingStatusReady:
-		// The dim check keeps a legacy mis-sized "ready" row (which the
-		// index backfill skipped) from erroring the KNN query; it serves
-		// empty items, matching the pending case.
-		if len(blob.Embedding) == catalog.EmbeddingDim {
-			return blob.Embedding, false
+	hashes := make([]string, 0, len(pairs))
+	seen := make(map[string]struct{}, len(pairs))
+	for _, pair := range pairs {
+		if pair.Blob.EmbeddingStatus != catalog.EmbeddingStatusReady || pair.Photo.Hash == "" {
+			continue
 		}
-		return nil, false
-	case catalog.EmbeddingStatusFailed:
-		return nil, true
-	default:
-		return nil, false
+		if _, dup := seen[pair.Photo.Hash]; dup {
+			continue
+		}
+		seen[pair.Photo.Hash] = struct{}{}
+		hashes = append(hashes, pair.Photo.Hash)
 	}
+	if len(hashes) == 0 {
+		return nil
+	}
+
+	vectorsByHash, err := s.vectors.RetrieveVectorsByHashes(ctx, hashes)
+	if err != nil {
+		return fmt.Errorf("retrieve album %q vectors: %w", albumID, err)
+	}
+	records := make([]qdrant.PhotoRecord, 0, len(pairs))
+	for _, pair := range pairs {
+		vector, ok := vectorsByHash[pair.Photo.Hash]
+		if !ok || len(vector) == 0 {
+			continue
+		}
+		records = append(records, qdrant.PhotoRecord{
+			AlbumID: pair.Photo.AlbumID,
+			Idx:     pair.Photo.Index,
+			Hash:    pair.Photo.Hash,
+			W:       pair.Photo.Width,
+			H:       pair.Photo.Height,
+			Vector:  vector,
+		})
+	}
+	if len(records) == 0 {
+		return nil
+	}
+	return s.vectors.UpsertPhotos(ctx, records)
 }

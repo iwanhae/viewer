@@ -6,10 +6,14 @@ import (
 	"fmt"
 	"math"
 	"path/filepath"
+	"sort"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"viewer/internal/catalog"
+	"viewer/internal/qdrant"
 )
 
 // ---------------------------------------------------------------------------
@@ -24,7 +28,7 @@ func approxEqual(a, b float64) bool {
 // the test finishes.
 func newTestCatalog(t *testing.T) *catalog.Store {
 	t.Helper()
-	store, err := catalog.Open(filepath.Join(t.TempDir(), "test.db"))
+	store, err := catalog.Open(filepath.Join(t.TempDir(), "test.db"), nil)
 	if err != nil {
 		t.Fatalf("open catalog: %v", err)
 	}
@@ -36,12 +40,12 @@ func newTestCatalog(t *testing.T) *catalog.Store {
 	return store
 }
 
-// newTestService builds a recommendation service over the catalog. Tests that
-// only exercise the in-memory index pass a nil images service and a nil
-// embedder, which switches embedding off.
-func newTestService(t *testing.T, cat *catalog.Store, embedder EmbeddingProvider) *Service {
+// newTestService builds a recommendation service over the catalog with a nil
+// images service, which keeps the background workers out of the way. A nil
+// embedder switches embedding off.
+func newTestService(t *testing.T, cat *catalog.Store, vectors VectorStore, embedder EmbeddingProvider) *Service {
 	t.Helper()
-	svc := NewService(cat, nil, embedder, nil)
+	svc := NewService(cat, vectors, nil, embedder, nil)
 	if svc == nil {
 		t.Fatalf("new recommend service returned nil")
 	}
@@ -79,29 +83,28 @@ func seedBlob(t *testing.T, cat *catalog.Store, hash string) {
 	}
 }
 
-func seedReadyEmbedding(t *testing.T, cat *catalog.Store, hash string, vector []float32) {
+func seedReadyEmbedding(t *testing.T, svc *Service, hash string, vector []float32) {
 	t.Helper()
-	seedBlob(t, cat, hash)
-	seedEmbeddingOutcome(t, cat, hash, catalog.EmbeddingStatusReady, vector, "")
+	seedBlob(t, svc.catalog, hash)
+	seedEmbeddingOutcome(t, svc, hash, catalog.EmbeddingStatusReady, vector, "")
 }
 
-func seedFailedEmbedding(t *testing.T, cat *catalog.Store, hash string, errText string) {
+func seedFailedEmbedding(t *testing.T, svc *Service, hash string, errText string) {
 	t.Helper()
-	seedBlob(t, cat, hash)
-	seedEmbeddingOutcome(t, cat, hash, catalog.EmbeddingStatusFailed, nil, errText)
+	seedBlob(t, svc.catalog, hash)
+	seedEmbeddingOutcome(t, svc, hash, catalog.EmbeddingStatusFailed, nil, errText)
 }
 
 // seedEmbeddingOutcome pushes one terminal embedding outcome through the
-// public claim→apply path: the claim marks the blob processing, the apply
-// lands the result and mirrors a ready vector into the vec0 index in the same
-// transaction. The claim uses an already-expired lease and sweeps every
-// claimable blob so the target is always among the claimed rows; blobs that
-// only happened to be swept stay reclaimable, which is as good as pending for
-// the workers under test.
-func seedEmbeddingOutcome(t *testing.T, cat *catalog.Store, hash string, status catalog.EmbeddingStatus, vector []float32, errText string) {
+// service's production write path, so the catalog bookkeeping and the vector
+// store move together exactly as a real write-back would. The claim uses an
+// already-expired lease and sweeps every claimable blob so the target is always
+// among the claimed rows; blobs that only happened to be swept keep an expired
+// lease, which reclaims exactly like pending for everyone under test.
+func seedEmbeddingOutcome(t *testing.T, svc *Service, hash string, status catalog.EmbeddingStatus, vector []float32, errText string) {
 	t.Helper()
 	ctx := context.Background()
-	claimed, err := cat.ClaimPendingEmbeddings(ctx, 64, time.Now().Add(-time.Minute))
+	claimed, err := svc.catalog.ClaimPendingEmbeddings(ctx, MaxClaimLimit, time.Now().Add(-time.Minute))
 	if err != nil {
 		t.Fatalf("claim pending embeddings: %v", err)
 	}
@@ -115,7 +118,7 @@ func seedEmbeddingOutcome(t *testing.T, cat *catalog.Store, hash string, status 
 	if !claimable {
 		// Already past pending: only acceptable when a previous seed left the
 		// blob in exactly the requested terminal state.
-		blob, err := cat.GetBlob(ctx, hash)
+		blob, err := svc.catalog.GetBlob(ctx, hash)
 		if err != nil {
 			t.Fatalf("get blob %s: %v", hash, err)
 		}
@@ -124,7 +127,7 @@ func seedEmbeddingOutcome(t *testing.T, cat *catalog.Store, hash string, status 
 		}
 		return
 	}
-	applied, rejected, err := cat.ApplyEmbeddingResults(ctx, []catalog.EmbeddingResult{{
+	applied, rejected, err := svc.ApplyEmbeddingResults(ctx, []catalog.EmbeddingResult{{
 		Hash:   hash,
 		Status: status,
 		Vector: vector,
@@ -133,184 +136,252 @@ func seedEmbeddingOutcome(t *testing.T, cat *catalog.Store, hash string, status 
 	if err != nil {
 		t.Fatalf("apply embedding result %s: %v", hash, err)
 	}
-	if len(applied) != 1 || len(rejected) != 0 {
-		t.Fatalf("apply embedding result %s: applied=%v rejected=%v", hash, applied, rejected)
+	if applied != 1 || len(rejected) != 0 {
+		t.Fatalf("apply embedding result %s: applied=%d rejected=%v", hash, applied, rejected)
 	}
 }
 
 // vec768 builds a full-length embedding whose first components are vals and
 // whose remainder is zero, so tests can write short direction literals while
-// satisfying the catalog's float[768] column. Cosine similarity between two
-// vec768 vectors equals the cosine of the short forms they encode.
+// satisfying the fixed width. Cosine similarity between two vec768 vectors
+// equals the cosine of the short forms they encode.
 func vec768(vals ...float32) []float32 {
 	vector := make([]float32, catalog.EmbeddingDim)
 	copy(vector, vals)
 	return vector
 }
 
-// ---------------------------------------------------------------------------
-// LoadAll
-// ---------------------------------------------------------------------------
-
-func TestLoadAllBuildsIndexFromCatalogRows(t *testing.T) {
-	cat := newTestCatalog(t)
-	ctx := context.Background()
-
-	seedReadyEmbedding(t, cat, "hash-a", vec768(3, 4))
-	seedFailedEmbedding(t, cat, "hash-b", "embed image: boom")
-	seedBlob(t, cat, "hash-pending")
-	seedBlob(t, cat, "hash-orphan") // no photo references it
-
-	seedAlbum(t, cat, "album-a",
-		catalog.Photo{Index: 0, Name: "a0.jpg", Hash: "hash-a", Width: 10, Height: 20, Ratio: 0.5},
-		catalog.Photo{Index: 1, Name: "a1.jpg", Hash: "hash-b", Width: 20, Height: 20, Ratio: 1},
-	)
-	seedAlbum(t, cat, "album-b",
-		catalog.Photo{Index: 0, Name: "b0.jpg", Hash: "hash-pending", Width: 30, Height: 40, Ratio: 0.75},
-	)
-
-	svc := newTestService(t, cat, nil)
-	if err := svc.LoadAll(ctx); err != nil {
-		t.Fatalf("LoadAll: %v", err)
+// dimVector builds a valid-length embedding filled with one value, so tests
+// can express "the same vector" without spelling out 768 floats.
+func dimVector(fill float32) []float32 {
+	vector := make([]float32, catalog.EmbeddingDim)
+	for i := range vector {
+		vector[i] = fill
 	}
-
-	// Ready embeddings live in the catalog's vector index, not in memory:
-	// only the correctly-sized vector is queryable, while failed and pending
-	// blobs never enter it.
-	neighbors, err := cat.FindNeighborEmbeddings(ctx, vec768(3, 4), 10)
-	if err != nil {
-		t.Fatalf("FindNeighborEmbeddings: %v", err)
-	}
-	if len(neighbors) != 1 || neighbors[0].Hash != "hash-a" {
-		t.Fatalf("neighbors=%+v want only hash-a", neighbors)
-	}
-
-	refs := svc.photosByHash["hash-a"]
-	if len(refs) != 1 {
-		t.Fatalf("hash-a refs=%d want=1", len(refs))
-	}
-	if refs[0].AlbumID != "album-a" || refs[0].Index != 0 || refs[0].Width != 10 || refs[0].Height != 20 {
-		t.Fatalf("unexpected hash-a ref: %+v", refs[0])
-	}
-	if hashes := svc.hashesByAlbum["album-a"]; len(hashes) != 2 {
-		t.Fatalf("album-a hashes=%d want=2", len(hashes))
-	}
-	if _, ok := svc.hashesByAlbum["album-a"]["hash-b"]; !ok {
-		t.Fatalf("album-a reverse index missing failed blob hash")
-	}
-
-	// LoadAll is a full rebuild: re-running must not duplicate refs.
-	if err := svc.LoadAll(ctx); err != nil {
-		t.Fatalf("second LoadAll: %v", err)
-	}
-	if len(svc.photosByHash["hash-a"]) != 1 || len(svc.photosByHash["hash-pending"]) != 1 {
-		t.Fatalf("LoadAll duplicated refs: hash-a=%d hash-pending=%d",
-			len(svc.photosByHash["hash-a"]), len(svc.photosByHash["hash-pending"]))
-	}
+	return vector
 }
 
-func TestLoadAllAndReloadAlbumWithoutCatalog(t *testing.T) {
-	svc := newTestService(t, nil, nil)
-	if err := svc.LoadAll(context.Background()); err != nil {
-		t.Fatalf("LoadAll without catalog: %v", err)
-	}
-	if err := svc.ReloadAlbum(context.Background(), "album-a"); err != nil {
-		t.Fatalf("ReloadAlbum without catalog: %v", err)
-	}
+func nanVector() []float32 {
+	vector := dimVector(1)
+	vector[0] = float32(math.NaN())
+	return vector
 }
 
 // ---------------------------------------------------------------------------
-// ReloadAlbum
+// fakeVectorStore
 // ---------------------------------------------------------------------------
 
-func TestReloadAlbumAddsAndRefreshes(t *testing.T) {
-	cat := newTestCatalog(t)
-	ctx := context.Background()
+// fakeVectorStore is an honest in-memory stand-in for the Qdrant client: points
+// are keyed by the same deterministic point IDs, GroupSearch really ranks by
+// cosine and applies the same exclusions, and every operation is recorded so
+// tests can pin the order writes happen in.
+type fakeVectorStore struct {
+	mu            sync.Mutex
+	points        map[string]qdrant.PhotoRecord
+	ensureCalls   int
+	upsertBatches [][]qdrant.PhotoRecord
+	ops           []string
+	ensureErr     error
+	upsertErr     error
+	groupErr      error
+}
 
-	seedReadyEmbedding(t, cat, "hash-a0", vec768(1, 0))
-	seedAlbum(t, cat, "album-a", catalog.Photo{Index: 0, Name: "a0.jpg", Hash: "hash-a0", Width: 1, Height: 1, Ratio: 1})
+func newFakeVectorStore() *fakeVectorStore {
+	return &fakeVectorStore{points: make(map[string]qdrant.PhotoRecord)}
+}
 
-	svc := newTestService(t, cat, nil)
-	if err := svc.LoadAll(ctx); err != nil {
-		t.Fatalf("LoadAll: %v", err)
-	}
+func (f *fakeVectorStore) EnsureCollection(ctx context.Context) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.ensureCalls++
+	f.ops = append(f.ops, "ensure")
+	return f.ensureErr
+}
 
-	// album-b exists in the catalog but is not in the in-memory index yet.
-	seedReadyEmbedding(t, cat, "hash-b0", vec768(0, 1))
-	seedAlbum(t, cat, "album-b", catalog.Photo{Index: 0, Name: "b0.jpg", Hash: "hash-b0", Width: 2, Height: 2, Ratio: 1})
-	if _, ok := svc.hashesByAlbum["album-b"]; ok {
-		t.Fatalf("album-b indexed before ReloadAlbum")
+func (f *fakeVectorStore) UpsertPhotos(ctx context.Context, records []qdrant.PhotoRecord) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.ops = append(f.ops, fmt.Sprintf("upsert:%d", len(records)))
+	if f.upsertErr != nil {
+		return f.upsertErr
 	}
+	copied := append([]qdrant.PhotoRecord(nil), records...)
+	f.upsertBatches = append(f.upsertBatches, copied)
+	for _, record := range copied {
+		f.points[qdrant.PointID(record.AlbumID, record.Idx)] = record
+	}
+	return nil
+}
 
-	if err := svc.ReloadAlbum(ctx, "album-b"); err != nil {
-		t.Fatalf("ReloadAlbum(album-b): %v", err)
+func (f *fakeVectorStore) GroupSearch(ctx context.Context, queryPointID, excludeAlbumID, excludeHash string, limit int) ([]qdrant.PhotoHit, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.groupErr != nil {
+		return nil, f.groupErr
 	}
-	if _, ok := svc.hashesByAlbum["album-b"]["hash-b0"]; !ok {
-		t.Fatalf("ReloadAlbum did not index album-b")
+	query, ok := f.points[queryPointID]
+	if !ok {
+		// The live client answers 404 with empty results, not an error.
+		return nil, nil
 	}
-	if refs := svc.photosByHash["hash-b0"]; len(refs) != 1 || refs[0].AlbumID != "album-b" {
-		t.Fatalf("unexpected hash-b0 refs: %+v", refs)
+	type scored struct {
+		record qdrant.PhotoRecord
+		score  float64
 	}
+	var matches []scored
+	for id, record := range f.points {
+		if id == queryPointID || record.AlbumID == excludeAlbumID || record.Hash == excludeHash {
+			continue
+		}
+		matches = append(matches, scored{record: record, score: cosine(query.Vector, record.Vector)})
+	}
+	// Rank exactly like Qdrant: score descending, deterministic tie-break.
+	sort.Slice(matches, func(i, j int) bool {
+		if matches[i].score != matches[j].score {
+			return matches[i].score > matches[j].score
+		}
+		if matches[i].record.AlbumID != matches[j].record.AlbumID {
+			return matches[i].record.AlbumID < matches[j].record.AlbumID
+		}
+		return matches[i].record.Idx < matches[j].record.Idx
+	})
+	// group_size=1 semantics: after ranking, only the best photo per album
+	// survives, and the limit caps the number of albums.
+	hits := make([]qdrant.PhotoHit, 0, limit)
+	seenAlbum := make(map[string]struct{}, len(matches))
+	for _, match := range matches {
+		if _, dup := seenAlbum[match.record.AlbumID]; dup {
+			continue
+		}
+		seenAlbum[match.record.AlbumID] = struct{}{}
+		hits = append(hits, qdrant.PhotoHit{
+			AlbumID: match.record.AlbumID,
+			Idx:     match.record.Idx,
+			Hash:    match.record.Hash,
+			W:       match.record.W,
+			H:       match.record.H,
+			Score:   match.score,
+		})
+		if len(hits) == limit {
+			break
+		}
+	}
+	return hits, nil
+}
 
-	// Refreshing an album drops stale hashes and picks up the new photo.
-	seedReadyEmbedding(t, cat, "hash-a1", vec768(0, 1))
-	seedAlbum(t, cat, "album-a", catalog.Photo{Index: 0, Name: "a1.jpg", Hash: "hash-a1", Width: 3, Height: 3, Ratio: 1})
+func (f *fakeVectorStore) RetrieveVectorsByHashes(ctx context.Context, hashes []string) (map[string][]float32, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.ops = append(f.ops, fmt.Sprintf("retrieve:%d", len(hashes)))
+	vectors := make(map[string][]float32, len(hashes))
+	for _, record := range f.points {
+		if _, seen := vectors[record.Hash]; seen {
+			continue
+		}
+		for _, hash := range hashes {
+			if hash == record.Hash {
+				vectors[record.Hash] = append([]float32(nil), record.Vector...)
+				break
+			}
+		}
+	}
+	return vectors, nil
+}
 
-	if err := svc.ReloadAlbum(ctx, "album-a"); err != nil {
-		t.Fatalf("ReloadAlbum(album-a): %v", err)
+func (f *fakeVectorStore) DeleteByAlbum(ctx context.Context, albumID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.ops = append(f.ops, "delete:"+albumID)
+	for id, record := range f.points {
+		if record.AlbumID == albumID {
+			delete(f.points, id)
+		}
 	}
-	if _, ok := svc.hashesByAlbum["album-a"]["hash-a0"]; ok {
-		t.Fatalf("stale hash-a0 still in album-a reverse index")
-	}
-	if _, ok := svc.photosByHash["hash-a0"]; ok {
-		t.Fatalf("stale hash-a0 ref still in photos index")
-	}
-	if _, ok := svc.hashesByAlbum["album-a"]["hash-a1"]; !ok {
-		t.Fatalf("new hash-a1 missing from album-a reverse index")
-	}
-	if refs := svc.photosByHash["hash-a1"]; len(refs) != 1 || refs[0].Index != 0 || refs[0].Width != 3 {
-		t.Fatalf("unexpected hash-a1 refs: %+v", refs)
-	}
-	// Unrelated albums are untouched.
-	if _, ok := svc.photosByHash["hash-b0"]; !ok {
-		t.Fatalf("ReloadAlbum(album-a) dropped album-b entries")
-	}
+	return nil
+}
 
-	// Blank album id is a no-op, and unknown albums do not error or panic.
-	if err := svc.ReloadAlbum(ctx, "   "); err != nil {
-		t.Fatalf("ReloadAlbum(blank): %v", err)
+func (f *fakeVectorStore) CountVectors(ctx context.Context) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.points), nil
+}
+
+// snapshot returns copies of the stored points plus the recorded op list, so
+// assertions cannot race the store.
+func (f *fakeVectorStore) snapshot() (map[string]qdrant.PhotoRecord, []string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	points := make(map[string]qdrant.PhotoRecord, len(f.points))
+	for id, record := range f.points {
+		points[id] = record
 	}
-	if err := svc.ReloadAlbum(ctx, "album-missing"); err != nil {
-		t.Fatalf("ReloadAlbum(album-missing): %v", err)
+	return points, append([]string(nil), f.ops...)
+}
+
+// resetOps drops the recorded call list, so a test can bracket one operation
+// and assert on exactly its writes.
+func (f *fakeVectorStore) resetOps() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.ops = nil
+}
+
+// cosine is the honest ranking the fake promises: scale-invariant similarity in
+// [-1, 1], with a zero vector defined as matching nothing.
+func cosine(a, b []float32) float64 {
+	if len(a) != len(b) {
+		return 0
 	}
-	if _, ok := svc.hashesByAlbum["album-missing"]; ok {
-		t.Fatalf("unknown album must not be indexed")
+	var dot, normA, normB float64
+	for i := range a {
+		dot += float64(a[i]) * float64(b[i])
+		normA += float64(a[i]) * float64(a[i])
+		normB += float64(b[i]) * float64(b[i])
 	}
+	if normA == 0 || normB == 0 {
+		return 0
+	}
+	return dot / math.Sqrt(normA*normB)
 }
 
 // ---------------------------------------------------------------------------
 // Recommend
 // ---------------------------------------------------------------------------
 
-func TestRecommendOrdersCrossAlbumNeighborsByScore(t *testing.T) {
+// TestRecommendGroupsOnePhotoPerAlbumByScore seeds the store through the real
+// write-back path and pins the response shape: one hit per foreign album,
+// ranked by similarity, with the photo fields and the raw score carried onto
+// the wire unchanged.
+func TestRecommendGroupsOnePhotoPerAlbumByScore(t *testing.T) {
 	cat := newTestCatalog(t)
+	store := newFakeVectorStore()
+	svc := newTestService(t, cat, store, nil)
 	ctx := context.Background()
 
-	seedReadyEmbedding(t, cat, "hash-query", vec768(1, 0))
-	seedReadyEmbedding(t, cat, "hash-same-album", vec768(1, 0))
-	seedReadyEmbedding(t, cat, "hash-b", vec768(0.9, 0.1))
-	seedReadyEmbedding(t, cat, "hash-c", vec768(0, 1))
-
+	seedBlob(t, cat, "hash-query")
+	seedBlob(t, cat, "hash-twin")
+	seedBlob(t, cat, "hash-close")
+	seedBlob(t, cat, "hash-far")
 	seedAlbum(t, cat, "album-a",
 		catalog.Photo{Index: 0, Name: "a0.jpg", Hash: "hash-query", Width: 100, Height: 200, Ratio: 0.5},
-		catalog.Photo{Index: 1, Name: "a1.jpg", Hash: "hash-same-album", Width: 100, Height: 100, Ratio: 1},
+		catalog.Photo{Index: 1, Name: "a1.jpg", Hash: "hash-twin", Width: 100, Height: 100, Ratio: 1},
 	)
-	seedAlbum(t, cat, "album-b", catalog.Photo{Index: 0, Name: "b0.jpg", Hash: "hash-b", Width: 10, Height: 20, Ratio: 0.5})
-	seedAlbum(t, cat, "album-c", catalog.Photo{Index: 0, Name: "c0.jpg", Hash: "hash-c", Width: 30, Height: 40, Ratio: 0.75})
+	// album-b holds two photos of the same image: both become points, but only
+	// the better-scoring one may come back.
+	seedAlbum(t, cat, "album-b",
+		catalog.Photo{Index: 0, Name: "b0.jpg", Hash: "hash-close", Width: 10, Height: 20, Ratio: 0.5},
+		catalog.Photo{Index: 1, Name: "b1.jpg", Hash: "hash-close", Width: 10, Height: 20, Ratio: 0.5},
+	)
+	seedAlbum(t, cat, "album-c", catalog.Photo{Index: 0, Name: "c0.jpg", Hash: "hash-far", Width: 30, Height: 40, Ratio: 0.75})
 
-	svc := newTestService(t, cat, nil)
-	if err := svc.LoadAll(ctx); err != nil {
-		t.Fatalf("LoadAll: %v", err)
+	seedReadyEmbedding(t, svc, "hash-query", vec768(1, 0))
+	seedReadyEmbedding(t, svc, "hash-twin", vec768(1, 0))
+	seedReadyEmbedding(t, svc, "hash-close", vec768(0.9, 0.1))
+	seedReadyEmbedding(t, svc, "hash-far", vec768(0, 1))
+
+	points, _ := store.snapshot()
+	if len(points) != 5 {
+		t.Fatalf("store holds %d points, want 5 (one per photo): %+v", len(points), points)
 	}
 
 	resp, err := svc.Recommend(ctx, "album-a", 0, 10)
@@ -318,7 +389,7 @@ func TestRecommendOrdersCrossAlbumNeighborsByScore(t *testing.T) {
 		t.Fatalf("Recommend: %v", err)
 	}
 	if len(resp.Items) != 2 {
-		t.Fatalf("items=%d want=2: %+v", len(resp.Items), resp.Items)
+		t.Fatalf("items=%d want=2 (one per album): %+v", len(resp.Items), resp.Items)
 	}
 	if resp.Items[0].AlbumID != "album-b" || resp.Items[1].AlbumID != "album-c" {
 		t.Fatalf("unexpected order: %+v", resp.Items)
@@ -326,8 +397,12 @@ func TestRecommendOrdersCrossAlbumNeighborsByScore(t *testing.T) {
 	if !(resp.Items[0].Score > resp.Items[1].Score) {
 		t.Fatalf("expected descending scores, got %+v", resp.Items)
 	}
-	if resp.Items[0].I != 0 || resp.Items[0].W != 10 || resp.Items[0].H != 20 {
+	// Photo fields and the raw score pass straight through.
+	if resp.Items[0].I != 0 || resp.Items[0].Hash != "hash-close" || resp.Items[0].W != 10 || resp.Items[0].H != 20 {
 		t.Fatalf("unexpected album-b item: %+v", resp.Items[0])
+	}
+	if !approxEqual(resp.Items[0].Score, cosine(vec768(1, 0), vec768(0.9, 0.1))) {
+		t.Fatalf("score=%v want the cosine similarity", resp.Items[0].Score)
 	}
 	for _, item := range resp.Items {
 		if item.AlbumID == "album-a" {
@@ -336,80 +411,67 @@ func TestRecommendOrdersCrossAlbumNeighborsByScore(t *testing.T) {
 	}
 }
 
-func TestRecommendExcludesPhotosFromQueryAlbum(t *testing.T) {
+func TestRecommendExcludesQueryHashAcrossAlbums(t *testing.T) {
 	cat := newTestCatalog(t)
+	store := newFakeVectorStore()
+	svc := newTestService(t, cat, store, nil)
 	ctx := context.Background()
 
-	// The same-album twin is a perfect match, so it would rank first if the
-	// album filter were missing.
-	seedReadyEmbedding(t, cat, "hash-query", vec768(1, 0))
-	seedReadyEmbedding(t, cat, "hash-twin", vec768(1, 0))
-	seedReadyEmbedding(t, cat, "hash-other", vec768(0.5, 0.5))
+	// hash-shared appears in three albums. Querying one of them must exclude
+	// the shared hash everywhere, not just in the query album.
+	seedBlob(t, cat, "hash-shared")
+	seedBlob(t, cat, "hash-other")
+	seedAlbum(t, cat, "album-a", catalog.Photo{Index: 0, Name: "a.jpg", Hash: "hash-shared", Width: 1, Height: 1, Ratio: 1})
+	seedAlbum(t, cat, "album-b", catalog.Photo{Index: 0, Name: "b.jpg", Hash: "hash-shared", Width: 1, Height: 1, Ratio: 1})
+	seedAlbum(t, cat, "album-c", catalog.Photo{Index: 0, Name: "c.jpg", Hash: "hash-other", Width: 1, Height: 1, Ratio: 1})
 
-	seedAlbum(t, cat, "album-a",
-		catalog.Photo{Index: 0, Name: "a0.jpg", Hash: "hash-query", Width: 1, Height: 1, Ratio: 1},
-		catalog.Photo{Index: 1, Name: "a1.jpg", Hash: "hash-twin", Width: 1, Height: 1, Ratio: 1},
-	)
-	seedAlbum(t, cat, "album-b", catalog.Photo{Index: 0, Name: "b0.jpg", Hash: "hash-other", Width: 1, Height: 1, Ratio: 1})
-
-	svc := newTestService(t, cat, nil)
-	if err := svc.LoadAll(ctx); err != nil {
-		t.Fatalf("LoadAll: %v", err)
-	}
+	seedReadyEmbedding(t, svc, "hash-shared", vec768(1, 0))
+	seedReadyEmbedding(t, svc, "hash-other", vec768(0.5, 0.5))
 
 	resp, err := svc.Recommend(ctx, "album-a", 0, 10)
 	if err != nil {
 		t.Fatalf("Recommend: %v", err)
 	}
-	if len(resp.Items) != 1 {
-		t.Fatalf("items=%d want=1: %+v", len(resp.Items), resp.Items)
-	}
-	if resp.Items[0].AlbumID != "album-b" {
-		t.Fatalf("expected only album-b, got %+v", resp.Items[0])
+	if len(resp.Items) != 1 || resp.Items[0].AlbumID != "album-c" {
+		t.Fatalf("expected only album-c, got %+v", resp.Items)
 	}
 }
 
-func TestRecommendReturnsEmptyItemsWhenNoCrossAlbumNeighbors(t *testing.T) {
+func TestRecommendReturnsEmptyItemsWhenNothingIndexed(t *testing.T) {
 	cat := newTestCatalog(t)
+	store := newFakeVectorStore()
+	svc := newTestService(t, cat, store, nil)
 	ctx := context.Background()
 
-	seedReadyEmbedding(t, cat, "hash-a0", vec768(1, 0))
-	seedReadyEmbedding(t, cat, "hash-a1", vec768(0.9, 0.1))
-	seedAlbum(t, cat, "album-a",
-		catalog.Photo{Index: 0, Name: "a0.jpg", Hash: "hash-a0", Width: 1, Height: 1, Ratio: 1},
-		catalog.Photo{Index: 1, Name: "a1.jpg", Hash: "hash-a1", Width: 1, Height: 1, Ratio: 1},
-	)
-
-	svc := newTestService(t, cat, nil)
-	if err := svc.LoadAll(ctx); err != nil {
-		t.Fatalf("LoadAll: %v", err)
+	seedBlob(t, cat, "hash-a")
+	seedAlbum(t, cat, "album-a", catalog.Photo{Index: 0, Name: "a.jpg", Hash: "hash-a", Width: 1, Height: 1, Ratio: 1})
+	// The blob is ready in the catalog but its vector never reached the store
+	// (e.g. the store was wiped): the search finds no query point.
+	seedReadyEmbedding(t, svc, "hash-a", vec768(1, 0))
+	if err := store.DeleteByAlbum(ctx, "album-a"); err != nil {
+		t.Fatalf("wipe store: %v", err)
 	}
 
 	resp, err := svc.Recommend(ctx, "album-a", 0, 12)
 	if err != nil {
 		t.Fatalf("Recommend: %v", err)
 	}
-	if resp.Items == nil {
-		t.Fatalf("expected non-nil empty items list")
-	}
-	if len(resp.Items) != 0 {
-		t.Fatalf("expected no recommendations, got %d: %+v", len(resp.Items), resp.Items)
+	if resp.Items == nil || len(resp.Items) != 0 {
+		t.Fatalf("expected a non-nil empty item list, got %+v", resp.Items)
 	}
 }
 
 func TestRecommendReturnsEmptyItemsWhenQueryEmbeddingPending(t *testing.T) {
 	cat := newTestCatalog(t)
+	store := newFakeVectorStore()
+	svc := newTestService(t, cat, store, nil)
 	ctx := context.Background()
 
 	seedBlob(t, cat, "hash-pending")
-	seedReadyEmbedding(t, cat, "hash-b", vec768(1, 0))
-	seedAlbum(t, cat, "album-a", catalog.Photo{Index: 0, Name: "a0.jpg", Hash: "hash-pending", Width: 1, Height: 1, Ratio: 1})
-	seedAlbum(t, cat, "album-b", catalog.Photo{Index: 0, Name: "b0.jpg", Hash: "hash-b", Width: 1, Height: 1, Ratio: 1})
-
-	svc := newTestService(t, cat, nil)
-	if err := svc.LoadAll(ctx); err != nil {
-		t.Fatalf("LoadAll: %v", err)
-	}
+	seedBlob(t, cat, "hash-b")
+	seedAlbum(t, cat, "album-a", catalog.Photo{Index: 0, Name: "a.jpg", Hash: "hash-pending", Width: 1, Height: 1, Ratio: 1})
+	seedAlbum(t, cat, "album-b", catalog.Photo{Index: 0, Name: "b.jpg", Hash: "hash-b", Width: 1, Height: 1, Ratio: 1})
+	seedReadyEmbedding(t, svc, "hash-b", vec768(1, 0))
 
 	resp, err := svc.Recommend(ctx, "album-a", 0, 12)
 	if err != nil {
@@ -422,17 +484,16 @@ func TestRecommendReturnsEmptyItemsWhenQueryEmbeddingPending(t *testing.T) {
 
 func TestRecommendReturnsEmptyItemsWhenQueryEmbeddingFailed(t *testing.T) {
 	cat := newTestCatalog(t)
+	store := newFakeVectorStore()
+	svc := newTestService(t, cat, store, nil)
 	ctx := context.Background()
 
-	seedFailedEmbedding(t, cat, "hash-failed", "embed image: boom")
-	seedReadyEmbedding(t, cat, "hash-b", vec768(1, 0))
-	seedAlbum(t, cat, "album-a", catalog.Photo{Index: 0, Name: "a0.jpg", Hash: "hash-failed", Width: 1, Height: 1, Ratio: 1})
-	seedAlbum(t, cat, "album-b", catalog.Photo{Index: 0, Name: "b0.jpg", Hash: "hash-b", Width: 1, Height: 1, Ratio: 1})
-
-	svc := newTestService(t, cat, nil)
-	if err := svc.LoadAll(ctx); err != nil {
-		t.Fatalf("LoadAll: %v", err)
-	}
+	seedBlob(t, cat, "hash-failed")
+	seedBlob(t, cat, "hash-b")
+	seedAlbum(t, cat, "album-a", catalog.Photo{Index: 0, Name: "a.jpg", Hash: "hash-failed", Width: 1, Height: 1, Ratio: 1})
+	seedAlbum(t, cat, "album-b", catalog.Photo{Index: 0, Name: "b.jpg", Hash: "hash-b", Width: 1, Height: 1, Ratio: 1})
+	seedReadyEmbedding(t, svc, "hash-b", vec768(1, 0))
+	seedFailedEmbedding(t, svc, "hash-failed", "embed image: boom")
 
 	resp, err := svc.Recommend(ctx, "album-a", 0, 12)
 	if err != nil {
@@ -443,20 +504,37 @@ func TestRecommendReturnsEmptyItemsWhenQueryEmbeddingFailed(t *testing.T) {
 	}
 }
 
+func TestRecommendWithoutVectorStoreReportsUnavailable(t *testing.T) {
+	cat := newTestCatalog(t)
+	svc := newTestService(t, cat, nil, nil)
+	ctx := context.Background()
+
+	seedBlob(t, cat, "hash-a")
+	seedAlbum(t, cat, "album-a", catalog.Photo{Index: 0, Name: "a.jpg", Hash: "hash-a", Width: 1, Height: 1, Ratio: 1})
+
+	resp, err := svc.Recommend(ctx, "album-a", 0, 12)
+	if err == nil {
+		t.Fatalf("expected an error without a vector store, got %+v", resp)
+	}
+	if !strings.Contains(err.Error(), "vector store is not available") {
+		t.Fatalf("err=%v want the unavailability message", err)
+	}
+	if resp.Items != nil {
+		t.Fatalf("expected zero-value response on error, got %+v", resp)
+	}
+}
+
 // TestRecommendUnknownPhotoWrapsErrPhotoNotFound also pins that the recommend
 // sentinel is distinct from the catalog one: Recommend translates
 // catalog.ErrPhotoNotFound into its own error.
 func TestRecommendUnknownPhotoWrapsErrPhotoNotFound(t *testing.T) {
 	cat := newTestCatalog(t)
+	store := newFakeVectorStore()
+	svc := newTestService(t, cat, store, nil)
 	ctx := context.Background()
 
-	seedReadyEmbedding(t, cat, "hash-a", vec768(1, 0))
-	seedAlbum(t, cat, "album-a", catalog.Photo{Index: 0, Name: "a0.jpg", Hash: "hash-a", Width: 1, Height: 1, Ratio: 1})
-
-	svc := newTestService(t, cat, nil)
-	if err := svc.LoadAll(ctx); err != nil {
-		t.Fatalf("LoadAll: %v", err)
-	}
+	seedBlob(t, cat, "hash-a")
+	seedAlbum(t, cat, "album-a", catalog.Photo{Index: 0, Name: "a.jpg", Hash: "hash-a", Width: 1, Height: 1, Ratio: 1})
 
 	cases := []struct {
 		name    string
@@ -493,31 +571,13 @@ func TestRecommendUnknownPhotoWrapsErrPhotoNotFound(t *testing.T) {
 	}
 }
 
-func TestRecommendWithoutLoadedIndexReturnsEmptyNotPanic(t *testing.T) {
-	cat := newTestCatalog(t)
-	ctx := context.Background()
-
-	seedReadyEmbedding(t, cat, "hash-a", vec768(1, 0))
-	seedAlbum(t, cat, "album-a", catalog.Photo{Index: 0, Name: "a0.jpg", Hash: "hash-a", Width: 1, Height: 1, Ratio: 1})
-
-	// No LoadAll: the photo-ref maps are empty even though the catalog has the
-	// photo, and the query blob is the only indexed vector — excluded as the
-	// query itself. The result is an empty list rather than a panic.
-	svc := newTestService(t, cat, nil)
-	resp, err := svc.Recommend(ctx, "album-a", 0, 12)
-	if err != nil {
-		t.Fatalf("Recommend: %v", err)
-	}
-	if len(resp.Items) != 0 {
-		t.Fatalf("expected no recommendations, got %+v", resp.Items)
-	}
-}
-
 func TestRecommendLimitClamping(t *testing.T) {
 	cat := newTestCatalog(t)
+	store := newFakeVectorStore()
+	svc := newTestService(t, cat, store, nil)
 	ctx := context.Background()
 
-	seedReadyEmbedding(t, cat, "hash-query", vec768(1, 0))
+	seedBlob(t, cat, "hash-query")
 	seedAlbum(t, cat, "album-query", catalog.Photo{Index: 0, Name: "q.jpg", Hash: "hash-query", Width: 1, Height: 1, Ratio: 1})
 
 	// Enough distinct target albums to exercise the maxTopK clamp.
@@ -525,15 +585,12 @@ func TestRecommendLimitClamping(t *testing.T) {
 	for i := 0; i < targets; i++ {
 		hash := fmt.Sprintf("hash-target-%02d", i)
 		// Strictly decreasing similarity to the [1, 0] query.
-		seedReadyEmbedding(t, cat, hash, vec768(1-0.001*float32(i), 0.001*float32(i)))
+		seedBlob(t, cat, hash)
 		albumID := fmt.Sprintf("album-target-%02d", i)
 		seedAlbum(t, cat, albumID, catalog.Photo{Index: 0, Name: albumID + ".jpg", Hash: hash, Width: 1, Height: 1, Ratio: 1})
+		seedReadyEmbedding(t, svc, hash, vec768(1-0.001*float32(i), 0.001*float32(i)))
 	}
-
-	svc := newTestService(t, cat, nil)
-	if err := svc.LoadAll(ctx); err != nil {
-		t.Fatalf("LoadAll: %v", err)
-	}
+	seedReadyEmbedding(t, svc, "hash-query", vec768(1, 0))
 
 	cases := []struct {
 		name  string
@@ -582,13 +639,14 @@ func TestRecommendLimitClamping(t *testing.T) {
 
 func TestEmbeddingProgressFromCatalogCounts(t *testing.T) {
 	cat := newTestCatalog(t)
+	store := newFakeVectorStore()
+	svc := newTestService(t, cat, store, nil)
 
-	seedReadyEmbedding(t, cat, "hash-ready-1", vec768(1, 0))
-	seedReadyEmbedding(t, cat, "hash-ready-2", vec768(0, 1))
-	seedFailedEmbedding(t, cat, "hash-failed", "embed image: boom")
+	seedReadyEmbedding(t, svc, "hash-ready-1", vec768(1, 0))
+	seedReadyEmbedding(t, svc, "hash-ready-2", vec768(0, 1))
+	seedFailedEmbedding(t, svc, "hash-failed", "embed image: boom")
 	seedBlob(t, cat, "hash-pending")
 
-	svc := newTestService(t, cat, nil)
 	got := svc.EmbeddingProgress()
 
 	if got.Total != 4 || got.Ready != 2 || got.Failed != 1 || got.Pending != 1 {
@@ -601,7 +659,7 @@ func TestEmbeddingProgressFromCatalogCounts(t *testing.T) {
 
 func TestEmbeddingProgressEmptyCatalog(t *testing.T) {
 	cat := newTestCatalog(t)
-	svc := newTestService(t, cat, nil)
+	svc := newTestService(t, cat, newFakeVectorStore(), nil)
 
 	got := svc.EmbeddingProgress()
 	if got.Total != 0 || got.Ready != 0 || got.Failed != 0 || got.Pending != 0 {
@@ -619,16 +677,12 @@ func TestEmbeddingProgressNilDependencies(t *testing.T) {
 		t.Fatalf("unexpected progress for nil service: %+v", got)
 	}
 
-	svc := newTestService(t, nil, nil)
+	svc := newTestService(t, nil, nil, nil)
 	got = svc.EmbeddingProgress()
 	if got.Total != 0 || got.Ready != 0 || got.Failed != 0 || got.Pending != 0 || got.Ratio != 0 {
 		t.Fatalf("unexpected progress for nil catalog: %+v", got)
 	}
 }
-
-// ---------------------------------------------------------------------------
-// Vector validation helpers
-// ---------------------------------------------------------------------------
 
 func TestIsZeroNorm(t *testing.T) {
 	if !isZeroNorm(vec768()) {
@@ -662,6 +716,8 @@ func (g *gateEmbedder) Close() error { return nil }
 
 func TestEmbeddingProgressCountsAndEnabled(t *testing.T) {
 	cat := newTestCatalog(t)
+	store := newFakeVectorStore()
+	svc := newTestService(t, cat, store, nil)
 	seedAlbum(t, cat, "album-a",
 		catalog.Photo{Index: 0, Name: "a.jpg", Hash: "hash-shared"},
 		catalog.Photo{Index: 1, Name: "b.jpg", Hash: "hash-only-a"},
@@ -669,11 +725,17 @@ func TestEmbeddingProgressCountsAndEnabled(t *testing.T) {
 	seedAlbum(t, cat, "album-b", catalog.Photo{Index: 0, Name: "a.jpg", Hash: "hash-shared"})
 	seedBlob(t, cat, "hash-shared")
 	seedBlob(t, cat, "hash-only-a")
-	seedEmbeddingOutcome(t, cat, "hash-shared", catalog.EmbeddingStatusReady, dimVector(1), "")
+	seedEmbeddingOutcome(t, svc, "hash-shared", catalog.EmbeddingStatusReady, dimVector(1), "")
+
+	// The write-back created one point per photo showing the shared blob.
+	points, _ := store.snapshot()
+	if len(points) != 2 {
+		t.Fatalf("store holds %d points, want 2: %+v", len(points), points)
+	}
 
 	// A service without a provider reports the coverage but says plainly that
 	// it cannot embed anything, which is what stops a client from waiting.
-	disabled := newTestService(t, cat, nil)
+	disabled := newTestService(t, cat, store, nil)
 	progress := disabled.EmbeddingProgress()
 	if progress.Enabled {
 		t.Fatalf("expected Enabled=false without a provider: %+v", progress)
@@ -685,7 +747,7 @@ func TestEmbeddingProgressCountsAndEnabled(t *testing.T) {
 		t.Fatalf("ratio=%v want 0.5", progress.Ratio)
 	}
 
-	enabled := newTestService(t, cat, &gateEmbedder{started: make(chan struct{}), release: make(chan struct{})})
+	enabled := newTestService(t, cat, store, &gateEmbedder{started: make(chan struct{}), release: make(chan struct{})})
 	if progress := enabled.EmbeddingProgress(); !progress.Enabled || progress.Active {
 		t.Fatalf("expected Enabled=true and Active=false while idle: %+v", progress)
 	}
@@ -694,7 +756,7 @@ func TestEmbeddingProgressCountsAndEnabled(t *testing.T) {
 func TestEmbeddingProgressReportsActiveWhileEmbedding(t *testing.T) {
 	cat := newTestCatalog(t)
 	gate := &gateEmbedder{started: make(chan struct{}), release: make(chan struct{})}
-	svc := newTestService(t, cat, gate)
+	svc := newTestService(t, cat, newFakeVectorStore(), gate)
 
 	done := make(chan error, 1)
 	go func() {
@@ -720,40 +782,22 @@ func TestEmbeddingProgressReportsActiveWhileEmbedding(t *testing.T) {
 // External worker claim / write-back
 // ---------------------------------------------------------------------------
 
-// dimVector builds a valid-length embedding filled with one value, so tests
-// can express "the same vector" without spelling out 768 floats.
-func dimVector(fill float32) []float32 {
-	vector := make([]float32, catalog.EmbeddingDim)
-	for i := range vector {
-		vector[i] = fill
-	}
-	return vector
-}
-
-func nanVector() []float32 {
-	vector := dimVector(1)
-	vector[0] = float32(math.NaN())
-	return vector
-}
-
 func TestExternalWorkerClaimAndApplyRoundTrip(t *testing.T) {
 	cat := newTestCatalog(t)
+	store := newFakeVectorStore()
+	svc := newTestService(t, cat, store, nil)
 	ctx := context.Background()
 
 	seedBlob(t, cat, "hash-x")
 	seedAlbum(t, cat, "album-a",
 		catalog.Photo{Index: 0, Name: "a0.jpg", Hash: "hash-x", Width: 10, Height: 20, Ratio: 0.5})
-	seedReadyEmbedding(t, cat, "hash-y", dimVector(1))
+	seedBlob(t, cat, "hash-y")
 	seedAlbum(t, cat, "album-b",
 		catalog.Photo{Index: 0, Name: "b0.jpg", Hash: "hash-y", Width: 10, Height: 20, Ratio: 0.5})
+	seedReadyEmbedding(t, svc, "hash-y", dimVector(1))
 
 	// A nil embedder means the local model never loads; external backfill must
 	// work regardless.
-	svc := newTestService(t, cat, nil)
-	if err := svc.LoadAll(ctx); err != nil {
-		t.Fatalf("LoadAll: %v", err)
-	}
-
 	blobs, leaseUntil, err := svc.ClaimEmbeddings(ctx, 0)
 	if err != nil {
 		t.Fatalf("claim: %v", err)
@@ -774,7 +818,7 @@ func TestExternalWorkerClaimAndApplyRoundTrip(t *testing.T) {
 		t.Fatalf("expected pending=1 processing=1 while claimed, got %+v", progress)
 	}
 
-	// Bad vectors are rejected before anything is persisted.
+	// Bad vectors are rejected before either store sees anything.
 	_, rejected, err := svc.ApplyEmbeddingResults(ctx, []catalog.EmbeddingResult{
 		{Hash: "hash-x", Status: catalog.EmbeddingStatusReady, Vector: []float32{1, 2}},
 		{Hash: "hash-x", Status: catalog.EmbeddingStatusReady, Vector: nanVector()},
@@ -784,6 +828,9 @@ func TestExternalWorkerClaimAndApplyRoundTrip(t *testing.T) {
 	}
 	if len(rejected) != 2 || rejected[0].Reason != catalog.EmbeddingRejectWrongDim || rejected[1].Reason != catalog.EmbeddingRejectBadVector {
 		t.Fatalf("expected wrong_dim then bad_vector rejections, got %+v", rejected)
+	}
+	if points, _ := store.snapshot(); len(points) != 1 {
+		t.Fatalf("rejected vectors must not reach the store, points=%+v", points)
 	}
 
 	applied, rejected, err := svc.ApplyEmbeddingResults(ctx, []catalog.EmbeddingResult{
@@ -801,8 +848,8 @@ func TestExternalWorkerClaimAndApplyRoundTrip(t *testing.T) {
 		t.Fatalf("expected full coverage after write-back, got %+v", progress)
 	}
 
-	// The in-memory index picked the vector up without a reload, so the new
-	// photo immediately recommends across albums.
+	// The new point is searchable without any reload step, so the fresh photo
+	// immediately recommends across albums.
 	resp, err := svc.Recommend(ctx, "album-a", 0, 5)
 	if err != nil {
 		t.Fatalf("recommend: %v", err)
@@ -815,18 +862,152 @@ func TestExternalWorkerClaimAndApplyRoundTrip(t *testing.T) {
 	}
 }
 
+// TestApplyEmbeddingResultsWritesQdrantBeforeSQLite pins the write order that
+// makes crashes recoverable: a store failure leaves the catalog completely
+// untouched — the blob keeps its processing claim so a retry can land both —
+// and a success makes the point searchable before the status flips.
+func TestApplyEmbeddingResultsWritesQdrantBeforeSQLite(t *testing.T) {
+	cat := newTestCatalog(t)
+	svc := newTestService(t, cat, newFakeVectorStore(), nil)
+	ctx := context.Background()
+
+	seedBlob(t, cat, "hash-x")
+	seedAlbum(t, cat, "album-a", catalog.Photo{Index: 0, Name: "a.jpg", Hash: "hash-x", Width: 1, Height: 1, Ratio: 1})
+	if _, _, err := svc.ClaimEmbeddings(ctx, 0); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+
+	failing := newFakeVectorStore()
+	failing.upsertErr = errors.New("qdrant unreachable")
+	// Swap the store under the service for the failing one.
+	svc.vectors = failing
+	applied, rejected, err := svc.ApplyEmbeddingResults(ctx, []catalog.EmbeddingResult{
+		{Hash: "hash-x", Status: catalog.EmbeddingStatusReady, Vector: dimVector(1)},
+	})
+	if err == nil {
+		t.Fatalf("expected the store failure to surface, got applied=%d", applied)
+	}
+	if applied != 0 || rejected != nil {
+		t.Fatalf("a failed store write must report nothing applied, got applied=%d rejected=%+v", applied, rejected)
+	}
+	// SQLite is untouched: the blob keeps its processing state and its lease.
+	blob, err := cat.GetBlob(ctx, "hash-x")
+	if err != nil || blob.EmbeddingStatus != catalog.EmbeddingStatusProcessing {
+		t.Fatalf("blob=%+v err=%v want still processing after store failure", blob, err)
+	}
+
+	// The healthy store lands both writes, in that order.
+	working := newFakeVectorStore()
+	svc.vectors = working
+	applied, rejected, err = svc.ApplyEmbeddingResults(ctx, []catalog.EmbeddingResult{
+		{Hash: "hash-x", Status: catalog.EmbeddingStatusReady, Vector: dimVector(1)},
+	})
+	if err != nil || applied != 1 || len(rejected) != 0 {
+		t.Fatalf("apply: err=%v applied=%d rejected=%+v", err, applied, rejected)
+	}
+	points, ops := working.snapshot()
+	if len(points) != 1 {
+		t.Fatalf("expected one point, got %+v", points)
+	}
+	if len(ops) != 1 || ops[0] != "upsert:1" {
+		t.Fatalf("ops=%v want a single upsert", ops)
+	}
+	blob, err = cat.GetBlob(ctx, "hash-x")
+	if err != nil || blob.EmbeddingStatus != catalog.EmbeddingStatusReady {
+		t.Fatalf("blob=%+v err=%v want ready", blob, err)
+	}
+}
+
+// TestApplyEmbeddingResultsReembedOverwritesSamePoint covers the crash-window
+// recovery: a write-back whose vector already reached the store — a re-embed
+// after the SQLite half failed, or a duplicate report from a second worker —
+// upserts the very same deterministic point IDs, so the store converges to one
+// point per photo instead of duplicating them. The catalog side of a duplicate
+// report is rejected as not_claimed, which is what keeps it first-wins.
+func TestApplyEmbeddingResultsReembedOverwritesSamePoint(t *testing.T) {
+	cat := newTestCatalog(t)
+	store := newFakeVectorStore()
+	svc := newTestService(t, cat, store, nil)
+	ctx := context.Background()
+
+	seedBlob(t, cat, "hash-x")
+	seedAlbum(t, cat, "album-a", catalog.Photo{Index: 0, Name: "a.jpg", Hash: "hash-x", Width: 1, Height: 1, Ratio: 1})
+	seedAlbum(t, cat, "album-b", catalog.Photo{Index: 0, Name: "b.jpg", Hash: "hash-x", Width: 2, Height: 2, Ratio: 1})
+
+	if _, _, err := svc.ClaimEmbeddings(ctx, 0); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	applied, _, err := svc.ApplyEmbeddingResults(ctx, []catalog.EmbeddingResult{
+		{Hash: "hash-x", Status: catalog.EmbeddingStatusReady, Vector: dimVector(1)},
+	})
+	if err != nil || applied != 1 {
+		t.Fatalf("first apply: err=%v applied=%d", err, applied)
+	}
+
+	// A late duplicate report of the same hash (no fresh claim — the blob is
+	// already terminal): the store upsert is harmless, the catalog says no.
+	applied, rejected, err := svc.ApplyEmbeddingResults(ctx, []catalog.EmbeddingResult{
+		{Hash: "hash-x", Status: catalog.EmbeddingStatusReady, Vector: dimVector(3)},
+	})
+	if err != nil || applied != 0 {
+		t.Fatalf("duplicate apply: err=%v applied=%d", err, applied)
+	}
+	if len(rejected) != 1 || rejected[0].Reason != catalog.EmbeddingRejectNotClaimed {
+		t.Fatalf("rejected=%+v want one not_claimed rejection", rejected)
+	}
+
+	points, _ := store.snapshot()
+	if len(points) != 2 {
+		t.Fatalf("duplicate report duplicated points: %+v", points)
+	}
+	for _, record := range points {
+		if record.Vector[0] != 3 {
+			t.Fatalf("point %+v kept the stale first vector", record)
+		}
+	}
+}
+
+// TestApplyEmbeddingResultsSkipsOrphanHashesAndFailures: a ready hash no photo
+// references has no (album, idx) to become a point — its bookkeeping still
+// lands — and failed results never touch the store.
+func TestApplyEmbeddingResultsSkipsOrphanHashesAndFailures(t *testing.T) {
+	cat := newTestCatalog(t)
+	store := newFakeVectorStore()
+	svc := newTestService(t, cat, store, nil)
+	ctx := context.Background()
+
+	seedBlob(t, cat, "hash-orphan")
+	seedBlob(t, cat, "hash-doomed")
+	if _, _, err := svc.ClaimEmbeddings(ctx, 0); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+
+	applied, rejected, err := svc.ApplyEmbeddingResults(ctx, []catalog.EmbeddingResult{
+		{Hash: "hash-orphan", Status: catalog.EmbeddingStatusReady, Vector: dimVector(1)},
+		{Hash: "hash-doomed", Status: catalog.EmbeddingStatusFailed, Error: "decode image: boom"},
+	})
+	if err != nil || applied != 2 || len(rejected) != 0 {
+		t.Fatalf("apply: err=%v applied=%d rejected=%+v", err, applied, rejected)
+	}
+	points, ops := store.snapshot()
+	if len(points) != 0 || len(ops) != 0 {
+		t.Fatalf("no points may exist without photos: points=%+v ops=%v", points, ops)
+	}
+	blob, err := cat.GetBlob(ctx, "hash-orphan")
+	if err != nil || blob.EmbeddingStatus != catalog.EmbeddingStatusReady {
+		t.Fatalf("orphan blob=%+v err=%v want ready bookkeeping", blob, err)
+	}
+}
+
 func TestExternalWorkerReleaseAndFailedReport(t *testing.T) {
 	cat := newTestCatalog(t)
+	store := newFakeVectorStore()
+	svc := newTestService(t, cat, store, nil)
 	ctx := context.Background()
 
 	seedBlob(t, cat, "hash-x")
 	seedAlbum(t, cat, "album-a",
 		catalog.Photo{Index: 0, Name: "a0.jpg", Hash: "hash-x", Width: 10, Height: 20, Ratio: 0.5})
-
-	svc := newTestService(t, cat, nil)
-	if err := svc.LoadAll(ctx); err != nil {
-		t.Fatalf("LoadAll: %v", err)
-	}
 
 	blobs, _, err := svc.ClaimEmbeddings(ctx, 0)
 	if err != nil {
@@ -859,33 +1040,30 @@ func TestExternalWorkerReleaseAndFailedReport(t *testing.T) {
 	if progress := svc.EmbeddingProgress(); progress.Failed != 1 || progress.Pending != 0 {
 		t.Fatalf("expected failed=1 pending=0, got %+v", progress)
 	}
-	if _, failed := svc.queryVector(ctx, "hash-x"); !failed {
-		t.Fatalf("expected the failed hash to poison queries")
+	blob, err := cat.GetBlob(ctx, "hash-x")
+	if err != nil || blob.EmbeddingStatus != catalog.EmbeddingStatusFailed {
+		t.Fatalf("blob=%+v err=%v want failed", blob, err)
 	}
 }
 
-// A buggy worker can pad the hash with whitespace: the catalog trims it and
-// applies to the clean row, so the vec0 index and the report both land under
-// the same trimmed hash.
+// A buggy worker can pad the hash with whitespace: the service trims it, so the
+// store points and the catalog row land under the same clean hash.
 func TestExternalWorkerAppliesTrimmedHash(t *testing.T) {
 	cat := newTestCatalog(t)
+	store := newFakeVectorStore()
+	svc := newTestService(t, cat, store, nil)
 	ctx := context.Background()
 
 	seedBlob(t, cat, "hash-x")
 	seedAlbum(t, cat, "album-a",
 		catalog.Photo{Index: 0, Name: "a0.jpg", Hash: "hash-x", Width: 10, Height: 20, Ratio: 0.5})
-	seedReadyEmbedding(t, cat, "hash-y", dimVector(1))
+	seedBlob(t, cat, "hash-y")
 	seedAlbum(t, cat, "album-b",
 		catalog.Photo{Index: 0, Name: "b0.jpg", Hash: "hash-y", Width: 10, Height: 20, Ratio: 0.5})
+	seedReadyEmbedding(t, svc, "hash-y", dimVector(1))
 
-	svc := newTestService(t, cat, nil)
-	if err := svc.LoadAll(ctx); err != nil {
-		t.Fatalf("LoadAll: %v", err)
-	}
-
-	blobs, _, err := svc.ClaimEmbeddings(ctx, 0)
-	if err != nil || len(blobs) != 1 {
-		t.Fatalf("claim: %v blobs=%+v", err, blobs)
+	if _, _, err := svc.ClaimEmbeddings(ctx, 0); err != nil {
+		t.Fatalf("claim: %v", err)
 	}
 	applied, rejected, err := svc.ApplyEmbeddingResults(ctx, []catalog.EmbeddingResult{
 		{Hash: " hash-x ", Status: catalog.EmbeddingStatusReady, Vector: dimVector(3)},
@@ -894,8 +1072,8 @@ func TestExternalWorkerAppliesTrimmedHash(t *testing.T) {
 		t.Fatalf("apply: err=%v applied=%d rejected=%+v", err, applied, rejected)
 	}
 
-	// The index knows the trimmed hash: the cross-album neighbor query works,
-	// which it would not if the padded hash had poisoned the maps.
+	// The store knows the trimmed hash: the cross-album neighbor query works,
+	// which it would not if the padded hash had poisoned the points.
 	result, err := svc.Recommend(ctx, "album-b", 0, 5)
 	if err != nil {
 		t.Fatalf("recommend: %v", err)
@@ -905,29 +1083,27 @@ func TestExternalWorkerAppliesTrimmedHash(t *testing.T) {
 	}
 }
 
-// The catalog applies the first result per hash in a batch and rejects the
-// rest; the recommendation view must follow the same side of that race, not
-// the last submission.
+// The service applies the first result per hash in a batch and rejects the
+// rest; the store must receive the first submission's vector, not the last.
 func TestExternalWorkerDuplicateHashIsFirstWins(t *testing.T) {
 	cat := newTestCatalog(t)
+	store := newFakeVectorStore()
+	svc := newTestService(t, cat, store, nil)
 	ctx := context.Background()
 
 	seedBlob(t, cat, "hash-x")
 	seedAlbum(t, cat, "album-a",
 		catalog.Photo{Index: 0, Name: "a0.jpg", Hash: "hash-x", Width: 10, Height: 20, Ratio: 0.5})
-	seedReadyEmbedding(t, cat, "hash-y", dimVector(1))
+	seedBlob(t, cat, "hash-y")
 	seedAlbum(t, cat, "album-b",
 		catalog.Photo{Index: 0, Name: "b0.jpg", Hash: "hash-y", Width: 10, Height: 20, Ratio: 0.5})
+	seedReadyEmbedding(t, svc, "hash-y", dimVector(1))
 
-	svc := newTestService(t, cat, nil)
-	if err := svc.LoadAll(ctx); err != nil {
-		t.Fatalf("LoadAll: %v", err)
-	}
 	if _, _, err := svc.ClaimEmbeddings(ctx, 0); err != nil {
 		t.Fatalf("claim: %v", err)
 	}
 
-	// ready first, failed second: the catalog stores ready, so the index must
+	// ready first, failed second: the catalog stores ready, so the store must
 	// know the vector, not the failure.
 	applied, rejected, err := svc.ApplyEmbeddingResults(ctx, []catalog.EmbeddingResult{
 		{Hash: "hash-x", Status: catalog.EmbeddingStatusReady, Vector: dimVector(4)},
@@ -950,13 +1126,13 @@ func TestExternalWorkerDuplicateHashIsFirstWins(t *testing.T) {
 
 func TestExternalWorkerRenewReportsWhatRenewed(t *testing.T) {
 	cat := newTestCatalog(t)
+	svc := newTestService(t, cat, newFakeVectorStore(), nil)
 	ctx := context.Background()
 
 	seedBlob(t, cat, "hash-x")
 	seedAlbum(t, cat, "album-a",
 		catalog.Photo{Index: 0, Name: "a0.jpg", Hash: "hash-x", Width: 10, Height: 20, Ratio: 0.5})
 
-	svc := newTestService(t, cat, nil)
 	if _, _, err := svc.ClaimEmbeddings(ctx, 0); err != nil {
 		t.Fatalf("claim: %v", err)
 	}
@@ -970,5 +1146,99 @@ func TestExternalWorkerRenewReportsWhatRenewed(t *testing.T) {
 	}
 	if len(renewed) != 1 || renewed[0] != "hash-x" {
 		t.Fatalf("renewed=%v want only hash-x: the ghost never had a lease", renewed)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// ReloadAlbum
+// ---------------------------------------------------------------------------
+
+// TestReloadAlbumSyncsStoreAfterReextraction covers the album-ready callback:
+// re-extraction gave album-a a photo whose blob was already embedded elsewhere.
+// The reload deletes the album's old points, reads back the album's ready
+// pairs, retrieves their vectors from the store, and re-upserts — in that
+// order — while blobs that are not ready stay pointless.
+func TestReloadAlbumSyncsStoreAfterReextraction(t *testing.T) {
+	cat := newTestCatalog(t)
+	store := newFakeVectorStore()
+	svc := newTestService(t, cat, store, nil)
+	ctx := context.Background()
+
+	// hash-b is embedded under album-b first; hash-old belonged to album-a.
+	seedBlob(t, cat, "hash-old")
+	seedBlob(t, cat, "hash-b")
+	seedBlob(t, cat, "hash-pending")
+	seedAlbum(t, cat, "album-a",
+		catalog.Photo{Index: 0, Name: "a0.jpg", Hash: "hash-old", Width: 1, Height: 1, Ratio: 1})
+	seedAlbum(t, cat, "album-b", catalog.Photo{Index: 0, Name: "b0.jpg", Hash: "hash-b", Width: 5, Height: 5, Ratio: 1})
+	seedReadyEmbedding(t, svc, "hash-old", vec768(1, 0))
+	seedReadyEmbedding(t, svc, "hash-b", vec768(0, 1))
+
+	// Re-extraction replaces album-a's photo set: the old hash is gone, the
+	// shared ready blob and a still-pending blob take its place.
+	if err := cat.DeletePhotos(ctx, "album-a"); err != nil {
+		t.Fatalf("delete photos: %v", err)
+	}
+	if err := cat.InsertPhoto(ctx, catalog.Photo{AlbumID: "album-a", Index: 0, Name: "new.jpg", Hash: "hash-b", Width: 5, Height: 5, Ratio: 1}); err != nil {
+		t.Fatalf("insert new photo: %v", err)
+	}
+	if err := cat.InsertPhoto(ctx, catalog.Photo{AlbumID: "album-a", Index: 1, Name: "pending.jpg", Hash: "hash-pending", Width: 1, Height: 1, Ratio: 1}); err != nil {
+		t.Fatalf("insert pending photo: %v", err)
+	}
+
+	store.resetOps()
+	if err := svc.ReloadAlbum(ctx, "album-a"); err != nil {
+		t.Fatalf("ReloadAlbum: %v", err)
+	}
+
+	// Exactly the documented order: delete, then retrieve (only the ready
+	// hashes are looked up — the pending photo is filtered before the store is
+	// asked), then upsert.
+	_, ops := store.snapshot()
+	wantOps := []string{"delete:album-a", "retrieve:1", "upsert:1"}
+	if len(ops) != len(wantOps) {
+		t.Fatalf("ops=%v want %v", ops, wantOps)
+	}
+	for i, op := range wantOps {
+		if ops[i] != op {
+			t.Fatalf("op %d = %q, want %q (all ops %v)", i, ops[i], op, ops)
+		}
+	}
+
+	points, _ := store.snapshot()
+	// album-a's stale point is gone and replaced by the shared blob's vector;
+	// the pending photo has no point. album-b is untouched.
+	if _, ok := points[qdrant.PointID("album-a", 0)]; !ok {
+		t.Fatalf("album-a idx0 missing after reload: %+v", points)
+	}
+	if _, ok := points[qdrant.PointID("album-a", 1)]; ok {
+		t.Fatalf("pending photo must not get a point: %+v", points)
+	}
+	reloaded := points[qdrant.PointID("album-a", 0)]
+	if reloaded.Hash != "hash-b" || reloaded.AlbumID != "album-a" || reloaded.Idx != 0 {
+		t.Fatalf("unexpected reloaded point: %+v", reloaded)
+	}
+	if !approxEqual(cosine(reloaded.Vector, vec768(0, 1)), 1) {
+		t.Fatalf("reloaded vector is not the retrieved one: %+v", reloaded.Vector)
+	}
+	if _, ok := points[qdrant.PointID("album-b", 0)]; !ok {
+		t.Fatalf("ReloadAlbum(album-a) must not touch album-b: %+v", points)
+	}
+
+	// A blank id and an unknown album are no-ops.
+	if err := svc.ReloadAlbum(ctx, "   "); err != nil {
+		t.Fatalf("ReloadAlbum(blank): %v", err)
+	}
+	if err := svc.ReloadAlbum(ctx, "album-missing"); err != nil {
+		t.Fatalf("ReloadAlbum(album-missing): %v", err)
+	}
+}
+
+// TestReloadAlbumWithoutDependenciesIsNoop: a service without a catalog or
+// vector store has nothing to sync and must stay silent.
+func TestReloadAlbumWithoutDependenciesIsNoop(t *testing.T) {
+	svc := newTestService(t, nil, nil, nil)
+	if err := svc.ReloadAlbum(context.Background(), "album-a"); err != nil {
+		t.Fatalf("ReloadAlbum without dependencies: %v", err)
 	}
 }
