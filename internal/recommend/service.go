@@ -576,7 +576,7 @@ func isZeroNorm(vector []float32) bool {
 // failure was transient (the claim is released and the blob returns to the
 // pending queue for an early retry).
 func (s *Service) embedBlob(ctx context.Context, hash string) bool {
-	result, err := s.images.GetImageByHash(ctx, hash)
+	data, err := s.images.GetImageBytes(ctx, hash)
 	if err != nil {
 		log.Printf("recommend: blob=%s image load failed: %v", hash, err)
 		s.persistFailed(context.Background(), hash, fmt.Sprintf("load image bytes: %v", err))
@@ -584,7 +584,7 @@ func (s *Service) embedBlob(ctx context.Context, hash string) bool {
 	}
 
 	startedAt := time.Now()
-	vector, err := s.computeEmbedding(ctx, result.Bytes)
+	vector, err := s.computeEmbedding(ctx, data)
 	if err != nil {
 		if isTransientEmbedError(err) {
 			log.Printf("recommend: blob=%s embed transient failure: %v", hash, err)
@@ -627,7 +627,7 @@ func (s *Service) embedBlob(ctx context.Context, hash string) bool {
 
 	log.Printf(
 		"recommend: embedded blob=%s bytes=%d dim=%d elapsed=%s",
-		hash, len(result.Bytes), len(vector), time.Since(startedAt).Round(time.Millisecond),
+		hash, len(data), len(vector), time.Since(startedAt).Round(time.Millisecond),
 	)
 	return false
 }

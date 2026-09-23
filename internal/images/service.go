@@ -36,12 +36,6 @@ type Service struct {
 	store   blobStore
 }
 
-// ImageResult is raw image bytes ready to be written to an HTTP response.
-type ImageResult struct {
-	Bytes       []byte
-	ContentType string
-}
-
 // ImageStream is an image body read from S3 into memory. The reader supports
 // seeking so that http.ServeContent can answer range requests, and Close is
 // kept so handlers can defer it exactly as they did for the file-backed stream.
@@ -80,6 +74,17 @@ func IsSupportedWidth(w int) bool {
 	return slices.Contains(widthLadder, w)
 }
 
+// newStream wraps fully-read blob bytes in a seekable stream. The reader stays
+// a *bytes.Reader so http.ServeContent can answer range requests.
+func newStream(data []byte, contentType, hash string) *ImageStream {
+	return &ImageStream{
+		Content:     bytes.NewReader(data),
+		SizeBytes:   int64(len(data)),
+		ContentType: contentType,
+		Hash:        hash,
+	}
+}
+
 // OpenImageByHash fetches a content-addressed blob from S3 into memory and
 // wraps it in a seekable reader.
 func (s *Service) OpenImageByHash(ctx context.Context, hash string) (*ImageStream, error) {
@@ -87,12 +92,7 @@ func (s *Service) OpenImageByHash(ctx context.Context, hash string) (*ImageStrea
 	if err != nil {
 		return nil, err
 	}
-	return &ImageStream{
-		Content:     bytes.NewReader(data),
-		SizeBytes:   int64(len(data)),
-		ContentType: contentType,
-		Hash:        hash,
-	}, nil
+	return newStream(data, contentType, hash), nil
 }
 
 // OpenImageByHashScaled returns a blob scaled to fit within width, preserving
@@ -116,23 +116,13 @@ func (s *Service) OpenImageByHashScaled(ctx context.Context, hash string, width 
 		return nil, fmt.Errorf("probe image %s: %w", hash, err)
 	}
 	if config.Width <= width {
-		return &ImageStream{
-			Content:     bytes.NewReader(data),
-			SizeBytes:   int64(len(data)),
-			ContentType: contentType,
-			Hash:        hash,
-		}, nil
+		return newStream(data, contentType, hash), nil
 	}
 	encoded, err := encodeScaledJPEG(data, width)
 	if err != nil {
 		return nil, err
 	}
-	return &ImageStream{
-		Content:     bytes.NewReader(encoded),
-		SizeBytes:   int64(len(encoded)),
-		ContentType: "image/jpeg",
-		Hash:        fmt.Sprintf("%s:w%d", hash, width),
-	}, nil
+	return newStream(encoded, "image/jpeg", fmt.Sprintf("%s:w%d", hash, width)), nil
 }
 
 // encodeScaledJPEG decodes an original image and resamples it to fit within
@@ -156,14 +146,14 @@ func encodeScaledJPEG(data []byte, width int) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-// GetImageByHash returns the raw bytes of a content-addressed blob. Embedding
+// GetImageBytes returns the raw bytes of a content-addressed blob. Embedding
 // workers need the bytes in memory anyway.
-func (s *Service) GetImageByHash(ctx context.Context, hash string) (ImageResult, error) {
-	data, contentType, err := s.fetchBlob(ctx, hash)
+func (s *Service) GetImageBytes(ctx context.Context, hash string) ([]byte, error) {
+	data, _, err := s.fetchBlob(ctx, hash)
 	if err != nil {
-		return ImageResult{}, err
+		return nil, err
 	}
-	return ImageResult{Bytes: data, ContentType: contentType}, nil
+	return data, nil
 }
 
 // PresignBlobURL returns a short-lived URL that downloads the blob straight

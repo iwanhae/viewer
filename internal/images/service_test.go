@@ -223,22 +223,19 @@ func TestOpenImageByHashSupportsSeeking(t *testing.T) {
 	}
 }
 
-func TestGetImageByHashReturnsBytes(t *testing.T) {
+func TestGetImageBytesReturnsBytes(t *testing.T) {
 	cat := openTestCatalog(t)
 	store := newFakeBlobStore()
 	store.objects[pipeline.BlobKey("hash-a")] = []byte("image-bytes")
 	seedPhoto(t, cat, "album-a", 0, "hash-a", "image/png")
 
 	svc := newTestService(t, cat, store)
-	result, err := svc.GetImageByHash(context.Background(), "hash-a")
+	data, err := svc.GetImageBytes(context.Background(), "hash-a")
 	if err != nil {
-		t.Fatalf("get image by hash: %v", err)
+		t.Fatalf("get image bytes: %v", err)
 	}
-	if string(result.Bytes) != "image-bytes" {
-		t.Fatalf("bytes=%q", result.Bytes)
-	}
-	if result.ContentType != "image/png" {
-		t.Fatalf("content type=%q", result.ContentType)
+	if string(data) != "image-bytes" {
+		t.Fatalf("bytes=%q", data)
 	}
 }
 
@@ -252,7 +249,7 @@ func TestOpenImageByHashMissingBlob(t *testing.T) {
 	if _, err := svc.OpenImageByHash(context.Background(), "  "); err == nil {
 		t.Fatalf("expected error for empty hash")
 	}
-	if _, err := svc.GetImageByHash(context.Background(), "nope"); !errors.Is(err, ErrImageEntryNotFound) {
+	if _, err := svc.GetImageBytes(context.Background(), "nope"); !errors.Is(err, ErrImageEntryNotFound) {
 		t.Fatalf("expected ErrImageEntryNotFound, got %v", err)
 	}
 }
