@@ -515,7 +515,7 @@ func (s *Service) ApplyEmbeddingResults(ctx context.Context, results []catalog.E
 			continue
 		}
 		if result.Status == catalog.EmbeddingStatusReady {
-			if len(result.Vector) != EmbeddingDim {
+			if len(result.Vector) != catalog.EmbeddingDim {
 				rejected = append(rejected, catalog.RejectedEmbedding{Hash: result.Hash, Reason: RejectWrongDim})
 				continue
 			}

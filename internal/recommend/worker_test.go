@@ -161,7 +161,7 @@ type okEmbedder struct{}
 func (okEmbedder) Load(context.Context) error { return nil }
 
 func (okEmbedder) Embed(_ context.Context, _ []byte) ([]float32, error) {
-	vector := make([]float32, EmbeddingDim)
+	vector := make([]float32, catalog.EmbeddingDim)
 	vector[0] = 1
 	return vector, nil
 }

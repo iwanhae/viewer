@@ -143,7 +143,7 @@ func seedEmbeddingOutcome(t *testing.T, cat *catalog.Store, hash string, status 
 // satisfying the catalog's float[768] column. Cosine similarity between two
 // vec768 vectors equals the cosine of the short forms they encode.
 func vec768(vals ...float32) []float32 {
-	vector := make([]float32, EmbeddingDim)
+	vector := make([]float32, catalog.EmbeddingDim)
 	copy(vector, vals)
 	return vector
 }
@@ -723,7 +723,7 @@ func TestEmbeddingProgressReportsActiveWhileEmbedding(t *testing.T) {
 // dimVector builds a valid-length embedding filled with one value, so tests
 // can express "the same vector" without spelling out 768 floats.
 func dimVector(fill float32) []float32 {
-	vector := make([]float32, EmbeddingDim)
+	vector := make([]float32, catalog.EmbeddingDim)
 	for i := range vector {
 		vector[i] = fill
 	}

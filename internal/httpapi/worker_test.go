@@ -112,8 +112,8 @@ func TestWorkerClaimLeasesBlobsAndHandsOutDownloads(t *testing.T) {
 		t.Fatalf("claim status=%d body=%s", rec.Code, rec.Body.String())
 	}
 	payload := decodeClaim(t, rec)
-	if payload.EmbeddingDim != recommend.EmbeddingDim {
-		t.Fatalf("embeddingDim=%d want=%d", payload.EmbeddingDim, recommend.EmbeddingDim)
+	if payload.EmbeddingDim != catalog.EmbeddingDim {
+		t.Fatalf("embeddingDim=%d want=%d", payload.EmbeddingDim, catalog.EmbeddingDim)
 	}
 	if payload.LeaseUntil.IsZero() {
 		t.Fatalf("claim response must carry a lease deadline")
@@ -176,8 +176,8 @@ func TestWorkerResultsRoundTripReachesSearchAndRecommendations(t *testing.T) {
 
 	body, err := json.Marshal(map[string]any{
 		"results": []map[string]string{
-			{"hash": first.Hash, "status": "ready", "vectorB64": encodeVector(flatVector(recommend.EmbeddingDim, 0.5))},
-			{"hash": second.Hash, "status": "ready", "vectorB64": encodeVector(flatVector(recommend.EmbeddingDim, 0.25))},
+			{"hash": first.Hash, "status": "ready", "vectorB64": encodeVector(flatVector(catalog.EmbeddingDim, 0.5))},
+			{"hash": second.Hash, "status": "ready", "vectorB64": encodeVector(flatVector(catalog.EmbeddingDim, 0.25))},
 		},
 	})
 	if err != nil {
@@ -256,7 +256,7 @@ func TestWorkerResultsRejectsBadItemsPerHash(t *testing.T) {
 		t.Fatalf("seed unclaimed blob: %v", err)
 	}
 
-	valid := encodeVector(flatVector(recommend.EmbeddingDim, 0.25))
+	valid := encodeVector(flatVector(catalog.EmbeddingDim, 0.25))
 	body, err := json.Marshal(map[string]any{
 		"results": []map[string]string{
 			// Not base64 at all.
@@ -318,7 +318,7 @@ func TestWorkerResultsRejectsBadItemsPerHash(t *testing.T) {
 }
 
 func nanVector() []float32 {
-	vector := flatVector(recommend.EmbeddingDim, 1)
+	vector := flatVector(catalog.EmbeddingDim, 1)
 	vector[0] = float32(math.NaN())
 	return vector
 }
@@ -448,7 +448,7 @@ func TestWorkerResultsRejectsWhitespaceHash(t *testing.T) {
 	// per-item rejection carrying what the worker sent, not vanish between
 	// updated and rejected.
 	body, err := json.Marshal(map[string]any{
-		"results": []map[string]string{{"hash": "   ", "status": "ready", "vectorB64": encodeVector(flatVector(recommend.EmbeddingDim, 1))}},
+		"results": []map[string]string{{"hash": "   ", "status": "ready", "vectorB64": encodeVector(flatVector(catalog.EmbeddingDim, 1))}},
 	})
 	if err != nil {
 		t.Fatalf("marshal: %v", err)

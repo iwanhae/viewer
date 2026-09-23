@@ -136,7 +136,7 @@ func (s *Server) claimEmbeddings(w http.ResponseWriter, r *http.Request) {
 		leased = append(leased, blob.Hash)
 	}
 	writeJSON(w, http.StatusOK, claimResponse{
-		EmbeddingDim: recommend.EmbeddingDim,
+		EmbeddingDim: catalog.EmbeddingDim,
 		LeaseUntil:   leaseUntil,
 		Claimed:      claimed,
 	})
