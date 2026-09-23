@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { Link, useNavigate } from 'react-router-dom'
+import { useNavigate } from 'react-router-dom'
 import { PageTopBar } from '../components/PageTopBar'
 import { MasonryWall } from '../components/MasonryWall'
 import { THUMBNAIL_WIDTH, imageByHashUrl } from '../api/client'
@@ -71,14 +71,7 @@ export function PhotoSearchPage() {
   return (
     <div className="album-search-page" data-testid="photo-search-page">
       <div className="album-search-shell">
-        <PageTopBar
-          title="Search photos"
-          actions={
-            <Link className="photo-nav-button" to="/albums/find">
-              Find albums
-            </Link>
-          }
-        />
+        <PageTopBar title="Search photos" />
 
         <div className="search-field">
           <SearchIcon />

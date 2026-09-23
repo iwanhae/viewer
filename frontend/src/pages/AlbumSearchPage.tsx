@@ -112,19 +112,7 @@ export function AlbumSearchPage() {
   return (
     <div className="album-search-page" data-testid="album-search-page">
       <div className="album-search-shell">
-        <PageTopBar
-          title="Find albums"
-          actions={
-            <>
-              <Link className="photo-nav-button" to="/search">
-                Search photos
-              </Link>
-              <Link className="photo-nav-button" to="/upload">
-                Upload
-              </Link>
-            </>
-          }
-        />
+        <PageTopBar title="Find albums" />
 
         <div className="search-field">
           <SearchIcon />

@@ -13,7 +13,9 @@ import {
 } from '../utils/storage'
 import { MasonryWall } from '../components/MasonryWall'
 import { BottomIsland } from '../components/BottomIsland'
-import { ColumnsIcon, ModeIcon, NextIcon, PrevIcon, RefreshIcon, ShortcutIcon } from '../components/IslandIcons'
+import { ColumnsIcon, ModeIcon, NextIcon, PrevIcon, RefreshIcon } from '../components/IslandIcons'
+import { AdminIcon, AlbumsIcon, SearchIcon, UploadIcon } from '../components/IslandIcons'
+import { useAdminAvailable } from '../hooks/useAdminAvailable'
 
 const WALL_COLUMNS_KEY = 'wall_columns'
 const DEFAULT_COLUMNS = 3
@@ -30,6 +32,7 @@ function nextTimestampSeed(currentSeed?: string): string {
 
 export function WallPage() {
   const navigate = useNavigate()
+  const adminAvailability = useAdminAvailable()
   const [searchParams, setSearchParams] = useSearchParams()
   const [columns, setColumns] = useState(() =>
     readNumberPreference(WALL_COLUMNS_KEY, COLUMN_OPTIONS, DEFAULT_COLUMNS),
@@ -286,39 +289,6 @@ export function WallPage() {
                 },
               ]
             : []),
-          {
-            id: 'wall-shortcut',
-            icon: <ShortcutIcon />,
-            ariaLabel: 'Open shortcuts',
-            tooltip: 'Shortcut',
-            testId: 'wall-shortcut',
-            renderPopup: ({ close }) => (
-              <div className="bottom-island-popup-stack" data-testid="wall-shortcut-popup">
-                <button
-                  type="button"
-                  className="bottom-island-popup-option"
-                  data-testid="wall-find"
-                  onClick={() => {
-                    close()
-                    navigate('/albums/find')
-                  }}
-                >
-                  Find albums
-                </button>
-                <button
-                  type="button"
-                  className="bottom-island-popup-option"
-                  data-testid="wall-upload"
-                  onClick={() => {
-                    close()
-                    navigate('/upload')
-                  }}
-                >
-                  Upload
-                </button>
-              </div>
-            ),
-          },
           ...(mode === 'random'
             ? [
                 {
@@ -342,6 +312,49 @@ export function WallPage() {
                   testId: 'wall-page-next',
                   onClick: () => changeLatestPage(latestPage + 1, pageInfo.nextCursor),
                   disabled: loading || !pageInfo.hasNext,
+                },
+              ]
+            : []),
+          // Every destination lives here now — the sub-pages only know the way
+          // back to the wall. Admin is a server-served page outside the SPA,
+          // and it is shown only when this deployment actually serves it.
+          {
+            kind: 'divider' as const,
+            id: 'wall-nav-divider',
+          },
+          {
+            id: 'wall-nav-albums',
+            icon: <AlbumsIcon />,
+            ariaLabel: 'Find albums',
+            tooltip: 'Find albums',
+            testId: 'wall-nav-albums',
+            onClick: () => navigate('/albums/find'),
+          },
+          {
+            id: 'wall-nav-search',
+            icon: <SearchIcon />,
+            ariaLabel: 'Search photos',
+            tooltip: 'Search photos',
+            testId: 'wall-nav-search',
+            onClick: () => navigate('/search'),
+          },
+          {
+            id: 'wall-nav-upload',
+            icon: <UploadIcon />,
+            ariaLabel: 'Upload',
+            tooltip: 'Upload',
+            testId: 'wall-nav-upload',
+            onClick: () => navigate('/upload'),
+          },
+          ...(adminAvailability === 'available'
+            ? [
+                {
+                  id: 'wall-nav-admin',
+                  icon: <AdminIcon />,
+                  ariaLabel: 'Open admin dashboard',
+                  tooltip: 'Admin',
+                  testId: 'wall-nav-admin',
+                  onClick: () => window.location.assign('/admin/'),
                 },
               ]
             : []),

@@ -382,10 +382,7 @@ export function UploadPage() {
   return (
     <div className="upload-page" data-testid="upload-page" onDragEnter={onDragEnter} onDragOver={onDragOver} onDragLeave={onDragLeave} onDrop={onDrop}>
       <div className="upload-shell">
-        <PageTopBar
-          title="Upload"
-          actions={<Link className="photo-nav-button" to="/albums/find" data-testid="upload-go-find">Find albums</Link>}
-        />
+        <PageTopBar title="Upload" />
 
         <input ref={fileInputRef} type="file" accept=".zip" multiple hidden onChange={onPickFiles} data-testid="upload-pick-input" />
 

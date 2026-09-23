@@ -142,3 +142,60 @@ export function UpIcon({ title }: IconProps) {
     </SvgIcon>
   )
 }
+
+export function AlbumsIcon({ title }: IconProps) {
+  return (
+    <SvgIcon title={title}>
+      <rect x="8" y="4.5" width="11.5" height="8.5" rx="1.5" stroke="currentColor" strokeWidth="1.8" />
+      <rect x="4.5" y="10.5" width="11.5" height="9" rx="1.5" stroke="currentColor" strokeWidth="1.8" />
+    </SvgIcon>
+  )
+}
+
+export function SearchIcon({ title }: IconProps) {
+  return (
+    <SvgIcon title={title}>
+      <circle cx="11" cy="11" r="6.5" stroke="currentColor" strokeWidth="1.8" />
+      <path
+        d="m16 16 4.5 4.5"
+        stroke="currentColor"
+        strokeWidth="1.8"
+        strokeLinecap="round"
+      />
+    </SvgIcon>
+  )
+}
+
+export function UploadIcon({ title }: IconProps) {
+  return (
+    <SvgIcon title={title}>
+      <path d="M12 15V4.5" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+      <path
+        d="m7.5 8.5 4.5-4 4.5 4"
+        stroke="currentColor"
+        strokeWidth="1.8"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+      <path
+        d="M4.5 15.5v2A2.5 2.5 0 0 0 7 20h10a2.5 2.5 0 0 0 2.5-2.5v-2"
+        stroke="currentColor"
+        strokeWidth="1.8"
+        strokeLinecap="round"
+      />
+    </SvgIcon>
+  )
+}
+
+export function AdminIcon({ title }: IconProps) {
+  return (
+    <SvgIcon title={title}>
+      <path
+        d="M12 4 5.5 6.5v5c0 4.2 2.8 7.2 6.5 8.5 3.7-1.3 6.5-4.3 6.5-8.5v-5Z"
+        stroke="currentColor"
+        strokeWidth="1.8"
+        strokeLinejoin="round"
+      />
+    </SvgIcon>
+  )
+}
