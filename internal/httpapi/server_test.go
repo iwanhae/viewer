@@ -471,8 +471,8 @@ func TestSearchByImageEndpointReturnsRankedItems(t *testing.T) {
 	vectors := newFakeVectorStore()
 	if err := vectors.UpsertPhotos(context.Background(), []qdrant.PhotoRecord{
 		{AlbumID: "album-a", Idx: 0, Hash: "hash-a", W: 10, H: 10, Vector: searchVector(1, 0.2)},
-		{AlbumID: "album-a", Idx: 1, Hash: "hash-b", W: 10, H: 10, Vector: searchVector(0, 1)},
-		{AlbumID: "album-a", Idx: 2, Hash: "hash-c", W: 10, H: 10, Vector: searchVector(0.99, 0.02)},
+		{AlbumID: "album-a", Idx: 1, Hash: "hash-b", W: 10, H: 10, Vector: searchVector(0.99, 0.02)},
+		{AlbumID: "album-b", Idx: 0, Hash: "hash-c", W: 10, H: 10, Vector: searchVector(0.5, 0.5)},
 	}); err != nil {
 		t.Fatalf("seed points: %v", err)
 	}
@@ -490,13 +490,17 @@ func TestSearchByImageEndpointReturnsRankedItems(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
-	// Descending cosine against [1, 0.2]: hash-a is identical (score 1),
-	// hash-c nearly parallel, hash-b nearly orthogonal and cut by the limit.
+	// Descending cosine against [1, 0.2]: hash-a is identical (score 1) and
+	// hash-b nearly parallel, but both live in album-a, so only hash-a comes
+	// back; album-b's best fills the second slot, and nothing else is left.
 	if len(resp.Items) != 2 {
-		t.Fatalf("items=%d want=2: %+v", len(resp.Items), resp.Items)
+		t.Fatalf("items=%d want=2 (one per album): %+v", len(resp.Items), resp.Items)
 	}
 	if resp.Items[0].Hash != "hash-a" || resp.Items[1].Hash != "hash-c" {
 		t.Fatalf("unexpected ranking: %+v", resp.Items)
+	}
+	if resp.Items[1].AlbumID != "album-b" {
+		t.Fatalf("album-a duplicated in the results: %+v", resp.Items)
 	}
 	first := resp.Items[0]
 	if first.AlbumID != "album-a" || first.I != 0 || first.W != 10 || first.H != 10 {

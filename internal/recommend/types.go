@@ -37,7 +37,7 @@ type VectorStore interface {
 	EnsureCollection(ctx context.Context) error
 	UpsertPhotos(ctx context.Context, records []qdrant.PhotoRecord) error
 	GroupSearch(ctx context.Context, queryPointID, excludeAlbumID, excludeHash string, limit int) ([]qdrant.PhotoHit, error)
-	SearchByVector(ctx context.Context, vector []float32, limit int) ([]qdrant.PhotoHit, error)
+	SearchByVectorGrouped(ctx context.Context, vector []float32, limit int) ([]qdrant.PhotoHit, error)
 	RetrieveVectorsByHashes(ctx context.Context, hashes []string) (map[string][]float32, error)
 	DeleteByAlbum(ctx context.Context, albumID string) error
 	CountVectors(ctx context.Context) (int, error)

@@ -321,13 +321,16 @@ func (c *Client) GroupSearch(ctx context.Context, queryPointID, excludeAlbumID, 
 	return hits, nil
 }
 
-// SearchByVector returns the limit nearest photos to vector, best first. The
-// vector comes from the query side (the text tower), so it is sent as a plain
-// JSON float array — this Qdrant build rejects base64 — and a missing
-// collection (404) means "no results yet", the same contract GroupSearch's
-// wipe-recovery policy relies on. Unlike GroupSearch there is no album
-// grouping or exclusion: every matching photo comes back.
-func (c *Client) SearchByVector(ctx context.Context, vector []float32, limit int) ([]PhotoHit, error) {
+// SearchByVectorGrouped returns the limit albums whose best-scoring photo is
+// nearest to vector, best album first. The vector comes from the query side
+// (the text tower or an uploaded image), so it is sent as a plain JSON float
+// array — this Qdrant build rejects base64 — and a missing collection (404)
+// means "no results yet", the same contract GroupSearch's wipe-recovery policy
+// relies on. Qdrant ranks each group by its top-scoring member, so group_size
+// 1 yields exactly the best photo per album; unlike GroupSearch there is no
+// exclusion, since a query that did not come from a photo has nothing to
+// exclude.
+func (c *Client) SearchByVectorGrouped(ctx context.Context, vector []float32, limit int) ([]PhotoHit, error) {
 	if limit <= 0 {
 		// Nothing is being asked for; skip the round trip rather than have
 		// Qdrant reject the request.
@@ -338,25 +341,35 @@ func (c *Client) SearchByVector(ctx context.Context, vector []float32, limit int
 		// any other width would be rejected server-side anyway.
 		return nil, fmt.Errorf("query vector has %d dimensions, want %d", len(vector), c.dim)
 	}
-	body := queryRequest{Query: vector, Limit: limit, WithPayload: true}
-	var out queryResponse
-	err := c.do(ctx, http.MethodPost, c.endpoint("/points/query", nil), body, &out)
+	body := groupedVectorSearchRequest{
+		Query:       vector,
+		GroupBy:     "album_id",
+		Limit:       limit,
+		GroupSize:   1,
+		WithPayload: true,
+	}
+	var out groupSearchResponse
+	err := c.do(ctx, http.MethodPost, c.endpoint("/points/query/groups", nil), body, &out)
 	if err != nil {
 		if isStatus(err, http.StatusNotFound) {
 			return nil, nil
 		}
-		return nil, fmt.Errorf("search by vector: %w", err)
+		return nil, fmt.Errorf("grouped vector search: %w", err)
 	}
-	hits := make([]PhotoHit, 0, len(out.Result.Points))
-	for _, p := range out.Result.Points {
-		hits = append(hits, PhotoHit{
-			AlbumID: p.Payload.AlbumID,
-			Idx:     p.Payload.Idx,
-			Hash:    p.Payload.Hash,
-			W:       p.Payload.W,
-			H:       p.Payload.H,
-			Score:   p.Score,
-		})
+	hits := make([]PhotoHit, 0)
+	for _, g := range out.Result.Groups {
+		// group_size is 1, but flatten whatever arrives, in order, skipping
+		// groups that came back without hits.
+		for _, h := range g.Hits {
+			hits = append(hits, PhotoHit{
+				AlbumID: h.Payload.AlbumID,
+				Idx:     h.Payload.Idx,
+				Hash:    h.Payload.Hash,
+				W:       h.Payload.W,
+				H:       h.Payload.H,
+				Score:   h.Score,
+			})
+		}
 	}
 	return hits, nil
 }
@@ -504,22 +517,16 @@ type groupSearchRequest struct {
 	WithPayload bool    `json:"with_payload"`
 }
 
-// queryRequest is the POST .../points/query body for a vector query. The query
-// vector is a plain JSON float array because this Qdrant build rejects base64.
-type queryRequest struct {
+// groupedVectorSearchRequest is the POST .../points/query/groups body for a
+// vector query. The query vector is a plain JSON float array because this
+// Qdrant build rejects base64. There is no filter field on purpose: the
+// vector searches run from outside the catalog, so nothing is excluded.
+type groupedVectorSearchRequest struct {
 	Query       []float32 `json:"query"`
+	GroupBy     string    `json:"group_by"`
 	Limit       int       `json:"limit"`
+	GroupSize   int       `json:"group_size"`
 	WithPayload bool      `json:"with_payload"`
-}
-
-// queryResponse is the slice of the query reply the client uses.
-type queryResponse struct {
-	Result struct {
-		Points []struct {
-			Score   float64      `json:"score"`
-			Payload pointPayload `json:"payload"`
-		} `json:"points"`
-	} `json:"result"`
 }
 
 // groupSearchResponse is the slice of the query/groups reply the client uses.

@@ -188,10 +188,12 @@ func (f *fakeVectorStore) GroupSearch(_ context.Context, queryPointID, excludeAl
 	return hits, nil
 }
 
-// SearchByVector ranks every stored point against the query vector by honest
-// cosine similarity. Unlike GroupSearch there is no exclusion and no album
-// grouping: search must see every photo.
-func (f *fakeVectorStore) SearchByVector(_ context.Context, vector []float32, limit int) ([]qdrant.PhotoHit, error) {
+// SearchByVectorGrouped ranks every stored point against the query vector by
+// honest cosine similarity, then keeps only the best photo per album, ranked by
+// that score — the grouping Qdrant does on the wire for the vector searches.
+// There is no exclusion: a query that did not come from a photo has nothing to
+// exclude.
+func (f *fakeVectorStore) SearchByVectorGrouped(_ context.Context, vector []float32, limit int) ([]qdrant.PhotoHit, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	type scored struct {
@@ -212,10 +214,12 @@ func (f *fakeVectorStore) SearchByVector(_ context.Context, vector []float32, li
 		return matches[i].record.Idx < matches[j].record.Idx
 	})
 	hits := make([]qdrant.PhotoHit, 0, limit)
+	seenAlbum := make(map[string]struct{}, len(matches))
 	for _, match := range matches {
-		if len(hits) == limit {
-			break
+		if _, dup := seenAlbum[match.record.AlbumID]; dup {
+			continue
 		}
+		seenAlbum[match.record.AlbumID] = struct{}{}
 		hits = append(hits, qdrant.PhotoHit{
 			AlbumID: match.record.AlbumID,
 			Idx:     match.record.Idx,
@@ -224,6 +228,9 @@ func (f *fakeVectorStore) SearchByVector(_ context.Context, vector []float32, li
 			H:       match.record.H,
 			Score:   match.score,
 		})
+		if len(hits) == limit {
+			break
+		}
 	}
 	return hits, nil
 }
@@ -664,8 +671,8 @@ func TestPhotoSearchReturnsRankedItems(t *testing.T) {
 	vectors := newFakeVectorStore()
 	if err := vectors.UpsertPhotos(context.Background(), []qdrant.PhotoRecord{
 		{AlbumID: "album-a", Idx: 0, Hash: "hash-a", W: 10, H: 10, Vector: searchVector(1, 0.2)},
-		{AlbumID: "album-a", Idx: 1, Hash: "hash-b", W: 10, H: 10, Vector: searchVector(0, 1)},
-		{AlbumID: "album-a", Idx: 2, Hash: "hash-c", W: 10, H: 10, Vector: searchVector(0.99, 0.02)},
+		{AlbumID: "album-a", Idx: 1, Hash: "hash-b", W: 10, H: 10, Vector: searchVector(0.99, 0.02)},
+		{AlbumID: "album-b", Idx: 0, Hash: "hash-c", W: 10, H: 10, Vector: searchVector(0.5, 0.5)},
 	}); err != nil {
 		t.Fatalf("seed points: %v", err)
 	}
@@ -684,13 +691,17 @@ func TestPhotoSearchReturnsRankedItems(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
-	// Descending cosine against [1, 0.2]: hash-a is identical (score 1),
-	// hash-c nearly parallel, hash-b nearly orthogonal and cut by the limit.
+	// Descending cosine against [1, 0.2]: hash-a is identical (score 1) and
+	// hash-b nearly parallel, but both live in album-a, so only hash-a comes
+	// back; album-b's best fills the second slot, and nothing else is left.
 	if len(resp.Items) != 2 {
-		t.Fatalf("items=%d want=2: %+v", len(resp.Items), resp.Items)
+		t.Fatalf("items=%d want=2 (one per album): %+v", len(resp.Items), resp.Items)
 	}
 	if resp.Items[0].Hash != "hash-a" || resp.Items[1].Hash != "hash-c" {
 		t.Fatalf("unexpected ranking: %+v", resp.Items)
+	}
+	if resp.Items[1].AlbumID != "album-b" {
+		t.Fatalf("album-a duplicated in the results: %+v", resp.Items)
 	}
 	first := resp.Items[0]
 	if first.AlbumID != "album-a" || first.I != 0 || first.W != 10 || first.H != 10 {

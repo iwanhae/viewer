@@ -336,32 +336,29 @@ func TestGroupSearchSkipsRequestWhenLimitNotPositive(t *testing.T) {
 	}
 }
 
-// searchFixture has two ranked points; a point with no payload fields would
-// decode to the zero PhotoHit, so both carry full payloads.
-const searchFixture = `{"result":{"points":[
-  {"id":"p-b2","score":0.93,"payload":{"album_id":"al-b","idx":2,"hash":"h-b2","w":640,"h":480}},
-  {"id":"p-c0","score":0.41,"payload":{"album_id":"al-c","idx":0,"hash":"h-c0","w":100,"h":50}}
-]},"status":"ok"}`
-
-func TestSearchByVectorRequestShapeAndHits(t *testing.T) {
+// TestSearchByVectorGroupedRequestShapeAndHits pins the wire body: the query
+// vector goes out as a plain JSON float array on the groups endpoint, grouped
+// by album with one hit per group and no filter, and the reply is flattened in
+// server order.
+func TestSearchByVectorGroupedRequestShapeAndHits(t *testing.T) {
 	var rawBody []byte
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost || r.URL.Path != "/collections/"+testCollection+"/points/query" {
+		if r.Method != http.MethodPost || r.URL.Path != "/collections/"+testCollection+"/points/query/groups" {
 			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
 			http.Error(w, "bad request", http.StatusBadRequest)
 			return
 		}
 		rawBody, _ = io.ReadAll(r.Body)
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(searchFixture))
+		_, _ = w.Write([]byte(groupSearchFixture))
 	}))
 	defer srv.Close()
 
 	vector := []float32{0.25, -1, 2, 3}
 	c := newTestClient(srv, "")
-	hits, err := c.SearchByVector(context.Background(), vector, 7)
+	hits, err := c.SearchByVectorGrouped(context.Background(), vector, 7)
 	if err != nil {
-		t.Fatalf("SearchByVector: %v", err)
+		t.Fatalf("SearchByVectorGrouped: %v", err)
 	}
 
 	// Inspect the raw body before decoding: a quoted "query" value would mean
@@ -381,19 +378,29 @@ func TestSearchByVectorRequestShapeAndHits(t *testing.T) {
 	if !reflect.DeepEqual(sentVector, vector) {
 		t.Errorf("query vector = %v, want %v", sentVector, vector)
 	}
+	if string(body["group_by"]) != `"album_id"` {
+		t.Errorf("group_by = %s, want album_id", body["group_by"])
+	}
+	if string(body["group_size"]) != "1" {
+		t.Errorf("group_size = %s, want 1", body["group_size"])
+	}
 	if string(body["limit"]) != "7" {
 		t.Errorf("limit = %s, want 7", body["limit"])
 	}
 	if string(body["with_payload"]) != "true" {
 		t.Errorf("with_payload = %s, want true", body["with_payload"])
 	}
+	if filterRaw, ok := body["filter"]; ok {
+		t.Errorf("body carries a filter %s, want none", filterRaw)
+	}
 
 	want := []PhotoHit{
 		{AlbumID: "al-b", Idx: 2, Hash: "h-b2", W: 640, H: 480, Score: 0.93},
-		{AlbumID: "al-c", Idx: 0, Hash: "h-c0", W: 100, H: 50, Score: 0.41},
+		{AlbumID: "al-c", Idx: 0, Hash: "h-c0", W: 100, H: 50, Score: 0.81},
+		{AlbumID: "al-c", Idx: 1, Hash: "h-c1", W: 200, H: 60, Score: 0.5},
 	}
 	if len(hits) != len(want) {
-		t.Fatalf("hits = %+v, want %d hits in server order", hits, len(want))
+		t.Fatalf("hits = %+v, want %d flattened hits in server order", hits, len(want))
 	}
 	for i, w := range want {
 		if hits[i] != w {
@@ -402,7 +409,7 @@ func TestSearchByVectorRequestShapeAndHits(t *testing.T) {
 	}
 }
 
-func TestSearchByVectorNotFoundMeansNoHits(t *testing.T) {
+func TestSearchByVectorGroupedNotFoundMeansNoHits(t *testing.T) {
 	// A missing collection is 404 on this Qdrant build, and callers (wipe
 	// recovery) rely on that surfacing as an empty result.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -413,16 +420,16 @@ func TestSearchByVectorNotFoundMeansNoHits(t *testing.T) {
 	defer srv.Close()
 
 	c := newTestClient(srv, "")
-	hits, err := c.SearchByVector(context.Background(), make([]float32, testDim), 5)
+	hits, err := c.SearchByVectorGrouped(context.Background(), make([]float32, testDim), 5)
 	if err != nil {
-		t.Fatalf("SearchByVector on 404: %v", err)
+		t.Fatalf("SearchByVectorGrouped on 404: %v", err)
 	}
 	if hits != nil {
 		t.Fatalf("hits = %+v, want nil", hits)
 	}
 }
 
-func TestSearchByVectorSkipsRequestWhenLimitNotPositive(t *testing.T) {
+func TestSearchByVectorGroupedSkipsRequestWhenLimitNotPositive(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Errorf("unexpected request %s %s: a non-positive limit must not hit the server", r.Method, r.URL.Path)
 	}))
@@ -430,26 +437,26 @@ func TestSearchByVectorSkipsRequestWhenLimitNotPositive(t *testing.T) {
 
 	c := newTestClient(srv, "")
 	for _, limit := range []int{0, -1} {
-		hits, err := c.SearchByVector(context.Background(), make([]float32, testDim), limit)
+		hits, err := c.SearchByVectorGrouped(context.Background(), make([]float32, testDim), limit)
 		if err != nil {
-			t.Fatalf("SearchByVector(limit=%d): %v", limit, err)
+			t.Fatalf("SearchByVectorGrouped(limit=%d): %v", limit, err)
 		}
 		if hits != nil {
-			t.Fatalf("SearchByVector(limit=%d) hits = %+v, want nil", limit, hits)
+			t.Fatalf("SearchByVectorGrouped(limit=%d) hits = %+v, want nil", limit, hits)
 		}
 	}
 }
 
-func TestSearchByVectorRejectsDimensionMismatch(t *testing.T) {
+func TestSearchByVectorGroupedRejectsDimensionMismatch(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Errorf("unexpected request %s %s: a wrong-dimension vector must be rejected before any HTTP call", r.Method, r.URL.Path)
 	}))
 	defer srv.Close()
 
 	c := newTestClient(srv, "")
-	hits, err := c.SearchByVector(context.Background(), make([]float32, testDim+1), 5)
+	hits, err := c.SearchByVectorGrouped(context.Background(), make([]float32, testDim+1), 5)
 	if err == nil {
-		t.Fatalf("SearchByVector with %d dimensions succeeded, want an error", testDim+1)
+		t.Fatalf("SearchByVectorGrouped with %d dimensions succeeded, want an error", testDim+1)
 	}
 	if !strings.Contains(err.Error(), "dimensions") {
 		t.Fatalf("err = %v, want it to mention the dimension mismatch", err)

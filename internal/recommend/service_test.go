@@ -176,8 +176,8 @@ func nanVector() []float32 {
 // are keyed by the same deterministic point IDs, GroupSearch really ranks by
 // cosine and applies the same exclusions, and every operation is recorded so
 // tests can pin the order writes happen in.
-// searchCall records one SearchByVector call, so a test can pin the vector and
-// the limit the service forwarded to the store.
+// searchCall records one SearchByVectorGrouped call, so a test can pin the
+// vector and the limit the service forwarded to the store.
 type searchCall struct {
 	vector []float32
 	limit  int
@@ -279,11 +279,13 @@ func (f *fakeVectorStore) GroupSearch(ctx context.Context, queryPointID, exclude
 	return hits, nil
 }
 
-// SearchByVector ranks every stored point against the query vector by honest
-// cosine similarity. Unlike GroupSearch there is no exclusion and no album
-// grouping: search must see every photo, so ties break on album then idx only
-// to keep the order deterministic.
-func (f *fakeVectorStore) SearchByVector(_ context.Context, vector []float32, limit int) ([]qdrant.PhotoHit, error) {
+// SearchByVectorGrouped ranks every stored point against the query vector by
+// honest cosine similarity, then keeps only the best photo per album, ranked by
+// that score — the grouping Qdrant does on the wire for the vector searches, so
+// the service tests see the same contract Search and SearchByImage rely on.
+// There is no exclusion: a query that did not come from a photo has nothing to
+// exclude.
+func (f *fakeVectorStore) SearchByVectorGrouped(_ context.Context, vector []float32, limit int) ([]qdrant.PhotoHit, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.searches = append(f.searches, searchCall{vector: append([]float32(nil), vector...), limit: limit})
@@ -307,11 +309,15 @@ func (f *fakeVectorStore) SearchByVector(_ context.Context, vector []float32, li
 		}
 		return matches[i].record.Idx < matches[j].record.Idx
 	})
+	// group_size=1 semantics: after ranking, only the best photo per album
+	// survives, and the limit caps the number of albums.
 	hits := make([]qdrant.PhotoHit, 0, limit)
+	seenAlbum := make(map[string]struct{}, len(matches))
 	for _, match := range matches {
-		if len(hits) == limit {
-			break
+		if _, dup := seenAlbum[match.record.AlbumID]; dup {
+			continue
 		}
+		seenAlbum[match.record.AlbumID] = struct{}{}
 		hits = append(hits, qdrant.PhotoHit{
 			AlbumID: match.record.AlbumID,
 			Idx:     match.record.Idx,
@@ -320,6 +326,9 @@ func (f *fakeVectorStore) SearchByVector(_ context.Context, vector []float32, li
 			H:       match.record.H,
 			Score:   match.score,
 		})
+		if len(hits) == limit {
+			break
+		}
 	}
 	return hits, nil
 }
@@ -381,7 +390,7 @@ func (f *fakeVectorStore) resetOps() {
 	f.ops = nil
 }
 
-// searchCalls returns copies of the recorded SearchByVector calls.
+// searchCalls returns copies of the recorded SearchByVectorGrouped calls.
 func (f *fakeVectorStore) searchCalls() []searchCall {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -735,10 +744,9 @@ func (e *textEmbedder) EmbedText(context.Context, string) ([]float32, error) {
 }
 
 // TestSearchRanksPhotosByCosine seeds the store directly — Search never
-// touches the catalog — and pins the contract that separates search from
-// Recommend: every matching photo comes back in descending cosine order,
-// duplicates and all, with the photo fields and the raw score carried onto
-// the wire unchanged.
+// touches the catalog — and pins the response shape: the best photo of each
+// album comes back in descending cosine order, with the photo fields and the
+// raw score carried onto the wire unchanged.
 func TestSearchRanksPhotosByCosine(t *testing.T) {
 	store := newFakeVectorStore()
 	stub := &textEmbedder{vector: vec768(1, 0)}
@@ -746,7 +754,8 @@ func TestSearchRanksPhotosByCosine(t *testing.T) {
 	ctx := context.Background()
 
 	// vec768 encodes short directions at full width, so the cosines against the
-	// [1, 0] query are, best first: 0.9998, 0.9988, 0.7071 and 0.
+	// [1, 0] query are, best first: 0.9998, 0.9988, 0.7071 and 0. Both albums
+	// hold two photos, so only their better-scoring one may come back.
 	if err := store.UpsertPhotos(ctx, []qdrant.PhotoRecord{
 		{AlbumID: "album-a", Idx: 0, Hash: "hash-near", W: 800, H: 600, Vector: vec768(1, 0.05)},
 		{AlbumID: "album-a", Idx: 1, Hash: "hash-twin", W: 800, H: 600, Vector: vec768(0.99, 0.02)},
@@ -760,9 +769,9 @@ func TestSearchRanksPhotosByCosine(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Search: %v", err)
 	}
-	wantHashes := []string{"hash-twin", "hash-near", "hash-mid", "hash-far"}
+	wantHashes := []string{"hash-twin", "hash-mid"}
 	if len(resp.Items) != len(wantHashes) {
-		t.Fatalf("items=%d want=%d (search returns every photo, no album grouping): %+v", len(resp.Items), len(wantHashes), resp.Items)
+		t.Fatalf("items=%d want=%d (one photo per album, no duplicate albums): %+v", len(resp.Items), len(wantHashes), resp.Items)
 	}
 	for i, hash := range wantHashes {
 		if resp.Items[i].Hash != hash {
@@ -923,9 +932,9 @@ func (e *imageSearchEmbedder) Embed(context.Context, []byte) ([]float32, error) 
 func (e *imageSearchEmbedder) Close() error { return nil }
 
 // TestSearchByImageRanksPhotosByCosine drives the image search through a fixed
-// vision vector and pins the same wire shape as Search: every matching photo
-// comes back in descending cosine order with the photo fields and the raw
-// score carried onto the wire unchanged.
+// vision vector and pins the same wire shape as Search: the best photo of each
+// album comes back in descending cosine order with the photo fields and the
+// raw score carried onto the wire unchanged.
 func TestSearchByImageRanksPhotosByCosine(t *testing.T) {
 	store := newFakeVectorStore()
 	stub := &imageSearchEmbedder{vector: vec768(1, 0)}
@@ -933,7 +942,8 @@ func TestSearchByImageRanksPhotosByCosine(t *testing.T) {
 	ctx := context.Background()
 
 	// vec768 encodes short directions at full width, so the cosines against the
-	// [1, 0] query are, best first: 0.9998, 0.9988, 0.7071 and 0.
+	// [1, 0] query are, best first: 0.9998, 0.9988, 0.7071 and 0. Both albums
+	// hold two photos, so only their better-scoring one may come back.
 	if err := store.UpsertPhotos(ctx, []qdrant.PhotoRecord{
 		{AlbumID: "album-a", Idx: 0, Hash: "hash-near", W: 800, H: 600, Vector: vec768(1, 0.05)},
 		{AlbumID: "album-a", Idx: 1, Hash: "hash-twin", W: 800, H: 600, Vector: vec768(0.99, 0.02)},
@@ -947,9 +957,9 @@ func TestSearchByImageRanksPhotosByCosine(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SearchByImage: %v", err)
 	}
-	wantHashes := []string{"hash-twin", "hash-near", "hash-mid", "hash-far"}
+	wantHashes := []string{"hash-twin", "hash-mid"}
 	if len(resp.Items) != len(wantHashes) {
-		t.Fatalf("items=%d want=%d (image search returns every photo, no album grouping): %+v", len(resp.Items), len(wantHashes), resp.Items)
+		t.Fatalf("items=%d want=%d (one photo per album, no duplicate albums): %+v", len(resp.Items), len(wantHashes), resp.Items)
 	}
 	for i, hash := range wantHashes {
 		if resp.Items[i].Hash != hash {

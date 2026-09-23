@@ -37,8 +37,8 @@ const (
 
 	// defaultSearchTopK and maxSearchTopK bound natural-language search result
 	// sizes. They are separate from the recommendation bounds because search
-	// returns every matching photo instead of one per album, so a query needs
-	// a wider ceiling before it starts feeling truncated.
+	// ranks the whole catalog instead of one query photo's neighborhood, so a
+	// query needs a wider ceiling before it starts feeling truncated.
 	defaultSearchTopK = 24
 	maxSearchTopK     = 96
 )
@@ -718,12 +718,12 @@ func (s *Service) Recommend(ctx context.Context, albumID string, photoIndex int,
 }
 
 // Search embeds a natural-language query with the SigLIP2 text tower and
-// returns the nearest embedded photos, best first. Unlike Recommend there is
-// no album grouping or exclusion: every matching photo comes back, so a
-// picture posted in several albums simply ranks once per point it has. The
-// text half of the model is found by a capability check at call time, so a
-// service built with an image-only embedder reports
-// ErrTextEmbeddingUnavailable rather than failing to construct at all.
+// returns the best-scoring embedded photo of each of the limit nearest albums,
+// best first — limit bounds albums, not photos, so a picture posted in several
+// albums ranks once, through its best photo. The text half of the model is
+// found by a capability check at call time, so a service built with an
+// image-only embedder reports ErrTextEmbeddingUnavailable rather than failing
+// to construct at all.
 func (s *Service) Search(ctx context.Context, query string, limit int) (RecommendationResponse, error) {
 	if limit <= 0 {
 		limit = defaultSearchTopK
@@ -755,7 +755,7 @@ func (s *Service) Search(ctx context.Context, query string, limit int) (Recommen
 		return RecommendationResponse{}, fmt.Errorf("text embedder returned a degenerate vector with %d entries", len(vector))
 	}
 
-	hits, err := s.vectors.SearchByVector(ctx, vector, limit)
+	hits, err := s.vectors.SearchByVectorGrouped(ctx, vector, limit)
 	if err != nil {
 		return RecommendationResponse{}, fmt.Errorf("search by vector: %w", err)
 	}
@@ -776,10 +776,10 @@ func (s *Service) Search(ctx context.Context, query string, limit int) (Recommen
 }
 
 // SearchByImage embeds an uploaded image with the vision tower and returns the
-// nearest embedded photos, best first. The query vector lands in the same
-// space as the stored points — it is the exact tower the ingest pipeline uses
-// — and like Search there is no album grouping or exclusion: every matching
-// photo comes back.
+// best-scoring photo of each of the limit nearest albums, best first. The
+// query vector lands in the same space as the stored points — it is the exact
+// tower the ingest pipeline uses — and like Search the store groups by album,
+// so a picture posted in several albums ranks once, through its best photo.
 //
 // The error classes mirror the wire contract. A payload that is empty or
 // undecodable is the request's fault and reports ErrUnreadableImage, which
@@ -825,7 +825,7 @@ func (s *Service) SearchByImage(ctx context.Context, imageBytes []byte, limit in
 		return RecommendationResponse{}, fmt.Errorf("image embedder returned a degenerate vector with %d entries", len(vector))
 	}
 
-	hits, err := s.vectors.SearchByVector(ctx, vector, limit)
+	hits, err := s.vectors.SearchByVectorGrouped(ctx, vector, limit)
 	if err != nil {
 		return RecommendationResponse{}, fmt.Errorf("search by vector: %w", err)
 	}
