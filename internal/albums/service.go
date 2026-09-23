@@ -318,18 +318,7 @@ func (s *Service) ReadyAlbumPhotoCounts(ctx context.Context) ([]models.AlbumPhot
 	if s == nil || s.catalog == nil {
 		return []models.AlbumPhotoCount{}, nil
 	}
-	counts, err := s.catalog.ListReadyAlbumPhotoCounts(ctx)
-	if err != nil {
-		return nil, err
-	}
-	out := make([]models.AlbumPhotoCount, 0, len(counts))
-	for _, count := range counts {
-		out = append(out, models.AlbumPhotoCount{
-			AlbumID:    count.AlbumID,
-			PhotoCount: count.PhotoCount,
-		})
-	}
-	return out, nil
+	return s.catalog.ListReadyAlbumPhotoCounts(ctx)
 }
 
 // PhotoMetaAt returns one photo of an album by index.

@@ -17,6 +17,8 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"viewer/internal/models"
+
 	_ "modernc.org/sqlite"
 	// The catalog also owns the vector index (blob_embeddings), so the
 	// sqlite-vec extension is registered here for every connection this
@@ -577,16 +579,10 @@ func (s *Store) ListReadyAlbumCovers(ctx context.Context) ([]AlbumCover, error) 
 	return covers, nil
 }
 
-// AlbumPhotoCount is a ready album's id with its photo count.
-type AlbumPhotoCount struct {
-	AlbumID    string
-	PhotoCount int
-}
-
 // ListReadyAlbumPhotoCounts returns the id and photo count of every ready
 // album that has photos, ordered by id. It feeds the random-feed sampler,
 // which needs only the album pool rather than every photo row.
-func (s *Store) ListReadyAlbumPhotoCounts(ctx context.Context) ([]AlbumPhotoCount, error) {
+func (s *Store) ListReadyAlbumPhotoCounts(ctx context.Context) ([]models.AlbumPhotoCount, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, photo_count FROM albums
 		WHERE status = ? AND photo_count > 0
@@ -596,9 +592,9 @@ func (s *Store) ListReadyAlbumPhotoCounts(ctx context.Context) ([]AlbumPhotoCoun
 	}
 	defer rows.Close()
 
-	counts := make([]AlbumPhotoCount, 0)
+	counts := make([]models.AlbumPhotoCount, 0)
 	for rows.Next() {
-		var count AlbumPhotoCount
+		var count models.AlbumPhotoCount
 		if err := rows.Scan(&count.AlbumID, &count.PhotoCount); err != nil {
 			return nil, fmt.Errorf("scan ready album photo count: %w", err)
 		}
