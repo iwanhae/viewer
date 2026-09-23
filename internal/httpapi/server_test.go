@@ -290,6 +290,35 @@ func TestRecommendationsEndpointWithNilRecommendService(t *testing.T) {
 	}
 }
 
+// TestRecommendationsEndpointWithDisabledVectorStore covers the Qdrant-less
+// deployment: a live recommend service whose vector store is nil must answer
+// with the same 503 UNAVAILABLE shape as a nil service, since clients have no
+// way to tell the two configurations apart and should not have to. The
+// nil-store check precedes the photo lookup, so no fixture is needed.
+func TestRecommendationsEndpointWithDisabledVectorStore(t *testing.T) {
+	cat, err := catalog.Open(filepath.Join(t.TempDir(), "test.db"), nil)
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	defer cat.Close()
+	recommendService := recommend.NewService(cat, nil, nil, nil, nil)
+	router := New(nil, nil, nil, recommendService, "", nil, "").Router()
+
+	req := httptest.NewRequest(http.MethodGet, "/api/recommendations/album-a/0?limit=12", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d want=%d body=%s", rec.Code, http.StatusServiceUnavailable, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "\"code\":\"UNAVAILABLE\"") {
+		t.Fatalf("expected UNAVAILABLE error code in body, got: %s", rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "recommendations are not available") {
+		t.Fatalf("expected the disabled message in body, got: %s", rec.Body.String())
+	}
+}
+
 func requestWithURLParam(key string, value string) *http.Request {
 	req := httptest.NewRequest(http.MethodGet, "/api/image/album/0", nil)
 	rctx := chi.NewRouteContext()

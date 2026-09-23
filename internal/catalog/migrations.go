@@ -219,7 +219,7 @@ func migrateVectorsToQdrant(ctx context.Context, tx *sql.Tx, sink VectorSink) er
 		}
 		log.Printf("catalog: uploaded %d photo embedding(s) to the vector store", uploaded)
 	} else if uploadable > 0 {
-		return fmt.Errorf("refusing to drop %d photo embedding(s): no vector store is configured to receive them", uploadable)
+		return fmt.Errorf("refusing to drop %d photo embedding(s): Qdrant is not configured, so there is nowhere to migrate them; start once with QDRANT_URL and QDRANT_COLLECTION set (plus QDRANT_API_KEY if the server requires it) to upload them", uploadable)
 	}
 
 	// Blobs whose stored vector does not fit the column were never queryable —

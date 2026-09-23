@@ -134,6 +134,9 @@ func TestStatsAggregatesCatalogAndVectorStore(t *testing.T) {
 	if stats.Drift != -1 {
 		t.Fatalf("drift=%d want=-1 (store holds fewer points than the catalog promises)", stats.Drift)
 	}
+	if !stats.VectorStoreEnabled {
+		t.Fatalf("vectorStoreEnabled=false want=true (a vector counter is wired)")
+	}
 	if stats.ModelEnabled {
 		t.Fatalf("modelEnabled=true want=false (no recommend service)")
 	}
@@ -179,11 +182,20 @@ func TestStatsNilVectorCounterDegradesWithoutError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("stats with nil vector counter: %v", err)
 	}
+	if stats.VectorStoreEnabled {
+		t.Fatalf("vectorStoreEnabled=true want=false (nil vector counter)")
+	}
 	if stats.QdrantPoints != 0 {
 		t.Fatalf("qdrantPoints=%d want=0", stats.QdrantPoints)
 	}
-	if stats.Drift != -2 {
-		t.Fatalf("drift=%d want=-2", stats.Drift)
+	// Drift stays 0 rather than -2: with no store there is no measurement,
+	// and a fabricated negative would render the dashboard as "missing
+	// points" when the truth is just "Qdrant is off".
+	if stats.Drift != 0 {
+		t.Fatalf("drift=%d want=0", stats.Drift)
+	}
+	if stats.ExpectedPoints != 2 {
+		t.Fatalf("expectedPoints=%d want=2 (the catalog's real ready-pair count)", stats.ExpectedPoints)
 	}
 }
 

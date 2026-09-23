@@ -150,12 +150,21 @@ function render(stats) {
   setCount('embFailed', emb.failed);
   setCount('embTotal', emb.total);
 
-  setCount('expected', stats.expectedPoints);
-  setCount('actual', stats.qdrantPoints);
+  // Without a vector store the point figures are unmeasured zeros, so they
+  // must not read as a green "in sync" — "disabled" is the honest rendering.
   const drift = $('drift');
-  drift.textContent = (stats.drift > 0 ? '+' : '') + stats.drift +
-    (stats.drift === 0 ? ' (in sync)' : '');
-  drift.className = stats.drift === 0 ? 'num ok' : 'num bad';
+  if (stats.vectorStoreEnabled === false) {
+    setCount('expected', 'disabled');
+    setCount('actual', 'disabled');
+    drift.textContent = 'disabled';
+    drift.className = 'num';
+  } else {
+    setCount('expected', stats.expectedPoints);
+    setCount('actual', stats.qdrantPoints);
+    drift.textContent = (stats.drift > 0 ? '+' : '') + stats.drift +
+      (stats.drift === 0 ? ' (in sync)' : '');
+    drift.className = stats.drift === 0 ? 'num ok' : 'num bad';
+  }
   $('model').textContent = stats.modelEnabled ? 'yes' : 'no';
 }
 

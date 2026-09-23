@@ -428,8 +428,8 @@ func TestOpenRefusesNilSinkWithVectors(t *testing.T) {
 	_, err := Open(path, nil)
 	if err == nil {
 		t.Fatalf("expected open to refuse dropping vectors with no sink")
-	} else if !strings.Contains(err.Error(), "no vector store") {
-		t.Fatalf("expected the error to explain the missing sink, got %v", err)
+	} else if !strings.Contains(err.Error(), "refusing to drop") || !strings.Contains(err.Error(), "Qdrant is not configured") {
+		t.Fatalf("expected the error to explain the missing Qdrant configuration, got %v", err)
 	}
 	if got := fileVersion(t, path); got != 2 {
 		t.Fatalf("user_version=%d want unchanged 2", got)

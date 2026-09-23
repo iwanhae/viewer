@@ -264,12 +264,17 @@ func TestLoadDefaultsToNoS3Prefix(t *testing.T) {
 	}
 }
 
-func setRequiredEnv(t *testing.T) {
+func setS3Env(t *testing.T) {
 	t.Helper()
 	t.Setenv("S3_ENDPOINT", "https://example.invalid")
 	t.Setenv("S3_BUCKET", "viewer")
 	t.Setenv("S3_ACCESS_KEY", "access")
 	t.Setenv("S3_SECRET_KEY", "secret")
+}
+
+func setRequiredEnv(t *testing.T) {
+	t.Helper()
+	setS3Env(t)
 	t.Setenv("QDRANT_URL", "https://qdrant.example.test")
 	t.Setenv("QDRANT_API_KEY", "qdrant-key")
 	t.Setenv("QDRANT_COLLECTION", "photo_embeddings")
@@ -290,31 +295,126 @@ func TestLoadRejectsBlankWorkerToken(t *testing.T) {
 	}
 }
 
-// TestLoadRequiresEveryQdrantValue mirrors the S3 requirement for the Qdrant
-// settings vector search depends on, and pins the message each failure names.
-func TestLoadRequiresEveryQdrantValue(t *testing.T) {
+// TestLoadQdrantConfigurationMatrix walks the Qdrant settings through every
+// combination that matters: QDRANT_URL is the on/off switch for vector
+// search, a set-but-blank variable still means an operator typo rather than
+// an opt-out, and a half-set configuration is rejected by naming the missing
+// variable instead of silently booting with recommendations off.
+func TestLoadQdrantConfigurationMatrix(t *testing.T) {
 	cases := []struct {
-		name    string
-		envKey  string
-		wantErr string
+		name        string
+		url         string
+		apiKey      string
+		collection  string
+		wantErr     string
+		wantEnabled bool
 	}{
-		{name: "missing url", envKey: "QDRANT_URL", wantErr: "QDRANT_URL is required"},
-		{name: "missing api key", envKey: "QDRANT_API_KEY", wantErr: "QDRANT_API_KEY is required"},
-		{name: "missing collection", envKey: "QDRANT_COLLECTION", wantErr: "QDRANT_COLLECTION is required"},
+		{name: "all unset disables vector search", wantEnabled: false},
+		{
+			name:        "url, collection and key enable vector search",
+			url:         "https://qdrant.example.test",
+			apiKey:      "qdrant-key",
+			collection:  "photo_embeddings",
+			wantEnabled: true,
+		},
+		{
+			name:        "url and collection without a key enable vector search",
+			url:         "https://qdrant.example.test",
+			collection:  "photo_embeddings",
+			wantEnabled: true,
+		},
+		{
+			name:    "url without collection names the missing variable",
+			url:     "https://qdrant.example.test",
+			wantErr: "QDRANT_COLLECTION is required when QDRANT_URL is set",
+		},
+		{
+			name:       "collection without url names the missing variable",
+			collection: "photo_embeddings",
+			wantErr:    "QDRANT_URL is required when QDRANT_API_KEY or QDRANT_COLLECTION is set",
+		},
+		{
+			name:    "key without url names the missing variable",
+			apiKey:  "qdrant-key",
+			wantErr: "QDRANT_URL is required when QDRANT_API_KEY or QDRANT_COLLECTION is set",
+		},
+		{
+			name:    "whitespace url is set but blank",
+			url:     "   ",
+			wantErr: "QDRANT_URL is set but blank",
+		},
+		{
+			name:       "whitespace key with url is set but blank",
+			url:        "https://qdrant.example.test",
+			collection: "photo_embeddings",
+			apiKey:     "   ",
+			wantErr:    "QDRANT_API_KEY is set but blank",
+		},
+		{
+			name:    "whitespace key without url is still set but blank",
+			apiKey:  "   ",
+			wantErr: "QDRANT_API_KEY is set but blank",
+		},
+		{
+			name:       "whitespace collection with url is set but blank",
+			url:        "https://qdrant.example.test",
+			collection: "   ",
+			wantErr:    "QDRANT_COLLECTION is set but blank",
+		},
+		{
+			name:       "whitespace collection without url is still set but blank",
+			collection: "   ",
+			wantErr:    "QDRANT_COLLECTION is set but blank",
+		},
+		{
+			name:       "unusable url format is rejected",
+			url:        "qdrant.example.test",
+			collection: "photo_embeddings",
+			wantErr:    "QDRANT_URL must be an http or https URL with a host",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			setRequiredEnv(t)
-			t.Setenv(tc.envKey, "")
+			setS3Env(t)
+			t.Setenv("QDRANT_URL", tc.url)
+			t.Setenv("QDRANT_API_KEY", tc.apiKey)
+			t.Setenv("QDRANT_COLLECTION", tc.collection)
 
-			_, err := Load()
-			if err == nil {
-				t.Fatalf("Load expected an error for %s", tc.name)
+			cfg, err := Load()
+			if tc.wantErr != "" {
+				if err == nil {
+					t.Fatalf("Load expected an error containing %q", tc.wantErr)
+				}
+				if !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("Load error %q want it to contain %q", err.Error(), tc.wantErr)
+				}
+				return
 			}
-			if !strings.Contains(err.Error(), tc.wantErr) {
-				t.Fatalf("Load error %q want it to contain %q", err.Error(), tc.wantErr)
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if cfg.QdrantEnabled() != tc.wantEnabled {
+				t.Fatalf("QdrantEnabled()=%v want=%v", cfg.QdrantEnabled(), tc.wantEnabled)
 			}
 		})
+	}
+}
+
+// TestLoadQdrantDisabled pins the disabled boot: with no Qdrant variable set
+// at all, Load succeeds and QdrantEnabled() is false, which is what lets the
+// app skip the client construction, EnsureCollection and the drift check.
+func TestLoadQdrantDisabled(t *testing.T) {
+	setS3Env(t)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.QdrantEnabled() {
+		t.Fatalf("QdrantEnabled()=true want=false with no Qdrant variable set")
+	}
+	if cfg.QdrantURL != "" || cfg.QdrantAPIKey != "" || cfg.QdrantCollection != "" {
+		t.Fatalf("qdrant fields=%q %q %q want all empty", cfg.QdrantURL, cfg.QdrantAPIKey, cfg.QdrantCollection)
 	}
 }
 
@@ -413,8 +513,29 @@ func TestLoadQdrantHappyPath(t *testing.T) {
 	if cfg.QdrantCollection != "photo_embeddings" {
 		t.Fatalf("QdrantCollection=%q want photo_embeddings", cfg.QdrantCollection)
 	}
+	if !cfg.QdrantEnabled() {
+		t.Fatalf("QdrantEnabled()=false want=true with Qdrant fully configured")
+	}
 	if cfg.AdminToken != "" {
 		t.Fatalf("AdminToken=%q want empty when ADMIN_TOKEN is unset", cfg.AdminToken)
+	}
+
+	// The API key is optional: a server without authentication must boot
+	// without a placeholder value, since the client only sends the header
+	// when the key is set.
+	setRequiredEnv(t)
+	t.Setenv("ADMIN_TOKEN", "")
+	t.Setenv("QDRANT_API_KEY", "")
+
+	cfgNoKey, err := Load()
+	if err != nil {
+		t.Fatalf("Load without QDRANT_API_KEY: %v", err)
+	}
+	if cfgNoKey.QdrantAPIKey != "" {
+		t.Fatalf("QdrantAPIKey=%q want empty", cfgNoKey.QdrantAPIKey)
+	}
+	if !cfgNoKey.QdrantEnabled() {
+		t.Fatalf("QdrantEnabled()=false want=true with url and collection set")
 	}
 }
 

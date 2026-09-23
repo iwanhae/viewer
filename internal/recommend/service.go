@@ -48,10 +48,11 @@ const (
 type Service struct {
 	catalog *catalog.Store
 
-	// vectors is nil when no vector store is wired up (some tests). Writes then
-	// degrade to SQLite-only bookkeeping and Recommend reports the store as
-	// unavailable rather than answering with an empty list that looks like
-	// "no similar photos".
+	// vectors is nil when no vector store is wired up (a deployment without
+	// QDRANT_URL, some tests). Writes then degrade to SQLite-only bookkeeping
+	// and Recommend reports the store as unavailable (ErrVectorStoreUnavailable)
+	// rather than answering with an empty list that looks like "no similar
+	// photos".
 	vectors VectorStore
 
 	images *images.Service
@@ -666,7 +667,7 @@ func (s *Service) Recommend(ctx context.Context, albumID string, photoIndex int,
 		return RecommendationResponse{}, fmt.Errorf("catalog is not available")
 	}
 	if s.vectors == nil {
-		return RecommendationResponse{}, fmt.Errorf("vector store is not available")
+		return RecommendationResponse{}, ErrVectorStoreUnavailable
 	}
 
 	photo, err := s.catalog.PhotoAt(ctx, albumID, photoIndex)

@@ -179,7 +179,7 @@ func TestAdminStatsShape(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
 		t.Fatalf("decode stats: %v", err)
 	}
-	for _, key := range []string{"albums", "albumsByStatus", "photos", "blobs", "embedding", "expectedPoints", "qdrantPoints", "drift", "modelEnabled"} {
+	for _, key := range []string{"albums", "albumsByStatus", "photos", "blobs", "embedding", "expectedPoints", "qdrantPoints", "drift", "vectorStoreEnabled", "modelEnabled"} {
 		if _, ok := payload[key]; !ok {
 			t.Fatalf("stats JSON missing key %q in %v", key, payload)
 		}
@@ -206,6 +206,44 @@ func TestAdminStatsShape(t *testing.T) {
 	}
 	if payload["modelEnabled"] != false {
 		t.Fatalf("modelEnabled=%v want=false", payload["modelEnabled"])
+	}
+	if payload["vectorStoreEnabled"] != true {
+		t.Fatalf("vectorStoreEnabled=%v want=true (a vector counter is wired)", payload["vectorStoreEnabled"])
+	}
+}
+
+// TestAdminStatsShapeWithDisabledVectorStore pins the JSON shape when no
+// vector store is wired up — the deployment without Qdrant: the flag says so
+// explicitly, the point figures degrade to unmeasured zeros instead of a
+// fabricated drift, and expectedPoints keeps its real catalog value.
+func TestAdminStatsShapeWithDisabledVectorStore(t *testing.T) {
+	store := openAdminTestCatalog(t)
+	seedEmbeddingFixture(t, store)
+	adminService := admin.NewService(store, nil, nil)
+	router := New(nil, nil, nil, nil, "", adminService, "sekrit").Router()
+
+	rec := doAdminRequest(t, router, http.MethodGet, "/admin/api/stats", basicAuthHeader("operator", "sekrit"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d want=200 body=%s", rec.Code, rec.Body.String())
+	}
+
+	var payload struct {
+		ExpectedPoints     int64 `json:"expectedPoints"`
+		QdrantPoints       int64 `json:"qdrantPoints"`
+		Drift              int64 `json:"drift"`
+		VectorStoreEnabled bool  `json:"vectorStoreEnabled"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode stats: %v", err)
+	}
+	if payload.VectorStoreEnabled {
+		t.Fatalf("vectorStoreEnabled=true want=false (nil vector store)")
+	}
+	if payload.QdrantPoints != 0 || payload.Drift != 0 {
+		t.Fatalf("points=%+v want qdrant=0 drift=0", payload)
+	}
+	if payload.ExpectedPoints != 1 {
+		t.Fatalf("expectedPoints=%d want=1 (the fixture's one ready photo pair)", payload.ExpectedPoints)
 	}
 }
 

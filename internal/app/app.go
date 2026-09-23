@@ -42,8 +42,8 @@ func Run(ctx context.Context) error {
 		return err
 	}
 	log.Printf(
-		"viewer: config loaded on port=%d catalog=%s s3_prefix=%s qdrant=%s collection=%s",
-		cfg.Port, cfg.DBPath(), cfg.DescribePrefix(), cfg.QdrantURL, cfg.QdrantCollection,
+		"viewer: config loaded on port=%d catalog=%s s3_prefix=%s",
+		cfg.Port, cfg.DBPath(), cfg.DescribePrefix(),
 	)
 	if cfg.WorkerToken != "" {
 		log.Printf("viewer: embedding worker API requires a bearer token")
@@ -54,6 +54,11 @@ func Run(ctx context.Context) error {
 		log.Printf("viewer: admin UI enabled and requires Basic auth (password = ADMIN_TOKEN)")
 	} else {
 		log.Printf("viewer: admin UI is disabled (set ADMIN_TOKEN to enable it)")
+	}
+	if cfg.QdrantEnabled() {
+		log.Printf("viewer: vector search enabled (qdrant=%s collection=%s)", cfg.QdrantURL, cfg.QdrantCollection)
+	} else {
+		log.Printf("viewer: vector search is disabled (set QDRANT_URL and QDRANT_COLLECTION to enable photo recommendations)")
 	}
 
 	// The store comes up before the catalog: the bucket holds a snapshot of
@@ -74,9 +79,18 @@ func Run(ctx context.Context) error {
 
 	// Vectors live in the external Qdrant collection, not in SQLite (since
 	// migration 0003 the catalog stores only their status). The client is the
-	// upload target the migration needs while it moves any still-stored vectors
-	// over, so it must exist before the catalog opens.
-	vectorStore := qdrant.New(cfg.QdrantURL, cfg.QdrantAPIKey, cfg.QdrantCollection, catalog.EmbeddingDim)
+	// upload target the migration needs while it moves any still-stored
+	// vectors over, so it must exist before the catalog opens — except when
+	// Qdrant is not configured at all, in which case the store stays nil and
+	// the catalog, the services and the workers all run with recommendations
+	// disabled. The variable is declared as the interface type on purpose: a
+	// nil *qdrant.Client stored in a concrete-typed variable turns into a
+	// typed nil once it reaches the catalog's and the service's interface
+	// fields, and every nil check downstream would then see a live store.
+	var vectorStore recommend.VectorStore
+	if cfg.QdrantEnabled() {
+		vectorStore = qdrant.New(cfg.QdrantURL, cfg.QdrantAPIKey, cfg.QdrantCollection, catalog.EmbeddingDim)
+	}
 	cat, err := catalog.Open(cfg.DBPath(), vectorStore)
 	if err != nil {
 		return fmt.Errorf("open metadata catalog: %w", err)
@@ -86,9 +100,12 @@ func Run(ctx context.Context) error {
 	// The migration only guarantees the collection exists when it had vectors
 	// to move. Ensure it on every boot so a fresh or already-migrated catalog
 	// is searchable too; a mismatched collection config fails the start here
-	// rather than surfacing as errors on the first search.
-	if err := vectorStore.EnsureCollection(ctx); err != nil {
-		return fmt.Errorf("ensure vector collection: %w", err)
+	// rather than surfacing as errors on the first search. With Qdrant
+	// disabled there is no collection to ensure and none to search.
+	if cfg.QdrantEnabled() {
+		if err := vectorStore.EnsureCollection(ctx); err != nil {
+			return fmt.Errorf("ensure vector collection: %w", err)
+		}
 	}
 
 	// The store and the catalog are written by different paths (worker
@@ -96,13 +113,16 @@ func Run(ctx context.Context) error {
 	// commonly after a catalog backup was restored over a store that kept its
 	// old points, or the other way around. Nothing here repairs that
 	// automatically; the mismatch is logged so the operator can re-embed or
-	// wipe whichever side is stale.
-	if readyPairs, err := cat.ReadyPairCount(ctx); err != nil {
-		log.Printf("viewer: counting ready embeddings failed: %v", err)
-	} else if points, err := vectorStore.CountVectors(ctx); err != nil {
-		log.Printf("viewer: counting vector store points failed: %v", err)
-	} else if points != int(readyPairs) {
-		log.Printf("viewer: WARNING vector store holds %d point(s) but the catalog has %d ready photo pair(s); recommendations may be incomplete until the two are re-synced", points, readyPairs)
+	// wipe whichever side is stale. The comparison only exists when both
+	// sides do, i.e. when Qdrant is enabled.
+	if cfg.QdrantEnabled() {
+		if readyPairs, err := cat.ReadyPairCount(ctx); err != nil {
+			log.Printf("viewer: counting ready embeddings failed: %v", err)
+		} else if points, err := vectorStore.CountVectors(ctx); err != nil {
+			log.Printf("viewer: counting vector store points failed: %v", err)
+		} else if points != int(readyPairs) {
+			log.Printf("viewer: WARNING vector store holds %d point(s) but the catalog has %d ready photo pair(s); recommendations may be incomplete until the two are re-synced", points, readyPairs)
+		}
 	}
 
 	imageService := images.NewService(cat, store)

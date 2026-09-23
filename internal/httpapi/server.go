@@ -328,6 +328,13 @@ func (s *Server) getRecommendations(w http.ResponseWriter, r *http.Request) {
 			writeError(w, r, http.StatusNotFound, "NOT_FOUND", "photo not found")
 			return
 		}
+		if errors.Is(err, recommend.ErrVectorStoreUnavailable) {
+			// Qdrant is not configured, which is a deployment state rather
+			// than a failure: the same 503 shape as the nil-service case
+			// above, so clients treat both identically.
+			writeError(w, r, http.StatusServiceUnavailable, "UNAVAILABLE", "recommendations are not available")
+			return
+		}
 		writeError(w, r, http.StatusInternalServerError, "INTERNAL", err.Error())
 		return
 	}

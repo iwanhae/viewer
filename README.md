@@ -1,6 +1,6 @@
 # viewer
 
-Self-hosted photo album server. Upload a zip of photos; the server stores each image as a content-addressed blob in S3-compatible object storage, catalogs albums in SQLite, computes SigLIP2 image embeddings into an external Qdrant server, and serves a React frontend plus a JSON API from a single Go binary.
+Self-hosted photo album server. Upload a zip of photos; the server stores each image as a content-addressed blob in S3-compatible object storage, catalogs albums in SQLite, computes SigLIP2 image embeddings into an optional external Qdrant server, and serves a React frontend plus a JSON API from a single Go binary. Without Qdrant everything works except the "similar photos" recommendations, which answer with a 503.
 
 ## Features
 
@@ -47,6 +47,8 @@ Docker:
 
 ```sh
 docker build -t viewer .
+# The three QDRANT_* variables are optional: without them the viewer runs
+# with photo recommendations disabled and everything else working.
 docker run -d --name viewer \
   -p 8080:8080 \
   -v viewer-state:/var/lib/viewer \
@@ -77,9 +79,9 @@ The viewer is deployed as a Docker image, and every setting is an environment va
 | `S3_USE_PATH_STYLE` | no | `true` | `true` addresses the bucket in the request path (`https://host/bucket/key` — what self-hosted stores expect); `false` uses a subdomain (`https://bucket.host/key`, needs wildcard DNS). |
 | `STATE_DIR` | no | `/var/lib/viewer` | Absolute directory holding the SQLite catalog (`viewer.db`) and the backup stamp. Must be an absolute path. Mount a volume here — the album-to-photo mapping cannot be rebuilt from the blobs. |
 | `PORT` | no | `8080` | HTTP listen port. |
-| `QDRANT_URL` | yes | — | Base URL of the Qdrant server's REST API; must be an http/https URL with a host. |
-| `QDRANT_API_KEY` | yes | — | Sent as the `api-key` header on every Qdrant request. |
-| `QDRANT_COLLECTION` | yes | — | Qdrant collection holding the per-photo embedding points. Deliberately no default: the viewer refuses to start without it. |
+| `QDRANT_URL` | no | (empty) | Base URL of the Qdrant server's REST API; must be an http/https URL with a host. Setting it turns photo recommendations on; leaving it empty runs the viewer without a vector store. |
+| `QDRANT_API_KEY` | no | (empty) | Sent as the `api-key` header on every Qdrant request. Sent only when set, so an unauthenticated server needs no placeholder. |
+| `QDRANT_COLLECTION` | when `QDRANT_URL` is set | — | Qdrant collection holding the per-photo embedding points. Deliberately no default: the viewer refuses to start with a URL but no collection. |
 | `SIGLIP2_MODEL_URL` | no | built-in mirror | Base URL the SigLIP2 checkpoint (`config.json`, `model.safetensors`) is fetched from on first start into `/app/siglip2`. Mount a prepared directory at `/app/siglip2` to skip the download. |
 | `EMBEDDING_WORKER_TOKEN` | no | (empty) | Bearer token required on the external embedding-worker API. Empty disables that check (trusted networks only); the rest of the API is unaffected. |
 | `ADMIN_TOKEN` | no | (empty) | Basic-auth password for `/admin`. Empty keeps the admin UI disabled. |
@@ -87,7 +89,8 @@ The viewer is deployed as a Docker image, and every setting is an environment va
 
 Notes:
 
-- Set-but-blank values of `EMBEDDING_WORKER_TOKEN`, `QDRANT_API_KEY`, `QDRANT_COLLECTION`, and `ADMIN_TOKEN` are rejected at startup rather than silently meaning "off".
+- Set-but-blank values of `QDRANT_URL`, `EMBEDDING_WORKER_TOKEN`, `QDRANT_API_KEY`, `QDRANT_COLLECTION`, and `ADMIN_TOKEN` are rejected at startup rather than silently meaning "off".
+- Similarly, `QDRANT_API_KEY` or `QDRANT_COLLECTION` without `QDRANT_URL` is rejected: Qdrant is optional, but half-configured is a mistake, not an opt-out.
 - Some values are fixed constants, not environment variables: the 1 GiB upload cap, the 15 minute presign TTL, the `us-east-1` signing region, and the `/app/siglip2` checkpoint directory. See `internal/config/config.go`.
 
 ## API overview

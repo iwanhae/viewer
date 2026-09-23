@@ -107,24 +107,28 @@ type Config struct {
 	WorkerToken string
 
 	// QdrantURL is the REST base URL of the external Qdrant server vector
-	// search talks to: the HTTP client appends a collection path to it. Load
-	// trims surrounding whitespace and trailing slashes the way ModelURL is
-	// trimmed, and rejects a value that is not an http or https URL with a
-	// host.
+	// search talks to: the HTTP client appends a collection path to it. It is
+	// also the switch for the whole feature: an unset value boots the viewer
+	// without a vector store, with photo recommendations disabled and
+	// everything else working. Load trims surrounding whitespace and trailing
+	// slashes the way ModelURL is trimmed, and rejects a non-empty value that
+	// is not an http or https URL with a host.
 	QdrantURL string
 
 	// QdrantAPIKey is the value sent as the api-key header on every Qdrant
-	// request.
+	// request. It is optional: the client sends the header only when set, so
+	// a server without authentication needs no placeholder value here.
 	QdrantAPIKey string
 
 	// QdrantCollection is the name of the Qdrant collection that holds the
 	// per-photo embedding points: every upsert, search, count and migration
-	// upload is scoped to it. It is required with no default, so nothing is
-	// ever created or queried under an accidental collection name — a fallback
-	// constant would silently fork the corpus between deployments that spell
-	// the collection differently. The value is passed through as configured
-	// with no charset validation, because the server rejects invalid
-	// collection names; requiredness is the only contract here.
+	// upload is scoped to it. It is required whenever QdrantURL is set, and
+	// has no default, so nothing is ever created or queried under an
+	// accidental collection name — a fallback constant would silently fork
+	// the corpus between deployments that spell the collection differently.
+	// The value is passed through as configured with no charset validation,
+	// because the server rejects invalid collection names; requiredness is
+	// the only contract here.
 	QdrantCollection string
 
 	// AdminToken is the credential the admin page requires, sent as the Basic
@@ -137,8 +141,10 @@ type Config struct {
 // DBPath is the SQLite catalog inside StateDir.
 func (c Config) DBPath() string { return filepath.Join(c.StateDir, "viewer.db") }
 
-// Load reads the deployment settings from the environment and validates that
-// the object store and the Qdrant endpoint and collection are fully configured.
+// Load reads the deployment settings from the environment and validates them.
+// The object store is required. Qdrant is optional: an unset QDRANT_URL boots
+// the viewer with vector search disabled, and setting it also requires
+// QDRANT_COLLECTION, while QDRANT_API_KEY stays optional either way.
 func Load() (Config, error) {
 	usePathStyle, err := getenvBool("S3_USE_PATH_STYLE", DefaultS3UsePathStyle)
 	if err != nil {
@@ -149,6 +155,7 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	workerToken := strings.TrimSpace(os.Getenv("EMBEDDING_WORKER_TOKEN"))
+	rawQdrantURL := os.Getenv("QDRANT_URL")
 	qdrantAPIKey := strings.TrimSpace(os.Getenv("QDRANT_API_KEY"))
 	qdrantCollection := strings.TrimSpace(os.Getenv("QDRANT_COLLECTION"))
 	adminToken := strings.TrimSpace(os.Getenv("ADMIN_TOKEN"))
@@ -165,7 +172,7 @@ func Load() (Config, error) {
 		AllowBackupOverwrite: allowBackupOverwrite,
 		ModelURL:             normalizeModelURL(os.Getenv("SIGLIP2_MODEL_URL")),
 		WorkerToken:          workerToken,
-		QdrantURL:            normalizeQdrantURL(os.Getenv("QDRANT_URL")),
+		QdrantURL:            normalizeQdrantURL(rawQdrantURL),
 		QdrantAPIKey:         qdrantAPIKey,
 		QdrantCollection:     qdrantCollection,
 		AdminToken:           adminToken,
@@ -189,29 +196,39 @@ func Load() (Config, error) {
 		// API. A whitespace-only value would silently run it unauthenticated,
 		// which is exactly the accident this check exists to prevent.
 		return Config{}, fmt.Errorf("EMBEDDING_WORKER_TOKEN is set but blank")
-	case cfg.QdrantURL == "":
-		return Config{}, fmt.Errorf("QDRANT_URL is required")
-	case !validQdrantURL(cfg.QdrantURL):
-		return Config{}, fmt.Errorf("QDRANT_URL must be an http or https URL with a host, got %q", cfg.QdrantURL)
+	case rawQdrantURL != "" && cfg.QdrantURL == "":
+		// The variable was set, so the operator meant to point the viewer at
+		// Qdrant. A whitespace-only value would otherwise read as "unset" and
+		// silently boot with recommendations off, which is exactly the
+		// accident this check exists to prevent.
+		return Config{}, fmt.Errorf("QDRANT_URL is set but blank")
 	case os.Getenv("QDRANT_API_KEY") != "" && qdrantAPIKey == "":
 		// The variable was set, so the operator meant to authenticate to
 		// Qdrant. This case precedes the "is required" check so the message
 		// says the value was seen and rejected, not never supplied.
 		return Config{}, fmt.Errorf("QDRANT_API_KEY is set but blank")
-	case cfg.QdrantAPIKey == "":
-		return Config{}, fmt.Errorf("QDRANT_API_KEY is required")
 	case os.Getenv("QDRANT_COLLECTION") != "" && qdrantCollection == "":
 		// The variable was set, so the operator meant to name the collection
 		// the points live in. This case precedes the "is required" check so
 		// the message says the value was seen and rejected, not never
 		// supplied.
 		return Config{}, fmt.Errorf("QDRANT_COLLECTION is set but blank")
-	case cfg.QdrantCollection == "":
+	case cfg.QdrantURL == "" && (qdrantAPIKey != "" || qdrantCollection != ""):
+		// Qdrant is otherwise optional, so a lone key or collection would
+		// silently boot with recommendations off. The operator plainly meant
+		// to configure it, so name the missing variable instead.
+		return Config{}, fmt.Errorf("QDRANT_URL is required when QDRANT_API_KEY or QDRANT_COLLECTION is set")
+	case cfg.QdrantURL != "" && !validQdrantURL(cfg.QdrantURL):
+		// Gated on a non-empty URL: validQdrantURL("") is false, and an empty
+		// URL is the disabled configuration, not a malformed one, so an
+		// unguarded check would reject every Qdrant-less boot.
+		return Config{}, fmt.Errorf("QDRANT_URL must be an http or https URL with a host, got %q", cfg.QdrantURL)
+	case cfg.QdrantURL != "" && cfg.QdrantCollection == "":
 		// There is deliberately no fallback name: a default would let a
 		// deployment come up creating and querying a collection the operator
 		// never chose, and corpus written there would not follow the real one
 		// when the setting is fixed.
-		return Config{}, fmt.Errorf("QDRANT_COLLECTION is required")
+		return Config{}, fmt.Errorf("QDRANT_COLLECTION is required when QDRANT_URL is set")
 	case os.Getenv("ADMIN_TOKEN") != "" && adminToken == "":
 		// The variable was set, so the operator meant to protect the admin
 		// page. A whitespace-only value would silently leave the admin UI
@@ -272,6 +289,12 @@ func (c Config) DescribePrefix() string {
 	return c.S3Prefix
 }
 
+// QdrantEnabled reports whether an external Qdrant vector store is configured.
+// Load guarantees QdrantCollection is set whenever QdrantURL is, so this one
+// condition is the whole story; boot gates the client construction,
+// EnsureCollection, and the drift check on it.
+func (c Config) QdrantEnabled() bool { return c.QdrantURL != "" }
+
 // normalizeStateDir falls back to DefaultStateDir when STATE_DIR is unset or
 // blank, and otherwise cleans the value so "/data/" and "/data" agree.
 func normalizeStateDir(raw string) string {
@@ -296,7 +319,7 @@ func normalizeModelURL(raw string) string {
 // normalizeQdrantURL trims the Qdrant REST base URL the same way ModelURL is
 // trimmed - surrounding whitespace and trailing slashes - so the vector client
 // can append a collection path directly. Unlike ModelURL there is no default:
-// an empty result is rejected by the "QDRANT_URL is required" check.
+// an empty result means Qdrant is not configured and vector search stays off.
 func normalizeQdrantURL(raw string) string {
 	return strings.TrimRight(strings.TrimSpace(raw), "/")
 }

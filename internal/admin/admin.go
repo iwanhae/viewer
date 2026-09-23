@@ -58,7 +58,12 @@ type Stats struct {
 	ExpectedPoints int64 `json:"expectedPoints"`
 	QdrantPoints   int64 `json:"qdrantPoints"`
 	Drift          int64 `json:"drift"`
-	ModelEnabled   bool  `json:"modelEnabled"`
+	// VectorStoreEnabled says a vector store is wired up at all. When it is
+	// false, the point figures above are unmeasured zeros — not readings of
+	// an empty store — and the dashboard must render them as disabled rather
+	// than as a green "in sync".
+	VectorStoreEnabled bool `json:"vectorStoreEnabled"`
+	ModelEnabled       bool `json:"modelEnabled"`
 }
 
 // Service backs the admin page. Everything it reports is read straight out of
@@ -70,9 +75,11 @@ type Service struct {
 	recommend *recommend.Service
 }
 
-// NewService builds the admin service. A nil vectors counter degrades Stats to
-// zero Qdrant points (which is how tests run without a store); a nil catalog
-// makes every call fail, the same contract the recommend service applies.
+// NewService builds the admin service. A nil vectors counter reports the
+// store as disabled — VectorStoreEnabled false, with zero points and drift as
+// unmeasured values, which is how a deployment without Qdrant runs — and a
+// nil catalog makes every call fail, the same contract the recommend service
+// applies.
 func NewService(cat *catalog.Store, vectors VectorCounter, recommend *recommend.Service) *Service {
 	return &Service{cat: cat, vectors: vectors, recommend: recommend}
 }
@@ -121,8 +128,12 @@ func (s *Service) Stats(ctx context.Context) (Stats, error) {
 			return Stats{}, fmt.Errorf("count vector store points: %w", err)
 		}
 		stats.QdrantPoints = int64(points)
+		// Drift is only meaningful against a real reading. Computed with no
+		// store wired up it would always read -expected and render as a red
+		// "missing everything" that is really just "Qdrant is off".
+		stats.Drift = stats.QdrantPoints - stats.ExpectedPoints
+		stats.VectorStoreEnabled = true
 	}
-	stats.Drift = stats.QdrantPoints - stats.ExpectedPoints
 	stats.ModelEnabled = s.recommend != nil && s.recommend.Enabled()
 	return stats, nil
 }

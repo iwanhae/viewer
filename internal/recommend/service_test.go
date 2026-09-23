@@ -516,6 +516,9 @@ func TestRecommendWithoutVectorStoreReportsUnavailable(t *testing.T) {
 	if err == nil {
 		t.Fatalf("expected an error without a vector store, got %+v", resp)
 	}
+	if !errors.Is(err, ErrVectorStoreUnavailable) {
+		t.Fatalf("err=%v want ErrVectorStoreUnavailable", err)
+	}
 	if !strings.Contains(err.Error(), "vector store is not available") {
 		t.Fatalf("err=%v want the unavailability message", err)
 	}
