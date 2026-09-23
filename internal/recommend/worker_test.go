@@ -108,7 +108,7 @@ func TestEmbeddingWorkerReportsProgressWithRealModel(t *testing.T) {
 
 	imageService := images.NewService(cat, store)
 	svc := NewService(cat, imageService, NewVisionEmbedder(vision.Config{ModelID: filepath.Join(dir, "model"), Backend: "go"}), nil)
-	t.Cleanup(func() { _ = svc.Close() })
+	t.Cleanup(func() { _ = svc.close() })
 	if err := svc.LoadModel(ctx); err != nil {
 		t.Fatalf("LoadModel: %v", err)
 	}
@@ -121,9 +121,7 @@ func TestEmbeddingWorkerReportsProgressWithRealModel(t *testing.T) {
 	log.SetOutput(capture)
 	defer log.SetOutput(os.Stderr)
 
-	if err := svc.Start(ctx); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
+	svc.Start(ctx)
 
 	deadline := time.Now().Add(10 * time.Minute)
 	observedActive := false
@@ -192,10 +190,8 @@ func TestEmbeddingDrainHookFiresAfterTheQueueDrains(t *testing.T) {
 	if err := svc.LoadModel(ctx); err != nil {
 		t.Fatalf("LoadModel: %v", err)
 	}
-	t.Cleanup(func() { _ = svc.Close() })
-	if err := svc.Start(ctx); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
+	t.Cleanup(func() { _ = svc.close() })
+	svc.Start(ctx)
 
 	select {
 	case <-drains:

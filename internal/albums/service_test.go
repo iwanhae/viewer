@@ -337,44 +337,6 @@ func TestGetAlbumReturnsPhotosInLegacyShape(t *testing.T) {
 	}
 }
 
-func TestAllAlbumsOnlyReturnsReadyAlbums(t *testing.T) {
-	svc, cat := newTestService(t, newFakeStore(), nil)
-	ctx := context.Background()
-
-	seed := []struct {
-		id     string
-		status catalog.AlbumStatus
-	}{
-		{id: "ready-b", status: catalog.AlbumStatusReady},
-		{id: "ready-a", status: catalog.AlbumStatusReady},
-		{id: "pending", status: catalog.AlbumStatusQueued},
-	}
-	for _, item := range seed {
-		if err := cat.CreateAlbum(ctx, catalog.Album{
-			ID:               item.id,
-			OriginalFilename: item.id + ".zip",
-			Status:           item.status,
-			CreatedAt:        "2026-02-17T10:00:00Z",
-		}); err != nil {
-			t.Fatalf("create album: %v", err)
-		}
-		if err := cat.InsertPhoto(ctx, catalog.Photo{
-			AlbumID: item.id, Index: 0, Name: "a.png", Hash: "hash-" + item.id, Width: 1, Height: 1, Ratio: 1,
-		}); err != nil {
-			t.Fatalf("insert photo: %v", err)
-		}
-	}
-
-	albumsList := svc.AllAlbums()
-	got := make([]string, 0, len(albumsList))
-	for _, album := range albumsList {
-		got = append(got, album.AlbumID)
-	}
-	if !reflect.DeepEqual(got, []string{"ready-a", "ready-b"}) {
-		t.Fatalf("albums=%v want=[ready-a ready-b]", got)
-	}
-}
-
 func TestSearchAlbumsByNameReturnsItems(t *testing.T) {
 	svc, cat := newTestService(t, newFakeStore(), nil)
 	ctx := context.Background()
@@ -521,9 +483,6 @@ func TestRegisterStagedUploadQueuesAlbum(t *testing.T) {
 
 func TestServiceWithNilCatalogDegradesGracefully(t *testing.T) {
 	svc := NewService(nil, newFakeStore(), nil)
-	if svc.AllAlbums() != nil {
-		t.Fatalf("expected nil albums for nil catalog")
-	}
 	if _, err := svc.GetAlbum(context.Background(), "album-a"); !errors.Is(err, ErrAlbumNotFound) {
 		t.Fatalf("expected ErrAlbumNotFound, got %v", err)
 	}

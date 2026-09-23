@@ -82,16 +82,59 @@ func seedBlob(t *testing.T, cat *catalog.Store, hash string) {
 func seedReadyEmbedding(t *testing.T, cat *catalog.Store, hash string, vector []float32) {
 	t.Helper()
 	seedBlob(t, cat, hash)
-	if err := cat.SetBlobEmbedding(context.Background(), hash, catalog.EmbeddingStatusReady, vector, ""); err != nil {
-		t.Fatalf("set ready embedding %s: %v", hash, err)
-	}
+	seedEmbeddingOutcome(t, cat, hash, catalog.EmbeddingStatusReady, vector, "")
 }
 
 func seedFailedEmbedding(t *testing.T, cat *catalog.Store, hash string, errText string) {
 	t.Helper()
 	seedBlob(t, cat, hash)
-	if err := cat.SetBlobEmbedding(context.Background(), hash, catalog.EmbeddingStatusFailed, nil, errText); err != nil {
-		t.Fatalf("set failed embedding %s: %v", hash, err)
+	seedEmbeddingOutcome(t, cat, hash, catalog.EmbeddingStatusFailed, nil, errText)
+}
+
+// seedEmbeddingOutcome pushes one terminal embedding outcome through the
+// public claim→apply path: the claim marks the blob processing, the apply
+// lands the result and mirrors a ready vector into the vec0 index in the same
+// transaction. The claim uses an already-expired lease and sweeps every
+// claimable blob so the target is always among the claimed rows; blobs that
+// only happened to be swept stay reclaimable, which is as good as pending for
+// the workers under test.
+func seedEmbeddingOutcome(t *testing.T, cat *catalog.Store, hash string, status catalog.EmbeddingStatus, vector []float32, errText string) {
+	t.Helper()
+	ctx := context.Background()
+	claimed, err := cat.ClaimPendingEmbeddings(ctx, 64, time.Now().Add(-time.Minute))
+	if err != nil {
+		t.Fatalf("claim pending embeddings: %v", err)
+	}
+	claimable := false
+	for _, blob := range claimed {
+		if blob.Hash == hash {
+			claimable = true
+			break
+		}
+	}
+	if !claimable {
+		// Already past pending: only acceptable when a previous seed left the
+		// blob in exactly the requested terminal state.
+		blob, err := cat.GetBlob(ctx, hash)
+		if err != nil {
+			t.Fatalf("get blob %s: %v", hash, err)
+		}
+		if blob.EmbeddingStatus != status {
+			t.Fatalf("blob %s not claimable (status %q, want %q)", hash, blob.EmbeddingStatus, status)
+		}
+		return
+	}
+	applied, rejected, err := cat.ApplyEmbeddingResults(ctx, []catalog.EmbeddingResult{{
+		Hash:   hash,
+		Status: status,
+		Vector: vector,
+		Error:  errText,
+	}})
+	if err != nil {
+		t.Fatalf("apply embedding result %s: %v", hash, err)
+	}
+	if len(applied) != 1 || len(rejected) != 0 {
+		t.Fatalf("apply embedding result %s: applied=%v rejected=%v", hash, applied, rejected)
 	}
 }
 
@@ -146,7 +189,7 @@ func TestLoadAllBuildsIndexFromCatalogRows(t *testing.T) {
 	if len(refs) != 1 {
 		t.Fatalf("hash-a refs=%d want=1", len(refs))
 	}
-	if refs[0].AlbumID != "album-a" || refs[0].Index != 0 || refs[0].Width != 10 || refs[0].Height != 20 || refs[0].Ratio != 0.5 {
+	if refs[0].AlbumID != "album-a" || refs[0].Index != 0 || refs[0].Width != 10 || refs[0].Height != 20 {
 		t.Fatalf("unexpected hash-a ref: %+v", refs[0])
 	}
 	if hashes := svc.hashesByAlbum["album-a"]; len(hashes) != 2 {
@@ -626,10 +669,7 @@ func TestEmbeddingProgressCountsAndEnabled(t *testing.T) {
 	seedAlbum(t, cat, "album-b", catalog.Photo{Index: 0, Name: "a.jpg", Hash: "hash-shared"})
 	seedBlob(t, cat, "hash-shared")
 	seedBlob(t, cat, "hash-only-a")
-
-	if err := cat.SetBlobEmbedding(context.Background(), "hash-shared", catalog.EmbeddingStatusReady, dimVector(1), ""); err != nil {
-		t.Fatalf("set ready embedding: %v", err)
-	}
+	seedEmbeddingOutcome(t, cat, "hash-shared", catalog.EmbeddingStatusReady, dimVector(1), "")
 
 	// A service without a provider reports the coverage but says plainly that
 	// it cannot embed anything, which is what stops a client from waiting.

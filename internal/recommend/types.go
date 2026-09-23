@@ -50,7 +50,6 @@ type photoRef struct {
 	Hash    string
 	Width   int
 	Height  int
-	Ratio   float64
 }
 
 type RecommendationItem struct {

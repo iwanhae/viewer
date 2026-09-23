@@ -147,15 +147,17 @@ func TestS3StoreKeyPrefixReachesEveryRequest(t *testing.T) {
 		t.Errorf("exists=%v size=%d want true/%d", exists, size, len("image-bytes"))
 	}
 
-	if err := store.DeleteObject(ctx, "blobs/deadbeef"); err != nil {
-		t.Fatalf("DeleteObject: %v", err)
+	if err := store.DeleteObjects(ctx, []string{"blobs/deadbeef"}); err != nil {
+		t.Fatalf("DeleteObjects: %v", err)
 	}
 
+	// A batch delete does not target the object path: it POSTs the keys in an
+	// XML body on the bucket root, and the prefix rides inside the body.
 	want := []struct{ method, path string }{
 		{http.MethodPut, "/test-bucket/viewer/blobs/deadbeef"},
 		{http.MethodGet, "/test-bucket/viewer/blobs/deadbeef"},
 		{http.MethodHead, "/test-bucket/viewer/blobs/deadbeef"},
-		{http.MethodDelete, "/test-bucket/viewer/blobs/deadbeef"},
+		{http.MethodPost, "/test-bucket"},
 	}
 	got := *requests
 	if len(got) != len(want) {
@@ -165,6 +167,14 @@ func TestS3StoreKeyPrefixReachesEveryRequest(t *testing.T) {
 		if got[i].method != w.method || got[i].path != w.path {
 			t.Errorf("request %d = %s, want %s %s", i, got[i], w.method, w.path)
 		}
+	}
+	deleteReq := got[len(got)-1]
+	query, err := neturl.ParseQuery(deleteReq.query)
+	if err != nil || !query.Has("delete") {
+		t.Errorf("delete query=%q want a delete parameter", deleteReq.query)
+	}
+	if !strings.Contains(deleteReq.body, "<Key>viewer/blobs/deadbeef</Key>") {
+		t.Errorf("delete body=%q want the prefixed key", deleteReq.body)
 	}
 }
 
@@ -198,12 +208,18 @@ func TestS3StoreListObjectsStripsKeyPrefix(t *testing.T) {
 		t.Errorf("first object=%+v want etag-1 size 10", objects[0])
 	}
 
-	// A listed key must round-trip through the other methods unchanged.
-	if err := store.DeleteObject(context.Background(), objects[0].Key); err != nil {
-		t.Fatalf("DeleteObject: %v", err)
+	// A listed key must round-trip through the other methods unchanged: the
+	// batch delete carries the prefix exactly once, in the body's key.
+	if err := store.DeleteObjects(context.Background(), []string{objects[0].Key}); err != nil {
+		t.Fatalf("DeleteObjects: %v", err)
 	}
-	if path := (*requests)[1].path; path != "/test-bucket/viewer/uploads/first.zip" {
-		t.Errorf("delete path=%q want /test-bucket/viewer/uploads/first.zip", path)
+	deleteReq := (*requests)[1]
+	if deleteReq.method != http.MethodPost || deleteReq.path != "/test-bucket" {
+		t.Errorf("delete request = %s, want POST /test-bucket", deleteReq)
+	}
+	if !strings.Contains(deleteReq.body, "<Key>viewer/uploads/first.zip</Key>") ||
+		strings.Contains(deleteReq.body, "viewer/viewer/") {
+		t.Errorf("delete body=%q want viewer/uploads/first.zip prefixed exactly once", deleteReq.body)
 	}
 }
 

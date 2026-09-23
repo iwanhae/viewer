@@ -57,13 +57,6 @@ CREATE TABLE IF NOT EXISTS photos (
 CREATE INDEX IF NOT EXISTS idx_photos_hash ON photos(hash);
 `
 
-// Catalogs written before album statuses matched the wire format stored READY
-// for a finished album and PENDING for a freshly registered one. Rewrite those
-// rows so an existing database keeps working.
-const rewriteLegacyAlbumStatuses = `
-UPDATE albums SET status = 'SUCCEEDED' WHERE status = 'READY';
-UPDATE albums SET status = 'QUEUED' WHERE status = 'PENDING';`
-
 // blobEmbeddingsDDL builds the vector index over blob embeddings. The table is
 // keyed by the blob hash itself — no surrogate id — and cosine distance is
 // computed by the index, which makes pre-normalization unnecessary: cosine is

@@ -53,7 +53,7 @@ func TestServiceWithoutEmbedderReportsDisabled(t *testing.T) {
 	if svc.Enabled() {
 		t.Fatalf("Enabled()=true want=false when embedding is off")
 	}
-	if err := svc.Close(); err != nil {
+	if err := svc.close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
 }
@@ -159,7 +159,7 @@ func TestServiceEmbedsAndPersistsWithRealModel(t *testing.T) {
 	if !svc.Enabled() {
 		t.Fatalf("Enabled()=false want=true")
 	}
-	t.Cleanup(func() { _ = svc.Close() })
+	t.Cleanup(func() { _ = svc.close() })
 	if err := svc.LoadModel(ctx); err != nil {
 		t.Fatalf("LoadModel: %v", err)
 	}
@@ -175,9 +175,7 @@ func TestServiceEmbedsAndPersistsWithRealModel(t *testing.T) {
 	if got, want := len(vector), 768; got != want {
 		t.Fatalf("embedding length=%d want=%d", got, want)
 	}
-	if err := cat.SetBlobEmbedding(ctx, "hash-a", catalog.EmbeddingStatusReady, vector, ""); err != nil {
-		t.Fatalf("persist embedding: %v", err)
-	}
+	seedEmbeddingOutcome(t, cat, "hash-a", catalog.EmbeddingStatusReady, vector, "")
 
 	blob, err := cat.GetBlob(ctx, "hash-a")
 	if err != nil {

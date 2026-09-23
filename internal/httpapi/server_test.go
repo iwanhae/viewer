@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"viewer/internal/albums"
@@ -153,7 +154,12 @@ func testFeedService() *feed.Service {
 
 // seedEmbeddingFixture creates one ready album with three distinct blobs: one
 // embedded, one failed and one still pending, so every count is non-zero and
-// distinguishable.
+// distinguishable. The terminal outcomes go through the public claim→apply
+// path: the claim marks the blobs processing (with an already-expired lease,
+// so they stay reclaimable), and the apply lands both results in one
+// transaction, mirroring the ready vector into the vec0 index. hash-c is never
+// applied for, so it counts as pending — counts derive pending as
+// total-ready-failed, which processing blobs still fall under.
 func seedEmbeddingFixture(t *testing.T, cat *catalog.Store) {
 	t.Helper()
 
@@ -178,11 +184,31 @@ func seedEmbeddingFixture(t *testing.T, cat *catalog.Store) {
 			t.Fatalf("upsert blob: %v", err)
 		}
 	}
-	if err := cat.SetBlobEmbedding(ctx, "hash-a", catalog.EmbeddingStatusReady, make([]float32, catalog.EmbeddingDim), ""); err != nil {
-		t.Fatalf("set ready embedding: %v", err)
+	claimed, err := cat.ClaimPendingEmbeddings(ctx, 64, time.Now().Add(-time.Minute))
+	if err != nil {
+		t.Fatalf("claim pending embeddings: %v", err)
 	}
-	if err := cat.SetBlobEmbedding(ctx, "hash-b", catalog.EmbeddingStatusFailed, nil, "embed failed"); err != nil {
-		t.Fatalf("set failed embedding: %v", err)
+	claimable := make(map[string]bool, len(claimed))
+	for _, blob := range claimed {
+		claimable[blob.Hash] = true
+	}
+	if !claimable["hash-a"] || !claimable["hash-b"] {
+		t.Fatalf("claim pending embeddings: got %v, want hash-a and hash-b claimable", claimable)
+	}
+	applied, rejected, err := cat.ApplyEmbeddingResults(ctx, []catalog.EmbeddingResult{
+		{Hash: "hash-a", Status: catalog.EmbeddingStatusReady, Vector: make([]float32, catalog.EmbeddingDim)},
+		{Hash: "hash-b", Status: catalog.EmbeddingStatusFailed, Error: "embed failed"},
+	})
+	if err != nil {
+		t.Fatalf("apply embedding results: %v", err)
+	}
+	if len(applied) != 2 || len(rejected) != 0 {
+		t.Fatalf("apply embedding results: applied=%v rejected=%v", applied, rejected)
+	}
+	// The claim swept hash-c along with the two targets; hand it back so the
+	// fixture's "still pending" blob really is pending, not processing.
+	if err := cat.ReleaseEmbeddingClaims(ctx, []string{"hash-c"}); err != nil {
+		t.Fatalf("release hash-c claim: %v", err)
 	}
 }
 

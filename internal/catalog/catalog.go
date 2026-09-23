@@ -701,13 +701,13 @@ func (s *Store) GetBlob(ctx context.Context, hash string) (*Blob, error) {
 	return &blob, nil
 }
 
-// SetBlobEmbedding is the unconditional low-level write for a blob's embedding
+// setBlobEmbedding is the unconditional low-level write for a blob's embedding
 // outcome: it overwrites whichever status the blob currently has, and keeps the
 // vec0 index in lockstep — a ready vector is (re-)indexed, any other status
 // un-indexes the blob. Production workers must go through
 // ClaimPendingEmbeddings + ApplyEmbeddingResults so a terminal result can never
 // be clobbered; this stays for tests and one-off administrative fixes.
-func (s *Store) SetBlobEmbedding(ctx context.Context, hash string, status EmbeddingStatus, vector []float32, errorText string) error {
+func (s *Store) setBlobEmbedding(ctx context.Context, hash string, status EmbeddingStatus, vector []float32, errorText string) error {
 	// The vec0 column is typed float[EmbeddingDim]: a wrong-length vector
 	// would fail the index insert mid-transaction, so refuse it up front.
 	if status == EmbeddingStatusReady && len(vector) != EmbeddingDim {
@@ -1082,18 +1082,6 @@ func truncateErrorText(text string) string {
 		cut = cut[:len(cut)-1]
 	}
 	return cut
-}
-
-// IndexedEmbeddingCount reports how many vectors the blob_embeddings index
-// holds. Compared against EmbeddingCounts' Ready it exposes index drift: the
-// two differ only while embeddings are in flight or when a backfill skipped a
-// malformed row.
-func (s *Store) IndexedEmbeddingCount(ctx context.Context) (int, error) {
-	var count int
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM blob_embeddings`).Scan(&count); err != nil {
-		return 0, fmt.Errorf("count indexed embeddings: %w", err)
-	}
-	return count, nil
 }
 
 // EmbeddingCounts reports embedding coverage across distinct blobs.

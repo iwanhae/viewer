@@ -82,7 +82,7 @@ func (s *S3Store) physicalKey(key string) string {
 }
 
 // logicalKey is the inverse of physicalKey. Callers only ever see logical keys,
-// so a listed object can be fed straight back into CopyObject or DeleteObject.
+// so a listed object can be fed straight back into CopyObject or DeleteObjects.
 func (s *S3Store) logicalKey(key string) string {
 	return strings.TrimPrefix(key, s.prefix)
 }
@@ -177,21 +177,6 @@ func (s *S3Store) StatObject(ctx context.Context, key string) (Object, bool, err
 		Size:         aws.ToInt64(o.ContentLength),
 		ETag:         aws.ToString(o.ETag),
 	}, true, nil
-}
-
-func (s *S3Store) DeleteObject(ctx context.Context, key string) error {
-	key = strings.TrimSpace(key)
-	if key == "" {
-		return fmt.Errorf("key is required")
-	}
-	_, err := s.client.DeleteObject(ctx, &s3.DeleteObjectInput{
-		Bucket: aws.String(s.bucket),
-		Key:    aws.String(s.physicalKey(key)),
-	})
-	if err != nil {
-		return fmt.Errorf("delete object %s: %w", key, err)
-	}
-	return nil
 }
 
 // maxDeleteObjectsPerRequest is the DeleteObjects API's per-request key limit.

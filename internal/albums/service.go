@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sort"
 	"strings"
 	"time"
 
@@ -373,50 +372,6 @@ func (s *Service) ReadyAlbumCovers(ctx context.Context) ([]models.AlbumCoverEntr
 		})
 	}
 	return out, nil
-}
-
-// AllAlbums returns every ready album with its photos.
-func (s *Service) AllAlbums() []*models.AlbumIndex {
-	if s == nil || s.catalog == nil {
-		return nil
-	}
-	ctx := context.Background()
-	albumsList, err := s.catalog.ListAlbumsByStatus(ctx, catalog.AlbumStatusReady)
-	if err != nil {
-		return nil
-	}
-	photos, err := s.catalog.ListReadyAlbumPhotos(ctx)
-	if err != nil {
-		return nil
-	}
-
-	photosByAlbum := make(map[string][]models.PhotoMeta, len(albumsList))
-	for _, photo := range photos {
-		photosByAlbum[photo.AlbumID] = append(photosByAlbum[photo.AlbumID], photoMetaFromRow(photo))
-	}
-
-	out := make([]*models.AlbumIndex, 0, len(albumsList))
-	for _, album := range albumsList {
-		albumPhotos := photosByAlbum[album.ID]
-		if len(albumPhotos) == 0 {
-			continue
-		}
-		out = append(out, &models.AlbumIndex{
-			AlbumID:          album.ID,
-			OriginalFilename: album.OriginalFilename,
-			CreatedAt:        album.CreatedAt,
-			PhotoCount:       len(albumPhotos),
-			Photos:           albumPhotos,
-		})
-	}
-
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].AlbumID != out[j].AlbumID {
-			return out[i].AlbumID < out[j].AlbumID
-		}
-		return out[i].CreatedAt < out[j].CreatedAt
-	})
-	return out
 }
 
 func albumIndexFromRows(album *catalog.Album, photos []catalog.Photo) *models.AlbumIndex {

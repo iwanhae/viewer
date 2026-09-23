@@ -57,7 +57,6 @@ type Service struct {
 	onEmbeddingDrain func(ctx context.Context) error
 
 	startOnce sync.Once
-	startErr  error
 
 	// modelMu guards model loading and modelErr. A failed load marks the
 	// embedder unusable so the ingest pipeline keeps blobs pending instead of
@@ -129,8 +128,8 @@ func (s *Service) Enabled() bool {
 	return s.modelErr == nil
 }
 
-// Close releases the embedding model.
-func (s *Service) Close() error {
+// close releases the embedding model.
+func (s *Service) close() error {
 	if s == nil || s.embedder == nil {
 		return nil
 	}
@@ -219,7 +218,6 @@ func (s *Service) addPairLocked(pair catalog.PhotoWithBlob) {
 		Hash:    hash,
 		Width:   pair.Photo.Width,
 		Height:  pair.Photo.Height,
-		Ratio:   pair.Photo.Ratio,
 	})
 	if s.hashesByAlbum[pair.Photo.AlbumID] == nil {
 		s.hashesByAlbum[pair.Photo.AlbumID] = make(map[string]struct{})
@@ -244,25 +242,22 @@ func (s *Service) removeHashForAlbumLocked(hash string, albumID string) {
 }
 
 // Start launches the background embedding workers.
-func (s *Service) Start(ctx context.Context) error {
+func (s *Service) Start(ctx context.Context) {
 	s.startOnce.Do(func() {
 		if !s.Enabled() {
-			s.startErr = nil
 			return
 		}
 
 		go func() {
 			<-ctx.Done()
-			_ = s.Close()
+			_ = s.close()
 		}()
 
 		concurrency := embeddingConcurrency
 		for i := 0; i < concurrency; i++ {
 			go s.workerLoop(ctx)
 		}
-		s.startErr = nil
 	})
-	return s.startErr
 }
 
 func (s *Service) workerLoop(ctx context.Context) {
@@ -637,8 +632,9 @@ func (s *Service) embedBlob(ctx context.Context, hash string) bool {
 	return false
 }
 
-// persistFailed records a permanent failure for a claimed blob and reflects it
-// in the in-memory index.
+// persistFailed records a permanent failure for a claimed blob in the catalog:
+// ApplyEmbeddingResults flips the blob to the failed status, which takes it out
+// of the pending queue for good and counts it as done in the progress counts.
 func (s *Service) persistFailed(ctx context.Context, hash string, errText string) {
 	applied, rejected, err := s.ApplyEmbeddingResults(ctx, []catalog.EmbeddingResult{{
 		Hash:   hash,

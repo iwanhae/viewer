@@ -207,7 +207,7 @@ func TestBlobUpsertPreservesEmbedding(t *testing.T) {
 	if err := store.UpsertBlob(ctx, Blob{Hash: "hash-a", SizeBytes: 11, ContentType: "image/png"}); err != nil {
 		t.Fatalf("upsert blob: %v", err)
 	}
-	if err := store.SetBlobEmbedding(ctx, "hash-a", EmbeddingStatusReady, vec768(0.25, -1, 3), ""); err != nil {
+	if err := store.setBlobEmbedding(ctx, "hash-a", EmbeddingStatusReady, vec768(0.25, -1, 3), ""); err != nil {
 		t.Fatalf("set embedding: %v", err)
 	}
 
@@ -244,10 +244,10 @@ func TestEmbeddingCountsAndClaim(t *testing.T) {
 			t.Fatalf("upsert blob %s: %v", hash, err)
 		}
 	}
-	if err := store.SetBlobEmbedding(ctx, "ready", EmbeddingStatusReady, vec768(1), ""); err != nil {
+	if err := store.setBlobEmbedding(ctx, "ready", EmbeddingStatusReady, vec768(1), ""); err != nil {
 		t.Fatalf("set ready: %v", err)
 	}
-	if err := store.SetBlobEmbedding(ctx, "failed", EmbeddingStatusFailed, nil, "boom"); err != nil {
+	if err := store.setBlobEmbedding(ctx, "failed", EmbeddingStatusFailed, nil, "boom"); err != nil {
 		t.Fatalf("set failed: %v", err)
 	}
 
@@ -812,7 +812,7 @@ func TestBackupToRoundTrips(t *testing.T) {
 	if err := store.UpsertBlob(ctx, Blob{Hash: "hash-a", SizeBytes: 5, ContentType: "image/png"}); err != nil {
 		t.Fatalf("upsert blob: %v", err)
 	}
-	if err := store.SetBlobEmbedding(ctx, "hash-a", EmbeddingStatusReady, vec768(0.5, -2), ""); err != nil {
+	if err := store.setBlobEmbedding(ctx, "hash-a", EmbeddingStatusReady, vec768(0.5, -2), ""); err != nil {
 		t.Fatalf("set embedding: %v", err)
 	}
 	if err := store.InsertPhoto(ctx, Photo{AlbumID: "album-a", Index: 0, Name: "a.png", Hash: "hash-a", Width: 2, Height: 1, Ratio: 2}); err != nil {
@@ -917,7 +917,7 @@ func TestEmbeddingCountsByAlbumCountsSharedBlobsPerAlbum(t *testing.T) {
 			t.Fatalf("upsert blob %s: %v", hash, err)
 		}
 	}
-	if err := store.SetBlobEmbedding(ctx, "hash-shared", EmbeddingStatusReady, vec768(1, 0), ""); err != nil {
+	if err := store.setBlobEmbedding(ctx, "hash-shared", EmbeddingStatusReady, vec768(1, 0), ""); err != nil {
 		t.Fatalf("set embedding: %v", err)
 	}
 
@@ -1076,13 +1076,13 @@ func TestFindNeighborEmbeddingsOrdersAndBreaksTiesByHash(t *testing.T) {
 	}
 	// hash-a and hash-z point the same way; hash-m points elsewhere. Cosine
 	// ignores length, so the doubled vector ranks identically to the original.
-	if err := store.SetBlobEmbedding(ctx, "hash-a", EmbeddingStatusReady, vec768(1), ""); err != nil {
+	if err := store.setBlobEmbedding(ctx, "hash-a", EmbeddingStatusReady, vec768(1), ""); err != nil {
 		t.Fatalf("set hash-a: %v", err)
 	}
-	if err := store.SetBlobEmbedding(ctx, "hash-z", EmbeddingStatusReady, vec768(2), ""); err != nil {
+	if err := store.setBlobEmbedding(ctx, "hash-z", EmbeddingStatusReady, vec768(2), ""); err != nil {
 		t.Fatalf("set hash-z: %v", err)
 	}
-	if err := store.SetBlobEmbedding(ctx, "hash-m", EmbeddingStatusReady, vec768(-1), ""); err != nil {
+	if err := store.setBlobEmbedding(ctx, "hash-m", EmbeddingStatusReady, vec768(-1), ""); err != nil {
 		t.Fatalf("set hash-m: %v", err)
 	}
 
@@ -1240,7 +1240,7 @@ func TestSetBlobEmbeddingSyncsVectorIndex(t *testing.T) {
 	ctx := context.Background()
 
 	// No blob row: refuse, and leave nothing in the index.
-	if err := store.SetBlobEmbedding(ctx, "ghost", EmbeddingStatusReady, vec768(1), ""); !errors.Is(err, ErrBlobNotFound) {
+	if err := store.setBlobEmbedding(ctx, "ghost", EmbeddingStatusReady, vec768(1), ""); !errors.Is(err, ErrBlobNotFound) {
 		t.Fatalf("set on unknown hash: err=%v want ErrBlobNotFound", err)
 	}
 	neighbors, err := store.FindNeighborEmbeddings(ctx, vec768(1), 10)
@@ -1251,7 +1251,7 @@ func TestSetBlobEmbeddingSyncsVectorIndex(t *testing.T) {
 	if err := store.UpsertBlob(ctx, Blob{Hash: "hash-a", SizeBytes: 1}); err != nil {
 		t.Fatalf("upsert blob: %v", err)
 	}
-	if err := store.SetBlobEmbedding(ctx, "hash-a", EmbeddingStatusReady, vec768(1), ""); err != nil {
+	if err := store.setBlobEmbedding(ctx, "hash-a", EmbeddingStatusReady, vec768(1), ""); err != nil {
 		t.Fatalf("set ready: %v", err)
 	}
 	neighbors, err = store.FindNeighborEmbeddings(ctx, vec768(1), 10)
@@ -1261,7 +1261,7 @@ func TestSetBlobEmbeddingSyncsVectorIndex(t *testing.T) {
 
 	// An overwrite replaces the stored and indexed vector instead of
 	// colliding with it.
-	if err := store.SetBlobEmbedding(ctx, "hash-a", EmbeddingStatusReady, vec768(-1), ""); err != nil {
+	if err := store.setBlobEmbedding(ctx, "hash-a", EmbeddingStatusReady, vec768(-1), ""); err != nil {
 		t.Fatalf("overwrite ready: %v", err)
 	}
 	blob, err := store.GetBlob(ctx, "hash-a")
@@ -1278,12 +1278,12 @@ func TestSetBlobEmbeddingSyncsVectorIndex(t *testing.T) {
 	}
 
 	// A wrong-sized vector is refused up front and changes nothing.
-	if err := store.SetBlobEmbedding(ctx, "hash-a", EmbeddingStatusReady, vec768(1)[:3], ""); err == nil {
+	if err := store.setBlobEmbedding(ctx, "hash-a", EmbeddingStatusReady, vec768(1)[:3], ""); err == nil {
 		t.Fatalf("expected error for wrong-dim vector")
 	}
 
 	// Demoting to failed un-indexes the blob.
-	if err := store.SetBlobEmbedding(ctx, "hash-a", EmbeddingStatusFailed, nil, "boom"); err != nil {
+	if err := store.setBlobEmbedding(ctx, "hash-a", EmbeddingStatusFailed, nil, "boom"); err != nil {
 		t.Fatalf("demote to failed: %v", err)
 	}
 	neighbors, err = store.FindNeighborEmbeddings(ctx, vec768(-1), 10)

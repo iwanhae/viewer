@@ -535,26 +535,6 @@ func inputShape(imageSize, batch int) shapes.Shape {
 	return shapes.Make(dtypes.Float32, batch, imageChannels, imageSize, imageSize)
 }
 
-// Embeds computes embeddings for a batch of preprocessed images.
-//
-// The graph is compiled for a single image; images are pushed through it one at
-// a time. On the pure-Go backend one image already saturates the CPU, so a
-// wider graph would not make the batch faster.
-func (m *Model) Embeds(ctx context.Context, batch []Image) ([][]float32, error) {
-	if len(batch) == 0 {
-		return nil, nil
-	}
-	vectors := make([][]float32, len(batch))
-	for i := range batch {
-		vector, err := m.Embed(ctx, batch[i])
-		if err != nil {
-			return nil, fmt.Errorf("image %d: %w", i, err)
-		}
-		vectors[i] = vector
-	}
-	return vectors, nil
-}
-
 // Embed computes the embedding of a single preprocessed image.
 func (m *Model) Embed(ctx context.Context, image Image) ([]float32, error) {
 	if err := ctx.Err(); err != nil {
@@ -587,17 +567,8 @@ func (m *Model) Embed(ctx context.Context, image Image) ([]float32, error) {
 	return values[0], nil
 }
 
-// EmbedDim reports the length of the produced embedding vectors.
-func (m *Model) EmbedDim() int { return m.embedDim }
-
 // ImageSize reports the square input side the tower expects.
 func (m *Model) ImageSize() int { return m.imageSize }
-
-// Backend reports the GoMLX backend name backing the model.
-func (m *Model) Backend() string { return m.config.Backend }
-
-// ModelID reports the checkpoint the model was loaded from.
-func (m *Model) ModelID() string { return m.config.ModelID }
 
 // Describe returns a human readable summary for logs.
 func (m *Model) Describe() string {

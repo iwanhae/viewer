@@ -149,10 +149,7 @@ func Run(ctx context.Context) error {
 			return
 		}
 		log.Printf("viewer: recommendation service enabled (model=%s)", cfgpkg.ModelDir)
-		if err := recommendService.Start(ctx); err != nil {
-			log.Printf("viewer: embedding worker startup failed: %v", err)
-			return
-		}
+		recommendService.Start(ctx)
 		log.Printf("viewer: embedding background workers started")
 	}()
 
