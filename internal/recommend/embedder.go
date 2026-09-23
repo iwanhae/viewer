@@ -74,6 +74,22 @@ func (v *VisionEmbedder) Embed(ctx context.Context, imageBytes []byte) ([]float3
 	return vector, nil
 }
 
+// EmbedText computes the query-side embedding of one natural-language query.
+// It is the text half of the dual-tower model: the query vector lands in the
+// same space as the image embeddings, which is what lets a text vector search
+// the photo points directly.
+func (v *VisionEmbedder) EmbedText(ctx context.Context, text string) ([]float32, error) {
+	if err := v.Load(ctx); err != nil {
+		return nil, err
+	}
+
+	vector, err := v.model.EmbedText(ctx, text)
+	if err != nil {
+		return nil, fmt.Errorf("embed text: %w", err)
+	}
+	return vector, nil
+}
+
 // Close releases the compiled graph.
 func (v *VisionEmbedder) Close() error {
 	if v.model == nil {

@@ -188,6 +188,46 @@ func (f *fakeVectorStore) GroupSearch(_ context.Context, queryPointID, excludeAl
 	return hits, nil
 }
 
+// SearchByVector ranks every stored point against the query vector by honest
+// cosine similarity. Unlike GroupSearch there is no exclusion and no album
+// grouping: search must see every photo.
+func (f *fakeVectorStore) SearchByVector(_ context.Context, vector []float32, limit int) ([]qdrant.PhotoHit, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	type scored struct {
+		record qdrant.PhotoRecord
+		score  float64
+	}
+	matches := make([]scored, 0, len(f.points))
+	for _, record := range f.points {
+		matches = append(matches, scored{record: record, score: cosineSimilarity(vector, record.Vector)})
+	}
+	sort.Slice(matches, func(i, j int) bool {
+		if matches[i].score != matches[j].score {
+			return matches[i].score > matches[j].score
+		}
+		if matches[i].record.AlbumID != matches[j].record.AlbumID {
+			return matches[i].record.AlbumID < matches[j].record.AlbumID
+		}
+		return matches[i].record.Idx < matches[j].record.Idx
+	})
+	hits := make([]qdrant.PhotoHit, 0, limit)
+	for _, match := range matches {
+		if len(hits) == limit {
+			break
+		}
+		hits = append(hits, qdrant.PhotoHit{
+			AlbumID: match.record.AlbumID,
+			Idx:     match.record.Idx,
+			Hash:    match.record.Hash,
+			W:       match.record.W,
+			H:       match.record.H,
+			Score:   match.score,
+		})
+	}
+	return hits, nil
+}
+
 func (f *fakeVectorStore) RetrieveVectorsByHashes(_ context.Context, hashes []string) (map[string][]float32, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -564,5 +604,99 @@ func TestFinalizeUnknownAlbumReturnsNotFound(t *testing.T) {
 	rec := harness.do(t, http.MethodPost, "/api/albums/missing/finalize", nil)
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("status=%d want=404 body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+// textSearchEmbedder is the text-capable variant of stubEmbedder: it satisfies
+// both recommend provider interfaces, so the photo-search endpoint can be
+// driven end to end without a checkpoint. Every query maps to one fixed vector.
+type textSearchEmbedder struct {
+	vector []float32
+}
+
+func (e textSearchEmbedder) Load(context.Context) error { return nil }
+
+func (e textSearchEmbedder) Embed(context.Context, []byte) ([]float32, error) {
+	return nil, errors.New("stub embedder must not be called")
+}
+
+func (e textSearchEmbedder) Close() error { return nil }
+
+func (e textSearchEmbedder) EmbedText(context.Context, string) ([]float32, error) {
+	return e.vector, nil
+}
+
+// searchVector builds a full-length embedding from a short leading direction,
+// mirroring the vec768 helper the recommend tests use.
+func searchVector(lead ...float32) []float32 {
+	vector := make([]float32, catalog.EmbeddingDim)
+	copy(vector, lead)
+	return vector
+}
+
+// TestPhotoSearchWithoutTextEmbeddingReportsUnavailable covers the deployment
+// with an image-only embedder: the harness's stub has no text half, so the
+// endpoint answers with the same 503 UNAVAILABLE shape as a disabled feature
+// rather than a 500.
+func TestPhotoSearchWithoutTextEmbeddingReportsUnavailable(t *testing.T) {
+	harness := newFlowHarness(t)
+	rec := harness.do(t, http.MethodGet, "/api/photos/search?q=a%20sunny%20beach", nil)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d want=%d body=%s", rec.Code, http.StatusServiceUnavailable, rec.Body.String())
+	}
+	if !bytes.Contains(rec.Body.Bytes(), []byte(`"code":"UNAVAILABLE"`)) {
+		t.Fatalf("expected UNAVAILABLE error code in body, got: %s", rec.Body.String())
+	}
+}
+
+// TestPhotoSearchReturnsRankedItems drives the search endpoint end to end: the
+// query is embedded by the text-capable stub, the store ranks by cosine, and
+// the response reuses the recommendation item shape on the wire.
+func TestPhotoSearchReturnsRankedItems(t *testing.T) {
+	cat, err := catalog.Open(filepath.Join(t.TempDir(), "catalog.db"), nil)
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	defer cat.Close()
+	seedEmbeddingFixture(t, cat)
+
+	query := searchVector(1, 0.2)
+	vectors := newFakeVectorStore()
+	if err := vectors.UpsertPhotos(context.Background(), []qdrant.PhotoRecord{
+		{AlbumID: "album-a", Idx: 0, Hash: "hash-a", W: 10, H: 10, Vector: searchVector(1, 0.2)},
+		{AlbumID: "album-a", Idx: 1, Hash: "hash-b", W: 10, H: 10, Vector: searchVector(0, 1)},
+		{AlbumID: "album-a", Idx: 2, Hash: "hash-c", W: 10, H: 10, Vector: searchVector(0.99, 0.02)},
+	}); err != nil {
+		t.Fatalf("seed points: %v", err)
+	}
+
+	recommendService := recommend.NewService(cat, vectors, nil, textSearchEmbedder{vector: query}, nil)
+	router := New(nil, nil, nil, recommendService, "", nil, "").Router()
+
+	req := httptest.NewRequest(http.MethodGet, "/api/photos/search?q=coastline&limit=2", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d want=%d body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	var resp recommend.RecommendationResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	// Descending cosine against [1, 0.2]: hash-a is identical (score 1),
+	// hash-c nearly parallel, hash-b nearly orthogonal and cut by the limit.
+	if len(resp.Items) != 2 {
+		t.Fatalf("items=%d want=2: %+v", len(resp.Items), resp.Items)
+	}
+	if resp.Items[0].Hash != "hash-a" || resp.Items[1].Hash != "hash-c" {
+		t.Fatalf("unexpected ranking: %+v", resp.Items)
+	}
+	first := resp.Items[0]
+	if first.AlbumID != "album-a" || first.I != 0 || first.W != 10 || first.H != 10 {
+		t.Fatalf("unexpected item shape: %+v", first)
+	}
+	if first.Score < 0.9999 {
+		t.Fatalf("score=%v want ~1 for an identical vector", first.Score)
 	}
 }

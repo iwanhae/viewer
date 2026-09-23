@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -175,15 +176,24 @@ func nanVector() []float32 {
 // are keyed by the same deterministic point IDs, GroupSearch really ranks by
 // cosine and applies the same exclusions, and every operation is recorded so
 // tests can pin the order writes happen in.
+// searchCall records one SearchByVector call, so a test can pin the vector and
+// the limit the service forwarded to the store.
+type searchCall struct {
+	vector []float32
+	limit  int
+}
+
 type fakeVectorStore struct {
 	mu            sync.Mutex
 	points        map[string]qdrant.PhotoRecord
 	ensureCalls   int
 	upsertBatches [][]qdrant.PhotoRecord
 	ops           []string
+	searches      []searchCall
 	ensureErr     error
 	upsertErr     error
 	groupErr      error
+	searchErr     error
 }
 
 func newFakeVectorStore() *fakeVectorStore {
@@ -269,6 +279,51 @@ func (f *fakeVectorStore) GroupSearch(ctx context.Context, queryPointID, exclude
 	return hits, nil
 }
 
+// SearchByVector ranks every stored point against the query vector by honest
+// cosine similarity. Unlike GroupSearch there is no exclusion and no album
+// grouping: search must see every photo, so ties break on album then idx only
+// to keep the order deterministic.
+func (f *fakeVectorStore) SearchByVector(_ context.Context, vector []float32, limit int) ([]qdrant.PhotoHit, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.searches = append(f.searches, searchCall{vector: append([]float32(nil), vector...), limit: limit})
+	if f.searchErr != nil {
+		return nil, f.searchErr
+	}
+	type scored struct {
+		record qdrant.PhotoRecord
+		score  float64
+	}
+	matches := make([]scored, 0, len(f.points))
+	for _, record := range f.points {
+		matches = append(matches, scored{record: record, score: cosine(vector, record.Vector)})
+	}
+	sort.Slice(matches, func(i, j int) bool {
+		if matches[i].score != matches[j].score {
+			return matches[i].score > matches[j].score
+		}
+		if matches[i].record.AlbumID != matches[j].record.AlbumID {
+			return matches[i].record.AlbumID < matches[j].record.AlbumID
+		}
+		return matches[i].record.Idx < matches[j].record.Idx
+	})
+	hits := make([]qdrant.PhotoHit, 0, limit)
+	for _, match := range matches {
+		if len(hits) == limit {
+			break
+		}
+		hits = append(hits, qdrant.PhotoHit{
+			AlbumID: match.record.AlbumID,
+			Idx:     match.record.Idx,
+			Hash:    match.record.Hash,
+			W:       match.record.W,
+			H:       match.record.H,
+			Score:   match.score,
+		})
+	}
+	return hits, nil
+}
+
 func (f *fakeVectorStore) RetrieveVectorsByHashes(ctx context.Context, hashes []string) (map[string][]float32, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -324,6 +379,21 @@ func (f *fakeVectorStore) resetOps() {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.ops = nil
+}
+
+// searchCalls returns copies of the recorded SearchByVector calls.
+func (f *fakeVectorStore) searchCalls() []searchCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]searchCall(nil), f.searches...)
+}
+
+// resetSearches drops the recorded search calls, so a test can bracket one
+// query and assert on exactly its store call.
+func (f *fakeVectorStore) resetSearches() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.searches = nil
 }
 
 // cosine is the honest ranking the fake promises: scale-invariant similarity in
@@ -633,6 +703,197 @@ func TestRecommendLimitClamping(t *testing.T) {
 			t.Fatalf("duplicate album %q in %+v", item.AlbumID, resp.Items)
 		}
 		seen[item.AlbumID] = struct{}{}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Search
+// ---------------------------------------------------------------------------
+
+// textEmbedder is a dual-capability stub: it satisfies EmbeddingProvider so it
+// can be wired into the service, and TextEmbeddingProvider so Search can reach
+// the query half. Every query maps to one fixed vector, which is what makes
+// the ranking assertable; the image half must never run in the search tests.
+type textEmbedder struct {
+	vector []float32
+	err    error
+}
+
+func (e *textEmbedder) Load(context.Context) error { return nil }
+
+func (e *textEmbedder) Embed(context.Context, []byte) ([]float32, error) {
+	return nil, errors.New("image embedding must not run in the search tests")
+}
+
+func (e *textEmbedder) Close() error { return nil }
+
+func (e *textEmbedder) EmbedText(context.Context, string) ([]float32, error) {
+	if e.err != nil {
+		return nil, e.err
+	}
+	return e.vector, nil
+}
+
+// TestSearchRanksPhotosByCosine seeds the store directly — Search never
+// touches the catalog — and pins the contract that separates search from
+// Recommend: every matching photo comes back in descending cosine order,
+// duplicates and all, with the photo fields and the raw score carried onto
+// the wire unchanged.
+func TestSearchRanksPhotosByCosine(t *testing.T) {
+	store := newFakeVectorStore()
+	stub := &textEmbedder{vector: vec768(1, 0)}
+	svc := newTestService(t, nil, store, stub)
+	ctx := context.Background()
+
+	// vec768 encodes short directions at full width, so the cosines against the
+	// [1, 0] query are, best first: 0.9998, 0.9988, 0.7071 and 0.
+	if err := store.UpsertPhotos(ctx, []qdrant.PhotoRecord{
+		{AlbumID: "album-a", Idx: 0, Hash: "hash-near", W: 800, H: 600, Vector: vec768(1, 0.05)},
+		{AlbumID: "album-a", Idx: 1, Hash: "hash-twin", W: 800, H: 600, Vector: vec768(0.99, 0.02)},
+		{AlbumID: "album-b", Idx: 0, Hash: "hash-mid", W: 800, H: 600, Vector: vec768(0.7, 0.7)},
+		{AlbumID: "album-b", Idx: 1, Hash: "hash-far", W: 800, H: 600, Vector: vec768(0, 1)},
+	}); err != nil {
+		t.Fatalf("seed points: %v", err)
+	}
+
+	resp, err := svc.Search(ctx, "a sunny beach", 10)
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	wantHashes := []string{"hash-twin", "hash-near", "hash-mid", "hash-far"}
+	if len(resp.Items) != len(wantHashes) {
+		t.Fatalf("items=%d want=%d (search returns every photo, no album grouping): %+v", len(resp.Items), len(wantHashes), resp.Items)
+	}
+	for i, hash := range wantHashes {
+		if resp.Items[i].Hash != hash {
+			t.Fatalf("item %d = %+v, want hash %s (descending cosine)", i, resp.Items[i], hash)
+		}
+	}
+	if !approxEqual(resp.Items[0].Score, cosine(stub.vector, vec768(0.99, 0.02))) {
+		t.Fatalf("score=%v want the cosine similarity", resp.Items[0].Score)
+	}
+	if resp.Items[0].AlbumID != "album-a" || resp.Items[0].I != 1 || resp.Items[0].W != 800 || resp.Items[0].H != 600 {
+		t.Fatalf("photo fields did not carry through: %+v", resp.Items[0])
+	}
+
+	// The store was asked once, with exactly the embedded query vector.
+	calls := store.searchCalls()
+	if len(calls) != 1 {
+		t.Fatalf("store calls=%d want=1", len(calls))
+	}
+	if !reflect.DeepEqual(calls[0].vector, stub.vector) || calls[0].limit != 10 {
+		t.Fatalf("store call carried vector %v limit %d, want the query vector at limit 10", calls[0].vector, calls[0].limit)
+	}
+}
+
+// TestSearchLimitClampsBeforeTheStoreQuery pins the clamping where it matters:
+// the store is asked for exactly the clamped limit, so the clamp is observable
+// in the recorded call rather than only in a trimmed response.
+func TestSearchLimitClampsBeforeTheStoreQuery(t *testing.T) {
+	store := newFakeVectorStore()
+	svc := newTestService(t, nil, store, &textEmbedder{vector: vec768(1)})
+	ctx := context.Background()
+
+	cases := []struct {
+		name  string
+		limit int
+		want  int
+	}{
+		{name: "zero gets the default", limit: 0, want: defaultSearchTopK},
+		{name: "negative gets the default", limit: -3, want: defaultSearchTopK},
+		{name: "requested limit passes through", limit: 1, want: 1},
+		{name: "oversized limit clamps to the max", limit: 1000, want: maxSearchTopK},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store.resetSearches()
+			if _, err := svc.Search(ctx, "anything", tc.limit); err != nil {
+				t.Fatalf("Search: %v", err)
+			}
+			calls := store.searchCalls()
+			if len(calls) != 1 {
+				t.Fatalf("store calls=%d want=1", len(calls))
+			}
+			if calls[0].limit != tc.want {
+				t.Fatalf("store limit=%d want=%d", calls[0].limit, tc.want)
+			}
+		})
+	}
+}
+
+func TestSearchWithoutVectorStoreReportsUnavailable(t *testing.T) {
+	svc := newTestService(t, nil, nil, &textEmbedder{vector: vec768(1)})
+	resp, err := svc.Search(context.Background(), "a query", 10)
+	if !errors.Is(err, ErrVectorStoreUnavailable) {
+		t.Fatalf("err=%v want ErrVectorStoreUnavailable", err)
+	}
+	if resp.Items != nil {
+		t.Fatalf("expected zero-value response on error, got %+v", resp)
+	}
+}
+
+// TestSearchWithoutTextEmbeddingReportsUnavailable covers the capability
+// check: gateEmbedder is an image-only provider, so the type assertion inside
+// Search must fail softly with ErrTextEmbeddingUnavailable — and the store
+// must never be asked for anything.
+func TestSearchWithoutTextEmbeddingReportsUnavailable(t *testing.T) {
+	store := newFakeVectorStore()
+	svc := newTestService(t, nil, store, &gateEmbedder{started: make(chan struct{}), release: make(chan struct{})})
+	resp, err := svc.Search(context.Background(), "a query", 10)
+	if !errors.Is(err, ErrTextEmbeddingUnavailable) {
+		t.Fatalf("err=%v want ErrTextEmbeddingUnavailable", err)
+	}
+	if errors.Is(err, ErrVectorStoreUnavailable) {
+		t.Fatalf("err=%v must not report the store unavailable", err)
+	}
+	if resp.Items != nil {
+		t.Fatalf("expected zero-value response on error, got %+v", resp)
+	}
+	if calls := store.searchCalls(); len(calls) != 0 {
+		t.Fatalf("store was queried despite no text embedder: %+v", calls)
+	}
+}
+
+func TestSearchRejectsBlankQuery(t *testing.T) {
+	store := newFakeVectorStore()
+	svc := newTestService(t, nil, store, &textEmbedder{vector: vec768(1)})
+	for _, query := range []string{"", "   ", "\t\n"} {
+		resp, err := svc.Search(context.Background(), query, 10)
+		if !errors.Is(err, ErrEmptyQuery) {
+			t.Fatalf("Search(%q) err=%v want ErrEmptyQuery", query, err)
+		}
+		if resp.Items != nil {
+			t.Fatalf("expected zero-value response on error, got %+v", resp)
+		}
+	}
+	if calls := store.searchCalls(); len(calls) != 0 {
+		t.Fatalf("store was queried for a blank query: %+v", calls)
+	}
+}
+
+// TestSearchRejectsDegenerateQueryVector applies the write path's degenerate
+// rules to the read path: a NaN or all-zero text vector would rank as NaN
+// against every point and drag the whole ranking down, so it is rejected
+// before the store is asked.
+func TestSearchRejectsDegenerateQueryVector(t *testing.T) {
+	cases := []struct {
+		name   string
+		vector []float32
+	}{
+		{name: "all-zero vector", vector: vec768()},
+		{name: "NaN vector", vector: nanVector()},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newFakeVectorStore()
+			svc := newTestService(t, nil, store, &textEmbedder{vector: tc.vector})
+			if _, err := svc.Search(context.Background(), "a query", 10); err == nil {
+				t.Fatal("Search succeeded with a degenerate query vector, want an error")
+			}
+			if calls := store.searchCalls(); len(calls) != 0 {
+				t.Fatalf("store was queried with a degenerate vector: %+v", calls)
+			}
+		})
 	}
 }
 

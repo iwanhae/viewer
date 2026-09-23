@@ -27,19 +27,35 @@ const (
 	MaxClaimLimit = 1024
 )
 
-// VectorStore is the remote vector index recommendations are searched in and
-// embedding results are written to. It is satisfied structurally by
-// *qdrant.Client. A nil store degrades the service: writes skip the index and
-// go to SQLite only, and Recommend reports the store as unavailable instead of
-// answering with results it cannot compute.
+// VectorStore is the remote vector index recommendations and natural-language
+// search queries are answered from, and embedding results are written to. It is
+// satisfied structurally by *qdrant.Client. A nil store degrades the service:
+// writes skip the index and go to SQLite only, and Recommend and Search report
+// the store as unavailable instead of answering with results they cannot
+// compute.
 type VectorStore interface {
 	EnsureCollection(ctx context.Context) error
 	UpsertPhotos(ctx context.Context, records []qdrant.PhotoRecord) error
 	GroupSearch(ctx context.Context, queryPointID, excludeAlbumID, excludeHash string, limit int) ([]qdrant.PhotoHit, error)
+	SearchByVector(ctx context.Context, vector []float32, limit int) ([]qdrant.PhotoHit, error)
 	RetrieveVectorsByHashes(ctx context.Context, hashes []string) (map[string][]float32, error)
 	DeleteByAlbum(ctx context.Context, albumID string) error
 	CountVectors(ctx context.Context) (int, error)
 }
+
+// TextEmbeddingProvider is the text half of the dual-tower model: it turns a
+// natural-language query into a vector that shares the image embedding space.
+// It is a capability check, not a new dependency — the production embedder
+// implements both halves, and test stubs implement only what they fake — so
+// Search type-asserts it at call time instead of taking a second provider in
+// the constructor.
+type TextEmbeddingProvider interface {
+	Load(ctx context.Context) error
+	EmbedText(ctx context.Context, text string) ([]float32, error)
+	Close() error
+}
+
+var _ TextEmbeddingProvider = (*VisionEmbedder)(nil)
 
 type RecommendationItem struct {
 	AlbumID string  `json:"albumId"`

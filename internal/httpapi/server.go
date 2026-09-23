@@ -73,6 +73,7 @@ func (s *Server) Router() http.Handler {
 		r.Get("/feed", s.getFeed)
 		r.Get("/image/{hash}", s.getImageByHash)
 		r.Head("/image/{hash}", s.getImageByHash)
+		r.Get("/photos/search", s.searchPhotos)
 		r.Get("/recommendations/{albumId}/{index}", s.getRecommendations)
 	})
 
@@ -333,6 +334,45 @@ func (s *Server) getRecommendations(w http.ResponseWriter, r *http.Request) {
 			// than a failure: the same 503 shape as the nil-service case
 			// above, so clients treat both identically.
 			writeError(w, r, http.StatusServiceUnavailable, "UNAVAILABLE", "recommendations are not available")
+			return
+		}
+		writeError(w, r, http.StatusInternalServerError, "INTERNAL", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+// searchPhotos answers GET /api/photos/search?q=...&limit=... with the photos
+// whose embeddings are nearest to the natural-language query.
+func (s *Server) searchPhotos(w http.ResponseWriter, r *http.Request) {
+	// The endpoint stays available even when the embedding model could not be
+	// loaded: the catalog simply has no embeddings to match against yet.
+	if s.recommend == nil {
+		writeError(w, r, http.StatusServiceUnavailable, "UNAVAILABLE", "photo search is not available")
+		return
+	}
+
+	limit, err := parseOptionalIntQuery(r, "limit", 24, 1, 96)
+	if err != nil {
+		writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", "invalid limit")
+		return
+	}
+	q := strings.TrimSpace(r.URL.Query().Get("q"))
+	if q == "" {
+		writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", "missing query")
+		return
+	}
+	result, err := s.recommend.Search(r.Context(), q, limit)
+	if err != nil {
+		if errors.Is(err, recommend.ErrEmptyQuery) {
+			writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", "missing query")
+			return
+		}
+		if errors.Is(err, recommend.ErrVectorStoreUnavailable) || errors.Is(err, recommend.ErrTextEmbeddingUnavailable) {
+			// Qdrant not configured, or an embedder without a text tower, are
+			// deployment states rather than failures: the same 503 shape as
+			// the nil-service case above, so clients treat all three alike.
+			writeError(w, r, http.StatusServiceUnavailable, "UNAVAILABLE", "photo search is not available")
 			return
 		}
 		writeError(w, r, http.StatusInternalServerError, "INTERNAL", err.Error())

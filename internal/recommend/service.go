@@ -34,6 +34,13 @@ const (
 	// defaultTopK and maxTopK bound recommendation result sizes.
 	defaultTopK = 12
 	maxTopK     = 48
+
+	// defaultSearchTopK and maxSearchTopK bound natural-language search result
+	// sizes. They are separate from the recommendation bounds because search
+	// returns every matching photo instead of one per album, so a query needs
+	// a wider ceiling before it starts feeling truncated.
+	defaultSearchTopK = 24
+	maxSearchTopK     = 96
 )
 
 // Service runs the background workers that compute embeddings for the
@@ -693,6 +700,64 @@ func (s *Service) Recommend(ctx context.Context, albumID string, photoIndex int,
 	}
 	if len(hits) == 0 {
 		return RecommendationResponse{Items: []RecommendationItem{}}, nil
+	}
+
+	items := make([]RecommendationItem, 0, len(hits))
+	for _, hit := range hits {
+		items = append(items, RecommendationItem{
+			AlbumID: hit.AlbumID,
+			I:       hit.Idx,
+			Hash:    hit.Hash,
+			W:       hit.W,
+			H:       hit.H,
+			Score:   hit.Score,
+		})
+	}
+
+	return RecommendationResponse{Items: items}, nil
+}
+
+// Search embeds a natural-language query with the SigLIP2 text tower and
+// returns the nearest embedded photos, best first. Unlike Recommend there is
+// no album grouping or exclusion: every matching photo comes back, so a
+// picture posted in several albums simply ranks once per point it has. The
+// text half of the model is found by a capability check at call time, so a
+// service built with an image-only embedder reports
+// ErrTextEmbeddingUnavailable rather than failing to construct at all.
+func (s *Service) Search(ctx context.Context, query string, limit int) (RecommendationResponse, error) {
+	if limit <= 0 {
+		limit = defaultSearchTopK
+	}
+	if limit > maxSearchTopK {
+		limit = maxSearchTopK
+	}
+
+	if s.vectors == nil {
+		return RecommendationResponse{}, ErrVectorStoreUnavailable
+	}
+	textEmbedder, ok := s.embedder.(TextEmbeddingProvider)
+	if !ok {
+		return RecommendationResponse{}, ErrTextEmbeddingUnavailable
+	}
+	trimmed := strings.TrimSpace(query)
+	if trimmed == "" {
+		return RecommendationResponse{}, ErrEmptyQuery
+	}
+
+	vector, err := textEmbedder.EmbedText(ctx, trimmed)
+	if err != nil {
+		return RecommendationResponse{}, fmt.Errorf("embed query: %w", err)
+	}
+	// The same degenerate-vector rules as the write path: a NaN/Inf or all-zero
+	// text vector would rank as NaN in the cosine distance and poison the
+	// whole neighbor list, so it is rejected before the store is asked.
+	if !allFinite(vector) || isZeroNorm(vector) {
+		return RecommendationResponse{}, fmt.Errorf("text embedder returned a degenerate vector with %d entries", len(vector))
+	}
+
+	hits, err := s.vectors.SearchByVector(ctx, vector, limit)
+	if err != nil {
+		return RecommendationResponse{}, fmt.Errorf("search by vector: %w", err)
 	}
 
 	items := make([]RecommendationItem, 0, len(hits))

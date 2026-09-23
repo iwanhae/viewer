@@ -319,6 +319,88 @@ func TestRecommendationsEndpointWithDisabledVectorStore(t *testing.T) {
 	}
 }
 
+func TestSearchEndpointWithNilRecommendService(t *testing.T) {
+	router := New(nil, nil, nil, nil, "", nil, "").Router()
+	req := httptest.NewRequest(http.MethodGet, "/api/photos/search?q=beach", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d want=%d body=%s", rec.Code, http.StatusServiceUnavailable, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "\"code\":\"UNAVAILABLE\"") {
+		t.Fatalf("expected UNAVAILABLE error code in body, got: %s", rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "photo search is not available") {
+		t.Fatalf("expected the disabled message in body, got: %s", rec.Body.String())
+	}
+}
+
+// TestSearchEndpointWithDisabledVectorStore covers the Qdrant-less deployment:
+// a live recommend service whose vector store is nil must answer with the same
+// 503 UNAVAILABLE shape as a nil service. The nil-store check precedes the
+// embedding, so no text-capable embedder or fixture is needed.
+func TestSearchEndpointWithDisabledVectorStore(t *testing.T) {
+	cat, err := catalog.Open(filepath.Join(t.TempDir(), "test.db"), nil)
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	defer cat.Close()
+	recommendService := recommend.NewService(cat, nil, nil, nil, nil)
+	router := New(nil, nil, nil, recommendService, "", nil, "").Router()
+
+	req := httptest.NewRequest(http.MethodGet, "/api/photos/search?q=beach", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d want=%d body=%s", rec.Code, http.StatusServiceUnavailable, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "\"code\":\"UNAVAILABLE\"") {
+		t.Fatalf("expected UNAVAILABLE error code in body, got: %s", rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "photo search is not available") {
+		t.Fatalf("expected the disabled message in body, got: %s", rec.Body.String())
+	}
+}
+
+// TestSearchEndpointValidatesQueryAndLimit pins the 400s the handler answers
+// before the service is ever asked: a blank query and an out-of-range limit
+// are bad requests, not empty results.
+func TestSearchEndpointValidatesQueryAndLimit(t *testing.T) {
+	cat, err := catalog.Open(filepath.Join(t.TempDir(), "test.db"), nil)
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	defer cat.Close()
+	recommendService := recommend.NewService(cat, nil, nil, nil, nil)
+	router := New(nil, nil, nil, recommendService, "", nil, "").Router()
+
+	cases := []struct {
+		name string
+		url  string
+	}{
+		{name: "missing query parameter", url: "/api/photos/search"},
+		{name: "whitespace query", url: "/api/photos/search?q=%20%20"},
+		{name: "limit below the floor", url: "/api/photos/search?q=beach&limit=0"},
+		{name: "limit above the ceiling", url: "/api/photos/search?q=beach&limit=97"},
+		{name: "non-numeric limit", url: "/api/photos/search?q=beach&limit=lots"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, tc.url, nil)
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, req)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status=%d want=%d body=%s", rec.Code, http.StatusBadRequest, rec.Body.String())
+			}
+			if !strings.Contains(rec.Body.String(), "\"code\":\"INVALID_REQUEST\"") {
+				t.Fatalf("expected INVALID_REQUEST error code in body, got: %s", rec.Body.String())
+			}
+		})
+	}
+}
+
 func requestWithURLParam(key string, value string) *http.Request {
 	req := httptest.NewRequest(http.MethodGet, "/api/image/album/0", nil)
 	rctx := chi.NewRouteContext()
