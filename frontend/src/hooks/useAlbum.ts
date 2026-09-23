@@ -1,11 +1,10 @@
-import { useCallback, useEffect, useState } from 'react'
-import { fetchAlbum, getCachedAlbum, seedCachedAlbum, type AlbumIndex } from '../api/client'
+import { useEffect, useState } from 'react'
+import { fetchAlbum, getCachedAlbum, type AlbumIndex } from '../api/client'
 
 type UseAlbumResult = {
   album: AlbumIndex | null
   loading: boolean
   error: string | null
-  refetch: () => Promise<void>
 }
 
 function resolveSeededAlbum(albumId: string, preferredAlbum?: AlbumIndex | null): AlbumIndex | null {
@@ -58,25 +57,5 @@ export function useAlbum(albumId: string, preferredAlbum?: AlbumIndex | null): U
     }
   }, [albumId, preferredAlbum])
 
-  const refetch = useCallback(async (): Promise<void> => {
-    if (!albumId) {
-      setError('Missing album ID')
-      return
-    }
-
-    setLoading(true)
-    setError(null)
-
-    try {
-      const fetched = await fetchAlbum(albumId)
-      seedCachedAlbum(fetched)
-      setAlbum(fetched)
-    } catch (err) {
-      setError((err as Error).message)
-    } finally {
-      setLoading(false)
-    }
-  }, [albumId])
-
-  return { album, loading, error, refetch }
+  return { album, loading, error }
 }
