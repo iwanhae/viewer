@@ -16,12 +16,10 @@ import (
 
 // FinalizeState is the JSON payload returned by the finalize endpoints.
 type FinalizeState struct {
-	AlbumID    string              `json:"albumId"`
-	Status     catalog.AlbumStatus `json:"status"`
-	PhotoCount int                 `json:"photoCount,omitempty"`
-	CreatedAt  string              `json:"createdAt,omitempty"`
-	Error      string              `json:"error,omitempty"`
-	UpdatedAt  string              `json:"updatedAt"`
+	AlbumID   string              `json:"albumId"`
+	Status    catalog.AlbumStatus `json:"status"`
+	Error     string              `json:"error,omitempty"`
+	UpdatedAt string              `json:"updatedAt"`
 }
 
 // Enqueuer schedules an album for background extraction. Enqueue blocks while
@@ -404,11 +402,9 @@ func finalizeStateFromAlbum(album *catalog.Album) FinalizeState {
 		return FinalizeState{}
 	}
 	return FinalizeState{
-		AlbumID:    album.ID,
-		Status:     album.Status,
-		PhotoCount: album.PhotoCount,
-		CreatedAt:  album.CreatedAt,
-		Error:      album.Error,
-		UpdatedAt:  album.UpdatedAt,
+		AlbumID:   album.ID,
+		Status:    album.Status,
+		Error:     album.Error,
+		UpdatedAt: album.UpdatedAt,
 	}
 }
