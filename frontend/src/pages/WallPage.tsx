@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
-import { imageByHashUrl, type FeedMode } from '../api/client'
+import { THUMBNAIL_WIDTH, imageByHashUrl, type FeedMode } from '../api/client'
 import { useFeed } from '../hooks/useFeed'
 import { useEmbeddingProgress } from '../hooks/useEmbeddingProgress'
 import { COLUMN_OPTIONS, pageForPhotoIndex, wallFocusKey } from '../utils/albumPaging'
@@ -199,7 +199,7 @@ export function WallPage() {
               }}
             >
               <img
-                src={imageByHashUrl(item.hash)}
+                src={imageByHashUrl(item.hash, THUMBNAIL_WIDTH)}
                 alt=""
                 loading="lazy"
                 style={{ aspectRatio: `${item.w} / ${item.h}` }}

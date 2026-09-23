@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { useLocation, useNavigate, useParams } from 'react-router-dom'
-import { imageByHashUrl, seedCachedAlbum, type AlbumIndex } from '../api/client'
+import { THUMBNAIL_WIDTH, imageByHashUrl, seedCachedAlbum, type AlbumIndex } from '../api/client'
 import { useAlbum } from '../hooks/useAlbum'
 import { useRecommendations } from '../hooks/useRecommendations'
 import { MasonryWall } from '../components/MasonryWall'
@@ -183,7 +183,7 @@ export function PhotoPage() {
                     data-testid="photo-recommendation-tile"
                   >
                     <img
-                      src={imageByHashUrl(item.hash)}
+                      src={imageByHashUrl(item.hash, THUMBNAIL_WIDTH)}
                       alt=""
                       loading="lazy"
                       style={{

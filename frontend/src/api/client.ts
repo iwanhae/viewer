@@ -28,6 +28,12 @@ export type {
   RecommendationResponse,
 } from './types'
 
+// THUMBNAIL_WIDTH is the grid-tile width: every wall, album-grid and
+// recommendation tile requests this scaled JPEG variant instead of the
+// original. It must stay on the server's width ladder (320/640/1024); scaled
+// responses carry the "<hash>:w<width>" ETag.
+export const THUMBNAIL_WIDTH = 640
+
 // imageByHashUrl builds the URL for one image by its content hash. An optional
 // width from the server's ladder (320/640/1024) asks for a scaled JPEG variant;
 // without it the endpoint serves the untouched original.
