@@ -17,7 +17,6 @@ import { ColumnsIcon, ModeIcon, NextIcon, PrevIcon, RefreshIcon, ShortcutIcon } 
 
 const WALL_COLUMNS_KEY = 'wall_columns'
 const DEFAULT_COLUMNS = 3
-const WALL_FEED_LIMIT = 40
 const wallModes: FeedMode[] = ['random', 'latest']
 
 function nextTimestampSeed(currentSeed?: string): string {
@@ -53,7 +52,6 @@ export function WallPage() {
     mode,
     mode === 'latest' ? latestCursor : '',
   )
-  const visibleItems = useMemo(() => items.slice(0, WALL_FEED_LIMIT), [items])
   const tileRefs = useRef(new Map<string, HTMLButtonElement>())
 
   // The single URL-hygiene effect: when the raw query does not spell out the
@@ -76,7 +74,7 @@ export function WallPage() {
   }, [latestCursor, latestPage, mode, seed])
 
   useEffect(() => {
-    if (!focus || loading || visibleItems.length === 0) return
+    if (!focus || loading || items.length === 0) return
     const target = tileRefs.current.get(focus)
     if (!target) {
       setSearchParams(
@@ -102,7 +100,7 @@ export function WallPage() {
       },
       { replace: true },
     )
-  }, [focus, loading, visibleItems.length, setSearchParams])
+  }, [focus, loading, items.length, setSearchParams])
 
   const setWallMode = (nextMode: FeedMode) => {
     setSearchParams((prev) => {
@@ -177,7 +175,7 @@ export function WallPage() {
   return (
     <div className="wall-page">
       <MasonryWall
-        items={visibleItems}
+        items={items}
         columnCount={columns}
         getItemWeight={(item) => item.h / Math.max(item.w, 1)}
         renderItem={(item) => {
