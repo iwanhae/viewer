@@ -1,6 +1,7 @@
 package config
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -269,6 +270,8 @@ func setRequiredEnv(t *testing.T) {
 	t.Setenv("S3_BUCKET", "viewer")
 	t.Setenv("S3_ACCESS_KEY", "access")
 	t.Setenv("S3_SECRET_KEY", "secret")
+	t.Setenv("QDRANT_URL", "https://qdrant.example.test")
+	t.Setenv("QDRANT_API_KEY", "qdrant-key")
 }
 
 // A whitespace-only token was set by an operator who meant to protect the
@@ -283,5 +286,154 @@ func TestLoadRejectsBlankWorkerToken(t *testing.T) {
 
 	if _, err := Load(); err == nil {
 		t.Fatalf("expected a blank EMBEDDING_WORKER_TOKEN to be rejected")
+	}
+}
+
+// TestLoadRequiresEveryQdrantValue mirrors the S3 requirement for the Qdrant
+// settings vector search depends on, and pins the message each failure names.
+func TestLoadRequiresEveryQdrantValue(t *testing.T) {
+	cases := []struct {
+		name    string
+		envKey  string
+		wantErr string
+	}{
+		{name: "missing url", envKey: "QDRANT_URL", wantErr: "QDRANT_URL is required"},
+		{name: "missing api key", envKey: "QDRANT_API_KEY", wantErr: "QDRANT_API_KEY is required"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			setRequiredEnv(t)
+			t.Setenv(tc.envKey, "")
+
+			_, err := Load()
+			if err == nil {
+				t.Fatalf("Load expected an error for %s", tc.name)
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("Load error %q want it to contain %q", err.Error(), tc.wantErr)
+			}
+		})
+	}
+}
+
+// TestLoadQdrantURL covers the base-URL trimming and the rejection of a value
+// the Qdrant REST client could not append a collection path to, so a bad
+// QDRANT_URL fails the start instead of the first vector search.
+func TestLoadQdrantURL(t *testing.T) {
+	cases := []struct {
+		name    string
+		raw     string
+		want    string
+		wantErr bool
+	}{
+		{name: "https", raw: "https://qdrant.example.test", want: "https://qdrant.example.test"},
+		{name: "http with port", raw: "http://qdrant:6333", want: "http://qdrant:6333"},
+		{name: "path prefix kept", raw: "https://proxy.example.test/qdrant", want: "https://proxy.example.test/qdrant"},
+		{name: "trailing slash", raw: "https://qdrant.example.test/", want: "https://qdrant.example.test"},
+		{name: "surrounding spaces", raw: "  https://qdrant.example.test  ", want: "https://qdrant.example.test"},
+		{name: "no scheme", raw: "qdrant.example.test", wantErr: true},
+		{name: "unsupported scheme", raw: "ftp://qdrant.example.test", wantErr: true},
+		{name: "no host", raw: "https://", wantErr: true},
+		{name: "whitespace only", raw: "   ", wantErr: true},
+		{name: "slashes only", raw: "///", wantErr: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			setRequiredEnv(t)
+			t.Setenv("QDRANT_URL", tc.raw)
+
+			cfg, err := Load()
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("Load(QDRANT_URL=%q) expected an error", tc.raw)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if cfg.QdrantURL != tc.want {
+				t.Fatalf("QdrantURL=%q want=%q for QDRANT_URL=%q", cfg.QdrantURL, tc.want, tc.raw)
+			}
+		})
+	}
+}
+
+// A whitespace-only QDRANT_API_KEY was set by an operator who meant to
+// authenticate to Qdrant, so it must fail loudly and by name instead of
+// reading like a variable that was never supplied.
+func TestLoadRejectsBlankQdrantAPIKey(t *testing.T) {
+	setRequiredEnv(t)
+	t.Setenv("QDRANT_API_KEY", "   ")
+
+	_, err := Load()
+	if err == nil {
+		t.Fatalf("expected a blank QDRANT_API_KEY to be rejected")
+	}
+	if !strings.Contains(err.Error(), "QDRANT_API_KEY is set but blank") {
+		t.Fatalf("Load error %q want it to contain %q", err.Error(), "QDRANT_API_KEY is set but blank")
+	}
+}
+
+// TestLoadQdrantHappyPath pins the fully configured boot: every required value
+// present and ADMIN_TOKEN absent, which must load with AdminToken empty so the
+// startup log can report the admin UI as disabled.
+func TestLoadQdrantHappyPath(t *testing.T) {
+	setRequiredEnv(t)
+	t.Setenv("ADMIN_TOKEN", "")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.QdrantURL != "https://qdrant.example.test" {
+		t.Fatalf("QdrantURL=%q want https://qdrant.example.test", cfg.QdrantURL)
+	}
+	if cfg.QdrantAPIKey != "qdrant-key" {
+		t.Fatalf("QdrantAPIKey=%q want qdrant-key", cfg.QdrantAPIKey)
+	}
+	if cfg.AdminToken != "" {
+		t.Fatalf("AdminToken=%q want empty when ADMIN_TOKEN is unset", cfg.AdminToken)
+	}
+}
+
+// TestLoadAdminToken covers the admin page being opt-in: an unset ADMIN_TOKEN
+// (indistinguishable from blank to os.Getenv) passes through empty, a set
+// value is trimmed, and a set-but-blank value is rejected rather than silently
+// meaning off.
+func TestLoadAdminToken(t *testing.T) {
+	cases := []struct {
+		name    string
+		raw     string
+		want    string
+		wantErr string
+	}{
+		{name: "unset", raw: "", want: ""},
+		{name: "set", raw: "admin-token", want: "admin-token"},
+		{name: "surrounding spaces", raw: "  admin-token  ", want: "admin-token"},
+		{name: "set but blank", raw: "   ", wantErr: "ADMIN_TOKEN is set but blank"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			setRequiredEnv(t)
+			t.Setenv("ADMIN_TOKEN", tc.raw)
+
+			cfg, err := Load()
+			if tc.wantErr != "" {
+				if err == nil {
+					t.Fatalf("Load(ADMIN_TOKEN=%q) expected an error", tc.raw)
+				}
+				if !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("Load error %q want it to contain %q", err.Error(), tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if cfg.AdminToken != tc.want {
+				t.Fatalf("AdminToken=%q want=%q for ADMIN_TOKEN=%q", cfg.AdminToken, tc.want, tc.raw)
+			}
+		})
 	}
 }

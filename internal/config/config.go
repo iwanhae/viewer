@@ -10,6 +10,7 @@ package config
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -104,13 +105,30 @@ type Config struct {
 	// auth off, which is only sensible on a network that cannot be reached by
 	// untrusted clients.
 	WorkerToken string
+
+	// QdrantURL is the REST base URL of the external Qdrant server vector
+	// search talks to: the HTTP client appends a collection path to it. Load
+	// trims surrounding whitespace and trailing slashes the way ModelURL is
+	// trimmed, and rejects a value that is not an http or https URL with a
+	// host.
+	QdrantURL string
+
+	// QdrantAPIKey is the value sent as the api-key header on every Qdrant
+	// request.
+	QdrantAPIKey string
+
+	// AdminToken is the credential the admin page requires, sent as the Basic
+	// auth password. Empty leaves the admin UI disabled, and Load passes the
+	// emptiness through rather than substituting a default, so the startup log
+	// can report the UI as off.
+	AdminToken string
 }
 
 // DBPath is the SQLite catalog inside StateDir.
 func (c Config) DBPath() string { return filepath.Join(c.StateDir, "viewer.db") }
 
 // Load reads the deployment settings from the environment and validates that
-// the object store is fully configured.
+// the object store and the Qdrant endpoint are fully configured.
 func Load() (Config, error) {
 	usePathStyle, err := getenvBool("S3_USE_PATH_STYLE", DefaultS3UsePathStyle)
 	if err != nil {
@@ -121,6 +139,8 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	workerToken := strings.TrimSpace(os.Getenv("EMBEDDING_WORKER_TOKEN"))
+	qdrantAPIKey := strings.TrimSpace(os.Getenv("QDRANT_API_KEY"))
+	adminToken := strings.TrimSpace(os.Getenv("ADMIN_TOKEN"))
 
 	cfg := Config{
 		Port:                 getenvInt("PORT", DefaultPort),
@@ -134,6 +154,9 @@ func Load() (Config, error) {
 		AllowBackupOverwrite: allowBackupOverwrite,
 		ModelURL:             normalizeModelURL(os.Getenv("SIGLIP2_MODEL_URL")),
 		WorkerToken:          workerToken,
+		QdrantURL:            normalizeQdrantURL(os.Getenv("QDRANT_URL")),
+		QdrantAPIKey:         qdrantAPIKey,
+		AdminToken:           adminToken,
 	}
 
 	switch {
@@ -154,6 +177,23 @@ func Load() (Config, error) {
 		// API. A whitespace-only value would silently run it unauthenticated,
 		// which is exactly the accident this check exists to prevent.
 		return Config{}, fmt.Errorf("EMBEDDING_WORKER_TOKEN is set but blank")
+	case cfg.QdrantURL == "":
+		return Config{}, fmt.Errorf("QDRANT_URL is required")
+	case !validQdrantURL(cfg.QdrantURL):
+		return Config{}, fmt.Errorf("QDRANT_URL must be an http or https URL with a host, got %q", cfg.QdrantURL)
+	case os.Getenv("QDRANT_API_KEY") != "" && qdrantAPIKey == "":
+		// The variable was set, so the operator meant to authenticate to
+		// Qdrant. This case precedes the "is required" check so the message
+		// says the value was seen and rejected, not never supplied.
+		return Config{}, fmt.Errorf("QDRANT_API_KEY is set but blank")
+	case cfg.QdrantAPIKey == "":
+		return Config{}, fmt.Errorf("QDRANT_API_KEY is required")
+	case os.Getenv("ADMIN_TOKEN") != "" && adminToken == "":
+		// The variable was set, so the operator meant to protect the admin
+		// page. A whitespace-only value would silently leave the admin UI
+		// disabled, which is exactly the accident this check exists to
+		// prevent.
+		return Config{}, fmt.Errorf("ADMIN_TOKEN is set but blank")
 	}
 
 	return cfg, nil
@@ -227,4 +267,24 @@ func normalizeModelURL(raw string) string {
 		return DefaultModelURL
 	}
 	return trimmed
+}
+
+// normalizeQdrantURL trims the Qdrant REST base URL the same way ModelURL is
+// trimmed - surrounding whitespace and trailing slashes - so the vector client
+// can append a collection path directly. Unlike ModelURL there is no default:
+// an empty result is rejected by the "QDRANT_URL is required" check.
+func normalizeQdrantURL(raw string) string {
+	return strings.TrimRight(strings.TrimSpace(raw), "/")
+}
+
+// validQdrantURL reports whether raw is a base URL the Qdrant REST client can
+// append a collection path to: it must parse, name http or https, and carry a
+// host. A value that fails any of those would otherwise surface as a request
+// error on the first vector search instead of a failed start.
+func validQdrantURL(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	return (u.Scheme == "http" || u.Scheme == "https") && u.Host != ""
 }
