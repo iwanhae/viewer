@@ -64,7 +64,6 @@ type AlbumCoverEntry struct {
 
 type FeedResponse struct {
 	Items      []FeedItem `json:"items"`
-	Cursor     string     `json:"cursor,omitempty"`
 	NextCursor string     `json:"nextCursor,omitempty"`
 	PrevCursor string     `json:"prevCursor,omitempty"`
 	HasNext    bool       `json:"hasNext"`

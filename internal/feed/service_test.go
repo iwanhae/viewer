@@ -465,8 +465,8 @@ func TestBuildLatestPaginationWithCursors(t *testing.T) {
 	if first.NextCursor == "" {
 		t.Fatalf("expected next cursor on first page")
 	}
-	if first.PrevCursor != "" || first.Cursor != "" {
-		t.Fatalf("unexpected first page cursors: prev=%q cursor=%q", first.PrevCursor, first.Cursor)
+	if first.PrevCursor != "" {
+		t.Fatalf("unexpected first page prev cursor: prev=%q", first.PrevCursor)
 	}
 
 	second, err := svc.Build(context.Background(), 2, "ignored", ModeLatest, first.NextCursor)
@@ -485,10 +485,6 @@ func TestBuildLatestPaginationWithCursors(t *testing.T) {
 	if second.PrevCursor != "" {
 		t.Fatalf("expected prev cursor for second page to point to first page anchor (empty), got=%q", second.PrevCursor)
 	}
-	if second.Cursor != first.NextCursor {
-		t.Fatalf("second page cursor mismatch: got=%q want=%q", second.Cursor, first.NextCursor)
-	}
-
 	third, err := svc.Build(context.Background(), 2, "ignored", ModeLatest, second.NextCursor)
 	if err != nil {
 		t.Fatalf("build failed: %v", err)

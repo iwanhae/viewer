@@ -239,11 +239,6 @@ func buildLatestPage(limit int, covers []models.AlbumCoverEntry, afterCursor str
 	hasPrev := start > 0
 	hasNext := end < len(ranked)
 
-	cursor := ""
-	if hasPrev {
-		cursor = encodeLatestCursor(ranked[start-1])
-	}
-
 	nextCursor := ""
 	if hasNext && end > 0 {
 		nextCursor = encodeLatestCursor(ranked[end-1])
@@ -262,7 +257,6 @@ func buildLatestPage(limit int, covers []models.AlbumCoverEntry, afterCursor str
 
 	return models.FeedResponse{
 		Items:      items,
-		Cursor:     cursor,
 		NextCursor: nextCursor,
 		PrevCursor: prevCursor,
 		HasNext:    hasNext,

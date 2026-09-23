@@ -13,7 +13,6 @@ export type FeedItem = {
 
 export type FeedResponse = {
   items: FeedItem[]
-  cursor?: string
   nextCursor?: string
   prevCursor?: string
   hasNext: boolean
