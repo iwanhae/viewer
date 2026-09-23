@@ -71,22 +71,6 @@ export function RefreshIcon({ title }: IconProps) {
   )
 }
 
-export function ShortcutIcon({ title }: IconProps) {
-  return (
-    <SvgIcon title={title}>
-      <circle cx="6.5" cy="6.5" r="2.4" stroke="currentColor" strokeWidth="1.8" />
-      <circle cx="17.5" cy="6.5" r="2.4" stroke="currentColor" strokeWidth="1.8" />
-      <circle cx="12" cy="17.5" r="2.4" stroke="currentColor" strokeWidth="1.8" />
-      <path
-        d="M8.5 8.1 10.8 15M15.5 8.1 13.2 15M8.8 6.5h6.4"
-        stroke="currentColor"
-        strokeWidth="1.8"
-        strokeLinecap="round"
-      />
-    </SvgIcon>
-  )
-}
-
 export function BackToAlbumIcon({ title }: IconProps) {
   return (
     <SvgIcon title={title}>
@@ -183,6 +167,16 @@ export function UploadIcon({ title }: IconProps) {
         strokeWidth="1.8"
         strokeLinecap="round"
       />
+    </SvgIcon>
+  )
+}
+
+export function MoreIcon({ title }: IconProps) {
+  return (
+    <SvgIcon title={title}>
+      <circle cx="5" cy="12" r="1.7" fill="currentColor" stroke="none" />
+      <circle cx="12" cy="12" r="1.7" fill="currentColor" stroke="none" />
+      <circle cx="19" cy="12" r="1.7" fill="currentColor" stroke="none" />
     </SvgIcon>
   )
 }

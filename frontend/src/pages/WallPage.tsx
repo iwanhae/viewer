@@ -14,7 +14,7 @@ import {
 import { MasonryWall } from '../components/MasonryWall'
 import { BottomIsland } from '../components/BottomIsland'
 import { ColumnsIcon, ModeIcon, NextIcon, PrevIcon, RefreshIcon } from '../components/IslandIcons'
-import { AlbumsIcon, SearchIcon, UploadIcon } from '../components/IslandIcons'
+import { AlbumsIcon, MoreIcon, SearchIcon, UploadIcon } from '../components/IslandIcons'
 
 const WALL_COLUMNS_KEY = 'wall_columns'
 const DEFAULT_COLUMNS = 3
@@ -314,36 +314,60 @@ export function WallPage() {
               ]
             : []),
           // Every destination lives here now — the sub-pages only know the way
-          // back to the wall. Admin stays off the toolbar on purpose: the only
-          // way to detect it is probing /admin/api/stats, an admin-only query
-          // that takes seconds, and that probe would fire on every wall load.
+          // back to the wall. They share one popover so the island stays narrow
+          // on phones, and Admin stays out of it on purpose: the only way to
+          // detect it is probing /admin/api/stats, an admin-only query that
+          // takes seconds, and that probe would fire on every wall load.
           {
             kind: 'divider' as const,
             id: 'wall-nav-divider',
           },
           {
-            id: 'wall-nav-albums',
-            icon: <AlbumsIcon />,
-            ariaLabel: 'Find albums',
-            tooltip: 'Find albums',
-            testId: 'wall-nav-albums',
-            onClick: () => navigate('/albums/find'),
-          },
-          {
-            id: 'wall-nav-search',
-            icon: <SearchIcon />,
-            ariaLabel: 'Search photos',
-            tooltip: 'Search photos',
-            testId: 'wall-nav-search',
-            onClick: () => navigate('/search'),
-          },
-          {
-            id: 'wall-nav-upload',
-            icon: <UploadIcon />,
-            ariaLabel: 'Upload',
-            tooltip: 'Upload',
-            testId: 'wall-nav-upload',
-            onClick: () => navigate('/upload'),
+            id: 'wall-nav',
+            icon: <MoreIcon />,
+            ariaLabel: 'Open navigation menu',
+            tooltip: 'Menu',
+            testId: 'wall-nav',
+            renderPopup: ({ close }) => (
+              <div className="bottom-island-popup-stack" data-testid="wall-nav-popup">
+                <button
+                  type="button"
+                  className="bottom-island-popup-option bottom-island-popup-row"
+                  data-testid="wall-nav-albums"
+                  onClick={() => {
+                    navigate('/albums/find')
+                    close()
+                  }}
+                >
+                  <AlbumsIcon />
+                  Find albums
+                </button>
+                <button
+                  type="button"
+                  className="bottom-island-popup-option bottom-island-popup-row"
+                  data-testid="wall-nav-search"
+                  onClick={() => {
+                    navigate('/search')
+                    close()
+                  }}
+                >
+                  <SearchIcon />
+                  Search photos
+                </button>
+                <button
+                  type="button"
+                  className="bottom-island-popup-option bottom-island-popup-row"
+                  data-testid="wall-nav-upload"
+                  onClick={() => {
+                    navigate('/upload')
+                    close()
+                  }}
+                >
+                  <UploadIcon />
+                  Upload
+                </button>
+              </div>
+            ),
           },
         ]}
       />

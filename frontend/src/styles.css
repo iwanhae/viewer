@@ -218,6 +218,14 @@
   color: var(--paper);
 }
 
+/* Nav entries inside the wall's popover: icon + label in one row. */
+.bottom-island-popup-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  text-align: left;
+}
+
 .status {
   position: fixed;
   top: 16px;
