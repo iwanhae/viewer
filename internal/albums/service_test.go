@@ -25,10 +25,10 @@ func newFakeStore() *fakeStore {
 	return &fakeStore{objects: make(map[string]int64)}
 }
 
-func (f *fakeStore) PresignPut(_ context.Context, key string, ttl time.Duration) (string, map[string]string, error) {
+func (f *fakeStore) PresignPut(_ context.Context, key string, ttl time.Duration) (string, error) {
 	f.presignCalls = append(f.presignCalls, key)
 	f.presignTTL = ttl
-	return "https://s3.example/" + key, map[string]string{"x-amz-acl": "private"}, nil
+	return "https://s3.example/" + key, nil
 }
 
 func (f *fakeStore) HeadObject(_ context.Context, key string) (bool, int64, error) {

@@ -30,7 +30,7 @@ type Enqueuer interface {
 }
 
 type albumStore interface {
-	PresignPut(ctx context.Context, key string, ttl time.Duration) (string, map[string]string, error)
+	PresignPut(ctx context.Context, key string, ttl time.Duration) (string, error)
 	HeadObject(ctx context.Context, key string) (bool, int64, error)
 }
 
@@ -48,7 +48,6 @@ type CreateUploadResult struct {
 	AlbumID   string
 	Key       string
 	UploadURL string
-	Headers   map[string]string
 }
 
 func NewService(cat *catalog.Store, store albumStore, enqueuer Enqueuer) *Service {
@@ -77,12 +76,9 @@ func (s *Service) CreateUpload(ctx context.Context, filename string, sizeBytes i
 
 	albumID := uuid.NewString()
 	key := pipeline.SourceKey(albumID)
-	url, headers, err := s.store.PresignPut(ctx, key, cfgpkg.PresignTTL)
+	url, err := s.store.PresignPut(ctx, key, cfgpkg.PresignTTL)
 	if err != nil {
 		return CreateUploadResult{}, err
-	}
-	if headers == nil {
-		headers = map[string]string{}
 	}
 
 	if err := s.catalog.CreateAlbum(ctx, catalog.Album{
@@ -99,7 +95,6 @@ func (s *Service) CreateUpload(ctx context.Context, filename string, sizeBytes i
 		AlbumID:   albumID,
 		Key:       key,
 		UploadURL: url,
-		Headers:   headers,
 	}, nil
 }
 

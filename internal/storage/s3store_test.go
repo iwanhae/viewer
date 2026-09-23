@@ -237,19 +237,25 @@ func TestS3StoreWithoutPrefixKeepsFlatLayout(t *testing.T) {
 }
 
 // TestS3StorePresignsUnderKeyPrefix checks the presigned upload URL the browser
-// PUTs to, which never goes through the store's own client.
+// PUTs to, which never goes through the store's own client. The signature pins
+// nothing beyond the Host header the URL already carries, so the PUT needs no
+// extra headers.
 func TestS3StorePresignsUnderKeyPrefix(t *testing.T) {
 	store, _ := newRecordingStore(t, "team-a/")
 
-	url, headers, err := store.PresignPut(context.Background(), "uploads/album-1.zip", time.Minute)
+	url, err := store.PresignPut(context.Background(), "uploads/album-1.zip", time.Minute)
 	if err != nil {
 		t.Fatalf("PresignPut: %v", err)
 	}
 	if !strings.Contains(url, "/test-bucket/team-a/uploads/album-1.zip") {
 		t.Errorf("presigned url=%q want the bucket and key prefix in the path", url)
 	}
-	if len(headers) != 0 {
-		t.Errorf("headers=%v want none", headers)
+	parsed, err := neturl.Parse(url)
+	if err != nil {
+		t.Fatalf("parse presigned url %q: %v", url, err)
+	}
+	if got := parsed.Query().Get("X-Amz-SignedHeaders"); got != "host" {
+		t.Errorf("X-Amz-SignedHeaders=%q want host (a plain PUT must satisfy the signature)", got)
 	}
 }
 
@@ -322,7 +328,7 @@ func TestS3StoreVirtualHostedAddressing(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			store := newVirtualHostedStore(t, tc.endpoint)
 
-			url, _, err := store.PresignPut(context.Background(), "uploads/album-1.zip", time.Minute)
+			url, err := store.PresignPut(context.Background(), "uploads/album-1.zip", time.Minute)
 			if err != nil {
 				t.Fatalf("PresignPut: %v", err)
 			}

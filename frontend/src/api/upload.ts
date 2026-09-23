@@ -26,12 +26,11 @@ type UploadAlbumObjectOptions = {
 
 // uploadAlbumObject PUTs a file straight to the presigned URL. It uses XHR
 // because fetch cannot report upload progress, and the progress bar is the
-// point. The presigned request must stay header-exact - adding a Content-Type
-// would break the signature - so only the headers the server signed are sent.
+// point. The presigned PUT needs no extra headers: the signature pins only the
+// Host header the URL itself carries.
 export function uploadAlbumObject(
   uploadURL: string,
   file: File,
-  headers: Record<string, string>,
   options: UploadAlbumObjectOptions = {},
 ): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -41,9 +40,6 @@ export function uploadAlbumObject(
     }
     const xhr = new XMLHttpRequest()
     xhr.open('PUT', uploadURL, true)
-    for (const [name, value] of Object.entries(headers)) {
-      xhr.setRequestHeader(name, value)
-    }
     xhr.upload.onprogress = (event) => {
       if (!event.lengthComputable) return
       options.onProgress?.({ bytes: event.loaded, total: event.total })

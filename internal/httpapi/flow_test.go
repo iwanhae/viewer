@@ -41,8 +41,8 @@ func newMemoryS3() *memoryS3 {
 	return &memoryS3{data: make(map[string][]byte)}
 }
 
-func (m *memoryS3) PresignPut(_ context.Context, key string, _ time.Duration) (string, map[string]string, error) {
-	return "memory://" + key, map[string]string{}, nil
+func (m *memoryS3) PresignPut(_ context.Context, key string, _ time.Duration) (string, error) {
+	return "memory://" + key, nil
 }
 
 func (m *memoryS3) PresignGet(_ context.Context, key string, _ time.Duration) (string, error) {

@@ -70,25 +70,17 @@ export async function fetchFeed(params?: {
 export async function createAlbum(file: File): Promise<{
   albumId: string
   uploadUrl: string
-  uploadHeaders: Record<string, string>
   objectKey: string
 }> {
-  const created = await requestJSON<{
+  return await requestJSON<{
     albumId: string
     uploadUrl: string
-    uploadHeaders?: Record<string, string>
     objectKey: string
   }>('/api/albums', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ filename: file.name, sizeBytes: file.size }),
   })
-  return {
-    albumId: created.albumId,
-    uploadUrl: created.uploadUrl,
-    uploadHeaders: created.uploadHeaders ?? {},
-    objectKey: created.objectKey,
-  }
 }
 
 // The PUT to the presigned URL lives in api/upload.ts: it needs XHR for

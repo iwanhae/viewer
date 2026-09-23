@@ -109,10 +109,9 @@ func (s *Server) createAlbum(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"albumId":       res.AlbumID,
-		"uploadUrl":     res.UploadURL,
-		"uploadHeaders": res.Headers,
-		"objectKey":     res.Key,
+		"albumId":   res.AlbumID,
+		"uploadUrl": res.UploadURL,
+		"objectKey": res.Key,
 	})
 }
 

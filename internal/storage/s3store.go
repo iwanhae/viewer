@@ -87,15 +87,18 @@ func (s *S3Store) logicalKey(key string) string {
 	return strings.TrimPrefix(key, s.prefix)
 }
 
-func (s *S3Store) PresignPut(ctx context.Context, key string, ttl time.Duration) (string, map[string]string, error) {
+// PresignPut returns a short-lived URL a browser can PUT a staging object to
+// directly. The SigV4 signature pins nothing but the Host header the URL
+// already carries, so the request needs no extra headers.
+func (s *S3Store) PresignPut(ctx context.Context, key string, ttl time.Duration) (string, error) {
 	out, err := s.presigner.PresignPutObject(ctx, &s3.PutObjectInput{
 		Bucket: aws.String(s.bucket),
 		Key:    aws.String(s.physicalKey(key)),
 	}, s3.WithPresignExpires(ttl))
 	if err != nil {
-		return "", nil, fmt.Errorf("presign put: %w", err)
+		return "", fmt.Errorf("presign put: %w", err)
 	}
-	return out.URL, map[string]string{}, nil
+	return out.URL, nil
 }
 
 // PresignGet returns a short-lived URL that downloads one object directly from

@@ -237,7 +237,7 @@ export function UploadPage() {
         albumID = created.albumId
         updateItem(item.id, { albumId: albumID })
 
-        await uploadAlbumObject(created.uploadUrl, item.file, created.uploadHeaders, {
+        await uploadAlbumObject(created.uploadUrl, item.file, {
           signal: controller.signal,
           onProgress: (progress) => {
             progressRef.current.set(item.id, progress)
