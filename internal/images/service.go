@@ -7,6 +7,7 @@ import (
 	"image"
 	"image/jpeg"
 	"io"
+	"slices"
 	"strings"
 	"time"
 
@@ -65,20 +66,18 @@ func NewService(cat *catalog.Store, store blobStore) *Service {
 	}
 }
 
-// WidthLadder lists the scaled widths the image endpoint accepts. The ladder
+// widthLadder lists the scaled widths the image endpoint accepts. The ladder
 // is deliberately short: every entry is a compile-time choice, not config.
+var widthLadder = []int{320, 640, 1024}
+
+// WidthLadder lists the scaled widths the image endpoint accepts.
 func WidthLadder() []int {
-	return []int{320, 640, 1024}
+	return widthLadder
 }
 
 // IsSupportedWidth reports whether w is on the width ladder.
 func IsSupportedWidth(w int) bool {
-	for _, candidate := range WidthLadder() {
-		if candidate == w {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(widthLadder, w)
 }
 
 // OpenImageByHash fetches a content-addressed blob from S3 into memory and

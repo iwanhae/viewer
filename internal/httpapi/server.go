@@ -215,8 +215,10 @@ func (s *Server) getImageByHash(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// An absent w serves the untouched original; a w on the width ladder asks
-	// for a scaled variant. Anything else is a client error.
-	width, err := parseOptionalIntQuery(r, "w", 0, 1, 4096)
+	// for a scaled variant. Ladder membership below is the whole range check —
+	// there is no separate upper bound — so only parse failures (non-numeric,
+	// zero, negative) reach this first error.
+	width, err := parseOptionalIntQuery(r, "w", 0, 1, 0)
 	if err != nil {
 		writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", "invalid image width")
 		return
