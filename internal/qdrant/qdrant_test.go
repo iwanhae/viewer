@@ -18,9 +18,14 @@ import (
 // client cares about the actual number.
 const testDim = 4
 
-// newTestClient points a client at srv with the default collection name.
+// testCollection is the collection name every test client is built with. The
+// package deliberately exports no default: production gets the name from
+// configuration, so the tests carry their own.
+const testCollection = "photo_embeddings"
+
+// newTestClient points a client at srv with the test collection name.
 func newTestClient(srv *httptest.Server, apiKey string) *Client {
-	return New(srv.URL, apiKey, DefaultCollection, testDim)
+	return New(srv.URL, apiKey, testCollection, testDim)
 }
 
 // testRecords builds n valid records spread over a few albums.
@@ -97,7 +102,7 @@ func TestUpsertPhotosChunksRequests(t *testing.T) {
 		if req.method != http.MethodPut {
 			t.Errorf("request %d method = %s, want PUT", i, req.method)
 		}
-		if req.path != "/collections/"+DefaultCollection+"/points" {
+		if req.path != "/collections/"+testCollection+"/points" {
 			t.Errorf("request %d path = %q", i, req.path)
 		}
 		if req.query != "wait=true" {
@@ -229,7 +234,7 @@ const groupSearchFixture = `{"result":{"groups":[
 func TestGroupSearchRequestShapeAndFlattening(t *testing.T) {
 	var reqBody map[string]any
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost || r.URL.Path != "/collections/"+DefaultCollection+"/points/query/groups" {
+		if r.Method != http.MethodPost || r.URL.Path != "/collections/"+testCollection+"/points/query/groups" {
 			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
 			http.Error(w, "bad request", http.StatusBadRequest)
 			return
@@ -336,10 +341,10 @@ func TestEnsureCollectionCreatesMissing(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
-		case r.Method == http.MethodGet && r.URL.Path == "/collections/"+DefaultCollection:
+		case r.Method == http.MethodGet && r.URL.Path == "/collections/"+testCollection:
 			w.WriteHeader(http.StatusNotFound)
 			_, _ = w.Write([]byte(`{"status":{"error":"Not found"}}`))
-		case r.Method == http.MethodPut && r.URL.Path == "/collections/"+DefaultCollection:
+		case r.Method == http.MethodPut && r.URL.Path == "/collections/"+testCollection:
 			createQuery = r.URL.RawQuery
 			if err := json.NewDecoder(r.Body).Decode(&createBody); err != nil {
 				t.Errorf("decode create body: %v", err)
@@ -438,7 +443,7 @@ func TestRetrieveVectorsByHashes(t *testing.T) {
 	}
 	var requests []chunk
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost || r.URL.Path != "/collections/"+DefaultCollection+"/points/scroll" {
+		if r.Method != http.MethodPost || r.URL.Path != "/collections/"+testCollection+"/points/scroll" {
 			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
 			http.Error(w, "bad request", http.StatusBadRequest)
 			return
@@ -561,7 +566,7 @@ func TestDeleteByAlbum(t *testing.T) {
 	var reqBody map[string]any
 	var query string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost || r.URL.Path != "/collections/"+DefaultCollection+"/points/delete" {
+		if r.Method != http.MethodPost || r.URL.Path != "/collections/"+testCollection+"/points/delete" {
 			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
 			http.Error(w, "bad request", http.StatusBadRequest)
 			return
@@ -598,7 +603,7 @@ func TestCountVectors(t *testing.T) {
 	var reqBody map[string]any
 	var query string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost || r.URL.Path != "/collections/"+DefaultCollection+"/points/count" {
+		if r.Method != http.MethodPost || r.URL.Path != "/collections/"+testCollection+"/points/count" {
 			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
 			http.Error(w, "bad request", http.StatusBadRequest)
 			return
@@ -639,7 +644,7 @@ func TestAPIKeyHeaderOnlyWhenConfigured(t *testing.T) {
 			}))
 			defer srv.Close()
 
-			c := New(srv.URL, key, DefaultCollection, testDim)
+			c := New(srv.URL, key, testCollection, testDim)
 			if _, err := c.CountVectors(context.Background()); err != nil {
 				t.Fatalf("CountVectors: %v", err)
 			}

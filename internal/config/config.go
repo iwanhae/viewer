@@ -117,6 +117,16 @@ type Config struct {
 	// request.
 	QdrantAPIKey string
 
+	// QdrantCollection is the name of the Qdrant collection that holds the
+	// per-photo embedding points: every upsert, search, count and migration
+	// upload is scoped to it. It is required with no default, so nothing is
+	// ever created or queried under an accidental collection name — a fallback
+	// constant would silently fork the corpus between deployments that spell
+	// the collection differently. The value is passed through as configured
+	// with no charset validation, because the server rejects invalid
+	// collection names; requiredness is the only contract here.
+	QdrantCollection string
+
 	// AdminToken is the credential the admin page requires, sent as the Basic
 	// auth password. Empty leaves the admin UI disabled, and Load passes the
 	// emptiness through rather than substituting a default, so the startup log
@@ -128,7 +138,7 @@ type Config struct {
 func (c Config) DBPath() string { return filepath.Join(c.StateDir, "viewer.db") }
 
 // Load reads the deployment settings from the environment and validates that
-// the object store and the Qdrant endpoint are fully configured.
+// the object store and the Qdrant endpoint and collection are fully configured.
 func Load() (Config, error) {
 	usePathStyle, err := getenvBool("S3_USE_PATH_STYLE", DefaultS3UsePathStyle)
 	if err != nil {
@@ -140,6 +150,7 @@ func Load() (Config, error) {
 	}
 	workerToken := strings.TrimSpace(os.Getenv("EMBEDDING_WORKER_TOKEN"))
 	qdrantAPIKey := strings.TrimSpace(os.Getenv("QDRANT_API_KEY"))
+	qdrantCollection := strings.TrimSpace(os.Getenv("QDRANT_COLLECTION"))
 	adminToken := strings.TrimSpace(os.Getenv("ADMIN_TOKEN"))
 
 	cfg := Config{
@@ -156,6 +167,7 @@ func Load() (Config, error) {
 		WorkerToken:          workerToken,
 		QdrantURL:            normalizeQdrantURL(os.Getenv("QDRANT_URL")),
 		QdrantAPIKey:         qdrantAPIKey,
+		QdrantCollection:     qdrantCollection,
 		AdminToken:           adminToken,
 	}
 
@@ -188,6 +200,18 @@ func Load() (Config, error) {
 		return Config{}, fmt.Errorf("QDRANT_API_KEY is set but blank")
 	case cfg.QdrantAPIKey == "":
 		return Config{}, fmt.Errorf("QDRANT_API_KEY is required")
+	case os.Getenv("QDRANT_COLLECTION") != "" && qdrantCollection == "":
+		// The variable was set, so the operator meant to name the collection
+		// the points live in. This case precedes the "is required" check so
+		// the message says the value was seen and rejected, not never
+		// supplied.
+		return Config{}, fmt.Errorf("QDRANT_COLLECTION is set but blank")
+	case cfg.QdrantCollection == "":
+		// There is deliberately no fallback name: a default would let a
+		// deployment come up creating and querying a collection the operator
+		// never chose, and corpus written there would not follow the real one
+		// when the setting is fixed.
+		return Config{}, fmt.Errorf("QDRANT_COLLECTION is required")
 	case os.Getenv("ADMIN_TOKEN") != "" && adminToken == "":
 		// The variable was set, so the operator meant to protect the admin
 		// page. A whitespace-only value would silently leave the admin UI

@@ -21,9 +21,6 @@ import (
 	"github.com/google/uuid"
 )
 
-// DefaultCollection is the collection the viewer keeps photo embeddings in.
-const DefaultCollection = "photo_embeddings"
-
 const (
 	// requestTimeout bounds a single Qdrant call: the server is remote and a
 	// hung request must not tie up a viewer request forever.

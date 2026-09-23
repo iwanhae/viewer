@@ -62,7 +62,7 @@ is what makes a wiped state volume recoverable from the bucket alone.
 ## Configuration
 
 The viewer is always deployed as the Docker image, so the whole configuration is
-eleven environment variables:
+twelve environment variables:
 
 - `S3_ENDPOINT`, `S3_BUCKET`, `S3_ACCESS_KEY`, `S3_SECRET_KEY` — required.
 - `S3_PREFIX` — optional key prefix, so several deployments can share one bucket
@@ -76,6 +76,10 @@ eleven environment variables:
   that holds the recommendation vectors (see "Vector store" below).
 - `QDRANT_API_KEY` — required; sent as the `api-key` header on every Qdrant
   request.
+- `QDRANT_COLLECTION` — required; the name of the Qdrant collection that holds
+  the per-photo embedding points. It has no default: the viewer refuses to
+  start without it, so nothing is ever created or queried under an accidental
+  collection name (see "Vector store" below).
 - `EMBEDDING_WORKER_TOKEN` — optional shared bearer token the external embedding
   worker API requires (see "External embedding workers" below; default empty,
   which turns that check off and is only sensible on a trusted network; a value
@@ -138,8 +142,9 @@ entirely.
 
 Embeddings live in an external Qdrant collection, not in SQLite: since catalog
 migration 0003 the database keeps only each blob's embedding status, and every
-vector is a point in the `photo_embeddings` collection (see "Vector store"
-below). The ingest pipeline never embeds anything itself; a blob whose
+vector is a point in the Qdrant collection named by `QDRANT_COLLECTION`
+(`photo_embeddings` in the examples here; see "Vector store" below). The
+ingest pipeline never embeds anything itself; a blob whose
 embedding was deferred (the model had not loaded) stays in the `pending` state,
 and the background embedding workers fill it in on a later run once a
 checkpoint is available. Those workers only start when the checkpoint loaded,
@@ -154,17 +159,22 @@ query photo, recommendations return an empty `items` list.
 
 ### Vector store
 
-Recommendation vectors live in a Qdrant collection the viewer owns:
-`photo_embeddings`, 768 float32 dimensions, cosine distance, one point per
-photo. The point ID is derived deterministically from `(albumId, index)`, so
+Recommendation vectors live in the Qdrant collection the viewer owns — the one
+`QDRANT_COLLECTION` names, `photo_embeddings` in the examples here — with 768
+float32 dimensions, cosine distance, one point per photo. The point ID is
+derived deterministically from `(albumId, index)`, so
 re-writing a photo's vector overwrites that point in place instead of
 duplicating it. Each point carries the photo's album id, index, blob hash and
 dimensions as payload, the group search filters the query's own album and hash
 on the store side, and it returns at most one photo per album.
 
-The connection is configured with the two required variables `QDRANT_URL` (base
-URL of the server's REST API) and `QDRANT_API_KEY` (sent as the `api-key`
-header on every request).
+The connection is configured with the three required variables `QDRANT_URL`
+(base URL of the server's REST API), `QDRANT_API_KEY` (sent as the `api-key`
+header on every request) and `QDRANT_COLLECTION` (the name of the collection
+holding the points). `QDRANT_COLLECTION` has no default: the viewer refuses to
+start without it, so nothing is ever created or queried under an accidental
+collection name, and migration 0003 uploads into whichever collection the
+process is configured with.
 
 Writes go to the two stores in a fixed order — vector store first, SQLite
 bookkeeping second — so a crash between the two leaves the blob still
@@ -175,7 +185,8 @@ reverse order could produce points the catalog does not know about.
 Boot order:
 
 - Migrations run while the catalog opens, before the HTTP server binds.
-  Migration 0003 moves any vectors still stored in SQLite into the collection.
+  Migration 0003 moves any vectors still stored in SQLite into the collection
+  `QDRANT_COLLECTION` names.
   It needs Qdrant to be reachable: uploads go out in batches of 256 with a
   `catalog: vector upload progress <n>/<total>` line every 50 batches, and a
   failed batch rolls the whole migration back so the next boot retries it from

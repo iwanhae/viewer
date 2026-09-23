@@ -272,6 +272,7 @@ func setRequiredEnv(t *testing.T) {
 	t.Setenv("S3_SECRET_KEY", "secret")
 	t.Setenv("QDRANT_URL", "https://qdrant.example.test")
 	t.Setenv("QDRANT_API_KEY", "qdrant-key")
+	t.Setenv("QDRANT_COLLECTION", "photo_embeddings")
 }
 
 // A whitespace-only token was set by an operator who meant to protect the
@@ -299,6 +300,7 @@ func TestLoadRequiresEveryQdrantValue(t *testing.T) {
 	}{
 		{name: "missing url", envKey: "QDRANT_URL", wantErr: "QDRANT_URL is required"},
 		{name: "missing api key", envKey: "QDRANT_API_KEY", wantErr: "QDRANT_API_KEY is required"},
+		{name: "missing collection", envKey: "QDRANT_COLLECTION", wantErr: "QDRANT_COLLECTION is required"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -375,6 +377,22 @@ func TestLoadRejectsBlankQdrantAPIKey(t *testing.T) {
 	}
 }
 
+// A whitespace-only QDRANT_COLLECTION was set by an operator who meant to name
+// the collection the points live in, so it must fail loudly and by name
+// instead of reading like a variable that was never supplied.
+func TestLoadRejectsBlankQdrantCollection(t *testing.T) {
+	setRequiredEnv(t)
+	t.Setenv("QDRANT_COLLECTION", "   ")
+
+	_, err := Load()
+	if err == nil {
+		t.Fatalf("expected a blank QDRANT_COLLECTION to be rejected")
+	}
+	if !strings.Contains(err.Error(), "QDRANT_COLLECTION is set but blank") {
+		t.Fatalf("Load error %q want it to contain %q", err.Error(), "QDRANT_COLLECTION is set but blank")
+	}
+}
+
 // TestLoadQdrantHappyPath pins the fully configured boot: every required value
 // present and ADMIN_TOKEN absent, which must load with AdminToken empty so the
 // startup log can report the admin UI as disabled.
@@ -391,6 +409,9 @@ func TestLoadQdrantHappyPath(t *testing.T) {
 	}
 	if cfg.QdrantAPIKey != "qdrant-key" {
 		t.Fatalf("QdrantAPIKey=%q want qdrant-key", cfg.QdrantAPIKey)
+	}
+	if cfg.QdrantCollection != "photo_embeddings" {
+		t.Fatalf("QdrantCollection=%q want photo_embeddings", cfg.QdrantCollection)
 	}
 	if cfg.AdminToken != "" {
 		t.Fatalf("AdminToken=%q want empty when ADMIN_TOKEN is unset", cfg.AdminToken)

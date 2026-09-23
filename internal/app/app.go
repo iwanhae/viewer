@@ -42,8 +42,8 @@ func Run(ctx context.Context) error {
 		return err
 	}
 	log.Printf(
-		"viewer: config loaded on port=%d catalog=%s s3_prefix=%s qdrant=%s",
-		cfg.Port, cfg.DBPath(), cfg.DescribePrefix(), cfg.QdrantURL,
+		"viewer: config loaded on port=%d catalog=%s s3_prefix=%s qdrant=%s collection=%s",
+		cfg.Port, cfg.DBPath(), cfg.DescribePrefix(), cfg.QdrantURL, cfg.QdrantCollection,
 	)
 	if cfg.WorkerToken != "" {
 		log.Printf("viewer: embedding worker API requires a bearer token")
@@ -76,7 +76,7 @@ func Run(ctx context.Context) error {
 	// migration 0003 the catalog stores only their status). The client is the
 	// upload target the migration needs while it moves any still-stored vectors
 	// over, so it must exist before the catalog opens.
-	vectorStore := qdrant.New(cfg.QdrantURL, cfg.QdrantAPIKey, qdrant.DefaultCollection, catalog.EmbeddingDim)
+	vectorStore := qdrant.New(cfg.QdrantURL, cfg.QdrantAPIKey, cfg.QdrantCollection, catalog.EmbeddingDim)
 	cat, err := catalog.Open(cfg.DBPath(), vectorStore)
 	if err != nil {
 		return fmt.Errorf("open metadata catalog: %w", err)
