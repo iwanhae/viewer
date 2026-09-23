@@ -14,8 +14,7 @@ import {
 import { MasonryWall } from '../components/MasonryWall'
 import { BottomIsland } from '../components/BottomIsland'
 import { ColumnsIcon, ModeIcon, NextIcon, PrevIcon, RefreshIcon } from '../components/IslandIcons'
-import { AdminIcon, AlbumsIcon, SearchIcon, UploadIcon } from '../components/IslandIcons'
-import { useAdminAvailable } from '../hooks/useAdminAvailable'
+import { AlbumsIcon, SearchIcon, UploadIcon } from '../components/IslandIcons'
 
 const WALL_COLUMNS_KEY = 'wall_columns'
 const DEFAULT_COLUMNS = 3
@@ -32,7 +31,6 @@ function nextTimestampSeed(currentSeed?: string): string {
 
 export function WallPage() {
   const navigate = useNavigate()
-  const adminAvailability = useAdminAvailable()
   const [searchParams, setSearchParams] = useSearchParams()
   const [columns, setColumns] = useState(() =>
     readNumberPreference(WALL_COLUMNS_KEY, COLUMN_OPTIONS, DEFAULT_COLUMNS),
@@ -316,8 +314,9 @@ export function WallPage() {
               ]
             : []),
           // Every destination lives here now — the sub-pages only know the way
-          // back to the wall. Admin is a server-served page outside the SPA,
-          // and it is shown only when this deployment actually serves it.
+          // back to the wall. Admin stays off the toolbar on purpose: the only
+          // way to detect it is probing /admin/api/stats, an admin-only query
+          // that takes seconds, and that probe would fire on every wall load.
           {
             kind: 'divider' as const,
             id: 'wall-nav-divider',
@@ -346,18 +345,6 @@ export function WallPage() {
             testId: 'wall-nav-upload',
             onClick: () => navigate('/upload'),
           },
-          ...(adminAvailability === 'available'
-            ? [
-                {
-                  id: 'wall-nav-admin',
-                  icon: <AdminIcon />,
-                  ariaLabel: 'Open admin dashboard',
-                  tooltip: 'Admin',
-                  testId: 'wall-nav-admin',
-                  onClick: () => window.location.assign('/admin/'),
-                },
-              ]
-            : []),
         ]}
       />
 

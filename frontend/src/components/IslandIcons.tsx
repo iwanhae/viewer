@@ -186,16 +186,3 @@ export function UploadIcon({ title }: IconProps) {
     </SvgIcon>
   )
 }
-
-export function AdminIcon({ title }: IconProps) {
-  return (
-    <SvgIcon title={title}>
-      <path
-        d="M12 4 5.5 6.5v5c0 4.2 2.8 7.2 6.5 8.5 3.7-1.3 6.5-4.3 6.5-8.5v-5Z"
-        stroke="currentColor"
-        strokeWidth="1.8"
-        strokeLinejoin="round"
-      />
-    </SvgIcon>
-  )
-}
