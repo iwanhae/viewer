@@ -87,7 +87,7 @@ func TestJSONBodyRejectsTrailingContent(t *testing.T) {
 }
 
 func TestFeedEndpointRejectsInvalidMode(t *testing.T) {
-	router := New(nil, testFeedService(), nil, nil, "").Router()
+	router := New(nil, testFeedService(), nil, nil, "", nil, "").Router()
 	req := httptest.NewRequest(http.MethodGet, "/api/feed?mode=invalid", nil)
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
@@ -101,7 +101,7 @@ func TestFeedEndpointRejectsInvalidMode(t *testing.T) {
 }
 
 func TestFeedEndpointSupportsLatestMode(t *testing.T) {
-	router := New(nil, testFeedService(), nil, nil, "").Router()
+	router := New(nil, testFeedService(), nil, nil, "", nil, "").Router()
 	req := httptest.NewRequest(http.MethodGet, "/api/feed?limit=25&mode=latest", nil)
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
@@ -115,7 +115,7 @@ func TestFeedEndpointSupportsLatestMode(t *testing.T) {
 }
 
 func TestFeedEndpointLatestSupportsAfterCursor(t *testing.T) {
-	router := New(nil, testFeedService(), nil, nil, "").Router()
+	router := New(nil, testFeedService(), nil, nil, "", nil, "").Router()
 
 	firstReq := httptest.NewRequest(http.MethodGet, "/api/feed?limit=1&mode=latest", nil)
 	firstRec := httptest.NewRecorder()
@@ -222,7 +222,7 @@ func TestMetricsEndpointPrometheusPayload(t *testing.T) {
 
 	recommendService := recommend.NewService(cat, nil, nil, nil, nil)
 
-	router := New(nil, nil, nil, recommendService, "").Router()
+	router := New(nil, nil, nil, recommendService, "", nil, "").Router()
 	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
@@ -259,7 +259,7 @@ func TestMetricsEndpointPrometheusPayload(t *testing.T) {
 }
 
 func TestMetricsEndpointWithNilRecommendService(t *testing.T) {
-	router := New(nil, nil, nil, nil, "").Router()
+	router := New(nil, nil, nil, nil, "", nil, "").Router()
 	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
@@ -277,7 +277,7 @@ func TestMetricsEndpointWithNilRecommendService(t *testing.T) {
 }
 
 func TestRecommendationsEndpointWithNilRecommendService(t *testing.T) {
-	router := New(nil, nil, nil, nil, "").Router()
+	router := New(nil, nil, nil, nil, "", nil, "").Router()
 	req := httptest.NewRequest(http.MethodGet, "/api/recommendations/album-a/0?limit=12", nil)
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)

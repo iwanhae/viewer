@@ -292,7 +292,7 @@ func newFlowHarnessWithToken(t *testing.T, workerToken string) *flowHarness {
 	pipelineService.Start(context.Background())
 
 	return &flowHarness{
-		router:   New(albumService, feed.NewService(albumService), imageService, recommendService, workerToken).Router(),
+		router:   New(albumService, feed.NewService(albumService), imageService, recommendService, workerToken, nil, "").Router(),
 		albums:   albumService,
 		s3:       s3,
 		catalog:  cat,

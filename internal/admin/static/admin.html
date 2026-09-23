@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>viewer admin</title>
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    font-family: system-ui, -apple-system, sans-serif;
+    margin: 2rem auto;
+    max-width: 44rem;
+    padding: 0 1rem;
+    line-height: 1.5;
+  }
+  h1 { font-size: 1.4rem; }
+  h2 {
+    font-size: 1.05rem;
+    margin-top: 2rem;
+    border-bottom: 1px solid #8884;
+    padding-bottom: .25rem;
+  }
+  table { border-collapse: collapse; margin: .5rem 0; }
+  th, td { text-align: left; padding: .15rem 1.5rem .15rem 0; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .muted { opacity: .65; font-size: .85rem; }
+  .row { display: flex; gap: 1rem; align-items: baseline; }
+  .ok { color: #15803d; }
+  .bad { color: #b91c1c; font-weight: 600; }
+  @media (prefers-color-scheme: dark) {
+    .ok { color: #4ade80; }
+    .bad { color: #f87171; }
+  }
+  button { font: inherit; padding: .35rem .9rem; cursor: pointer; }
+  #reindex {
+    margin-top: 2rem;
+    background: #b91c1c;
+    border-color: #b91c1c;
+    color: #fff;
+  }
+  #error {
+    display: none;
+    margin: 1rem 0;
+    padding: .5rem .75rem;
+    border: 1px solid #b91c1c;
+    color: #b91c1c;
+  }
+</style>
+</head>
+<body>
+<h1>viewer admin</h1>
+
+<div class="row">
+  <button id="refresh" type="button">Refresh</button>
+  <span class="muted">auto-refreshes every 5s &middot; updated <span id="updated">never</span></span>
+</div>
+<div id="error" role="alert"></div>
+
+<h2>Library</h2>
+<table>
+  <tr><th>Albums</th><td class="num" id="albums">&ndash;</td></tr>
+  <tr><th>Photos</th><td class="num" id="photos">&ndash;</td></tr>
+  <tr><th>Blobs (unique content)</th><td class="num" id="blobs">&ndash;</td></tr>
+</table>
+<div id="albumStatuses" class="muted"></div>
+
+<h2>Embeddings</h2>
+<p class="muted">
+  Counts are per blob &mdash; the unit the embedding pipeline leases and
+  tracks. Expected and actual points below are per photo, the unit the vector
+  store holds, so they are only ever compared with each other.
+</p>
+<table>
+  <tr><th>Pending</th><td class="num" id="embPending">&ndash;</td></tr>
+  <tr><th>Processing</th><td class="num" id="embProcessing">&ndash;</td></tr>
+  <tr><th>Ready</th><td class="num" id="embReady">&ndash;</td></tr>
+  <tr><th>Failed</th><td class="num" id="embFailed">&ndash;</td></tr>
+  <tr><th>Total blobs</th><td class="num" id="embTotal">&ndash;</td></tr>
+</table>
+
+<h2>Vector store</h2>
+<table>
+  <tr><th>Expected points (ready photo pairs)</th><td class="num" id="expected">&ndash;</td></tr>
+  <tr><th>Qdrant points</th><td class="num" id="actual">&ndash;</td></tr>
+  <tr><th>Drift</th><td class="num" id="drift">&ndash;</td></tr>
+  <tr><th>Embedding model</th><td id="model">&ndash;</td></tr>
+</table>
+
+<button id="reindex" type="button">Re-embed everything</button>
+<p class="muted">
+  Resets every ready and failed embedding to pending. The background workers
+  then re-embed the whole library from the stored originals &mdash; this is the
+  recovery path for a lost vector store, and it takes a long time.
+</p>
+
+<script>
+'use strict';
+const $ = (id) => document.getElementById(id);
+
+function showError(message) {
+  $('error').textContent = message;
+  $('error').style.display = 'block';
+}
+
+function clearError() {
+  $('error').style.display = 'none';
+}
+
+async function fetchJSON(url, options) {
+  const res = await fetch(url, Object.assign({ cache: 'no-store' }, options));
+  if (res.status === 401) {
+    throw new Error('authentication required — reload the page and enter the admin token');
+  }
+  let body = null;
+  try {
+    body = await res.json();
+  } catch {
+    throw new Error('response was not JSON (status ' + res.status + ')');
+  }
+  if (!res.ok) {
+    throw new Error((body && body.error && body.error.message) ||
+      ('request failed with status ' + res.status));
+  }
+  return body;
+}
+
+function setCount(id, value) {
+  $(id).textContent = (value === undefined || value === null) ? '–' : String(value);
+}
+
+function render(stats) {
+  setCount('albums', stats.albums);
+  setCount('photos', stats.photos);
+  setCount('blobs', stats.blobs);
+
+  // Always show the four pipeline states, plus anything the server knows that
+  // this page does not, so a new status is visible rather than silently
+  // swallowed by the fixed list.
+  const byStatus = stats.albumsByStatus || {};
+  const keys = [...new Set(['QUEUED', 'PROCESSING', 'SUCCEEDED', 'FAILED',
+    ...Object.keys(byStatus)])].sort();
+  $('albumStatuses').textContent = keys
+    .map((s) => s.toLowerCase() + ': ' + (byStatus[s] || 0))
+    .join(' · ');
+
+  const emb = stats.embedding || {};
+  setCount('embPending', emb.pending);
+  setCount('embProcessing', emb.processing);
+  setCount('embReady', emb.ready);
+  setCount('embFailed', emb.failed);
+  setCount('embTotal', emb.total);
+
+  setCount('expected', stats.expectedPoints);
+  setCount('actual', stats.qdrantPoints);
+  const drift = $('drift');
+  drift.textContent = (stats.drift > 0 ? '+' : '') + stats.drift +
+    (stats.drift === 0 ? ' (in sync)' : '');
+  drift.className = stats.drift === 0 ? 'num ok' : 'num bad';
+  $('model').textContent = stats.modelEnabled ? 'yes' : 'no';
+}
+
+async function refresh() {
+  try {
+    const stats = await fetchJSON('/admin/api/stats');
+    clearError();
+    render(stats);
+    $('updated').textContent = new Date().toLocaleTimeString();
+  } catch (err) {
+    showError('loading stats failed: ' + err.message);
+  }
+}
+
+$('refresh').addEventListener('click', refresh);
+
+// Poll only while somebody is looking: a background tab gains nothing from
+// the requests, and the visibilitychange catch-up keeps the numbers honest
+// right after the tab comes back.
+setInterval(() => {
+  if (document.visibilityState === 'visible') refresh();
+}, 5000);
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') refresh();
+});
+
+$('reindex').addEventListener('click', async () => {
+  const ok = confirm(
+    'This resets every ready and failed embedding to pending, so the whole ' +
+    'library gets re-embedded from scratch. It takes a long time and reruns ' +
+    'the model on every image. Continue?');
+  if (!ok) return;
+  try {
+    await fetchJSON('/admin/api/reindex', { method: 'POST' });
+    await refresh();
+  } catch (err) {
+    showError('reindex failed: ' + err.message);
+  }
+});
+
+refresh();
+</script>
+</body>
+</html>

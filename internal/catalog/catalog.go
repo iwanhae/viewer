@@ -103,13 +103,14 @@ type PhotoWithBlob struct {
 
 // EmbeddingCounts summarizes embedding coverage across distinct blobs. Pending
 // is derived as Total-Ready-Failed on purpose: it means "not done yet", so
-// blobs a worker is currently embedding keep counting toward it.
+// blobs a worker is currently embedding keep counting toward it. The json tags
+// exist for the admin stats payload, the one place this type is serialized.
 type EmbeddingCounts struct {
-	Total      int
-	Ready      int
-	Failed     int
-	Processing int
-	Pending    int
+	Total      int `json:"total"`
+	Ready      int `json:"ready"`
+	Failed     int `json:"failed"`
+	Processing int `json:"processing"`
+	Pending    int `json:"pending"`
 }
 
 // Store is a SQLite-backed metadata catalog.
@@ -1055,6 +1056,83 @@ func (s *Store) ReadyPairCount(ctx context.Context) (int64, error) {
 		return 0, fmt.Errorf("count ready photo pairs: %w", err)
 	}
 	return count, nil
+}
+
+// AlbumCounts reports the total number of albums and how many sit in each
+// pipeline status. Both figures come out of one GROUP BY so the total can
+// never disagree with its own breakdown the way two separate queries could,
+// with albums changing status between them.
+func (s *Store) AlbumCounts(ctx context.Context) (int64, map[string]int64, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT status, COUNT(*) FROM albums GROUP BY status`)
+	if err != nil {
+		return 0, nil, fmt.Errorf("count albums by status: %w", err)
+	}
+	defer rows.Close()
+
+	byStatus := make(map[string]int64)
+	var total int64
+	for rows.Next() {
+		var status string
+		var count int64
+		if err := rows.Scan(&status, &count); err != nil {
+			return 0, nil, fmt.Errorf("scan album status count: %w", err)
+		}
+		byStatus[status] = count
+		total += count
+	}
+	if err := rows.Err(); err != nil {
+		return 0, nil, fmt.Errorf("iterate album status counts: %w", err)
+	}
+	return total, byStatus, nil
+}
+
+// PhotoCount counts the photo rows: one per (album, idx) entry extraction
+// produced, distinct from the album count and from the deduplicated blob
+// count, because the same image can appear in several albums.
+func (s *Store) PhotoCount(ctx context.Context) (int64, error) {
+	var count int64
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM photos`).Scan(&count); err != nil {
+		return 0, fmt.Errorf("count photos: %w", err)
+	}
+	return count, nil
+}
+
+// BlobCount counts the blob rows, which is the unique-content count: identical
+// image bytes share one blob no matter how many photos reference them.
+func (s *Store) BlobCount(ctx context.Context) (int64, error) {
+	var count int64
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM blobs`).Scan(&count); err != nil {
+		return 0, fmt.Errorf("count blobs: %w", err)
+	}
+	return count, nil
+}
+
+// ResetReadyEmbeddings flips every terminal embedding outcome (ready and
+// failed) back to pending and returns how many rows moved. It is the recovery
+// path for a lost vector store: the background and external workers pick the
+// pending blobs up through the usual claim loop and rebuild the points, so no
+// restart and no manual surgery is needed. Processing rows are deliberately
+// excluded: a worker still holds that blob's lease and is about to write its
+// result back, and flipping the row under it would race that write-back — the
+// result would find a pending row, be rejected as not_claimed, and the work
+// already spent on it would be thrown away only for another worker to redo it.
+// Letting the in-flight batch finish costs nothing; its outcome is as good as
+// a fresh one.
+func (s *Store) ResetReadyEmbeddings(ctx context.Context) (int64, error) {
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE blobs
+		SET embedding_status = ?, embedding_error = '', embedding_lease_until = 0
+		WHERE embedding_status IN (?, ?)`,
+		string(EmbeddingStatusPending), string(EmbeddingStatusReady), string(EmbeddingStatusFailed),
+	)
+	if err != nil {
+		return 0, fmt.Errorf("reset ready embeddings: %w", err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("count reset embeddings: %w", err)
+	}
+	return affected, nil
 }
 
 // scanPhotoBlobPairs drains a photo/blob join query, converting the raw

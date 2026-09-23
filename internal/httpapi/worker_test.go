@@ -411,7 +411,7 @@ func TestWorkerRenewExtendsLease(t *testing.T) {
 }
 
 func TestWorkerEndpointsWithoutServices(t *testing.T) {
-	router := New(nil, nil, nil, nil, "").Router()
+	router := New(nil, nil, nil, nil, "", nil, "").Router()
 
 	for _, path := range []string{"/api/embedding/claim", "/api/embedding/renew", "/api/embedding/results"} {
 		req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{}`))

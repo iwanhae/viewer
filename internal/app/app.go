@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"time"
 
+	"viewer/internal/admin"
 	"viewer/internal/albums"
 	"viewer/internal/backup"
 	"viewer/internal/catalog"
@@ -48,6 +49,11 @@ func Run(ctx context.Context) error {
 		log.Printf("viewer: embedding worker API requires a bearer token")
 	} else {
 		log.Printf("viewer: embedding worker API is UNAUTHENTICATED (set EMBEDDING_WORKER_TOKEN to protect it)")
+	}
+	if cfg.AdminToken != "" {
+		log.Printf("viewer: admin UI enabled and requires Basic auth (password = ADMIN_TOKEN)")
+	} else {
+		log.Printf("viewer: admin UI is disabled (set ADMIN_TOKEN to enable it)")
 	}
 
 	// The store comes up before the catalog: the bucket holds a snapshot of
@@ -115,6 +121,13 @@ func Run(ctx context.Context) error {
 	recommendService := recommend.NewService(cat, vectorStore, imageService, recommend.NewVisionEmbedder(vision.Config{
 		ModelID: cfgpkg.ModelDir,
 	}), finalizer.Run)
+
+	// The admin service reads only the catalog and the vector store, and its
+	// re-embed trigger only flips catalog rows the workers already drain, so
+	// it needs nothing built after this point. Creating it here — before the
+	// HTTP bind, like everything else — means /admin answers from the first
+	// served request on.
+	adminService := admin.NewService(cat, vectorStore, recommendService)
 	pipelineService := pipeline.NewService(cat, store, pipeline.Options{
 		OnAlbumReady: func(albumID string) {
 			if err := recommendService.ReloadAlbum(context.Background(), albumID); err != nil {
@@ -146,7 +159,7 @@ func Run(ctx context.Context) error {
 		}
 	}()
 
-	h := httpapi.New(albumService, feedService, imageService, recommendService, cfg.WorkerToken).Router()
+	h := httpapi.New(albumService, feedService, imageService, recommendService, cfg.WorkerToken, adminService, cfg.AdminToken).Router()
 	srv := &http.Server{
 		Addr:              fmt.Sprintf(":%d", cfg.Port),
 		Handler:           h,

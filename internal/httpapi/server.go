@@ -14,6 +14,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"viewer/internal/admin"
 	"viewer/internal/albums"
 	"viewer/internal/catalog"
 	"viewer/internal/feed"
@@ -28,17 +29,25 @@ type Server struct {
 	images      *images.Service
 	recommend   *recommend.Service
 	workerToken string
+	admin       *admin.Service
+	adminToken  string
 }
 
 // New wires the API together. An empty workerToken runs the external worker
-// endpoints without auth, which is only sensible on a trusted network.
-func New(albumsService *albums.Service, feedService *feed.Service, imageService *images.Service, recommendService *recommend.Service, workerToken string) *Server {
+// endpoints without auth, which is only sensible on a trusted network. The
+// admin surface only registers when both an adminService and an adminToken are
+// supplied: a dashboard that answered without its credential would be an
+// unauthenticated view of the whole library, so either half missing simply
+// leaves /admin a 404.
+func New(albumsService *albums.Service, feedService *feed.Service, imageService *images.Service, recommendService *recommend.Service, workerToken string, adminService *admin.Service, adminToken string) *Server {
 	return &Server{
 		albums:      albumsService,
 		feed:        feedService,
 		images:      imageService,
 		recommend:   recommendService,
 		workerToken: workerToken,
+		admin:       adminService,
+		adminToken:  adminToken,
 	}
 }
 
@@ -76,15 +85,49 @@ func (s *Server) Router() http.Handler {
 		r.Post("/api/embedding/results", s.postEmbeddingResults)
 	})
 
+	// The admin surface is the operator's dashboard and the re-embed recovery
+	// trigger. It is registered only when both the service and its token
+	// exist — see New — so a deployment without ADMIN_TOKEN gets a plain 404
+	// instead of an unauthenticated dashboard.
+	if s.admin != nil && s.adminToken != "" {
+		r.Route("/admin", func(r chi.Router) {
+			r.Use(s.requireAdminToken)
+			r.Get("/", admin.Page().ServeHTTP)
+			r.Get("/api/stats", s.adminStats)
+			r.Post("/api/reindex", s.adminReindex)
+		})
+	}
+
 	staticHandler := web.Handler()
-	r.NotFound(func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasPrefix(r.URL.Path, "/api/") {
+	// serveAPINotFound answers misses on the machine-facing surfaces with
+	// JSON. /admin joins /api there when the admin surface is disabled: the
+	// SPA fallback would otherwise serve the frontend's index.html for it,
+	// which reads as "the page exists but is broken" when the truth is "this
+	// deployment has no admin UI".
+	serveAPINotFound := func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/api/") || (!s.adminEnabled() && isAdminPath(r.URL.Path)) {
 			writeError(w, r, http.StatusNotFound, "NOT_FOUND", "resource not found")
 			return
 		}
 		staticHandler.ServeHTTP(w, r)
+	}
+	r.NotFound(serveAPINotFound)
+	// A method no registered route carries gets chi's bare 405 before NotFound
+	// ever runs. For a disabled admin surface that bare 405 would advertise
+	// that /admin exists under some other method, so it is folded into the
+	// same 404 the missing route produces; every other path keeps the default.
+	r.MethodNotAllowed(func(w http.ResponseWriter, r *http.Request) {
+		if !s.adminEnabled() && isAdminPath(r.URL.Path) {
+			serveAPINotFound(w, r)
+			return
+		}
+		w.WriteHeader(http.StatusMethodNotAllowed)
 	})
 	r.Get("/*", func(w http.ResponseWriter, r *http.Request) {
+		if !s.adminEnabled() && isAdminPath(r.URL.Path) {
+			serveAPINotFound(w, r)
+			return
+		}
 		staticHandler.ServeHTTP(w, r)
 	})
 

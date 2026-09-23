@@ -1161,3 +1161,146 @@ func TestApplyEmbeddingResultsRejectsWrongDimVector(t *testing.T) {
 		t.Fatalf("blob b=%+v err=%v want ready", blobB, err)
 	}
 }
+
+// seedBlobLease sets a blob's error text and lease directly, the fields the
+// production write-back path manages but GetBlob does not surface. The reset
+// and lease tests need to see them.
+func seedBlobLease(t *testing.T, store *Store, hash string, errText string, leaseUntil int64) {
+	t.Helper()
+	if _, err := store.db.Exec(`UPDATE blobs SET embedding_error = ?, embedding_lease_until = ? WHERE hash = ?`, errText, leaseUntil, hash); err != nil {
+		t.Fatalf("seed blob %s lease: %v", hash, err)
+	}
+}
+
+// blobLeaseRow reads the raw embedding row back, including the lease column
+// the Blob struct leaves out.
+func blobLeaseRow(t *testing.T, store *Store, hash string) (EmbeddingStatus, string, int64) {
+	t.Helper()
+	var status, errText string
+	var lease int64
+	if err := store.db.QueryRow(`SELECT embedding_status, embedding_error, embedding_lease_until FROM blobs WHERE hash = ?`, hash).Scan(&status, &errText, &lease); err != nil {
+		t.Fatalf("read blob %s: %v", hash, err)
+	}
+	return EmbeddingStatus(status), errText, lease
+}
+
+// TestAlbumPhotoBlobCounts pins the three library totals the admin page shows.
+// One blob shared by two albums proves the blob count is unique content, not
+// photo references.
+func TestAlbumPhotoBlobCounts(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+
+	albums := []Album{
+		{ID: "album-a", OriginalFilename: "a.zip", Status: AlbumStatusReady},
+		{ID: "album-b", OriginalFilename: "b.zip", Status: AlbumStatusFailed},
+		{ID: "album-c", OriginalFilename: "c.zip", Status: AlbumStatusQueued},
+	}
+	for _, album := range albums {
+		if err := store.CreateAlbum(ctx, album); err != nil {
+			t.Fatalf("create album: %v", err)
+		}
+	}
+	photos := []Photo{
+		{AlbumID: "album-a", Index: 0, Hash: "hash-shared"},
+		{AlbumID: "album-b", Index: 0, Hash: "hash-shared"},
+		{AlbumID: "album-b", Index: 1, Hash: "hash-only-b"},
+	}
+	for _, photo := range photos {
+		if err := store.InsertPhoto(ctx, photo); err != nil {
+			t.Fatalf("insert photo: %v", err)
+		}
+		if err := store.UpsertBlob(ctx, Blob{Hash: photo.Hash, SizeBytes: 1}); err != nil {
+			t.Fatalf("upsert blob: %v", err)
+		}
+	}
+
+	total, byStatus, err := store.AlbumCounts(ctx)
+	if err != nil {
+		t.Fatalf("album counts: %v", err)
+	}
+	if total != 3 {
+		t.Fatalf("album total=%d want=3", total)
+	}
+	if len(byStatus) != 3 || byStatus[string(AlbumStatusReady)] != 1 ||
+		byStatus[string(AlbumStatusFailed)] != 1 || byStatus[string(AlbumStatusQueued)] != 1 {
+		t.Fatalf("album byStatus=%v want one of each", byStatus)
+	}
+
+	photoCount, err := store.PhotoCount(ctx)
+	if err != nil || photoCount != 3 {
+		t.Fatalf("photo count=%d err=%v want=3", photoCount, err)
+	}
+	blobCount, err := store.BlobCount(ctx)
+	if err != nil || blobCount != 2 {
+		t.Fatalf("blob count=%d err=%v want=2 (hash-shared is one blob)", blobCount, err)
+	}
+}
+
+// TestAlbumCountsOnEmptyCatalog pins the empty case: zero albums means a zero
+// total and an empty (not nil-panicking) breakdown.
+func TestAlbumCountsOnEmptyCatalog(t *testing.T) {
+	store := openTestStore(t)
+
+	total, byStatus, err := store.AlbumCounts(context.Background())
+	if err != nil {
+		t.Fatalf("album counts: %v", err)
+	}
+	if total != 0 || len(byStatus) != 0 {
+		t.Fatalf("album total=%d byStatus=%v want all empty", total, byStatus)
+	}
+}
+
+// TestResetReadyEmbeddings pins the recovery path: ready and failed rows go
+// back to pending with their error text and lease cleared, while processing
+// rows are left strictly alone — a worker still holds that lease, and
+// flipping the row under it would race the in-flight write-back.
+func TestResetReadyEmbeddings(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+
+	for _, hash := range []string{"hash-ready", "hash-failed", "hash-processing", "hash-pending"} {
+		if err := store.UpsertBlob(ctx, Blob{Hash: hash, SizeBytes: 1}); err != nil {
+			t.Fatalf("upsert %s: %v", hash, err)
+		}
+	}
+	seedBlobStatus(t, store, "hash-ready", EmbeddingStatusReady)
+	seedBlobStatus(t, store, "hash-failed", EmbeddingStatusFailed)
+	seedBlobStatus(t, store, "hash-processing", EmbeddingStatusProcessing)
+	// Error text and lease on the rows that carry them, so the reset has
+	// something to clear (and the processing row proves nothing was cleared).
+	seedBlobLease(t, store, "hash-ready", "stale success note", 111)
+	seedBlobLease(t, store, "hash-failed", "embed exploded", 222)
+	seedBlobLease(t, store, "hash-processing", "worker still running", 333)
+
+	reset, err := store.ResetReadyEmbeddings(ctx)
+	if err != nil {
+		t.Fatalf("reset ready embeddings: %v", err)
+	}
+	if reset != 2 {
+		t.Fatalf("reset=%d want=2 (one ready, one failed)", reset)
+	}
+
+	status, errText, lease := blobLeaseRow(t, store, "hash-ready")
+	if status != EmbeddingStatusPending || errText != "" || lease != 0 {
+		t.Fatalf("hash-ready=(%s %q %d) want (pending \"\" 0)", status, errText, lease)
+	}
+	status, errText, lease = blobLeaseRow(t, store, "hash-failed")
+	if status != EmbeddingStatusPending || errText != "" || lease != 0 {
+		t.Fatalf("hash-failed=(%s %q %d) want (pending \"\" 0)", status, errText, lease)
+	}
+	status, errText, lease = blobLeaseRow(t, store, "hash-processing")
+	if status != EmbeddingStatusProcessing || errText != "worker still running" || lease != 333 {
+		t.Fatalf("hash-processing=(%s %q %d) want untouched processing row", status, errText, lease)
+	}
+	status, _, lease = blobLeaseRow(t, store, "hash-pending")
+	if status != EmbeddingStatusPending || lease != 0 {
+		t.Fatalf("hash-pending=(%s %d) want untouched pending row", status, lease)
+	}
+
+	// A second reset is a no-op: nothing terminal is left to flip.
+	reset, err = store.ResetReadyEmbeddings(ctx)
+	if err != nil || reset != 0 {
+		t.Fatalf("second reset=%d err=%v want 0", reset, err)
+	}
+}
