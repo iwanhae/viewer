@@ -90,6 +90,92 @@
   height: 12px;
 }
 
+/* The search-by-image picker: a quiet icon button inside the search field,
+   same footprint as the clear button but without the pill background. */
+.search-image-button {
+  flex: 0 0 auto;
+  width: 28px;
+  height: 28px;
+  border: 0;
+  border-radius: var(--radius-pill);
+  padding: 0;
+  background: transparent;
+  color: var(--ink-3);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: color var(--speed-fast) var(--ease);
+}
+
+.search-image-button:hover {
+  color: var(--ink);
+}
+
+.search-image-button svg {
+  width: 18px;
+  height: 18px;
+}
+
+/* The chosen file shows as a chip just above the toolbar: thumbnail from an
+   object URL, the file name, and a clear button. */
+.photo-search-chip-row {
+  display: flex;
+}
+
+.photo-search-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  max-width: 100%;
+  padding: 4px 6px 4px 4px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-pill);
+}
+
+.photo-search-chip img {
+  flex: 0 0 auto;
+  width: 28px;
+  height: 28px;
+  border-radius: var(--radius-pill);
+  object-fit: cover;
+  display: block;
+}
+
+.photo-search-chip-name {
+  font-size: var(--text-sm);
+  color: var(--ink-2);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.photo-search-chip-clear {
+  flex: 0 0 auto;
+  width: 20px;
+  height: 20px;
+  border: 0;
+  border-radius: var(--radius-pill);
+  padding: 0;
+  background: var(--line);
+  color: var(--ink-2);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+}
+
+.photo-search-chip-clear:hover {
+  color: var(--ink);
+}
+
+.photo-search-chip-clear svg {
+  width: 10px;
+  height: 10px;
+}
+
 .album-search-toolbar {
   display: flex;
   align-items: baseline;

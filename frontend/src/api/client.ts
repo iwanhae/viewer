@@ -143,6 +143,35 @@ export async function fetchPhotoSearch(params: {
   })
 }
 
+// searchPhotosByImage uploads a photo from the user's device and asks the
+// backend for visually similar catalog matches. The body is multipart with the
+// file in the "image" field; no Content-Type header is set on purpose —
+// requestJSON does not force one, so the browser generates the multipart
+// boundary itself. Errors come back through the same typed ApiError as the
+// JSON helpers, so the page can tell UNAVAILABLE (vector search off) from
+// ordinary failures.
+export async function searchPhotosByImage(params: {
+  file: File
+  limit?: number
+  signal?: AbortSignal
+}): Promise<PhotoSearchResponse> {
+  const query = new URLSearchParams()
+  if (params?.limit !== undefined) query.set('limit', String(params.limit))
+
+  const body = new FormData()
+  body.append('image', params.file)
+
+  const suffix = query.toString()
+  const path = suffix
+    ? `/api/photos/search-by-image?${suffix}`
+    : '/api/photos/search-by-image'
+  return await requestJSON<PhotoSearchResponse>(path, {
+    method: 'POST',
+    body,
+    signal: params?.signal,
+  })
+}
+
 export async function fetchRecommendations(
   albumId: string,
   index: number,
