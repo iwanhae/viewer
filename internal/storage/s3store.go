@@ -140,22 +140,10 @@ func (s *S3Store) GetObject(ctx context.Context, key string) (io.ReadCloser, str
 	return out.Body, ct, nil
 }
 
+// HeadObject reports one object's existence and size; it projects StatObject.
 func (s *S3Store) HeadObject(ctx context.Context, key string) (bool, int64, error) {
-	o, err := s.client.HeadObject(ctx, &s3.HeadObjectInput{
-		Bucket: aws.String(s.bucket),
-		Key:    aws.String(s.physicalKey(key)),
-	})
-	if err != nil {
-		if isS3NotFound(err) {
-			return false, 0, nil
-		}
-		return false, 0, fmt.Errorf("head object %s: %w", key, err)
-	}
-	var size int64
-	if o.ContentLength != nil {
-		size = *o.ContentLength
-	}
-	return true, size, nil
+	obj, ok, err := s.StatObject(ctx, key)
+	return ok, obj.Size, err
 }
 
 // StatObject reports one object's listing metadata, the way ListObjects
