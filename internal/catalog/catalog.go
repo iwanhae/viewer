@@ -127,6 +127,11 @@ func Open(path string) (*Store, error) {
 		}
 	}
 
+	// WAL lets the single writer and the readers proceed without blocking
+	// each other, foreign_keys enforces the photo-to-album references, and
+	// synchronous(NORMAL) is the setting WAL is designed for: commits cost no
+	// fsync, and the 10s busy timeout rides out the remaining lock contention
+	// instead of failing a request outright.
 	dsn := fmt.Sprintf(
 		"file:%s?_pragma=busy_timeout(10000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)&_pragma=synchronous(NORMAL)",
 		clean,

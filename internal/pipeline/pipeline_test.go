@@ -485,6 +485,21 @@ func TestEnqueueReturnsStoppedOnceTheWorkerIsGone(t *testing.T) {
 		t.Fatalf("worker never stopped")
 	}
 
+	// The worker's select saw both a cancelled context and a ready queue
+	// receive, so before returning it may have drained a few albums at random.
+	// The Enqueue below is only deterministic against a full queue - otherwise
+	// the free send slot races the closed stopped channel and the select can
+	// pick either - so top the buffer back up first. The worker is gone by
+	// now: stopped closes as the worker's deferred last act.
+	for {
+		select {
+		case svc.queue <- "refill":
+			continue
+		default:
+		}
+		break
+	}
+
 	if err := svc.Enqueue(context.Background(), "after-stop"); !errors.Is(err, ErrStopped) {
 		t.Fatalf("enqueue error=%v want ErrStopped", err)
 	}

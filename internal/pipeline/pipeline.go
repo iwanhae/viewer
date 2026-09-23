@@ -504,6 +504,9 @@ func imageEntries(files []*zip.File) []*zip.File {
 		}
 		entries = append(entries, file)
 	}
+	// The order assigns each photo its idx — the address the API and the UI
+	// use — so it must be deterministic: case-insensitive filename order keeps
+	// an album re-extracted from the same zip on the same indexes.
 	sort.Slice(entries, func(a, b int) bool {
 		return strings.ToLower(entries[a].Name) < strings.ToLower(entries[b].Name)
 	})
