@@ -1,403 +1,131 @@
 # viewer
 
-Photo viewer MVP with:
-- Go API server
-- React frontend embedded into one Go binary
+Self-hosted photo album server. Upload a zip of photos; the server stores each image as a content-addressed blob in S3-compatible object storage, catalogs albums in SQLite, computes SigLIP2 image embeddings into an external Qdrant server, and serves a React frontend plus a JSON API from a single Go binary.
+
+## Features
+
+- Zip batch upload via presigned PUT (1 GiB cap).
+- Deduplicated content-addressed storage: objects live at `blobs/<sha256>`, so identical images are stored once.
+- On-the-fly resized JPEGs (320/640/1024 widths), streamed from S3 and cached with blob-hash ETags.
+- Semantic "similar photos" recommendations across albums (SigLIP2-base, 768-dim vectors in Qdrant).
+- Lease-based HTTP API so external GPU workers can drain the embedding backlog.
+- Admin dashboard with embedding stats and a re-embed recovery trigger.
+- SQLite catalog backed up to the bucket and auto-restored on startup.
+- Upload drop zone: zips copied straight into the `uploads/` prefix (e.g. with `mc` or `aws s3 cp`) are picked up without a restart.
 
 ## Architecture
 
-Uploads are sent straight to object storage with a presigned `PUT`, but the zip
-is only a transport container. A single in-process worker downloads each staged
-zip sequentially, unpacks it entry by entry, and turns every image into a
-content-addressed blob:
+Object keys live under three prefixes: `uploads/` (staged zips), `blobs/` (content-addressed images), and `backups/` (catalog snapshots). Everything else is SQLite.
 
-1. `POST /api/albums` registers a `QUEUED` album in SQLite and returns a
-   presigned `PUT` URL for `uploads/<albumId>.zip`.
-2. The browser uploads the zip directly to S3.
-3. `POST /api/albums/<albumId>/finalize` queues the album for the pipeline
-   worker.
-4. The worker downloads the zip to local disk and walks its image entries in
-   filename order (case-insensitive, so photo indexes stay stable). For each
-   entry it:
-   - reads the image dimensions and computes the SHA-256 of the raw bytes,
-   - stores the original bytes in S3 at `blobs/<sha256>` (uploaded only once per
-     distinct content hash, so identical images never occupy storage twice),
-   - records the zip entry name, hash, width, height and ratio in SQLite.
+1. `POST /api/albums` registers a QUEUED album and returns a presigned PUT for `uploads/<albumId>.zip`; the browser uploads the zip straight to object storage.
+2. `POST /api/albums/<id>/finalize` queues extraction.
+3. A single-slot worker downloads the zip and stores every image as `blobs/<sha256>`, recording entry name, hash, width, and height in SQLite.
+4. Embedding workers — the built-in GoMLX one in-process, plus optional external ones — embed pending blobs and write vectors to Qdrant; the catalog keeps only embedding status.
+5. Image requests resolve `(albumId, index)` to a blob hash and stream `blobs/<hash>` from S3, served with `ETag` and `Cache-Control: public, max-age=86400, immutable`.
 
-   Extraction never computes embeddings: it leaves every blob in the `pending`
-   state for the embedding workers, which is what keeps a slow model download
-   from holding up album ingestion (see "Vector store" below).
-5. Once the worker has emptied its queue, the backup finalizer snapshots the
-   SQLite catalog to S3 (`backups/viewer.db`) and only then batch-deletes the
-   staged zips that snapshot covers — a failed extraction's zip included, since
-   the failure is now recorded in the catalog.
+Metadata lives in SQLite at `$STATE_DIR/viewer.db`. The bucket snapshot `backups/viewer.db` is restored at startup when it is newer than the local catalog, so a wiped state volume recovers from the bucket alone. The SigLIP2 checkpoint is fetched at first start into `/app/siglip2`; inference runs in-process, with no separate inference service. A cold start degrades gracefully: the server serves, embeddings wait.
 
-All metadata lives in the local SQLite catalog at `$STATE_DIR/viewer.db`
-(default `/var/lib/viewer`); S3 holds the staged zips (until the next drain),
-the deduplicated image blobs, and the catalog backup. The
-`albums/<id>/index.json` objects of previous versions are no longer written or
-read. Object keys below are the logical ones: set `S3_PREFIX` to nest all of
-them under a single prefix in the bucket.
+## Requirements
 
-Image requests are resolved as `(albumId, index)` -> photo row -> blob hash ->
-`blobs/<hash>`. The blob is fetched from S3 per request and served through
-`http.ServeContent`, so responses carry a `Content-Length`, support `Range`, and
-are revalidated with an `ETag` equal to the blob hash under
-`Cache-Control: public, max-age=86400, immutable` — a repeat view is a `304`
-the browser answers without reaching the server.
+- Go 1.27
+- Node 22 (frontend build)
+- Docker (alternative)
 
-`uploads/` is also the drop zone: at startup and every minute the viewer lists
-it, registers an album for every zip nothing owns yet, and queues an album whose
-zip is still waiting. A zip copied in with `mc`/`aws s3 cp` is therefore picked
-up without a restart, and any zip left behind by an interrupted extraction is
-retried. The scan never copies, moves or deletes: the backup finalizer empties
-the prefix in batches once a drain has backed the catalog up.
+Tests need no credentials.
 
-The catalog itself is backed up to the bucket, and the bucket restores the
-catalog: at startup the viewer compares `backups/viewer.db`'s timestamp with
-`viewer.db.backup-stamp` in `STATE_DIR` and replaces the local database when
-the bucket is ahead — including when the local file is missing entirely, which
-is what makes a wiped state volume recoverable from the bucket alone.
+## Getting started
+
+Local run — point `STATE_DIR` at a writable directory, since the container default `/var/lib/viewer` is not writable for a local user:
+
+```sh
+cp .env.example .env   # fill in the required variables
+make build
+make run               # loads ./.env if present
+```
+
+Docker:
+
+```sh
+docker build -t viewer .
+docker run -d --name viewer \
+  -p 8080:8080 \
+  -v viewer-state:/var/lib/viewer \
+  -v viewer-model:/app/siglip2 \
+  -e S3_ENDPOINT=https://s3.example.com \
+  -e S3_BUCKET=viewer \
+  -e S3_ACCESS_KEY=replace_me \
+  -e S3_SECRET_KEY=replace_me \
+  -e QDRANT_URL=https://qdrant.example.com \
+  -e QDRANT_API_KEY=replace_me \
+  -e QDRANT_COLLECTION=photo_embeddings \
+  viewer
+```
+
+`viewer-state` holds the SQLite catalog and must persist: the album-to-photo mapping cannot be rebuilt from the blobs. `viewer-model` keeps the ~1.5 GiB model checkpoint across container replacements. CI publishes the image to `ghcr.io/<owner>/<repo>`.
 
 ## Configuration
 
-The viewer is always deployed as the Docker image, so the whole configuration is
-twelve environment variables:
+The viewer is deployed as a Docker image, and every setting is an environment variable. `.env.example` documents the same set.
 
-- `S3_ENDPOINT`, `S3_BUCKET`, `S3_ACCESS_KEY`, `S3_SECRET_KEY` — required.
-- `S3_PREFIX` — optional key prefix, so several deployments can share one bucket
-  (default empty: objects sit at the bucket root).
-- `S3_USE_PATH_STYLE` — how the bucket is addressed: `true` (the default) puts it
-  in the request path, `false` in a subdomain of the endpoint.
-- `STATE_DIR` — absolute directory holding the SQLite catalog (default
-  `/var/lib/viewer`, the volume the image declares).
-- `PORT` — the port the container listens on (default `8080`).
-- `QDRANT_URL` — required; base URL of the external Qdrant server's REST API
-  that holds the recommendation vectors (see "Vector store" below).
-- `QDRANT_API_KEY` — required; sent as the `api-key` header on every Qdrant
-  request.
-- `QDRANT_COLLECTION` — required; the name of the Qdrant collection that holds
-  the per-photo embedding points. It has no default: the viewer refuses to
-  start without it, so nothing is ever created or queried under an accidental
-  collection name (see "Vector store" below).
-- `EMBEDDING_WORKER_TOKEN` — optional shared bearer token the external embedding
-  worker API requires (see "External embedding workers" below; default empty,
-  which turns that check off and is only sensible on a trusted network; a value
-  that is set but blank is rejected at startup).
+| Variable | Required | Default | Description |
+| --- | --- | --- | --- |
+| `S3_ENDPOINT` | yes | — | Object storage endpoint (S3, MinIO, Garage, ...). Any path prefix on the endpoint is kept. |
+| `S3_BUCKET` | yes | — | Bucket name. |
+| `S3_ACCESS_KEY` | yes | — | Access key. |
+| `S3_SECRET_KEY` | yes | — | Secret key. |
+| `S3_PREFIX` | no | (empty) | Key prefix so several deployments can share one bucket; surrounding slashes are trimmed. Objects become `<prefix>/uploads/...`, `<prefix>/blobs/...`, `<prefix>/backups/...`. |
+| `S3_USE_PATH_STYLE` | no | `true` | `true` addresses the bucket in the request path (`https://host/bucket/key` — what self-hosted stores expect); `false` uses a subdomain (`https://bucket.host/key`, needs wildcard DNS). |
+| `STATE_DIR` | no | `/var/lib/viewer` | Absolute directory holding the SQLite catalog (`viewer.db`) and the backup stamp. Must be an absolute path. Mount a volume here — the album-to-photo mapping cannot be rebuilt from the blobs. |
+| `PORT` | no | `8080` | HTTP listen port. |
+| `QDRANT_URL` | yes | — | Base URL of the Qdrant server's REST API; must be an http/https URL with a host. |
+| `QDRANT_API_KEY` | yes | — | Sent as the `api-key` header on every Qdrant request. |
+| `QDRANT_COLLECTION` | yes | — | Qdrant collection holding the per-photo embedding points. Deliberately no default: the viewer refuses to start without it. |
+| `SIGLIP2_MODEL_URL` | no | built-in mirror | Base URL the SigLIP2 checkpoint (`config.json`, `model.safetensors`) is fetched from on first start into `/app/siglip2`. Mount a prepared directory at `/app/siglip2` to skip the download. |
+| `EMBEDDING_WORKER_TOKEN` | no | (empty) | Bearer token required on the external embedding-worker API. Empty disables that check (trusted networks only); the rest of the API is unaffected. |
+| `ADMIN_TOKEN` | no | (empty) | Basic-auth password for `/admin`. Empty keeps the admin UI disabled. |
+| `ALLOW_BACKUP_OVERWRITE` | no | `false` | Lets the catalog finalizer overwrite the bucket's `backups/viewer.db` with a local database it would otherwise refuse to write (untraceable stamp, or drastically smaller than the backup it would replace). |
 
-By default the bucket is the first path segment of the request rather than a
-subdomain — `https://host/bucket/key` instead of `https://bucket.host/key` —
-which is what self-hosted stores like Garage and MinIO expect and needs no
-wildcard DNS. An endpoint that itself carries a path prefix keeps it:
-`https://host/gateway/bucket/key`. Set `S3_USE_PATH_STYLE=false` for a store that
-requires the subdomain form, which then needs wildcard DNS for the endpoint. The
-signing region is fixed at `us-east-1` because these stores ignore it.
+Notes:
 
-`STATE_DIR` holds `viewer.db`, the SQLite catalog, plus the backup stamp that
-records which bucket backup it reflects. The catalog is the only state that
-cannot be rebuilt from the blobs — the album-to-photo mapping exists nowhere
-else — which is exactly why the viewer keeps a snapshot of it at
-`backups/viewer.db` in the bucket: losing the volume costs one restart, not the
-library. The image Dockerfile declares `VOLUME /var/lib/viewer`; mount a host
-volume there (or point `STATE_DIR` at your own mount) to keep albums across
-container replacements.
+- Set-but-blank values of `EMBEDDING_WORKER_TOKEN`, `QDRANT_API_KEY`, `QDRANT_COLLECTION`, and `ADMIN_TOKEN` are rejected at startup rather than silently meaning "off".
+- Some values are fixed constants, not environment variables: the 1 GiB upload cap, the 15 minute presign TTL, the `us-east-1` signing region, and the `/app/siglip2` checkpoint directory. See `internal/config/config.go`.
 
-The viewer keeps no local caches: images stream straight from S3, and the only
-thing it writes outside the volume is the staged zip being unpacked, which goes
-to the OS temp directory. Startup clears that directory of leftovers from a
-crashed run, so a container replacement or a restart leaves nothing to clean up
-by hand.
+## API overview
 
-`S3_PREFIX=photos` stores this deployment's objects under `photos/`
-(`photos/blobs/<sha256>`, `photos/uploads/<albumId>.zip`). Surrounding slashes
-and whitespace are trimmed, so `photos`, `photos/` and `/photos/` are
-equivalent. The prefix is applied by the storage layer and never recorded in the
-catalog, so relocating a deployment's objects within the bucket does not
-invalidate the stored metadata.
+| Method | Path | Purpose |
+| --- | --- | --- |
+| GET | `/healthz` | Liveness. |
+| GET | `/metrics` | Prometheus metrics; the only exposure of embedding progress. |
+| POST | `/api/albums` | Register an album, get a presigned upload URL. |
+| POST | `/api/albums/{id}/finalize` | Queue extraction (`GET` returns current status). |
+| GET | `/api/albums/{id}` | Album detail with photos. |
+| GET | `/api/albums/search` | Filename substring search. |
+| GET | `/api/feed` | Paged photo wall. |
+| GET | `/api/image/{hash}` | Blob content; `?w=320\|640\|1024` returns a resized JPEG keyed by hash + width in the ETag. |
+| GET | `/api/recommendations/{albumId}/{index}` | Cross-album similar photos. |
+| POST | `/api/embedding/claim`, `/renew`, `/results` | External embedding-worker lease API (bearer-token when `EMBEDDING_WORKER_TOKEN` is set). |
+| GET | `/admin` | Dashboard (stats + re-embed trigger); enabled only when `ADMIN_TOKEN` is set. |
 
-Setting the prefix is not a migration: a deployment that already has objects at
-the bucket root must move its `blobs/` and `uploads/` keys under the new prefix,
-or the viewer will not see them.
+## External embedding workers
 
-Everything else is a constant in `internal/config`: the signing region, the 1 GiB
-upload limit, the 15 minute presign TTL, the `/app/siglip2` checkpoint
-location, and the `SIGLIP2_MODEL_URL` mirror the checkpoint is fetched from.
-Copy `.env.example` to `.env` for a local run. The test suite uses no
-credentials, so `make test` needs no environment file.
+The built-in embedder is a single in-process goroutine. The same claim/renew/results lease API is open to external workers, so a fleet of GPU boxes can drain a large backlog: claims lease pending blobs, results write vectors to Qdrant and then status to SQLite, and expired leases keep blobs from being stranded. See `recommender/README.md` for a ready-made Python worker (`uv sync`, `.env`, `uv run recommender`).
 
-There is no separate inference service to run: `viewer` loads the checkpoint
-from `/app/siglip2` and runs the vision tower in-process. The server starts
-listening right away, and the checkpoint resolves in a background goroutine: a
-cold start fetches it into that directory from `SIGLIP2_MODEL_URL`, a
-public-read mirror of the upstream Hugging Face files, logging position and
-rate every 5 seconds while the download runs. Until the model is in, the API
-answers recommendations from whatever points the vector store already holds and
-new blobs stay `pending`. A directory that already holds a checkpoint - a
-previous download or a mount - is never re-fetched. A checkpoint that fails to
-load or download only degrades: the container logs the failure, keeps serving,
-and returns recommendations from whatever points the vector store already holds.
-Mount a directory at `/app/siglip2` (holding `config.json` and
-`model.safetensors`) to supply a checkpoint by hand and skip the download
-entirely.
+## Development
 
-Embeddings live in an external Qdrant collection, not in SQLite: since catalog
-migration 0003 the database keeps only each blob's embedding status, and every
-vector is a point in the Qdrant collection named by `QDRANT_COLLECTION`
-(`photo_embeddings` in the examples here; see "Vector store" below). The
-ingest pipeline never embeds anything itself; a blob whose
-embedding was deferred (the model had not loaded) stays in the `pending` state,
-and the background embedding workers fill it in on a later run once a
-checkpoint is available. Those workers only start when the checkpoint loaded,
-so a server without a model never computes embeddings but still answers
-recommendation requests from the points the collection already holds. The same
-claim/write-back path is also open to external embedding workers, so a fleet of
-GPU boxes can drain a large backlog alongside the built-in one (see "External
-embedding workers" below). Recommendation responses
-are cross-album only: photos from the same album as the query are excluded from
-results on the store side. If no cross-album neighbors exist for an embedded
-query photo, recommendations return an empty `items` list.
+- `make build` — builds the frontend if stale (`FORCE=1` to force), then `bin/viewer`.
+- `make test` — Go unit and integration tests; no credentials or env file needed.
+- `make typecheck` — frontend `tsc --noEmit`.
+- `make run` — runs `bin/viewer` with `./.env`.
+- `make clean`.
 
-### Vector store
+The Go SigLIP2 port (`internal/vision`) is regression-tested against a PyTorch reference in `scripts/vision-reference/`; that test is skipped unless `VISION_REFERENCE_DIR` points at a generated bundle.
 
-Recommendation vectors live in the Qdrant collection the viewer owns — the one
-`QDRANT_COLLECTION` names, `photo_embeddings` in the examples here — with 768
-float32 dimensions, cosine distance, one point per photo. The point ID is
-derived deterministically from `(albumId, index)`, so
-re-writing a photo's vector overwrites that point in place instead of
-duplicating it. Each point carries the photo's album id, index, blob hash and
-dimensions as payload, the group search filters the query's own album and hash
-on the store side, and it returns at most one photo per album.
-
-The connection is configured with the three required variables `QDRANT_URL`
-(base URL of the server's REST API), `QDRANT_API_KEY` (sent as the `api-key`
-header on every request) and `QDRANT_COLLECTION` (the name of the collection
-holding the points). `QDRANT_COLLECTION` has no default: the viewer refuses to
-start without it, so nothing is ever created or queried under an accidental
-collection name, and migration 0003 uploads into whichever collection the
-process is configured with.
-
-Writes go to the two stores in a fixed order — vector store first, SQLite
-bookkeeping second — so a crash between the two leaves the blob still
-`processing`: its claim is re-leased, the blob is re-embedded, and the
-write-back upserts the very same point IDs, converging without duplicates. The
-reverse order could produce points the catalog does not know about.
-
-Boot order:
-
-- Migrations run while the catalog opens, before the HTTP server binds.
-  Migration 0003 moves any vectors still stored in SQLite into the collection
-  `QDRANT_COLLECTION` names.
-  It needs Qdrant to be reachable: uploads go out in batches of 256 with a
-  `catalog: vector upload progress <n>/<total>` line every 50 batches, and a
-  failed batch rolls the whole migration back so the next boot retries it from
-  scratch — idempotent upserts make that safe. Only after every vector is
-  uploaded does the migration drop the `embedding` column and the
-  `blob_embeddings` table, which is also why **downgrading to a pre-0003
-  binary is not supported**: those binaries read the vectors from SQLite, and
-  that schema is gone once the migration commits.
-- On every boot the viewer ensures the collection exists with the right
-  geometry before serving, so a wiped collection is recreated at startup
-  instead of turning every search into an error.
-
-Drift: the two stores are written by different paths (worker write-backs,
-migration, album reloads), so they can disagree — most commonly after a
-catalog backup was restored over a collection that kept its old points, or the
-other way around. Nothing repairs that automatically. At startup the viewer
-counts both sides and logs a WARNING when the point count differs from the
-catalog's ready photo count; recommendations stay up but may miss neighbors or
-serve stale ones until the sides are re-synced by re-embedding (which re-upserts)
-or by wiping whichever side is stale.
-
-Backups change meaning with 0003: `backups/viewer.db` no longer carries
-vectors, so the collection is not reconstructable from the bucket alone.
-Restoring a catalog backup over a live collection only triggers the drift
-warning — but losing the Qdrant data itself means re-embedding the library
-from the S3 originals.
-
-Search follows Qdrant's collection defaults: approximate HNSW once the
-collection outgrows `full_scan_threshold` (10000 points by default). The
-recommendation contract needs enough distinct cross-album albums, not an exact
-top-K, so the viewer sends no `search_params` and inherits those defaults; a
-deployment that needs bit-exact rankings can lower that threshold on the
-collection or query Qdrant directly with `params: {"exact": true}`.
-
-### Embedding progress
-
-Indexing and embedding are two stages, and the album status only covers the
-first: an album is `SUCCEEDED` while its embeddings may still be running. The
-API does not report that second stage - there is no embedding status endpoint,
-and the finalize response carries only the album status. The `/metrics`
-gauges (`viewer_embedding_*`, listed under Observability below) are the only
-exposure of how far embedding has come.
-
-`pending` counts everything not ready and not failed, including the blobs a
-worker currently holds a lease on; `processing` is that leased subset, which
-is observability for the worker fleet. When no checkpoint could be loaded -
-the fetch failed, or the files are missing - nothing is embedding and nothing
-ever will be, so `pending` never drains until a deployment with a model picks
-the blobs up. During the cold-start download window the workers are not up
-yet, so nothing moves until the checkpoint finishes loading. `failed` images
-are terminal — the retry worker skips them — so the `ready` gauge reaches
-`total` only when nothing is pending, and a failure is visible as
-`ready + failed == total` instead of a number that never fills.
-
-### External embedding workers
-
-The built-in worker is a single goroutine, and a first import of tens of
-millions of images is more than one process can chew through. The same
-claim/write-back path it uses is therefore exposed as a small API, so external
-workers can drain the backlog alongside it — and a dead worker cannot strand
-blobs, because leases expire:
-
-1. `POST /api/embedding/claim` with `{"limit":256}` leases a batch of pending
-   blobs:
-
-   ```json
-   {"embeddingDim":768,"leaseUntil":"2026-01-01T00:10:00Z","claimed":[{"hash":"<sha256>","sizeBytes":12345,"contentType":"image/jpeg","blobKey":"blobs/<sha256>","getUrl":"https://…"}]}
-   ```
-
-   `getUrl` is a presigned download valid for the 15 minute presign TTL;
-   workers that hold their own object-store credentials can ignore it and read
-   `blobKey` directly. The limit defaults to 64 and caps at 1024; an empty
-   `claimed` list means there is nothing to do. The endpoint answers even while
-   the server's own checkpoint is still loading — or without one at all — so a
-   backfill never waits on the in-process model.
-2. Embed the images externally. The vector length must equal `embeddingDim`
-   (768 for siglip2-base), and every component must be finite.
-3. `POST /api/embedding/results` writes a batch back in one request: ready
-   vectors are upserted into the `photo_embeddings` collection first, then the
-   status bookkeeping lands in SQLite in one transaction:
-
-   ```json
-   {"results":[{"hash":"<sha256>","status":"ready","vectorB64":"<base64 little-endian float32>"},{"hash":"<sha256>","status":"failed","error":"decode failed"}]}
-   ```
-
-   The response is
-   `{"updated":2,"rejected":[{"hash":"…","reason":"wrong_dim"}]}`, with one
-   rejection per refused item: `bad_base64`, `wrong_dim`, `bad_vector` (NaN,
-   Inf, or bytes that do not frame whole float32 values), `unknown_hash`,
-   `not_claimed`, `invalid_status` or `invalid_hash` (blank). Rejections are
-   final, not retryable — fix the payload or move on, never loop on one. A
-   result only ever lands on a blob still in the `processing` state, so a late
-   result can never overwrite another worker's bookkeeping, and nothing
-   reported can touch a blob nobody claimed; its vector may still be re-upserted
-   onto the same deterministic point IDs, which is harmless — same hash, same
-   image, so the duplicate write converges. One request carries at most 1024
-   results; a larger batch is refused whole with a 400, so split it.
-4. A batch that outgrows the 10 minute lease calls `POST /api/embedding/renew`
-   with `{"hashes":[…]}`. The response is
-   `{"leaseUntil":"…","renewed":["…"]}`, and `renewed` lists the hashes whose
-   lease actually moved: anything missing expired and was taken by another
-   worker (or already finished), so stop working on it — its write-back would
-   be rejected as `not_claimed`.
-
-A blob leaves `pending` only through a claim, so the built-in worker and an
-external fleet can run at once without double-embedding: whatever claims first
-wins, and the other sees it in neither of its next batches. Set
-`EMBEDDING_WORKER_TOKEN` to require `Authorization: Bearer <token>` on all
-three endpoints; the rest of the API is unaffected. Startup refuses a
-set-but-blank value — an operator who set something meant to protect the API —
-and logs which way the check resolved, so an open worker API is always visible
-in the log rather than silent.
-
-Docker:
-- `docker build .` produces one image: the Go viewer and the frontend assets.
-  It carries no checkpoint - a cold start downloads it (~1.5 GiB) into
-  `/app/siglip2` from `SIGLIP2_MODEL_URL` in the background while the server
-  is already serving, so the published image stays small.
-  Mount a volume at `/app/siglip2` to keep that download across container
-  replacements, or set `SIGLIP2_MODEL_URL` to mirror a different model.
-- CI publishes the viewer as `ghcr.io/<owner>/<repo>`.
-
-Only the first start needs egress to the mirror - the same host the viewer
-already talks to for object storage - and never to Hugging Face. A download
-that fails leaves no partial file behind: the next start retries, and in the
-meantime the viewer degrades to serving without embeddings rather than
-crashing.
-
-## Commands
-- `make build` compiles `bin/viewer`, rebuilding frontend assets when their sources are newer than the committed `internal/web/static` bundle (`make build FORCE=1` forces a frontend rebuild).
-- `make test` runs the Go unit/integration tests (`go test ./cmd/... ./internal/...`). It needs no credentials or environment file.
-- `make typecheck` runs the frontend TypeScript check without producing a bundle.
-- `make run` starts `bin/viewer` (loads `.env` if present, does not rebuild binaries). Set `STATE_DIR` to a writable directory: the container default `/var/lib/viewer` is not writable for a local user.
-- `make clean` removes build outputs and dependency caches. The viewer itself keeps no caches: images stream from S3 and staged zips live in the OS temp directory.
-
-## Upload drop zone
-- Whatever sits under `uploads/` is ingested: at startup and every minute the viewer lists the prefix, and for each zip it finds, it either queues the album that owns it again (its status is `QUEUED` or `PROCESSING`, so no worker holds it) or registers a new album and queues that. `albumId` is derived from the object's ETag and size, so dropping identical bytes twice resolves to one album.
-- Nothing is copied, moved or deleted by the scan. A finished album's zip is skipped and stays until the next drain-time batch delete, so a `SUCCEEDED` album with its zip still present is the normal state between a drain and the finalize that follows it.
-
-## Verifying the vision port
-
-`internal/vision` reimplements the SigLIP2 vision tower. Its accuracy is checked
-against an independent PyTorch implementation of the same checkpoint:
+## Project structure
 
 ```
-python -m venv /tmp/sigref-venv
-/tmp/sigref-venv/bin/pip install torch safetensors numpy Pillow
-SIGLIP2_MODEL=/path/to/model.safetensors \
-SIGLIP2_CONFIG=/path/to/config.json \
-VISION_OUT=/tmp/vision-bundle \
-    /tmp/sigref-venv/bin/python scripts/vision-reference/generate.py
-VISION_REFERENCE_DIR=/tmp/vision-bundle go test ./internal/vision/ -v
+cmd/viewer/                entry point
+internal/                  API, catalog, pipelines, vision, storage — see package docs for detail
+frontend/                  React + TypeScript + Vite SPA, built into internal/web/static and embedded
+recommender/               standalone Python embedding worker
+scripts/vision-reference/  PyTorch reference model for the vision-port test
 ```
-
-`generate.py` writes the source images, the pixels, and the expected embeddings
-into the bundle; `TestAgainstReference` then checks the resampler against Pillow
-(within one 8-bit level per channel) and the tower against PyTorch (max absolute
-difference below `1e-4`, cosine above `0.9995`). The test is skipped unless
-`VISION_REFERENCE_DIR` is set, because it needs the 1.5 GB checkpoint.
-
-## Observability
-- The server logs to stdout/stderr via Go's standard logger.
-- Long downloads report their position and rate every 5 seconds while they run,
-  so a slow start does not look like a hung one: a cold start fetching the
-  checkpoint logs
-  `checkpoint: fetching model.safetensors 512.0 MiB / 1.5 GiB (33.3%) at 40.0 MiB/s`,
-  and a startup restoring the catalog logs
-  `backup: restoring viewer.db 96.0 MiB / 1.2 GiB (7.8%) at 30.0 MiB/s`. A
-  download that finishes within one interval logs nothing beyond its completion
-  line.
-- Embedding is reported as it happens. The background workers log
-  `recommend: embedding run started pending=<n> ready=<n> total=<n>`, one
-  `recommend: embedded blob=<sha256> bytes=<n> dim=768 elapsed=<d>` line per
-  image, a `recommend: embedding progress ready=<n>/<n> pending=<n> failed=<n>`
-  line every 25 images, and finally
-  `recommend: embedding run finished embedded=<n> ready=<n>/<n> pending=<n> failed=<n> duration=<d> avg=<d>`.
-  A drain that keeps finding work stays one run, so the summaries mark real
-  start and end points rather than one per batch.
-- Extraction and embedding are separate stages, and each logs its own: the
-  pipeline logs `pipeline: album=<id> extracting entries=<n>` and ends with
-  `pipeline: album=<id> ready photos=<n> embedded=<n> pending=<n> failed=<n>`,
-  where those last three counts are the catalog's embedding state at that
-  moment — extraction never embeds itself, so `pending` is the work the album
-  just queued for the embedding workers.
-- The upload prefix is scanned at startup and then once a minute. Each scan logs
-  `upload ingest: prefix=uploads/ listed=<n> candidates=<n>`, one line per zip it
-  registers or requeues, and
-  `upload ingest: scan finished discovered=<n> registered=<n> requeued=<n> skipped=<n> errors=<n> duration=<d>`.
-  A failed scan is logged and retried on the next tick instead of ending the
-  watch.
-- Migrations run while the catalog opens, before the HTTP server binds. The
-  0003 migration logs `catalog: applied migration 0003_qdrant_vectors` when it
-  finishes and, while vectors are still moving, a
-  `catalog: vector upload progress <uploaded>/<total>` line every 50 batches —
-  a first boot over a large pre-0003 catalog stays on this step, talking to
-  Qdrant, until every vector is uploaded. Once the collection is ensured, a
-  point count that disagrees with the catalog logs
-  `viewer: WARNING vector store holds <n> point(s) but the catalog has <m> ready photo pair(s) …`
-  (see "Vector store" above for what it means and what does not fix it
-  automatically).
-- `/metrics` exposes `viewer_embedding_images_total`, `viewer_embedding_images_ready`, `viewer_embedding_images_failed`, `viewer_embedding_images_pending`, `viewer_embedding_images_processing` and `viewer_embedding_progress_ratio`, computed from the blob embedding statuses in the SQLite catalog.
-- Requests that end in a 5xx are logged with the method, path, raw query, request ID (Chi request ID middleware), remote address and the internal error message; the JSON error body carries the code and message.
-- Panics are logged with stack traces before the 500 response is returned.
-
-## Known gaps
-- Grid tiles are thumbnails: the wall, the album grid and the recommendation strip all request `GET /api/image/{hash}?w=640` (a scaled JPEG; an original already no wider than the request passes through untouched, and the scaled width joins the blob hash in the ETag) instead of moving full-size originals for tile-sized boxes. Originals are served only on the photo page and its download link. The endpoint is keyed by the blob hash alone: no album id, no catalog lookup, and the response carries `Cache-Control: public, max-age=86400, immutable` with the hash as the ETag, so repeat views are settled by the browser.
-- `GET /api/albums/search` matches the query anywhere in the lowercased original filename (not just as a prefix) and each result carries a `cover` — the photo at index 0 with its blob hash and dimensions — so the Find Albums page can render cover cards straight from `GET /api/image/{hash}?w=640` without a second request per album.
-- The upload scan adopts zips but never advertises itself: files dropped into the bucket from outside appear in the library without ever passing through the upload page. It also adopts a zip mid-library the moment it appears, with no way to park one aside.
-- Losing the state volume no longer loses the library — the bucket holds `backups/viewer.db` and startup restores it — but the backup lands only when the extraction queue drains, so anything uploaded since the last drain exists in exactly two places: the bucket's blobs and the local catalog. Backups of a deployment that never drains wait for its first drain.
-
-## Frontend
-- The bundle ships its own Space Grotesk (via fontsource, no CDN) over a design-token layer in `src/styles/tokens.css`; base primitives (focus ring, progress, skeleton, reduced-motion guards) live in `src/styles/base.css`, and the Find Albums and Upload pages own their styles next to their components.
-- `npm --prefix frontend run typecheck` runs `tsc --noEmit`; it gates `npm run build`, `make build` and the Docker build, so a type error fails the build instead of shipping.
-- Every reload revalidates `index.html` (`Cache-Control: no-cache`); the hashed files under `/assets/` are served `immutable`, so only a redeploy changes what the browser keeps.
