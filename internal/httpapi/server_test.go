@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -19,6 +21,7 @@ import (
 	"viewer/internal/catalog"
 	"viewer/internal/feed"
 	"viewer/internal/models"
+	"viewer/internal/qdrant"
 	"viewer/internal/recommend"
 )
 
@@ -398,6 +401,294 @@ func TestSearchEndpointValidatesQueryAndLimit(t *testing.T) {
 				t.Fatalf("expected INVALID_REQUEST error code in body, got: %s", rec.Body.String())
 			}
 		})
+	}
+}
+
+// visionSearchEmbedder is the image-capable variant of the harness's stubs: it
+// satisfies recommend.EmbeddingProvider with one fixed Embed vector, so the
+// search-by-image endpoint can be driven end to end without a checkpoint. An
+// optional err replaces the vector, shaped like the wraps the real embedder
+// produces.
+type visionSearchEmbedder struct {
+	vector []float32
+	err    error
+}
+
+func (e *visionSearchEmbedder) Load(context.Context) error { return nil }
+
+func (e *visionSearchEmbedder) Embed(context.Context, []byte) ([]float32, error) {
+	if e.err != nil {
+		return nil, e.err
+	}
+	return e.vector, nil
+}
+
+func (e *visionSearchEmbedder) Close() error { return nil }
+
+// searchByImageBody builds a multipart body holding one file part named
+// fieldName and returns it together with the Content-Type the request must
+// carry, since the boundary lives there.
+func searchByImageBody(t *testing.T, fieldName string, filename string, data []byte) (*bytes.Buffer, string) {
+	t.Helper()
+	var buf bytes.Buffer
+	writer := multipart.NewWriter(&buf)
+	part, err := writer.CreateFormFile(fieldName, filename)
+	if err != nil {
+		t.Fatalf("create form file: %v", err)
+	}
+	if _, err := part.Write(data); err != nil {
+		t.Fatalf("write form file: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close multipart writer: %v", err)
+	}
+	return &buf, writer.FormDataContentType()
+}
+
+// searchByImageRequest wraps a multipart body into a POST against the
+// search-by-image route.
+func searchByImageRequest(t *testing.T, url string, fieldName string, data []byte) *http.Request {
+	t.Helper()
+	body, contentType := searchByImageBody(t, fieldName, "query.png", data)
+	req := httptest.NewRequest(http.MethodPost, url, body)
+	req.Header.Set("Content-Type", contentType)
+	return req
+}
+
+// TestSearchByImageEndpointReturnsRankedItems drives the image-search endpoint
+// end to end: the upload is parsed out of the multipart body, embedded by the
+// vision-capable stub, and the store ranks by cosine into the same response
+// shape the text search answers with.
+func TestSearchByImageEndpointReturnsRankedItems(t *testing.T) {
+	cat, err := catalog.Open(filepath.Join(t.TempDir(), "catalog.db"), nil)
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	defer cat.Close()
+	seedEmbeddingFixture(t, cat)
+
+	query := searchVector(1, 0.2)
+	vectors := newFakeVectorStore()
+	if err := vectors.UpsertPhotos(context.Background(), []qdrant.PhotoRecord{
+		{AlbumID: "album-a", Idx: 0, Hash: "hash-a", W: 10, H: 10, Vector: searchVector(1, 0.2)},
+		{AlbumID: "album-a", Idx: 1, Hash: "hash-b", W: 10, H: 10, Vector: searchVector(0, 1)},
+		{AlbumID: "album-a", Idx: 2, Hash: "hash-c", W: 10, H: 10, Vector: searchVector(0.99, 0.02)},
+	}); err != nil {
+		t.Fatalf("seed points: %v", err)
+	}
+
+	recommendService := recommend.NewService(cat, vectors, nil, &visionSearchEmbedder{vector: query}, nil)
+	router := New(nil, nil, nil, recommendService, "", nil, "").Router()
+
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, searchByImageRequest(t, "/api/photos/search-by-image?limit=2", "image", testPNG(t, 4, 2, 10)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d want=%d body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	var resp recommend.RecommendationResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	// Descending cosine against [1, 0.2]: hash-a is identical (score 1),
+	// hash-c nearly parallel, hash-b nearly orthogonal and cut by the limit.
+	if len(resp.Items) != 2 {
+		t.Fatalf("items=%d want=2: %+v", len(resp.Items), resp.Items)
+	}
+	if resp.Items[0].Hash != "hash-a" || resp.Items[1].Hash != "hash-c" {
+		t.Fatalf("unexpected ranking: %+v", resp.Items)
+	}
+	first := resp.Items[0]
+	if first.AlbumID != "album-a" || first.I != 0 || first.W != 10 || first.H != 10 {
+		t.Fatalf("unexpected item shape: %+v", first)
+	}
+	if first.Score < 0.9999 {
+		t.Fatalf("score=%v want ~1 for an identical vector", first.Score)
+	}
+}
+
+// TestSearchByImageEndpointRejectsMissingImage pins the 400s for an upload
+// that carries no usable image part: the field absent altogether, and the
+// field present but zero bytes, are both bad requests.
+func TestSearchByImageEndpointRejectsMissingImage(t *testing.T) {
+	cat, err := catalog.Open(filepath.Join(t.TempDir(), "catalog.db"), nil)
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	defer cat.Close()
+	recommendService := recommend.NewService(cat, newFakeVectorStore(), nil, &visionSearchEmbedder{vector: searchVector(1)}, nil)
+	router := New(nil, nil, nil, recommendService, "", nil, "").Router()
+
+	cases := []struct {
+		name     string
+		field    string
+		fromBody []byte
+	}{
+		{name: "no image part", field: "not-image", fromBody: testPNG(t, 2, 2, 5)},
+		{name: "zero-byte image part", field: "image", fromBody: nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, searchByImageRequest(t, "/api/photos/search-by-image", tc.field, tc.fromBody))
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status=%d want=%d body=%s", rec.Code, http.StatusBadRequest, rec.Body.String())
+			}
+			if !strings.Contains(rec.Body.String(), "\"code\":\"INVALID_REQUEST\"") {
+				t.Fatalf("expected INVALID_REQUEST error code in body, got: %s", rec.Body.String())
+			}
+			if !strings.Contains(rec.Body.String(), "missing image") {
+				t.Fatalf("expected the missing-image message in body, got: %s", rec.Body.String())
+			}
+		})
+	}
+}
+
+// TestSearchByImageEndpointValidatesLimit pins the 400s the handler answers
+// before the body is even parsed: an out-of-range limit is a bad request, not
+// a clamped result.
+func TestSearchByImageEndpointValidatesLimit(t *testing.T) {
+	cat, err := catalog.Open(filepath.Join(t.TempDir(), "catalog.db"), nil)
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	defer cat.Close()
+	recommendService := recommend.NewService(cat, newFakeVectorStore(), nil, &visionSearchEmbedder{vector: searchVector(1)}, nil)
+	router := New(nil, nil, nil, recommendService, "", nil, "").Router()
+
+	for _, limit := range []string{"0", "97", "lots"} {
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, searchByImageRequest(t, "/api/photos/search-by-image?limit="+limit, "image", testPNG(t, 2, 2, 5)))
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("limit=%s status=%d want=%d body=%s", limit, rec.Code, http.StatusBadRequest, rec.Body.String())
+		}
+		if !strings.Contains(rec.Body.String(), "\"code\":\"INVALID_REQUEST\"") {
+			t.Fatalf("expected INVALID_REQUEST error code in body, got: %s", rec.Body.String())
+		}
+	}
+}
+
+func TestSearchByImageEndpointWithNilRecommendService(t *testing.T) {
+	router := New(nil, nil, nil, nil, "", nil, "").Router()
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, searchByImageRequest(t, "/api/photos/search-by-image", "image", testPNG(t, 2, 2, 5)))
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d want=%d body=%s", rec.Code, http.StatusServiceUnavailable, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "\"code\":\"UNAVAILABLE\"") {
+		t.Fatalf("expected UNAVAILABLE error code in body, got: %s", rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "photo search is not available") {
+		t.Fatalf("expected the disabled message in body, got: %s", rec.Body.String())
+	}
+}
+
+// TestSearchByImageEndpointWithDisabledVectorStore covers the Qdrant-less
+// deployment: a live recommend service whose vector store is nil must answer
+// with the same 503 UNAVAILABLE shape as a nil service.
+func TestSearchByImageEndpointWithDisabledVectorStore(t *testing.T) {
+	cat, err := catalog.Open(filepath.Join(t.TempDir(), "catalog.db"), nil)
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	defer cat.Close()
+	recommendService := recommend.NewService(cat, nil, nil, &visionSearchEmbedder{vector: searchVector(1)}, nil)
+	router := New(nil, nil, nil, recommendService, "", nil, "").Router()
+
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, searchByImageRequest(t, "/api/photos/search-by-image", "image", testPNG(t, 2, 2, 5)))
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d want=%d body=%s", rec.Code, http.StatusServiceUnavailable, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "\"code\":\"UNAVAILABLE\"") {
+		t.Fatalf("expected UNAVAILABLE error code in body, got: %s", rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "photo search is not available") {
+		t.Fatalf("expected the disabled message in body, got: %s", rec.Body.String())
+	}
+}
+
+// TestSearchByImageEndpointWithEmbedderFailure covers the "feature is off"
+// side of the contract: an embedder that cannot run the vision tower is a
+// deployment state, so the endpoint answers with the same 503 UNAVAILABLE
+// shape as a disabled store instead of a 500.
+func TestSearchByImageEndpointWithEmbedderFailure(t *testing.T) {
+	cat, err := catalog.Open(filepath.Join(t.TempDir(), "catalog.db"), nil)
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	defer cat.Close()
+	stub := &visionSearchEmbedder{err: errors.New("graph exploded")}
+	recommendService := recommend.NewService(cat, newFakeVectorStore(), nil, stub, nil)
+	router := New(nil, nil, nil, recommendService, "", nil, "").Router()
+
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, searchByImageRequest(t, "/api/photos/search-by-image", "image", testPNG(t, 2, 2, 5)))
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d want=%d body=%s", rec.Code, http.StatusServiceUnavailable, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "\"code\":\"UNAVAILABLE\"") {
+		t.Fatalf("expected UNAVAILABLE error code in body, got: %s", rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "photo search is not available") {
+		t.Fatalf("expected the disabled message in body, got: %s", rec.Body.String())
+	}
+}
+
+// TestSearchByImageEndpointWithUnreadableImage covers the 400 class: an
+// embedder rejection carrying ErrUnreadableImage — the wrap the real
+// preprocess path produces for a corrupt upload — reads as a bad request.
+func TestSearchByImageEndpointWithUnreadableImage(t *testing.T) {
+	cat, err := catalog.Open(filepath.Join(t.TempDir(), "catalog.db"), nil)
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	defer cat.Close()
+	stub := &visionSearchEmbedder{err: fmt.Errorf("preprocess image: %w", recommend.ErrUnreadableImage)}
+	recommendService := recommend.NewService(cat, newFakeVectorStore(), nil, stub, nil)
+	router := New(nil, nil, nil, recommendService, "", nil, "").Router()
+
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, searchByImageRequest(t, "/api/photos/search-by-image", "image", []byte("garbage bytes")))
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d want=%d body=%s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "\"code\":\"INVALID_REQUEST\"") {
+		t.Fatalf("expected INVALID_REQUEST error code in body, got: %s", rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "image could not be decoded") {
+		t.Fatalf("expected the unreadable message in body, got: %s", rec.Body.String())
+	}
+}
+
+// TestSearchByImageEndpointRejectsOversizedUpload pins the bounded body: a
+// payload past maxSearchImageBytes fails cleanly with its own 400 instead of
+// being spooled out in full, and the embedder is never asked to run on it.
+func TestSearchByImageEndpointRejectsOversizedUpload(t *testing.T) {
+	cat, err := catalog.Open(filepath.Join(t.TempDir(), "catalog.db"), nil)
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	defer cat.Close()
+	recommendService := recommend.NewService(cat, newFakeVectorStore(), nil, &visionSearchEmbedder{vector: searchVector(1)}, nil)
+	router := New(nil, nil, nil, recommendService, "", nil, "").Router()
+
+	// The multipart framing alone pushes the total past the reader limit.
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, searchByImageRequest(t, "/api/photos/search-by-image", "image", make([]byte, maxSearchImageBytes)))
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d want=%d body=%s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "\"code\":\"INVALID_REQUEST\"") {
+		t.Fatalf("expected INVALID_REQUEST error code in body, got: %s", rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "image too large") {
+		t.Fatalf("expected the too-large message in body, got: %s", rec.Body.String())
 	}
 }
 

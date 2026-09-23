@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -74,6 +75,7 @@ func (s *Server) Router() http.Handler {
 		r.Get("/image/{hash}", s.getImageByHash)
 		r.Head("/image/{hash}", s.getImageByHash)
 		r.Get("/photos/search", s.searchPhotos)
+		r.Post("/photos/search-by-image", s.searchPhotosByImage)
 		r.Get("/recommendations/{albumId}/{index}", s.getRecommendations)
 	})
 
@@ -372,6 +374,85 @@ func (s *Server) searchPhotos(w http.ResponseWriter, r *http.Request) {
 			// Qdrant not configured, or an embedder without a text tower, are
 			// deployment states rather than failures: the same 503 shape as
 			// the nil-service case above, so clients treat all three alike.
+			writeError(w, r, http.StatusServiceUnavailable, "UNAVAILABLE", "photo search is not available")
+			return
+		}
+		writeError(w, r, http.StatusInternalServerError, "INTERNAL", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+// maxSearchImageBytes bounds one search-by-image request. The upload is a
+// single photo, but browsers send original phone-camera sizes, so the ceiling
+// is generous; past it the request cannot produce an embedding anyway.
+const maxSearchImageBytes = 25 << 20
+
+// searchPhotosByImage answers POST /api/photos/search-by-image?limit=... with
+// the photos whose embeddings are nearest to the uploaded picture. The upload
+// arrives as multipart/form-data with one file part named "image" and is
+// embedded with the same vision tower the ingest pipeline uses.
+func (s *Server) searchPhotosByImage(w http.ResponseWriter, r *http.Request) {
+	// The endpoint stays available even when the embedding model could not be
+	// loaded: the catalog simply has no embeddings to match against yet.
+	if s.recommend == nil {
+		writeError(w, r, http.StatusServiceUnavailable, "UNAVAILABLE", "photo search is not available")
+		return
+	}
+
+	limit, err := parseOptionalIntQuery(r, "limit", 24, 1, 96)
+	if err != nil {
+		writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", "invalid limit")
+		return
+	}
+
+	// The body is bounded before parsing, so an oversized upload fails cleanly
+	// with its own message instead of being spooled out in full.
+	r.Body = http.MaxBytesReader(w, r.Body, maxSearchImageBytes)
+	if err := r.ParseMultipartForm(8 << 20); err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", "image too large")
+			return
+		}
+		writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", "invalid multipart form")
+		return
+	}
+	// Parts past the memory claim are spooled to temp files; the httptest
+	// harness has no server to clean them up, so do it here regardless.
+	defer func() {
+		if err := r.MultipartForm.RemoveAll(); err != nil {
+			log.Printf("search-by-image temp cleanup failed: %v", err)
+		}
+	}()
+
+	file, _, err := r.FormFile("image")
+	if err != nil {
+		writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", "missing image")
+		return
+	}
+	defer file.Close()
+	imageBytes, err := io.ReadAll(file)
+	if err != nil || len(imageBytes) == 0 {
+		writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", "missing image")
+		return
+	}
+
+	// Embedding is a real forward pass: bound it so a wedged graph cannot hold
+	// the request open past what a browser waits for.
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+
+	result, err := s.recommend.SearchByImage(ctx, imageBytes, limit)
+	if err != nil {
+		if errors.Is(err, recommend.ErrUnreadableImage) {
+			writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", "image could not be decoded")
+			return
+		}
+		if errors.Is(err, recommend.ErrVectorStoreUnavailable) || errors.Is(err, recommend.ErrImageEmbeddingUnavailable) {
+			// Qdrant not configured, or an embedder that cannot run the vision
+			// tower, are deployment states rather than failures: the same 503
+			// shape as the nil-service case above, so clients treat all alike.
 			writeError(w, r, http.StatusServiceUnavailable, "UNAVAILABLE", "photo search is not available")
 			return
 		}

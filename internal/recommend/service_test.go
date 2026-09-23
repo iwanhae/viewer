@@ -898,6 +898,221 @@ func TestSearchRejectsDegenerateQueryVector(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// SearchByImage
+// ---------------------------------------------------------------------------
+
+// imageSearchEmbedder is the vision-capable variant of textEmbedder: Embed maps
+// any uploaded image to one fixed vector, which is what makes the ranking
+// assertable. An optional err replaces the vector so the failure mappings can
+// be pinned, including a wrapped ErrUnreadableImage shaped like the wrap the
+// real preprocess path produces.
+type imageSearchEmbedder struct {
+	vector []float32
+	err    error
+}
+
+func (e *imageSearchEmbedder) Load(context.Context) error { return nil }
+
+func (e *imageSearchEmbedder) Embed(context.Context, []byte) ([]float32, error) {
+	if e.err != nil {
+		return nil, e.err
+	}
+	return e.vector, nil
+}
+
+func (e *imageSearchEmbedder) Close() error { return nil }
+
+// TestSearchByImageRanksPhotosByCosine drives the image search through a fixed
+// vision vector and pins the same wire shape as Search: every matching photo
+// comes back in descending cosine order with the photo fields and the raw
+// score carried onto the wire unchanged.
+func TestSearchByImageRanksPhotosByCosine(t *testing.T) {
+	store := newFakeVectorStore()
+	stub := &imageSearchEmbedder{vector: vec768(1, 0)}
+	svc := newTestService(t, nil, store, stub)
+	ctx := context.Background()
+
+	// vec768 encodes short directions at full width, so the cosines against the
+	// [1, 0] query are, best first: 0.9998, 0.9988, 0.7071 and 0.
+	if err := store.UpsertPhotos(ctx, []qdrant.PhotoRecord{
+		{AlbumID: "album-a", Idx: 0, Hash: "hash-near", W: 800, H: 600, Vector: vec768(1, 0.05)},
+		{AlbumID: "album-a", Idx: 1, Hash: "hash-twin", W: 800, H: 600, Vector: vec768(0.99, 0.02)},
+		{AlbumID: "album-b", Idx: 0, Hash: "hash-mid", W: 800, H: 600, Vector: vec768(0.7, 0.7)},
+		{AlbumID: "album-b", Idx: 1, Hash: "hash-far", W: 800, H: 600, Vector: vec768(0, 1)},
+	}); err != nil {
+		t.Fatalf("seed points: %v", err)
+	}
+
+	resp, err := svc.SearchByImage(ctx, []byte("an uploaded photo"), 10)
+	if err != nil {
+		t.Fatalf("SearchByImage: %v", err)
+	}
+	wantHashes := []string{"hash-twin", "hash-near", "hash-mid", "hash-far"}
+	if len(resp.Items) != len(wantHashes) {
+		t.Fatalf("items=%d want=%d (image search returns every photo, no album grouping): %+v", len(resp.Items), len(wantHashes), resp.Items)
+	}
+	for i, hash := range wantHashes {
+		if resp.Items[i].Hash != hash {
+			t.Fatalf("item %d = %+v, want hash %s (descending cosine)", i, resp.Items[i], hash)
+		}
+	}
+	if !approxEqual(resp.Items[0].Score, cosine(stub.vector, vec768(0.99, 0.02))) {
+		t.Fatalf("score=%v want the cosine similarity", resp.Items[0].Score)
+	}
+	if resp.Items[0].AlbumID != "album-a" || resp.Items[0].I != 1 || resp.Items[0].W != 800 || resp.Items[0].H != 600 {
+		t.Fatalf("photo fields did not carry through: %+v", resp.Items[0])
+	}
+
+	// The store was asked once, with exactly the embedded image vector.
+	calls := store.searchCalls()
+	if len(calls) != 1 {
+		t.Fatalf("store calls=%d want=1", len(calls))
+	}
+	if !reflect.DeepEqual(calls[0].vector, stub.vector) || calls[0].limit != 10 {
+		t.Fatalf("store call carried vector %v limit %d, want the image vector at limit 10", calls[0].vector, calls[0].limit)
+	}
+}
+
+// TestSearchByImageLimitClampsBeforeTheStoreQuery pins the clamping where it
+// matters: the store is asked for exactly the clamped limit, so the clamp is
+// observable in the recorded call rather than only in a trimmed response.
+func TestSearchByImageLimitClampsBeforeTheStoreQuery(t *testing.T) {
+	store := newFakeVectorStore()
+	svc := newTestService(t, nil, store, &imageSearchEmbedder{vector: vec768(1)})
+	ctx := context.Background()
+
+	cases := []struct {
+		name  string
+		limit int
+		want  int
+	}{
+		{name: "zero gets the default", limit: 0, want: defaultSearchTopK},
+		{name: "negative gets the default", limit: -3, want: defaultSearchTopK},
+		{name: "requested limit passes through", limit: 1, want: 1},
+		{name: "oversized limit clamps to the max", limit: 1000, want: maxSearchTopK},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store.resetSearches()
+			if _, err := svc.SearchByImage(ctx, []byte("an uploaded photo"), tc.limit); err != nil {
+				t.Fatalf("SearchByImage: %v", err)
+			}
+			calls := store.searchCalls()
+			if len(calls) != 1 {
+				t.Fatalf("store calls=%d want=1", len(calls))
+			}
+			if calls[0].limit != tc.want {
+				t.Fatalf("store limit=%d want=%d", calls[0].limit, tc.want)
+			}
+		})
+	}
+}
+
+func TestSearchByImageWithoutVectorStoreReportsUnavailable(t *testing.T) {
+	svc := newTestService(t, nil, nil, &imageSearchEmbedder{vector: vec768(1)})
+	resp, err := svc.SearchByImage(context.Background(), []byte("an uploaded photo"), 10)
+	if !errors.Is(err, ErrVectorStoreUnavailable) {
+		t.Fatalf("err=%v want ErrVectorStoreUnavailable", err)
+	}
+	if resp.Items != nil {
+		t.Fatalf("expected zero-value response on error, got %+v", resp)
+	}
+}
+
+// TestSearchByImageRejectsUnreadableUpload covers the 400 class: the stub's
+// error is wrapped exactly like the real preprocess path wraps a corrupt
+// upload, and the service must pass it through so the handler's errors.Is
+// still sees the sentinel — with no "embed query image" re-wrap on the way.
+func TestSearchByImageRejectsUnreadableUpload(t *testing.T) {
+	store := newFakeVectorStore()
+	stub := &imageSearchEmbedder{err: fmt.Errorf("preprocess image: %w", ErrUnreadableImage)}
+	svc := newTestService(t, nil, store, stub)
+	_, err := svc.SearchByImage(context.Background(), []byte("garbage bytes"), 10)
+	if !errors.Is(err, ErrUnreadableImage) {
+		t.Fatalf("err=%v want ErrUnreadableImage", err)
+	}
+	if strings.Contains(err.Error(), "embed query image") {
+		t.Fatalf("unreadable uploads pass through unwrapped, got: %v", err)
+	}
+	if calls := store.searchCalls(); len(calls) != 0 {
+		t.Fatalf("store was queried for an unreadable upload: %+v", calls)
+	}
+}
+
+// TestSearchByImageWrapsGenericEmbedFailure covers the 503 class: an embedder
+// failure that is not the upload's fault is wrapped with the embed text and
+// marked ErrImageEmbeddingUnavailable, which is what lets the handler answer
+// "feature is off" instead of a 500.
+func TestSearchByImageWrapsGenericEmbedFailure(t *testing.T) {
+	store := newFakeVectorStore()
+	stub := &imageSearchEmbedder{err: errors.New("graph exploded")}
+	svc := newTestService(t, nil, store, stub)
+	_, err := svc.SearchByImage(context.Background(), []byte("an uploaded photo"), 10)
+	if err == nil {
+		t.Fatal("SearchByImage succeeded with a failing embedder, want an error")
+	}
+	if !strings.Contains(err.Error(), "embed query image") {
+		t.Fatalf("expected the embed wrap text, got: %v", err)
+	}
+	if !errors.Is(err, ErrImageEmbeddingUnavailable) {
+		t.Fatalf("err=%v want ErrImageEmbeddingUnavailable so the handler answers 503", err)
+	}
+	if errors.Is(err, ErrUnreadableImage) || errors.Is(err, ErrVectorStoreUnavailable) {
+		t.Fatalf("err=%v must stay distinct from the request and store classes", err)
+	}
+	if calls := store.searchCalls(); len(calls) != 0 {
+		t.Fatalf("store was queried after a failed embed: %+v", calls)
+	}
+}
+
+// TestSearchByImageRejectsEmptyUpload pins that an empty body is classified as
+// an unreadable upload before the embedder is ever asked: the stub would
+// happily embed nothing, so reaching the store at all means the check failed.
+func TestSearchByImageRejectsEmptyUpload(t *testing.T) {
+	store := newFakeVectorStore()
+	svc := newTestService(t, nil, store, &imageSearchEmbedder{vector: vec768(1)})
+	for name, bytes := range map[string][]byte{"nil upload": nil, "empty upload": {}} {
+		_, err := svc.SearchByImage(context.Background(), bytes, 10)
+		if !errors.Is(err, ErrUnreadableImage) {
+			t.Fatalf("SearchByImage(%s) err=%v want ErrUnreadableImage", name, err)
+		}
+	}
+	if calls := store.searchCalls(); len(calls) != 0 {
+		t.Fatalf("store was queried for an empty upload: %+v", calls)
+	}
+}
+
+// TestSearchByImageRejectsDegenerateVector applies the write path's degenerate
+// rules to the image read path: a NaN or all-zero vision vector would rank as
+// NaN against every point and drag the whole ranking down, so it is rejected
+// before the store is asked — as an internal error, not a client fault.
+func TestSearchByImageRejectsDegenerateVector(t *testing.T) {
+	cases := []struct {
+		name   string
+		vector []float32
+	}{
+		{name: "all-zero vector", vector: vec768()},
+		{name: "NaN vector", vector: nanVector()},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newFakeVectorStore()
+			svc := newTestService(t, nil, store, &imageSearchEmbedder{vector: tc.vector})
+			_, err := svc.SearchByImage(context.Background(), []byte("an uploaded photo"), 10)
+			if err == nil {
+				t.Fatal("SearchByImage succeeded with a degenerate image vector, want an error")
+			}
+			if errors.Is(err, ErrUnreadableImage) {
+				t.Fatalf("err=%v is a server fault, not an unreadable upload", err)
+			}
+			if calls := store.searchCalls(); len(calls) != 0 {
+				t.Fatalf("store was queried with a degenerate vector: %+v", calls)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
 // EmbeddingProgress
 // ---------------------------------------------------------------------------
 

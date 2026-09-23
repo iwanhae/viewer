@@ -65,7 +65,11 @@ func (v *VisionEmbedder) Embed(ctx context.Context, imageBytes []byte) ([]float3
 
 	image, err := vision.Preprocess(imageBytes, v.model.ImageSize())
 	if err != nil {
-		return nil, fmt.Errorf("preprocess image: %w", err)
+		// Double wrap: the sentinel lets callers classify a garbage upload as
+		// a bad request without string matching, the text keeps the wrap the
+		// ingest worker logs. Graph/embed failures below stay unclassified —
+		// they are deployment states, not the upload's fault.
+		return nil, fmt.Errorf("preprocess image: %w: %w", err, ErrUnreadableImage)
 	}
 	vector, err := v.model.Embed(ctx, image)
 	if err != nil {

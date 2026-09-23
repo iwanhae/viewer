@@ -775,6 +775,76 @@ func (s *Service) Search(ctx context.Context, query string, limit int) (Recommen
 	return RecommendationResponse{Items: items}, nil
 }
 
+// SearchByImage embeds an uploaded image with the vision tower and returns the
+// nearest embedded photos, best first. The query vector lands in the same
+// space as the stored points — it is the exact tower the ingest pipeline uses
+// — and like Search there is no album grouping or exclusion: every matching
+// photo comes back.
+//
+// The error classes mirror the wire contract. A payload that is empty or
+// undecodable is the request's fault and reports ErrUnreadableImage, which
+// httpapi answers with a 400. A store that is not wired up or an embedder
+// that cannot run are deployment states and report ErrVectorStoreUnavailable
+// or ErrImageEmbeddingUnavailable, which httpapi answers with a 503. Anything
+// else is a genuine server fault.
+func (s *Service) SearchByImage(ctx context.Context, imageBytes []byte, limit int) (RecommendationResponse, error) {
+	if limit <= 0 {
+		limit = defaultSearchTopK
+	}
+	if limit > maxSearchTopK {
+		limit = maxSearchTopK
+	}
+
+	if s.vectors == nil {
+		return RecommendationResponse{}, ErrVectorStoreUnavailable
+	}
+	if s.embedder == nil {
+		return RecommendationResponse{}, ErrImageEmbeddingUnavailable
+	}
+	// An empty upload is as unreadable as a corrupt one, and it is caught here
+	// so the check does not depend on the embedder noticing.
+	if len(imageBytes) == 0 {
+		return RecommendationResponse{}, ErrUnreadableImage
+	}
+
+	vector, err := s.embedder.Embed(ctx, imageBytes)
+	if err != nil {
+		if errors.Is(err, ErrUnreadableImage) {
+			// Pass the classified error through unwrapped: the 400 is the
+			// client's to fix, and the preprocess detail belongs on the wire.
+			return RecommendationResponse{}, err
+		}
+		// Every other embed failure is the deployment, not the request: the
+		// sentinel marks it so httpapi answers 503 instead of 500.
+		return RecommendationResponse{}, fmt.Errorf("embed query image: %w: %w", err, ErrImageEmbeddingUnavailable)
+	}
+	// The same degenerate-vector rules as the write path: a NaN/Inf or all-zero
+	// query vector would rank as NaN in the cosine distance and poison the
+	// whole neighbor list, so it is rejected before the store is asked.
+	if !allFinite(vector) || isZeroNorm(vector) {
+		return RecommendationResponse{}, fmt.Errorf("image embedder returned a degenerate vector with %d entries", len(vector))
+	}
+
+	hits, err := s.vectors.SearchByVector(ctx, vector, limit)
+	if err != nil {
+		return RecommendationResponse{}, fmt.Errorf("search by vector: %w", err)
+	}
+
+	items := make([]RecommendationItem, 0, len(hits))
+	for _, hit := range hits {
+		items = append(items, RecommendationItem{
+			AlbumID: hit.AlbumID,
+			I:       hit.Idx,
+			Hash:    hit.Hash,
+			W:       hit.W,
+			H:       hit.H,
+			Score:   hit.Score,
+		})
+	}
+
+	return RecommendationResponse{Items: items}, nil
+}
+
 // ReloadAlbum re-syncs one album's points in the vector store with the
 // catalog's current photo rows: the album's existing points are deleted, the
 // album's photos with ready embeddings are read back from the catalog, their

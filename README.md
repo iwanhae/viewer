@@ -107,6 +107,7 @@ Notes:
 | GET | `/api/image/{hash}` | Blob content; `?w=320\|640\|1024` returns a resized JPEG keyed by hash + width in the ETag. |
 | GET | `/api/recommendations/{albumId}/{index}` | Cross-album similar photos. |
 | GET | `/api/photos/search?q=&limit=` | Nearest photos for a natural-language description; requires `QDRANT_URL`. |
+| POST | `/api/photos/search-by-image` | Nearest photos for an uploaded picture; requires `QDRANT_URL`. |
 | POST | `/api/embedding/claim`, `/renew`, `/results` | External embedding-worker lease API (bearer-token when `EMBEDDING_WORKER_TOKEN` is set). |
 | GET | `/admin` | Dashboard (stats + re-embed trigger); enabled only when `ADMIN_TOKEN` is set. |
 
