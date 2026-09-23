@@ -16,7 +16,7 @@ import (
 	"viewer/internal/progress"
 )
 
-// serveCheckpoint stands up a mirror with the two files under one prefix and
+// serveCheckpoint stands up a mirror with the three files under one prefix and
 // counts requests, so tests can assert that a complete directory is not
 // re-fetched.
 func serveCheckpoint(t *testing.T) (*httptest.Server, *int) {
@@ -29,6 +29,8 @@ func serveCheckpoint(t *testing.T) (*httptest.Server, *int) {
 			_, _ = w.Write([]byte(`{"model_type":"siglip"}`))
 		case "/siglip2/model.safetensors":
 			_, _ = w.Write([]byte("weights"))
+		case "/siglip2/tokenizer.json":
+			_, _ = w.Write([]byte(`{"version":"1.0"}`))
 		default:
 			http.NotFound(w, r)
 		}
@@ -50,6 +52,7 @@ func TestEnsureDownloadsMissingFiles(t *testing.T) {
 	for name, want := range map[string]string{
 		"config.json":       `{"model_type":"siglip"}`,
 		"model.safetensors": "weights",
+		"tokenizer.json":    `{"version":"1.0"}`,
 	} {
 		got, err := os.ReadFile(filepath.Join(dir, name))
 		if err != nil {
@@ -63,8 +66,8 @@ func TestEnsureDownloadsMissingFiles(t *testing.T) {
 	if err := Ensure(context.Background(), dir, srv.URL+"/siglip2/"); err != nil {
 		t.Fatalf("second Ensure: %v", err)
 	}
-	if *hits != 2 {
-		t.Fatalf("second Ensure re-fetched: hits=%d want 2", *hits)
+	if *hits != 3 {
+		t.Fatalf("second Ensure re-fetched: hits=%d want 3", *hits)
 	}
 }
 
@@ -81,8 +84,8 @@ func TestEnsureFetchesOnlyTheMissingFile(t *testing.T) {
 	if err := Ensure(context.Background(), dir, srv.URL+"/siglip2/"); err != nil {
 		t.Fatalf("Ensure: %v", err)
 	}
-	if *hits != 1 {
-		t.Fatalf("hits=%d want 1 (only the weights file)", *hits)
+	if *hits != 2 {
+		t.Fatalf("hits=%d want 2 (the weights and tokenizer files)", *hits)
 	}
 	got, err := os.ReadFile(filepath.Join(dir, "config.json"))
 	if err != nil {
@@ -106,8 +109,8 @@ func TestEnsureSkipsEmptyFile(t *testing.T) {
 	if err := Ensure(context.Background(), dir, srv.URL+"/siglip2/"); err != nil {
 		t.Fatalf("Ensure: %v", err)
 	}
-	if *hits != 2 {
-		t.Fatalf("hits=%d want 2 (empty weights file is not a checkpoint)", *hits)
+	if *hits != 3 {
+		t.Fatalf("hits=%d want 3 (empty weights file is not a checkpoint)", *hits)
 	}
 	got, err := os.ReadFile(filepath.Join(dir, "model.safetensors"))
 	if err != nil {

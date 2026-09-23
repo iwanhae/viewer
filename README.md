@@ -82,7 +82,7 @@ The viewer is deployed as a Docker image, and every setting is an environment va
 | `QDRANT_URL` | no | (empty) | Base URL of the Qdrant server's REST API; must be an http/https URL with a host. Setting it turns photo recommendations on; leaving it empty runs the viewer without a vector store. |
 | `QDRANT_API_KEY` | no | (empty) | Sent as the `api-key` header on every Qdrant request. Sent only when set, so an unauthenticated server needs no placeholder. |
 | `QDRANT_COLLECTION` | when `QDRANT_URL` is set | — | Qdrant collection holding the per-photo embedding points. Deliberately no default: the viewer refuses to start with a URL but no collection. |
-| `SIGLIP2_MODEL_URL` | no | built-in mirror | Base URL the SigLIP2 checkpoint (`config.json`, `model.safetensors`) is fetched from on first start into `/app/siglip2`. Mount a prepared directory at `/app/siglip2` to skip the download. |
+| `SIGLIP2_MODEL_URL` | no | built-in mirror | Base URL the SigLIP2 checkpoint (`config.json`, `model.safetensors`, `tokenizer.json`) is fetched from on first start into `/app/siglip2`. Mount a prepared directory at `/app/siglip2` to skip the download. |
 | `EMBEDDING_WORKER_TOKEN` | no | (empty) | Bearer token required on the external embedding-worker API. Empty disables that check (trusted networks only); the rest of the API is unaffected. |
 | `ADMIN_TOKEN` | no | (empty) | Basic-auth password for `/admin`. Empty keeps the admin UI disabled. |
 | `ALLOW_BACKUP_OVERWRITE` | no | `false` | Lets the catalog finalizer overwrite the bucket's `backups/viewer.db` with a local database it would otherwise refuse to write (untraceable stamp, or drastically smaller than the backup it would replace). |
@@ -106,6 +106,7 @@ Notes:
 | GET | `/api/feed` | Paged photo wall. |
 | GET | `/api/image/{hash}` | Blob content; `?w=320\|640\|1024` returns a resized JPEG keyed by hash + width in the ETag. |
 | GET | `/api/recommendations/{albumId}/{index}` | Cross-album similar photos. |
+| GET | `/api/photos/search?q=&limit=` | Nearest photos for a natural-language description; requires `QDRANT_URL`. |
 | POST | `/api/embedding/claim`, `/renew`, `/results` | External embedding-worker lease API (bearer-token when `EMBEDDING_WORKER_TOKEN` is set). |
 | GET | `/admin` | Dashboard (stats + re-embed trigger); enabled only when `ADMIN_TOKEN` is set. |
 

@@ -1,4 +1,5 @@
-// Package checkpoint provisions the SigLIP2 vision checkpoint on local disk.
+// Package checkpoint provisions the SigLIP2 vision checkpoint - config.json,
+// model.safetensors and tokenizer.json - on local disk.
 //
 // The Docker image ships without the checkpoint: a deployment either mounts a
 // prepared directory at the model directory, or the viewer fetches the files
@@ -22,19 +23,20 @@ import (
 	"viewer/internal/progress"
 )
 
-// The two files a checkpoint directory must hold. They use the upstream
+// The three files a checkpoint directory must hold. They use the upstream
 // repository's names, so a mirror is nothing but those files copied under one
 // URL prefix.
 const (
-	configFile  = "config.json"
-	weightsFile = "model.safetensors"
+	configFile    = "config.json"
+	weightsFile   = "model.safetensors"
+	tokenizerFile = "tokenizer.json"
 )
 
 // Ensure makes dir hold a complete checkpoint, downloading any missing file
 // from base (one file per <base>/<filename> URL). It is a no-op when dir
-// already holds both files, so a mounted checkpoint or a previous download is
-// never re-fetched. A file that cannot be fetched leaves no partial file
-// behind: the next start tries again from scratch.
+// already holds all three files, so a mounted checkpoint or a previous
+// download is never re-fetched. A file that cannot be fetched leaves no
+// partial file behind: the next start tries again from scratch.
 func Ensure(ctx context.Context, dir, base string) error {
 	base = strings.TrimRight(strings.TrimSpace(base), "/")
 	if base == "" {
@@ -44,7 +46,7 @@ func Ensure(ctx context.Context, dir, base string) error {
 		return fmt.Errorf("create model directory %s: %w", dir, err)
 	}
 
-	for _, name := range []string{configFile, weightsFile} {
+	for _, name := range []string{configFile, weightsFile, tokenizerFile} {
 		if err := ensureFile(ctx, dir, base, name); err != nil {
 			return err
 		}

@@ -26,10 +26,11 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /out/viewer ./cmd/viewe
 # A cold start fetches the checkpoint into /app/siglip2 from SIGLIP2_MODEL_URL
 # (default internal/config.DefaultModelURL), which keeps the published image
 # small and the build free of any dependency on the upstream model host. Mount
-# a volume - or a prepared directory holding config.json and model.safetensors
-# - at /app/siglip2 to keep the download across container replacements. Without
-# a checkpoint the viewer logs the load failure at startup and serves
-# recommendations from whatever embeddings the catalog already holds.
+# a volume - or a prepared directory holding config.json, model.safetensors and
+# tokenizer.json - at /app/siglip2 to keep the download across container
+# replacements. Without a checkpoint the viewer logs the load failure at
+# startup and serves recommendations from whatever embeddings the catalog
+# already holds.
 FROM debian:bookworm-slim
 
 COPY --from=backend-build --chown=65532:65532 /out/viewer /app/viewer
