@@ -27,6 +27,7 @@ import (
 	"github.com/gomlx/gomlx/core/tensors"
 	"github.com/gomlx/gomlx/ml/layers/activation"
 	"github.com/gomlx/gomlx/ml/nn"
+	"viewer/internal/textenc"
 )
 
 const (
@@ -76,6 +77,11 @@ type Model struct {
 
 	graphBackend compute.Backend
 	exec         *graph.Exec
+
+	// textExec is the compiled text tower and tokenizer encodes queries for
+	// it; together they power EmbedText.
+	textExec  *graph.Exec
+	tokenizer *textenc.Tokenizer
 
 	// mu serialises calls into exec: the pure-Go backend executes the graph
 	// in place and shares its scratch buffers between calls.
@@ -156,6 +162,21 @@ func Load(ctx context.Context, cfg Config) (*Model, error) {
 		return nil, fmt.Errorf("unsupported channel count %d", visCfg.NumChannels)
 	}
 
+	// The text tower is part of the same checkpoint and always loads with the
+	// vision tower: EmbedText has no fallback, so a missing or malformed
+	// tokenizer.json fails Load exactly like a missing checkpoint would.
+	textCfg, err := loadTextConfig(repo)
+	if err != nil {
+		return nil, err
+	}
+	if err := textCfg.validate(); err != nil {
+		return nil, err
+	}
+	tokenizer, err := loadTokenizer(repo)
+	if err != nil {
+		return nil, err
+	}
+
 	weights, err := openWeights(repo, visCfg)
 	if err != nil {
 		return nil, err
@@ -174,13 +195,21 @@ func Load(ctx context.Context, cfg Config) (*Model, error) {
 		heads:        visCfg.NumAttentionHead,
 		headDim:      visCfg.HiddenSize / visCfg.NumAttentionHead,
 		graphBackend: backend,
+		tokenizer:    tokenizer,
 	}
 	exec, err := model.compile(weights, visCfg)
+	if err != nil {
+		weights.Close()
+		return nil, err
+	}
+	textExec, err := model.compileText(weights, textCfg)
 	weights.Close()
 	if err != nil {
+		exec.Finalize()
 		return nil, err
 	}
 	model.exec = exec
+	model.textExec = textExec
 	return model, nil
 }
 
@@ -576,15 +605,21 @@ func (m *Model) Describe() string {
 		m.config.ModelID, m.config.Backend, m.imageSize, m.layers, m.heads, m.embedDim)
 }
 
-// Close releases the compiled graph. The model must not be used afterwards.
+// Close releases the compiled graphs. The model must not be used afterwards.
 func (m *Model) Close() error {
-	if m == nil || m.exec == nil {
+	if m == nil {
 		return nil
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.exec.Finalize()
-	m.exec = nil
+	if m.exec != nil {
+		m.exec.Finalize()
+		m.exec = nil
+	}
+	if m.textExec != nil {
+		m.textExec.Finalize()
+		m.textExec = nil
+	}
 	return nil
 }
 

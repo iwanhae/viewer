@@ -21,6 +21,11 @@ HEAD_DIM = 64
 LAYERS = 12
 INTERMEDIATE = 3072
 EPS = 1e-6
+# Text tower constants; mirrors internal/textenc.
+MAXLEN = 64
+EOS_ID = 1
+PAD_ID = 0
+VOCAB = 256000
 
 
 def gelu(x):
@@ -57,11 +62,13 @@ class Attention(torch.nn.Module):
         self.v = Linear(HIDDEN, HIDDEN)
         self.o = Linear(HIDDEN, HIDDEN)
 
-    def forward(self, x):
+    def forward(self, x, mask_bias=None):
         q = self.q(x).reshape(1, -1, HEADS, HEAD_DIM).permute(0, 2, 1, 3)
         k = self.k(x).reshape(1, -1, HEADS, HEAD_DIM).permute(0, 2, 1, 3)
         v = self.v(x).reshape(1, -1, HEADS, HEAD_DIM).permute(0, 2, 1, 3)
         scores = q @ k.transpose(-1, -2) / (HEAD_DIM**0.5)
+        if mask_bias is not None:
+            scores = scores + mask_bias
         scores = torch.softmax(scores, dim=-1)
         out = (scores @ v).permute(0, 2, 1, 3).reshape(1, -1, HIDDEN)
         return self.o(out)
@@ -85,8 +92,8 @@ class Layer(torch.nn.Module):
         self.ln2 = LayerNorm()
         self.mlp = Mlp()
 
-    def forward(self, x):
-        x = x + self.attn(self.ln1(x))
+    def forward(self, x, mask_bias=None):
+        x = x + self.attn(self.ln1(x), mask_bias)
         return x + self.mlp(self.ln2(x))
 
 
@@ -137,6 +144,68 @@ class Vision(torch.nn.Module):
             x = layer(x)
         x = self.post(x)
         return self.head(x)
+
+
+class TextTower(torch.nn.Module):
+    """SigLIP2 text encoder: bidirectional transformer pooling position -1.
+
+    The tokenizer right-pads every sequence to MAXLEN, and pad positions are
+    keyed out of attention with an additive -1e30 bias, so the hidden state at
+    the last position — where the <eos> marker always sits — is the only one
+    read. This mirrors HuggingFace's get_text_features for this checkpoint.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.token_embed = torch.nn.Embedding(VOCAB, HIDDEN)
+        self.pos_embed = torch.nn.Parameter(torch.zeros(MAXLEN, HIDDEN))
+        self.layers = torch.nn.ModuleList([Layer() for _ in range(LAYERS)])
+        self.final = LayerNorm()
+        self.head = Linear(HIDDEN, HIDDEN)
+
+    def forward(self, ids, mask):
+        x = self.token_embed(ids) + self.pos_embed
+        # (1-mask)*-1e30 on the key axis: pad keys cannot receive softmax
+        # weight, while pad queries may attend normally (their outputs are
+        # never read past the pooling slice).
+        bias = ((1.0 - mask) * -1e30).reshape(1, 1, 1, -1)
+        for layer in self.layers:
+            x = layer(x, bias)
+        x = self.final(x)
+        return self.head(x[:, -1, :])
+
+
+def load_text_model():
+    tensors = load_file(MODEL)
+    model = TextTower().eval()
+    state = {}
+    for name in model.state_dict():
+        state[name] = tensors[map_text_name(name)]
+    model.load_state_dict(state)
+    return model
+
+
+def map_text_name(name):
+    """Maps the text tower's module names onto the checkpoint's names."""
+    if name.startswith("token_embed."):
+        return "text_model.embeddings.token_embedding.weight"
+    if name.startswith("pos_embed"):
+        return "text_model.embeddings.position_embedding.weight"
+    if name.startswith("final."):
+        return "text_model.final_layer_norm." + name.split(".", 1)[1]
+    if name.startswith("head."):
+        return "text_model.head." + name.split(".", 1)[1]
+    if name.startswith("layers."):
+        _, idx, rest = name.split(".", 2)
+        rest = rest.replace("ln1.", "layer_norm1.").replace("ln2.", "layer_norm2.")
+        rest = rest.replace("attn.q.", "self_attn.q_proj.").replace(
+            "attn.k.", "self_attn.k_proj."
+        )
+        rest = rest.replace("attn.v.", "self_attn.v_proj.").replace(
+            "attn.o.", "self_attn.out_proj."
+        )
+        return f"text_model.encoder.layers.{idx}.{rest}"
+    raise KeyError(name)
 
 
 def load_model():

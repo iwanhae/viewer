@@ -8,6 +8,8 @@ import (
 	"math"
 	"os"
 	"testing"
+
+	"viewer/internal/textenc"
 )
 
 // Tolerances measured against the PyTorch reference bundle. The tower tracks
@@ -112,6 +114,106 @@ func TestAgainstReference(t *testing.T) {
 			}
 		}
 	})
+}
+
+// textCases are the texts the reference bundle's text half was generated from;
+// they mirror TEXT_CASES in scripts/vision-reference/generate.py.
+var textCases = []string{"english", "korean", "mixed", "emoji", "empty", "long"}
+
+// referenceTextCase is one entry of text_reference.json: the case text, the
+// ids and mask the reference tokenizer produced, and the text tower's
+// embedding for that exact token sequence.
+type referenceTextCase struct {
+	Text      string    `json:"text"`
+	IDs       []int32   `json:"ids"`
+	Mask      []float32 `json:"mask"`
+	Embedding []float32 `json:"embedding"`
+}
+
+// loadReferenceText reads the reference's expected text embeddings.
+func loadReferenceText(t *testing.T, dir string) map[string]referenceTextCase {
+	t.Helper()
+	raw, err := os.ReadFile(dir + "/text_reference.json")
+	if err != nil {
+		t.Fatalf("read text reference: %v", err)
+	}
+	var decoded struct {
+		Text map[string]referenceTextCase `json:"text"`
+	}
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("parse text reference: %v", err)
+	}
+	if len(decoded.Text) == 0 {
+		t.Fatalf("text reference has no cases")
+	}
+	return decoded.Text
+}
+
+// TestTextAgainstReference validates the text tower against an independent
+// PyTorch implementation of the same checkpoint. It shares TestAgainstReference's
+// bundle and opt-in behaviour, and its two subtests per case separate the two
+// things that could be wrong: "tower" feeds the reference's own ids and mask
+// through EmbedTokens so only the GoMLX graph is measured, while "endtoend"
+// feeds the raw text through EmbedText, adding the tokenizer to the measured
+// path.
+func TestTextAgainstReference(t *testing.T) {
+	dir := os.Getenv("VISION_REFERENCE_DIR")
+	if dir == "" {
+		t.Skip("VISION_REFERENCE_DIR is not set")
+	}
+	reference := loadReferenceText(t, dir)
+	model, err := Load(context.Background(), Config{ModelID: dir + "/model", Backend: "go"})
+	if err != nil {
+		t.Fatalf("load model: %v", err)
+	}
+	t.Log(model.Describe())
+
+	for _, label := range textCases {
+		want, ok := reference[label]
+		if !ok {
+			t.Fatalf("reference has no text embedding for %s", label)
+		}
+		if len(want.IDs) != textenc.MaxLen || len(want.Mask) != textenc.MaxLen {
+			t.Fatalf("text case %s: reference has %d ids and %d mask values, want %d",
+				label, len(want.IDs), len(want.Mask), textenc.MaxLen)
+		}
+		if len(want.Embedding) == 0 {
+			t.Fatalf("text case %s: reference has an empty embedding", label)
+		}
+
+		t.Run("tower/"+label, func(t *testing.T) {
+			got, err := model.EmbedTokens(context.Background(), want.IDs, want.Mask)
+			if err != nil {
+				t.Fatalf("embed tokens %s: %v", label, err)
+			}
+			checkTextEmbedding(t, label, got, want.Embedding)
+		})
+
+		t.Run("endtoend/"+label, func(t *testing.T) {
+			got, err := model.EmbedText(context.Background(), want.Text)
+			if err != nil {
+				t.Fatalf("embed text %s: %v", label, err)
+			}
+			checkTextEmbedding(t, label, got, want.Embedding)
+		})
+	}
+}
+
+// checkTextEmbedding applies the shared tolerances to one text embedding.
+func checkTextEmbedding(t *testing.T, label string, got, want []float32) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("embed text %s: got %d values, want %d", label, len(got), len(want))
+	}
+	cosine, maxAbs := compareVectors(got, want)
+	t.Logf("embed text %s: max_abs_diff=%g cosine=%.8f", label, maxAbs, cosine)
+	if maxAbs > embeddingTolerance {
+		t.Errorf("embed text %s: max_abs_diff=%g exceeds %g\n  got  =%v\n  want =%v",
+			label, maxAbs, embeddingTolerance, got[:4], want[:4])
+	}
+	if cosine < minCosine {
+		t.Errorf("embed text %s: cosine=%.8f below %g", label, cosine, minCosine)
+	}
 }
 
 func compareVectors(got, want []float32) (cosine, maxAbs float64) {
