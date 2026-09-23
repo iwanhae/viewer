@@ -8,16 +8,13 @@ import {
   uploadAlbumObject,
   type UploadProgress,
 } from '../api/upload'
-import type { EmbeddingProgress } from '../api/types'
 import { PageTopBar } from '../components/PageTopBar'
-import { useEmbeddingProgress } from '../hooks/useEmbeddingProgress'
 import { formatBytes } from '../utils/format'
 import './upload.css'
 
 // A file walks the stages left to right: it waits in the queue, a worker PUTs
 // it to storage, the server extracts it, and then the album is ready - the
-// server marks an album ready as soon as its images are extracted, and the
-// poll loop only stays alive afterwards to refresh the embedding counts.
+// server marks an album ready as soon as its images are extracted.
 type UploadStatus = 'queued' | 'uploading' | 'indexing' | 'ready' | 'failed' | 'canceled'
 
 // Upload workers own a slot only while the zip's bytes move to storage. Three
@@ -42,22 +39,7 @@ type UploadItem = {
   status: UploadStatus
   uploadedBytes: number
   albumId?: string
-  embedding?: EmbeddingProgress
   error?: string
-}
-
-// isEmbeddingPending reports whether the server still has images of this album
-// to embed. Embedding runs after an album is already visible, so a pending
-// count only keeps the informational progress line alive - it never blocks the
-// upload from finishing. A disabled embedder means the counts will never move,
-// so there is nothing to watch.
-function isEmbeddingPending(progress?: EmbeddingProgress): boolean {
-  return progress !== undefined && progress.enabled && progress.pending > 0
-}
-
-function embeddingPercent(progress?: EmbeddingProgress): number {
-  if (!progress || progress.total <= 0) return 0
-  return Math.min(100, Math.round((progress.ready / progress.total) * 100))
 }
 
 function nextItemID(): string {
@@ -132,7 +114,6 @@ export function UploadPage() {
   const [items, setItems] = useState<UploadItem[]>([])
   const [notice, setNotice] = useState<string | null>(null)
   const [isDragActive, setIsDragActive] = useState(false)
-  const embedding = useEmbeddingProgress()
 
   const updateItem = useCallback((itemID: string, next: Partial<UploadItem>) => {
     setItems((prev) => {
@@ -208,10 +189,9 @@ export function UploadPage() {
 
         // Indexing runs in the background pipeline: keep polling until the
         // album succeeds or fails. Success is what makes the album visible, so
-        // the item turns ready right away - embedding is a slower stage that
-        // continues afterwards on the server, and the loop only stays alive to
-        // refresh the embedded counts until nothing is left pending. A deadline
-        // just stops that refresh; the item still reports ready.
+        // the item turns ready right away and the poll ends with it. The
+        // deadline only bounds that loop when the server stays stuck between
+        // QUEUED and SUCCEEDED; there is nothing else left to wait for.
         const deadline = Date.now() + finalizePollTimeoutMs
         for (;;) {
           const state = await fetchFinalizeStatus(albumID, { signal: controller.signal })
@@ -220,12 +200,8 @@ export function UploadPage() {
             return
           }
           if (state.status === 'SUCCEEDED') {
-            updateItem(itemID, { status: 'ready', embedding: state.embedding, error: undefined })
-            if (!isEmbeddingPending(state.embedding)) {
-              return
-            }
-          } else if (state.embedding) {
-            updateItem(itemID, { embedding: state.embedding })
+            updateItem(itemID, { status: 'ready', error: undefined })
+            return
           }
           if (Date.now() >= deadline) {
             return
@@ -460,7 +436,6 @@ export function UploadPage() {
         status: 'queued' as const,
         uploadedBytes: 0,
         albumId: undefined,
-        embedding: undefined,
         error: undefined,
       }
     })
@@ -578,12 +553,6 @@ export function UploadPage() {
             <div className="progress">
               <div className="progress-bar" style={{ width: `${summary.progressPct}%` }} />
             </div>
-            {embedding && embedding.enabled && embedding.pending > 0 && (
-              <p className="upload-summary-embedding tnum" data-testid="upload-embedding-summary">
-                Embedding {embedding.ready}/{embedding.total} images ({Math.round(embedding.ratio * 100)}%)
-                {embedding.failed > 0 ? `, ${embedding.failed} failed` : ''}
-              </p>
-            )}
           </section>
         )}
 
@@ -604,14 +573,6 @@ export function UploadPage() {
                 <p className="upload-item-meta tnum">
                   {formatBytes(item.sizeBytes)}
                   {item.status === 'uploading' ? ` · ${pct}% uploaded` : ''}
-                  {item.embedding && item.embedding.enabled && item.embedding.total > 0
-                    ? ` · embedded ${item.embedding.ready}/${item.embedding.total}${
-                        item.embedding.failed > 0 ? `, ${item.embedding.failed} failed` : ''
-                      }`
-                    : ''}
-                  {item.embedding && !item.embedding.enabled && item.embedding.pending > 0
-                    ? ' · embeddings unavailable on this server'
-                    : ''}
                 </p>
                 {item.status === 'uploading' && (
                   <div
@@ -634,19 +595,6 @@ export function UploadPage() {
                     aria-label={`Indexing ${item.name}`}
                   >
                     <div className="progress-bar" />
-                  </div>
-                )}
-                {item.embedding && isEmbeddingPending(item.embedding) && (
-                  <div
-                    className="progress"
-                    data-testid="upload-embedding-progress"
-                    role="progressbar"
-                    aria-label="Embedding progress"
-                    aria-valuemin={0}
-                    aria-valuemax={item.embedding?.total ?? 0}
-                    aria-valuenow={item.embedding?.ready ?? 0}
-                  >
-                    <div className="progress-bar" style={{ width: `${embeddingPercent(item.embedding)}%` }} />
                   </div>
                 )}
                 {item.error && <p className="upload-item-error">{item.error}</p>}

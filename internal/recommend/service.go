@@ -430,21 +430,6 @@ func (s *Service) EmbeddingProgress() EmbeddingProgress {
 	return s.progressFrom(counts)
 }
 
-// AlbumEmbeddingProgress reports coverage for the distinct blobs one album
-// references, which is the progress a client uploading that album cares about.
-func (s *Service) AlbumEmbeddingProgress(ctx context.Context, albumID string) (EmbeddingProgress, error) {
-	if s == nil || s.catalog == nil || strings.TrimSpace(albumID) == "" {
-		return EmbeddingProgress{}, nil
-	}
-	counts, err := s.catalog.EmbeddingCountsByAlbum(ctx, albumID)
-	if err != nil {
-		return EmbeddingProgress{}, err
-	}
-	progress := s.progressFrom(counts)
-	progress.Active = false
-	return progress, nil
-}
-
 func (s *Service) progressFrom(counts catalog.EmbeddingCounts) EmbeddingProgress {
 	ratio := 0.0
 	if counts.Total > 0 {

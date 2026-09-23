@@ -88,12 +88,6 @@
   color: var(--ink-2);
 }
 
-.upload-summary-embedding {
-  margin: 0;
-  font-size: var(--text-sm);
-  color: var(--ink-2);
-}
-
 .upload-list {
   display: grid;
   gap: 10px;

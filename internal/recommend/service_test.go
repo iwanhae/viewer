@@ -649,17 +649,6 @@ func TestEmbeddingProgressCountsAndEnabled(t *testing.T) {
 	if progress := enabled.EmbeddingProgress(); !progress.Enabled || progress.Active {
 		t.Fatalf("expected Enabled=true and Active=false while idle: %+v", progress)
 	}
-
-	albumB, err := enabled.AlbumEmbeddingProgress(context.Background(), "album-b")
-	if err != nil {
-		t.Fatalf("album progress: %v", err)
-	}
-	if !albumB.Enabled || albumB.Total != 1 || albumB.Ready != 1 || albumB.Pending != 0 || !approxEqual(albumB.Ratio, 1) {
-		t.Fatalf("album-b progress=%+v want enabled total=1 ready=1 pending=0 ratio=1", albumB)
-	}
-	if albumB.Active {
-		t.Fatalf("a per-album view must not claim the worker's in-flight state: %+v", albumB)
-	}
 }
 
 func TestEmbeddingProgressReportsActiveWhileEmbedding(t *testing.T) {

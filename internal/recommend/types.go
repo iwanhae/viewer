@@ -66,17 +66,14 @@ type RecommendationResponse struct {
 	Items []RecommendationItem `json:"items"`
 }
 
-// EmbeddingProgress is the embedding coverage of a set of blobs, either the
-// whole catalog or a single album's. Ratio is Ready/Total, so it reaches 1 only
-// once every image has an embedding.
+// EmbeddingProgress is the embedding coverage of the whole catalog. Ratio is
+// Ready/Total, so it reaches 1 only once every image has an embedding.
 type EmbeddingProgress struct {
 	// Enabled reports whether the model is loaded. When it is false nothing is
-	// being embedded and nothing ever will be, so a client must not wait for
-	// Pending to reach zero: the difference between "not embedded yet" and
-	// "cannot embed" is what keeps a progress indicator honest.
+	// being embedded and nothing ever will be, so Pending never drains until a
+	// deployment with a model picks the blobs up.
 	Enabled bool `json:"enabled"`
-	// Active reports whether a forward pass is running right now. It is false
-	// for a per-album view, which only carries counts.
+	// Active reports whether a forward pass is running right now.
 	Active bool `json:"active"`
 	Total  int  `json:"total"`
 	Ready  int  `json:"ready"`

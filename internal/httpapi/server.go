@@ -1,7 +1,6 @@
 package httpapi
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -62,7 +61,6 @@ func (s *Server) Router() http.Handler {
 		r.Post("/albums/{albumId}/finalize", s.finalizeAlbum)
 		r.Get("/albums/{albumId}/finalize", s.getFinalizeStatus)
 		r.Get("/albums/{albumId}", s.getAlbum)
-		r.Get("/embedding", s.getEmbeddingStatus)
 		r.Get("/feed", s.getFeed)
 		r.Get("/image/{hash}", s.getImageByHash)
 		r.Head("/image/{hash}", s.getImageByHash)
@@ -70,9 +68,7 @@ func (s *Server) Router() http.Handler {
 	})
 
 	// The worker endpoints are the write surface for external embedding
-	// fleets, so they carry their own token check. A group rather than a
-	// mounted subrouter: a mount on /api/embedding would swallow the public
-	// GET /api/embedding status endpoint above.
+	// fleets, so they carry their own token check.
 	r.Group(func(r chi.Router) {
 		r.Use(s.requireWorkerToken)
 		r.Post("/api/embedding/claim", s.claimEmbeddings)
@@ -120,31 +116,6 @@ func (s *Server) createAlbum(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-type finalizeResponse struct {
-	albums.FinalizeState
-	// Embedding is the album's blob coverage. It is absent when the server has
-	// no recommendation service, which tells the client not to wait for
-	// embeddings it will never get.
-	Embedding *recommend.EmbeddingProgress `json:"embedding,omitempty"`
-}
-
-// finalizePayload adds embedding coverage to a finalize state, so a client that
-// has just uploaded can tell "indexed but still embedding" apart from "indexed
-// and fully embedded".
-func (s *Server) finalizePayload(ctx context.Context, state albums.FinalizeState) finalizeResponse {
-	payload := finalizeResponse{FinalizeState: state}
-	if s.recommend == nil {
-		return payload
-	}
-	progress, err := s.recommend.AlbumEmbeddingProgress(ctx, state.AlbumID)
-	if err != nil {
-		log.Printf("finalize: album=%s embedding progress failed: %v", state.AlbumID, err)
-		return payload
-	}
-	payload.Embedding = &progress
-	return payload
-}
-
 func (s *Server) finalizeAlbum(w http.ResponseWriter, r *http.Request) {
 	albumID := chi.URLParam(r, "albumId")
 	state, err := s.albums.RequestFinalize(r.Context(), albumID)
@@ -163,7 +134,7 @@ func (s *Server) finalizeAlbum(w http.ResponseWriter, r *http.Request) {
 	if state.Status == catalog.AlbumStatusReady {
 		status = http.StatusOK
 	}
-	writeJSON(w, status, s.finalizePayload(r.Context(), state))
+	writeJSON(w, status, state)
 }
 
 func (s *Server) getFinalizeStatus(w http.ResponseWriter, r *http.Request) {
@@ -179,7 +150,7 @@ func (s *Server) getFinalizeStatus(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, status, code, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, s.finalizePayload(r.Context(), state))
+	writeJSON(w, http.StatusOK, state)
 }
 
 func (s *Server) getAlbum(w http.ResponseWriter, r *http.Request) {
@@ -317,17 +288,6 @@ func (s *Server) getRecommendations(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, result)
-}
-
-// getEmbeddingStatus reports embedding coverage across the whole catalog. It
-// stays available without a recommendation service and simply reports zeros,
-// which the clients read as "nothing is being embedded".
-func (s *Server) getEmbeddingStatus(w http.ResponseWriter, r *http.Request) {
-	progress := recommend.EmbeddingProgress{}
-	if s.recommend != nil {
-		progress = s.recommend.EmbeddingProgress()
-	}
-	writeJSON(w, http.StatusOK, progress)
 }
 
 func (s *Server) getMetrics(w http.ResponseWriter, r *http.Request) {

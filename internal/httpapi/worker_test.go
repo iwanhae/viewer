@@ -150,18 +150,14 @@ func TestWorkerClaimLeasesBlobsAndHandsOutDownloads(t *testing.T) {
 		t.Fatalf("second claim returned %d blobs, want 0", len(again.Claimed))
 	}
 
-	// The progress view keeps pending derived (still 2, in-flight included)
-	// while processing makes the leases observable.
-	var progress struct {
-		Total      int `json:"total"`
-		Pending    int `json:"pending"`
-		Processing int `json:"processing"`
+	// Pending stays derived in the catalog counts (still 2, in-flight
+	// included) while processing makes the leases observable.
+	counts, err := harness.catalog.EmbeddingCounts(context.Background())
+	if err != nil {
+		t.Fatalf("embedding counts: %v", err)
 	}
-	if err := json.Unmarshal(harness.do(t, http.MethodGet, "/api/embedding", nil).Body.Bytes(), &progress); err != nil {
-		t.Fatalf("decode progress: %v", err)
-	}
-	if progress.Total != 2 || progress.Pending != 2 || progress.Processing != 2 {
-		t.Fatalf("progress=%+v want total=2 pending=2 processing=2", progress)
+	if counts.Total != 2 || counts.Pending != 2 || counts.Processing != 2 {
+		t.Fatalf("counts=%+v want total=2 pending=2 processing=2", counts)
 	}
 }
 
@@ -196,19 +192,14 @@ func TestWorkerResultsRoundTripReachesSearchAndRecommendations(t *testing.T) {
 		t.Fatalf("results=%+v want updated=2 rejected=0", payload)
 	}
 
-	// The coverage view flipped to fully ready, including the derived pending.
-	var progress struct {
-		Total      int     `json:"total"`
-		Ready      int     `json:"ready"`
-		Pending    int     `json:"pending"`
-		Processing int     `json:"processing"`
-		Ratio      float64 `json:"ratio"`
+	// The catalog counts flipped to fully ready, including the derived
+	// pending, and nothing is leased anymore.
+	counts, err := harness.catalog.EmbeddingCounts(context.Background())
+	if err != nil {
+		t.Fatalf("embedding counts: %v", err)
 	}
-	if err := json.Unmarshal(harness.do(t, http.MethodGet, "/api/embedding", nil).Body.Bytes(), &progress); err != nil {
-		t.Fatalf("decode progress: %v", err)
-	}
-	if progress.Total != 2 || progress.Ready != 2 || progress.Pending != 0 || progress.Processing != 0 || progress.Ratio != 1 {
-		t.Fatalf("progress=%+v want fully ready", progress)
+	if counts.Total != 2 || counts.Ready != 2 || counts.Pending != 0 || counts.Processing != 0 {
+		t.Fatalf("counts=%+v want fully ready", counts)
 	}
 
 	// The vectors are in the in-memory index: the query photo's best match is
@@ -375,8 +366,8 @@ func TestWorkerEndpointsRequireToken(t *testing.T) {
 
 	// The public read surface stays open: only the worker write path is
 	// token-gated.
-	if rec := harness.do(t, http.MethodGet, "/api/embedding", nil); rec.Code != http.StatusOK {
-		t.Fatalf("public embedding status=%d body=%s", rec.Code, rec.Body.String())
+	if rec := harness.do(t, http.MethodGet, "/metrics", nil); rec.Code != http.StatusOK {
+		t.Fatalf("public metrics status=%d body=%s", rec.Code, rec.Body.String())
 	}
 }
 

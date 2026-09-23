@@ -2,7 +2,6 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import { THUMBNAIL_WIDTH, imageByHashUrl, type FeedMode } from '../api/client'
 import { useFeed } from '../hooks/useFeed'
-import { useEmbeddingProgress } from '../hooks/useEmbeddingProgress'
 import { COLUMN_OPTIONS, pageForPhotoIndex, wallFocusKey } from '../utils/albumPaging'
 import { materializeWallParams, resolveWallParams } from '../utils/wallParams'
 import {
@@ -48,8 +47,6 @@ export function WallPage() {
   )
   const { mode, seed, latestPage, latestCursor } = wall
   const focus = searchParams.get('focus')
-
-  const embedding = useEmbeddingProgress()
 
   const { items, loading, error, pageInfo } = useFeed(
     mode === 'random' ? seed : '',
@@ -280,24 +277,6 @@ export function WallPage() {
               </div>
             ),
           },
-          // Embedding keeps running after an album is indexed, so the wall
-          // says so while there is work left instead of silently showing a
-          // feed that recommendations cannot use yet.
-          ...(embedding && embedding.enabled && embedding.pending > 0
-            ? [
-                {
-                  kind: 'indicator' as const,
-                  id: 'wall-embedding-indicator',
-                  label: (
-                    <span>
-                      Embedding {embedding.ready}/{embedding.total}
-                    </span>
-                  ),
-                  testId: 'wall-embedding-indicator',
-                  ariaLabel: `Embedding ${embedding.ready} of ${embedding.total} images`,
-                },
-              ]
-            : []),
           ...(mode === 'latest'
             ? [
                 {

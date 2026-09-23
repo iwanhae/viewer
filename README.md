@@ -147,32 +147,22 @@ recommendations return an empty `items` list.
 ### Embedding progress
 
 Indexing and embedding are two stages, and the album status only covers the
-first: an album is `SUCCEEDED` while its embeddings may still be running. Both
-stages are reported:
+first: an album is `SUCCEEDED` while its embeddings may still be running. The
+API does not report that second stage - there is no embedding status endpoint,
+and the finalize response carries only the album status. The `/metrics`
+gauges (`viewer_embedding_*`, listed under Observability below) are the only
+exposure of how far embedding has come.
 
-- `GET /api/albums/<albumId>/finalize` carries an `embedding` object covering
-  that album's distinct blobs, so the upload page can show an album that is
-  indexed but not yet fully embedded.
-- `GET /api/embedding` reports the same shape for the whole catalog; the wall
-  polls it and shows an `Embedding <ready>/<total>` indicator while work is
-  left.
-
-```json
-{"enabled":true,"active":true,"total":300,"ready":181,"failed":2,"pending":117,"processing":8,"ratio":0.603333}
-```
-
-`processing` is the subset of `pending` whose lease a worker currently holds —
-it is observability for the worker fleet, and the progress contract only ever
-promised `pending`, which keeps counting in-flight blobs.
-
-`enabled` is false when no checkpoint could be loaded - the fetch failed, or
-the files are missing. Nothing is embedding then and nothing ever will be, so
-a client stops waiting instead of showing a bar that cannot move; the blobs
-simply stay `pending` until a deployment with a model picks them up. During
-the cold-start download window `enabled` is already true while nothing is
-active yet: the workers come up when the checkpoint finishes loading. `failed` images are terminal — the retry worker skips them — so
-`ratio` reaches 1 only when nothing is pending, and a failure is visible as
-`ready + failed == total` instead of a bar that never fills.
+`pending` counts everything not ready and not failed, including the blobs a
+worker currently holds a lease on; `processing` is that leased subset, which
+is observability for the worker fleet. When no checkpoint could be loaded -
+the fetch failed, or the files are missing - nothing is embedding and nothing
+ever will be, so `pending` never drains until a deployment with a model picks
+the blobs up. During the cold-start download window the workers are not up
+yet, so nothing moves until the checkpoint finishes loading. `failed` images
+are terminal — the retry worker skips them — so the `ready` gauge reaches
+`total` only when nothing is pending, and a failure is visible as
+`ready + failed == total` instead of a number that never fills.
 
 ### External embedding workers
 
