@@ -43,6 +43,15 @@ func NewS3Store(ctx context.Context, cfg cfgpkg.Config) (*S3Store, error) {
 		ctx,
 		config.WithRegion(cfgpkg.S3Region),
 		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(cfg.S3AccessKey, cfg.S3SecretKey, "")),
+		// The 2024-11 SDK defaults turned on default integrity protections:
+		// requests grew an x-amz-checksum-mode header and uploads grew trailing
+		// checksums. Real AWS answers it fine, but self-hosted stores (Garage,
+		// MinIO) are free to switch the response to a slower checksummed
+		// streaming mode when asked, which throttles large downloads like the
+		// catalog restore to a fraction of the plain-GET rate. Pin the wire
+		// behavior back to checksums only where the operation requires them.
+		config.WithRequestChecksumCalculation(aws.RequestChecksumCalculationWhenRequired),
+		config.WithResponseChecksumValidation(aws.ResponseChecksumValidationWhenRequired),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("load aws config: %w", err)
