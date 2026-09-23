@@ -197,7 +197,7 @@ func OpenReadOnly(path string) (*Store, error) {
 	if clean == "" {
 		return nil, fmt.Errorf("catalog path is required")
 	}
-	dsn := fmt.Sprintf("file:%s?mode=ro&_pragma=query_only(1)", clean)
+	dsn := fmt.Sprintf("file:%s?mode=ro", clean)
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open catalog read-only: %w", err)
@@ -355,9 +355,6 @@ type AlbumSearchResult struct {
 // SearchAlbumsByName returns ready albums whose original filename contains the
 // query as a case-insensitive substring, newest first.
 func (s *Store) SearchAlbumsByName(ctx context.Context, q string, limit int) ([]AlbumSearchResult, error) {
-	if limit <= 0 {
-		limit = 20
-	}
 	normalized := strings.ToLower(strings.TrimSpace(q))
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT a.id, a.original_filename, a.size_bytes, a.status, a.source_key,
@@ -847,9 +844,6 @@ type RejectedEmbedding struct {
 // must run through QueryContext — RETURNING rows are dropped by ExecContext.
 // Rows come back in an unspecified order, so they are re-sorted by created_at.
 func (s *Store) ClaimPendingEmbeddings(ctx context.Context, limit int, leaseUntil time.Time) ([]Blob, error) {
-	if limit <= 0 {
-		limit = 64
-	}
 	now := time.Now()
 	rows, err := s.db.QueryContext(ctx, `
 		UPDATE blobs
