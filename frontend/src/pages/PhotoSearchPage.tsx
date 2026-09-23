@@ -7,7 +7,7 @@ import { usePhotoSearch } from '../hooks/usePhotoSearch'
 import { usePhotoImageSearch } from '../hooks/usePhotoImageSearch'
 import './albumSearch.css'
 
-const SEARCH_LIMIT = 40
+const SEARCH_LIMIT = 50
 const SKELETON_COUNT = 12
 const SEARCH_COLUMNS = 3
 
