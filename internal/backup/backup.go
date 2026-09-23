@@ -33,6 +33,7 @@ import (
 	"time"
 
 	"viewer/internal/catalog"
+	"viewer/internal/progress"
 	"viewer/internal/storage"
 )
 
@@ -442,7 +443,9 @@ func shouldRestore(backupObj *storage.Object, localExists bool, stamp time.Time,
 }
 
 // restoreObject downloads the snapshot and moves it over the database file, in
-// an order that never leaves a half-written catalog behind.
+// an order that never leaves a half-written catalog behind. The download
+// reports its position and rate while it runs, the same way the checkpoint
+// fetch does - a large catalog otherwise looks like a hung boot.
 func restoreObject(ctx context.Context, store Store, obj storage.Object, dbPath string) error {
 	log.Printf("backup: downloading catalog backup %s (%d bytes) to replace %s", BackupObjectKey, obj.Size, dbPath)
 	dir := filepath.Dir(dbPath)
@@ -463,7 +466,12 @@ func restoreObject(ctx context.Context, store Store, obj storage.Object, dbPath 
 	if err != nil {
 		return fmt.Errorf("create restore temp file: %w", err)
 	}
-	written, copyErr := io.Copy(tmp, body)
+	// obj.Size came from the stat above, so the progress lines carry the
+	// total and the percentage.
+	counting := progress.NewReader(body)
+	stopProgress := progress.Report("backup", "restoring", filepath.Base(BackupObjectKey), counting.Count, obj.Size)
+	written, copyErr := io.Copy(tmp, counting)
+	stopProgress()
 	closeErr := tmp.Close()
 	if copyErr != nil {
 		os.Remove(tmp.Name())

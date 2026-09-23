@@ -12,6 +12,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"viewer/internal/progress"
 )
 
 // serveCheckpoint stands up a mirror with the two files under one prefix and
@@ -155,9 +157,9 @@ func (l *lockedWriter) Write(p []byte) (int, error) {
 // Content-Length and a rate while it is still running, and the completed fetch
 // reports the average.
 func TestEnsureLogsDownloadProgress(t *testing.T) {
-	oldEvery := progressEvery
-	progressEvery = 10 * time.Millisecond
-	t.Cleanup(func() { progressEvery = oldEvery })
+	oldInterval := progress.Interval
+	progress.Interval = 10 * time.Millisecond
+	t.Cleanup(func() { progress.Interval = oldInterval })
 
 	var mu sync.Mutex
 	var out strings.Builder

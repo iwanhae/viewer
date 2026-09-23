@@ -279,6 +279,14 @@ difference below `1e-4`, cosine above `0.9995`). The test is skipped unless
 
 ## Observability
 - The server logs to stdout/stderr via Go's standard logger.
+- Long downloads report their position and rate every 5 seconds while they run,
+  so a slow start does not look like a hung one: a cold start fetching the
+  checkpoint logs
+  `checkpoint: fetching model.safetensors 512.0 MiB / 1.5 GiB (33.3%) at 40.0 MiB/s`,
+  and a startup restoring the catalog logs
+  `backup: restoring viewer.db 96.0 MiB / 1.2 GiB (7.8%) at 30.0 MiB/s`. A
+  download that finishes within one interval logs nothing beyond its completion
+  line.
 - Embedding is reported as it happens. The background workers log
   `recommend: embedding run started pending=<n> ready=<n> total=<n>`, one
   `recommend: embedded blob=<sha256> bytes=<n> dim=768 elapsed=<d>` line per
