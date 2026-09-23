@@ -115,9 +115,14 @@ export function AlbumSearchPage() {
         <PageTopBar
           title="Find albums"
           actions={
-            <Link className="photo-nav-button" to="/upload">
-              Upload
-            </Link>
+            <>
+              <Link className="photo-nav-button" to="/search">
+                Search photos
+              </Link>
+              <Link className="photo-nav-button" to="/upload">
+                Upload
+              </Link>
+            </>
           }
         />
 

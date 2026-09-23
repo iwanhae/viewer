@@ -58,6 +58,22 @@ export type AlbumSearchResponse = {
   albums: AlbumSearchItem[]
 }
 
+// PhotoSearchItem is one natural-language photo-search hit: the album and the
+// zero-based photo index to navigate to, the hash to render the thumbnail
+// from, and the ranking score the server ordered the items by.
+export type PhotoSearchItem = {
+  albumId: string
+  i: number
+  hash: string
+  w: number
+  h: number
+  score: number
+}
+
+export type PhotoSearchResponse = {
+  items: PhotoSearchItem[]
+}
+
 export type RecommendationItem = {
 	albumId: string
 	i: number

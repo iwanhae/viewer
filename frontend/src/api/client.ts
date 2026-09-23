@@ -7,6 +7,8 @@ import type {
   FeedResponse,
   FinalizeResponse,
   FinalizeStatus,
+  PhotoSearchItem,
+  PhotoSearchResponse,
   RecommendationItem,
   RecommendationResponse,
 } from './types'
@@ -22,6 +24,8 @@ export type {
   FinalizeResponse,
   FinalizeStatus,
   PhotoMeta,
+  PhotoSearchItem,
+  PhotoSearchResponse,
   RecommendationItem,
   RecommendationResponse,
 } from './types'
@@ -120,6 +124,23 @@ export async function fetchAlbumSearch(params?: {
   const suffix = query.toString()
   const path = suffix ? `/api/albums/search?${suffix}` : '/api/albums/search'
   return await requestJSON<AlbumSearchResponse>(path, { signal: params?.signal })
+}
+
+// fetchPhotoSearch asks the backend for natural-language photo matches. The
+// query is required (the empty case never leaves the hook), and the server
+// answers with items already ranked best-first.
+export async function fetchPhotoSearch(params: {
+  q: string
+  limit?: number
+  signal?: AbortSignal
+}): Promise<PhotoSearchResponse> {
+  const query = new URLSearchParams()
+  query.set('q', params.q)
+  if (params?.limit !== undefined) query.set('limit', String(params.limit))
+
+  return await requestJSON<PhotoSearchResponse>(`/api/photos/search?${query.toString()}`, {
+    signal: params?.signal,
+  })
 }
 
 export async function fetchRecommendations(
