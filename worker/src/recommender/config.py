@@ -48,8 +48,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--token",
-        default=_env("VIEWER_WORKER_TOKEN") or _env("EMBEDDING_WORKER_TOKEN"),
-        help="worker bearer token (VIEWER_WORKER_TOKEN, falls back to EMBEDDING_WORKER_TOKEN)",
+        default=_env("WORKER_TOKEN"),
+        help="shared worker bearer token (WORKER_TOKEN)",
     )
     parser.add_argument(
         "--model-url",

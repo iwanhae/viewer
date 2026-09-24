@@ -3,6 +3,8 @@ package httpapi
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"image"
 	_ "image/jpeg"
@@ -10,6 +12,11 @@ import (
 	"net/http/httptest"
 	"testing"
 )
+
+func bodyETag(data []byte) string {
+	sum := sha256.Sum256(data)
+	return `"` + hex.EncodeToString(sum[:]) + `"`
+}
 
 // TestGetImageServesBlobWithHTTPMetadata exercises the streaming image read
 // path end to end: the response must carry a length, an ETag derived from the
@@ -40,10 +47,10 @@ func TestGetImageServesBlobWithHTTPMetadata(t *testing.T) {
 	if got, want := rec.Header().Get("Content-Length"), fmt.Sprint(len(imageA)); got != want {
 		t.Fatalf("content-length=%q want=%q", got, want)
 	}
-	if got, want := rec.Header().Get("ETag"), `"`+photo.Hash+`"`; got != want {
+	if got, want := rec.Header().Get("ETag"), bodyETag(imageA); got != want {
 		t.Fatalf("etag=%q want=%q", got, want)
 	}
-	if got, want := rec.Header().Get("Cache-Control"), "public, max-age=86400, immutable"; got != want {
+	if got, want := rec.Header().Get("Cache-Control"), "public, max-age=86400"; got != want {
 		t.Fatalf("cache-control=%q want=%q", got, want)
 	}
 	if got := rec.Header().Get("Accept-Ranges"); got != "bytes" {
@@ -52,7 +59,7 @@ func TestGetImageServesBlobWithHTTPMetadata(t *testing.T) {
 
 	// A matching validator is answered with 304 and no body.
 	condReq := httptest.NewRequest(http.MethodGet, path, nil)
-	condReq.Header.Set("If-None-Match", `"`+photo.Hash+`"`)
+	condReq.Header.Set("If-None-Match", bodyETag(imageA))
 	condRec := httptest.NewRecorder()
 	harness.router.ServeHTTP(condRec, condReq)
 	if condRec.Code != http.StatusNotModified {
@@ -107,7 +114,7 @@ func TestGetImageServesScaledVariant(t *testing.T) {
 	if got := scaledRec.Header().Get("Content-Type"); got != "image/jpeg" {
 		t.Fatalf("scaled content-type=%q want=image/jpeg", got)
 	}
-	if got, want := scaledRec.Header().Get("ETag"), `"`+photo.Hash+`:w320"`; got != want {
+	if got, want := scaledRec.Header().Get("ETag"), bodyETag(scaledRec.Body.Bytes()); got != want {
 		t.Fatalf("scaled etag=%q want=%q", got, want)
 	}
 	config, _, err := image.DecodeConfig(bytes.NewReader(scaledRec.Body.Bytes()))
@@ -177,10 +184,10 @@ func TestGetImageSupportsHead(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("head status=%d body=%s", rec.Code, rec.Body.String())
 	}
-	if got, want := rec.Header().Get("ETag"), `"`+photo.Hash+`"`; got != want {
+	if got, want := rec.Header().Get("ETag"), bodyETag(imageA); got != want {
 		t.Fatalf("etag=%q want=%q", got, want)
 	}
-	if got := rec.Header().Get("Cache-Control"); got != "public, max-age=86400, immutable" {
+	if got := rec.Header().Get("Cache-Control"); got != "public, max-age=86400" {
 		t.Fatalf("cache-control=%q", got)
 	}
 	if rec.Body.Len() != 0 {
@@ -201,8 +208,10 @@ func TestGetImageScaledConditionalRequest(t *testing.T) {
 		t.Fatalf("photo at 0: %v", err)
 	}
 
-	req := httptest.NewRequest(http.MethodGet, "/api/image/"+photo.Hash+"?w=320", nil)
-	req.Header.Set("If-None-Match", `"`+photo.Hash+`:w320"`)
+	path := "/api/image/" + photo.Hash + "?w=320"
+	first := harness.do(t, http.MethodGet, path, nil)
+	req := httptest.NewRequest(http.MethodGet, path, nil)
+	req.Header.Set("If-None-Match", first.Header().Get("ETag"))
 	rec := httptest.NewRecorder()
 	harness.router.ServeHTTP(rec, req)
 	if rec.Code != http.StatusNotModified {

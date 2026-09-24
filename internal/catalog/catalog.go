@@ -88,6 +88,8 @@ type Blob struct {
 	Hash            string
 	SizeBytes       int64
 	ContentType     string
+	EncodingGate    bool
+	SourceRestored  bool
 	EmbeddingStatus EmbeddingStatus
 	EmbeddingError  string
 	CreatedAt       string
@@ -639,9 +641,8 @@ func scanPhoto(row scanner) (Photo, error) {
 	return photo, nil
 }
 
-// UpsertBlob records the existence of a content-addressed blob. It never
-// clobbers an existing embedding state: the conflict update touches only the
-// upload fields, and a fresh row starts out pending.
+// UpsertBlob records the source once. Later duplicate uploads leave stored
+// metadata alone unless the S3 object had gone missing and was restored.
 func (s *Store) UpsertBlob(ctx context.Context, blob Blob) error {
 	if strings.TrimSpace(blob.Hash) == "" {
 		return fmt.Errorf("blob hash is required")
@@ -650,13 +651,19 @@ func (s *Store) UpsertBlob(ctx context.Context, blob Blob) error {
 		blob.ContentType = "application/octet-stream"
 	}
 	now := nowRFC3339()
+	encodingStatus := "pending"
+	if blob.ContentType == "image/webp" {
+		encodingStatus = "skipped"
+	}
 	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO blobs (hash, size_bytes, content_type, embedding_status, embedding_error, created_at)
-		VALUES (?, ?, ?, ?, '', ?)
+		INSERT INTO blobs (hash, size_bytes, content_type, embedding_status, embedding_error, created_at, encoding_status, encoding_gate)
+		VALUES (?, ?, ?, ?, '', ?, ?, ?)
 		ON CONFLICT(hash) DO UPDATE SET
-			size_bytes   = excluded.size_bytes,
-			content_type = excluded.content_type`,
-		blob.Hash, blob.SizeBytes, blob.ContentType, string(EmbeddingStatusPending), now,
+			size_bytes=excluded.size_bytes, content_type=excluded.content_type,
+			encoding_status=excluded.encoding_status, encoding_token='', encoding_stage_key='', encoding_lease_until=0,
+			encoding_error=''
+		WHERE ?`,
+		blob.Hash, blob.SizeBytes, blob.ContentType, string(EmbeddingStatusPending), now, encodingStatus, blob.EncodingGate, blob.SourceRestored,
 	)
 	if err != nil {
 		return fmt.Errorf("upsert blob %s: %w", blob.Hash, err)
@@ -745,8 +752,9 @@ func (s *Store) ClaimPendingEmbeddings(ctx context.Context, limit int, leaseUnti
 		SET embedding_status = ?1, embedding_lease_until = ?2
 		WHERE hash IN (
 			SELECT hash FROM blobs
-			WHERE embedding_status = ?3
-			   OR (embedding_status = ?1 AND embedding_lease_until < ?4)
+			WHERE (embedding_status = ?3
+			   OR (embedding_status = ?1 AND embedding_lease_until < ?4))
+			  AND (encoding_gate = 0 OR encoding_status IN ('done', 'skipped', 'failed'))
 			ORDER BY created_at ASC
 			LIMIT ?5
 		)

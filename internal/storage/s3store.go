@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"sort"
 	"strings"
 	"time"
@@ -124,6 +125,25 @@ func (s *S3Store) PutObject(ctx context.Context, key string, body io.Reader, con
 	})
 	if err != nil {
 		return fmt.Errorf("put object %s: %w", key, err)
+	}
+	return nil
+}
+
+// CopyObjectIfMatch promotes a validated staging object without moving its
+// bytes through the API server. The source ETag guards against a late rewrite
+// through a still-valid presigned staging URL.
+func (s *S3Store) CopyObjectIfMatch(ctx context.Context, from, to, sourceETag, contentType string) error {
+	copySource := url.PathEscape(s.bucket) + "/" + strings.ReplaceAll(url.PathEscape(s.physicalKey(from)), "%2F", "/")
+	_, err := s.client.CopyObject(ctx, &s3.CopyObjectInput{
+		Bucket:            aws.String(s.bucket),
+		Key:               aws.String(s.physicalKey(to)),
+		CopySource:        aws.String(copySource),
+		CopySourceIfMatch: aws.String(sourceETag),
+		MetadataDirective: types.MetadataDirectiveReplace,
+		ContentType:       aws.String(contentType),
+	})
+	if err != nil {
+		return fmt.Errorf("copy object %s to %s: %w", from, to, err)
 	}
 	return nil
 }

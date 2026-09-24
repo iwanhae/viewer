@@ -1,4 +1,26 @@
-# recommender
+# worker
+
+One uv project provides two commands: `uv run recommender` for image
+embeddings and `uv run encoder` for WebP Q85 compression. Both read
+`VIEWER_BASE_URL` and `WORKER_TOKEN` from the environment or `worker/.env`.
+
+Setting `WORKER_TOKEN` on the server enables WebP encoding. Use the same token
+here. There is no separate WebP opt-out. Install the official `cwebp` CLI on
+the encoder host. From `worker/`:
+
+```sh
+uv sync
+uv run encoder                  # continuous claim -> encode -> complete loop
+uv run encoder --workers 8      # number of concurrent cwebp processes
+```
+
+The server claims the largest pending source blobs first. The encoder runs
+`cwebp -q 85 -alpha_q 100 -metadata all` and uploads only a smaller output to
+a temporary key. The server validates it before replacing the original blob.
+The output-size check includes copied EXIF, ICC, and XMP metadata. Already
+WebP images and outputs that are not smaller remain untouched.
+
+## Recommender
 
 External embedding worker for the viewer photo server. It claims batches of
 un-embedded blobs over the bearer-token worker API, fetches image bytes
@@ -27,15 +49,14 @@ auto-detected; `--device cpu|cuda` overrides.
 ## Run
 
 ```sh
-cp .env.example .env    # then fill in VIEWER_BASE_URL / VIEWER_WORKER_TOKEN
+cp .env.example .env    # then fill in VIEWER_BASE_URL / WORKER_TOKEN
 uv run recommender               # daemon: claim -> embed -> results, forever
 uv run recommender --once        # single claim -> embed -> results cycle
 uv run recommender --help        # all flags
 ```
 
-The token must match the server's `EMBEDDING_WORKER_TOKEN`. If the repo root
-`.env` already carries it, running from the repo root picks it up —
-`EMBEDDING_WORKER_TOKEN` is accepted as a fallback for `VIEWER_WORKER_TOKEN`.
+The token must match the server's `WORKER_TOKEN`. The repo root `.env` is also
+loaded when running from there.
 
 ## Throughput
 

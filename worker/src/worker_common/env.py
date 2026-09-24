@@ -1,7 +1,7 @@
 """Minimal .env loader.
 
 Loads the first .env found — the current working directory, then the
-recommender/ directory — into os.environ without ever overriding variables
+worker/ directory — into os.environ without ever overriding variables
 that are already set, so real environment variables always win.
 """
 
@@ -16,7 +16,7 @@ log = logging.getLogger(__name__)
 
 def load_dotenv() -> Path | None:
     """Apply the first .env found and return its path, or None."""
-    here = Path(__file__).resolve().parents[2]  # .../recommender
+    here = Path(__file__).resolve().parents[2]  # .../worker
     for candidate in (Path.cwd() / ".env", here / ".env"):
         if candidate.is_file():
             _apply(candidate)

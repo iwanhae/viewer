@@ -100,11 +100,9 @@ type Config struct {
 	// holds no file: one download per <ModelURL>/<filename>.
 	ModelURL string
 
-	// WorkerToken is the shared bearer token external embedding workers must
-	// present on the claim/renew/results endpoints. Empty switches the worker
-	// auth off, which is only sensible on a network that cannot be reached by
-	// untrusted clients.
-	WorkerToken string
+	// WorkerToken protects both external worker APIs.
+	WorkerToken         string
+	WebPEncodingEnabled bool
 
 	// QdrantURL is the REST base URL of the external Qdrant server vector
 	// search talks to: the HTTP client appends a collection path to it. It is
@@ -154,7 +152,7 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	workerToken := strings.TrimSpace(os.Getenv("EMBEDDING_WORKER_TOKEN"))
+	workerToken := strings.TrimSpace(os.Getenv("WORKER_TOKEN"))
 	rawQdrantURL := os.Getenv("QDRANT_URL")
 	qdrantAPIKey := strings.TrimSpace(os.Getenv("QDRANT_API_KEY"))
 	qdrantCollection := strings.TrimSpace(os.Getenv("QDRANT_COLLECTION"))
@@ -172,10 +170,14 @@ func Load() (Config, error) {
 		AllowBackupOverwrite: allowBackupOverwrite,
 		ModelURL:             normalizeModelURL(os.Getenv("SIGLIP2_MODEL_URL")),
 		WorkerToken:          workerToken,
-		QdrantURL:            normalizeQdrantURL(rawQdrantURL),
-		QdrantAPIKey:         qdrantAPIKey,
-		QdrantCollection:     qdrantCollection,
-		AdminToken:           adminToken,
+		// A configured worker token enables the external encoder and puts new
+		// non-WebP uploads behind the encoding gate. There is no separate
+		// opt-out: the same token configures both worker APIs.
+		WebPEncodingEnabled: workerToken != "",
+		QdrantURL:           normalizeQdrantURL(rawQdrantURL),
+		QdrantAPIKey:        qdrantAPIKey,
+		QdrantCollection:    qdrantCollection,
+		AdminToken:          adminToken,
 	}
 
 	switch {
@@ -191,11 +193,13 @@ func Load() (Config, error) {
 		// A relative path would silently land next to the binary instead of in
 		// a mounted volume, which loses the catalog on the next replacement.
 		return Config{}, fmt.Errorf("STATE_DIR must be an absolute path, got %q", cfg.StateDir)
-	case os.Getenv("EMBEDDING_WORKER_TOKEN") != "" && workerToken == "":
+	case os.Getenv("WORKER_TOKEN") != "" && workerToken == "":
 		// The variable was set, so the operator meant to protect the worker
 		// API. A whitespace-only value would silently run it unauthenticated,
 		// which is exactly the accident this check exists to prevent.
-		return Config{}, fmt.Errorf("EMBEDDING_WORKER_TOKEN is set but blank")
+		return Config{}, fmt.Errorf("WORKER_TOKEN is set but blank")
+	case strings.TrimSpace(os.Getenv("EMBEDDING_WORKER_TOKEN")) != "":
+		return Config{}, fmt.Errorf("EMBEDDING_WORKER_TOKEN was renamed to WORKER_TOKEN")
 	case rawQdrantURL != "" && cfg.QdrantURL == "":
 		// The variable was set, so the operator meant to point the viewer at
 		// Qdrant. A whitespace-only value would otherwise read as "unset" and

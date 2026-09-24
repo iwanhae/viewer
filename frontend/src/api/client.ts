@@ -33,12 +33,12 @@ export type {
 // THUMBNAIL_WIDTH is the grid-tile width: every wall, album-grid and
 // recommendation tile requests this scaled JPEG variant instead of the
 // original. It must stay on the server's width ladder (320/640/1024); scaled
-// responses carry the "<hash>:w<width>" ETag.
+// responses carry an ETag derived from the bytes served.
 export const THUMBNAIL_WIDTH = 640
 
-// imageByHashUrl builds the URL for one image by its content hash. An optional
+// imageByHashUrl builds the URL for one image by its original upload hash. An optional
 // width from the server's ladder (320/640/1024) asks for a scaled JPEG variant;
-// without it the endpoint serves the untouched original.
+// without it the endpoint serves the current stored image.
 export function imageByHashUrl(hash: string, width?: number): string {
   const base = `/api/image/${hash}`
   return width === undefined ? base : `${base}?w=${width}`

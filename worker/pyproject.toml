@@ -1,7 +1,7 @@
 [project]
-name = "recommender"
+name = "viewer-worker"
 version = "0.1.0"
-description = "External embedding worker for the viewer photo server"
+description = "External embedding and WebP workers for viewer"
 readme = "README.md"
 authors = [
     { name = "iwanhae", email = "iwanhae@gmail.com" }
@@ -9,20 +9,21 @@ authors = [
 requires-python = ">=3.12"
 dependencies = [
     "httpx>=0.27",
-    "numpy>=1.26",
-    "pillow>=10.1",
-    "safetensors>=0.4",
 ]
 
 [project.scripts]
 recommender = "recommender.cli:main"
+encoder = "encoder.cli:main"
+
+[tool.uv.build-backend]
+module-name = ["recommender", "encoder", "worker_common"]
 
 # torch is resolved from the index matching the machine it is synced on;
 # the extras are mutually exclusive so only one build can be in the venv.
 [project.optional-dependencies]
-cpu = ["torch>=2.7"]
-cu126 = ["torch>=2.7"]
-cu128 = ["torch>=2.7"]
+cpu = ["torch>=2.7", "numpy>=1.26", "pillow>=10.1", "safetensors>=0.4"]
+cu126 = ["torch>=2.7", "numpy>=1.26", "pillow>=10.1", "safetensors>=0.4"]
+cu128 = ["torch>=2.7", "numpy>=1.26", "pillow>=10.1", "safetensors>=0.4"]
 
 [tool.uv]
 conflicts = [

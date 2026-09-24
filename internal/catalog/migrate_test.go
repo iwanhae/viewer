@@ -208,9 +208,9 @@ func TestMigrationChainIsWellFormed(t *testing.T) {
 // dropped after the upload inside fn has fully succeeded. A stmt added back
 // here would destroy vectors that were never uploaded.
 func TestQdrantMigrationKeepsStmtsEmpty(t *testing.T) {
-	m := migrations[len(migrations)-1]
+	m := migrations[2]
 	if m.version != 3 || m.name != "qdrant_vectors" {
-		t.Fatalf("last migration = %d_%s, want 3_qdrant_vectors", m.version, m.name)
+		t.Fatalf("migration 3 = %d_%s, want 3_qdrant_vectors", m.version, m.name)
 	}
 	if len(m.stmts) != 0 {
 		t.Fatalf("migration 0003 carries %d stmts; they would run before the upload fn and drop vectors prematurely", len(m.stmts))

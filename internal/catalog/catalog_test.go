@@ -229,11 +229,18 @@ func TestUpsertBlobPreservesEmbeddingStatus(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get blob: %v", err)
 	}
-	if blob.SizeBytes != 22 {
-		t.Fatalf("expected refreshed size, got %d", blob.SizeBytes)
+	if blob.SizeBytes != 11 {
+		t.Fatalf("duplicate upload changed stored size to %d", blob.SizeBytes)
 	}
 	if blob.EmbeddingStatus != EmbeddingStatusReady {
 		t.Fatalf("expected embedding status preserved, got %+v", blob)
+	}
+	if err := store.UpsertBlob(ctx, Blob{Hash: "hash-a", SizeBytes: 22, ContentType: "image/jpeg", SourceRestored: true}); err != nil {
+		t.Fatalf("restore missing object metadata: %v", err)
+	}
+	blob, err = store.GetBlob(ctx, "hash-a")
+	if err != nil || blob.SizeBytes != 22 || blob.ContentType != "image/jpeg" || blob.EmbeddingStatus != EmbeddingStatusReady {
+		t.Fatalf("restored object metadata: %+v %v", blob, err)
 	}
 
 	if _, err := store.GetBlob(ctx, "missing"); !errors.Is(err, ErrBlobNotFound) {

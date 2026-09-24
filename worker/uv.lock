@@ -2,16 +2,16 @@ version = 1
 revision = 3
 requires-python = ">=3.12"
 resolution-markers = [
-    "extra != 'extra-11-recommender-cpu' and extra != 'extra-11-recommender-cu126' and extra == 'extra-11-recommender-cu128'",
-    "extra != 'extra-11-recommender-cpu' and extra == 'extra-11-recommender-cu126' and extra != 'extra-11-recommender-cu128'",
-    "sys_platform != 'darwin' and extra == 'extra-11-recommender-cpu' and extra != 'extra-11-recommender-cu126' and extra != 'extra-11-recommender-cu128'",
-    "sys_platform == 'darwin' and extra == 'extra-11-recommender-cpu' and extra != 'extra-11-recommender-cu126' and extra != 'extra-11-recommender-cu128'",
-    "extra != 'extra-11-recommender-cpu' and extra != 'extra-11-recommender-cu126' and extra != 'extra-11-recommender-cu128'",
+    "extra != 'extra-13-viewer-worker-cpu' and extra != 'extra-13-viewer-worker-cu126' and extra == 'extra-13-viewer-worker-cu128'",
+    "extra != 'extra-13-viewer-worker-cpu' and extra == 'extra-13-viewer-worker-cu126' and extra != 'extra-13-viewer-worker-cu128'",
+    "sys_platform != 'darwin' and extra == 'extra-13-viewer-worker-cpu' and extra != 'extra-13-viewer-worker-cu126' and extra != 'extra-13-viewer-worker-cu128'",
+    "sys_platform == 'darwin' and extra == 'extra-13-viewer-worker-cpu' and extra != 'extra-13-viewer-worker-cu126' and extra != 'extra-13-viewer-worker-cu128'",
+    "extra != 'extra-13-viewer-worker-cpu' and extra != 'extra-13-viewer-worker-cu126' and extra != 'extra-13-viewer-worker-cu128'",
 ]
 conflicts = [[
-    { package = "recommender", extra = "cpu" },
-    { package = "recommender", extra = "cu126" },
-    { package = "recommender", extra = "cu128" },
+    { package = "viewer-worker", extra = "cpu" },
+    { package = "viewer-worker", extra = "cu126" },
+    { package = "viewer-worker", extra = "cu128" },
 ]]
 
 [[package]]
@@ -20,7 +20,7 @@ version = "4.15.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "idna" },
-    { name = "typing-extensions", marker = "python_full_version < '3.15' or (extra == 'extra-11-recommender-cpu' and extra == 'extra-11-recommender-cu126') or (extra == 'extra-11-recommender-cpu' and extra == 'extra-11-recommender-cu128') or (extra == 'extra-11-recommender-cu126' and extra == 'extra-11-recommender-cu128')" },
+    { name = "typing-extensions", marker = "python_full_version < '3.15' or (extra == 'extra-13-viewer-worker-cpu' and extra == 'extra-13-viewer-worker-cu126') or (extra == 'extra-13-viewer-worker-cpu' and extra == 'extra-13-viewer-worker-cu128') or (extra == 'extra-13-viewer-worker-cu126' and extra == 'extra-13-viewer-worker-cu128')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/a9/d2/f4d173e22df740bc37b1db102b386ba719b66e95b0f0d751f556b387e6d2/anyio-4.15.1.tar.gz", hash = "sha256:9f28306018cbd6d329e64a36d58256edff76dd996fe423bc957326e578b82a94", size = 276966, upload-time = "2026-09-05T10:42:39.44Z" }
 wheels = [
@@ -758,41 +758,6 @@ wheels = [
 ]
 
 [[package]]
-name = "recommender"
-version = "0.1.0"
-source = { editable = "." }
-dependencies = [
-    { name = "httpx" },
-    { name = "numpy" },
-    { name = "pillow" },
-    { name = "safetensors" },
-]
-
-[package.optional-dependencies]
-cpu = [
-    { name = "torch", version = "2.14.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(sys_platform == 'darwin' and extra == 'extra-11-recommender-cpu') or (extra == 'extra-11-recommender-cpu' and extra == 'extra-11-recommender-cu126') or (extra == 'extra-11-recommender-cpu' and extra == 'extra-11-recommender-cu128') or (extra == 'extra-11-recommender-cu126' and extra == 'extra-11-recommender-cu128')" },
-    { name = "torch", version = "2.14.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(sys_platform != 'darwin' and extra == 'extra-11-recommender-cpu') or (extra == 'extra-11-recommender-cpu' and extra == 'extra-11-recommender-cu126') or (extra == 'extra-11-recommender-cpu' and extra == 'extra-11-recommender-cu128') or (extra == 'extra-11-recommender-cu126' and extra == 'extra-11-recommender-cu128')" },
-]
-cu126 = [
-    { name = "torch", version = "2.14.0+cu126", source = { registry = "https://download.pytorch.org/whl/cu126" } },
-]
-cu128 = [
-    { name = "torch", version = "2.11.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" } },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "httpx", specifier = ">=0.27" },
-    { name = "numpy", specifier = ">=1.26" },
-    { name = "pillow", specifier = ">=10.1" },
-    { name = "safetensors", specifier = ">=0.4" },
-    { name = "torch", marker = "extra == 'cpu'", specifier = ">=2.7", index = "https://download.pytorch.org/whl/cpu", conflict = { package = "recommender", extra = "cpu" } },
-    { name = "torch", marker = "extra == 'cu126'", specifier = ">=2.7", index = "https://download.pytorch.org/whl/cu126", conflict = { package = "recommender", extra = "cu126" } },
-    { name = "torch", marker = "extra == 'cu128'", specifier = ">=2.7", index = "https://download.pytorch.org/whl/cu128", conflict = { package = "recommender", extra = "cu128" } },
-]
-provides-extras = ["cpu", "cu126", "cu128"]
-
-[[package]]
 name = "safetensors"
 version = "0.8.0"
 source = { registry = "https://pypi.org/simple" }
@@ -843,7 +808,7 @@ version = "2.11.0+cu128"
 source = { registry = "https://download.pytorch.org/whl/cu128" }
 dependencies = [
     { name = "cuda-bindings", marker = "sys_platform == 'linux'" },
-    { name = "cuda-toolkit", version = "12.8.1", source = { registry = "https://pypi.org/simple" }, extra = ["cublas", "cudart", "cufft", "cufile", "cupti", "curand", "cusolver", "cusparse", "nvjitlink", "nvrtc", "nvtx"], marker = "(sys_platform == 'linux' and extra == 'extra-11-recommender-cu128') or (extra == 'extra-11-recommender-cu126' and extra == 'extra-11-recommender-cu128') or (extra == 'extra-11-recommender-cpu' and extra == 'extra-11-recommender-cu126') or (extra == 'extra-11-recommender-cpu' and extra == 'extra-11-recommender-cu128')" },
+    { name = "cuda-toolkit", version = "12.8.1", source = { registry = "https://pypi.org/simple" }, extra = ["cublas", "cudart", "cufft", "cufile", "cupti", "curand", "cusolver", "cusparse", "nvjitlink", "nvrtc", "nvtx"], marker = "(sys_platform == 'linux' and extra == 'extra-13-viewer-worker-cu128') or (extra == 'extra-13-viewer-worker-cu126' and extra == 'extra-13-viewer-worker-cu128') or (extra == 'extra-13-viewer-worker-cpu' and extra == 'extra-13-viewer-worker-cu126') or (extra == 'extra-13-viewer-worker-cpu' and extra == 'extra-13-viewer-worker-cu128')" },
     { name = "filelock" },
     { name = "fsspec" },
     { name = "jinja2" },
@@ -949,7 +914,7 @@ version = "2.14.0+cu126"
 source = { registry = "https://download.pytorch.org/whl/cu126" }
 dependencies = [
     { name = "cuda-bindings", marker = "python_full_version < '3.15' and sys_platform == 'linux'" },
-    { name = "cuda-toolkit", version = "12.6.3", source = { registry = "https://pypi.org/simple" }, extra = ["cublas", "cudart", "cufft", "cufile", "cupti", "curand", "cusolver", "cusparse", "nvrtc", "nvtx"], marker = "(sys_platform == 'linux' and extra == 'extra-11-recommender-cu126') or (extra == 'extra-11-recommender-cu126' and extra == 'extra-11-recommender-cu128') or (extra == 'extra-11-recommender-cpu' and extra == 'extra-11-recommender-cu126') or (extra == 'extra-11-recommender-cpu' and extra == 'extra-11-recommender-cu128')" },
+    { name = "cuda-toolkit", version = "12.6.3", source = { registry = "https://pypi.org/simple" }, extra = ["cublas", "cudart", "cufft", "cufile", "cupti", "curand", "cusolver", "cusparse", "nvrtc", "nvtx"], marker = "(sys_platform == 'linux' and extra == 'extra-13-viewer-worker-cu126') or (extra == 'extra-13-viewer-worker-cu126' and extra == 'extra-13-viewer-worker-cu128') or (extra == 'extra-13-viewer-worker-cpu' and extra == 'extra-13-viewer-worker-cu126') or (extra == 'extra-13-viewer-worker-cpu' and extra == 'extra-13-viewer-worker-cu128')" },
     { name = "filelock" },
     { name = "fsspec" },
     { name = "jinja2" },
@@ -1025,3 +990,50 @@ sdist = { url = "https://files.pythonhosted.org/packages/f6/cc/6253133b5bb138fc3
 wheels = [
     { url = "https://files.pythonhosted.org/packages/49/d3/b8441a820a491ddfc024b0b0cf0393375b75ea13866d9c66727e54c2fc80/typing_extensions-4.16.0-py3-none-any.whl", hash = "sha256:481caa481374e813c1b176ada14e97f1f67a4539ce9cfeb3f350d78d6370c2e8", size = 45571, upload-time = "2026-07-02T08:40:04.659Z" },
 ]
+
+[[package]]
+name = "viewer-worker"
+version = "0.1.0"
+source = { editable = "." }
+dependencies = [
+    { name = "httpx" },
+]
+
+[package.optional-dependencies]
+cpu = [
+    { name = "numpy" },
+    { name = "pillow" },
+    { name = "safetensors" },
+    { name = "torch", version = "2.14.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(sys_platform == 'darwin' and extra == 'extra-13-viewer-worker-cpu') or (extra == 'extra-13-viewer-worker-cpu' and extra == 'extra-13-viewer-worker-cu126') or (extra == 'extra-13-viewer-worker-cpu' and extra == 'extra-13-viewer-worker-cu128') or (extra == 'extra-13-viewer-worker-cu126' and extra == 'extra-13-viewer-worker-cu128')" },
+    { name = "torch", version = "2.14.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(sys_platform != 'darwin' and extra == 'extra-13-viewer-worker-cpu') or (extra == 'extra-13-viewer-worker-cpu' and extra == 'extra-13-viewer-worker-cu126') or (extra == 'extra-13-viewer-worker-cpu' and extra == 'extra-13-viewer-worker-cu128') or (extra == 'extra-13-viewer-worker-cu126' and extra == 'extra-13-viewer-worker-cu128')" },
+]
+cu126 = [
+    { name = "numpy" },
+    { name = "pillow" },
+    { name = "safetensors" },
+    { name = "torch", version = "2.14.0+cu126", source = { registry = "https://download.pytorch.org/whl/cu126" } },
+]
+cu128 = [
+    { name = "numpy" },
+    { name = "pillow" },
+    { name = "safetensors" },
+    { name = "torch", version = "2.11.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" } },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "httpx", specifier = ">=0.27" },
+    { name = "numpy", marker = "extra == 'cpu'", specifier = ">=1.26" },
+    { name = "numpy", marker = "extra == 'cu126'", specifier = ">=1.26" },
+    { name = "numpy", marker = "extra == 'cu128'", specifier = ">=1.26" },
+    { name = "pillow", marker = "extra == 'cpu'", specifier = ">=10.1" },
+    { name = "pillow", marker = "extra == 'cu126'", specifier = ">=10.1" },
+    { name = "pillow", marker = "extra == 'cu128'", specifier = ">=10.1" },
+    { name = "safetensors", marker = "extra == 'cpu'", specifier = ">=0.4" },
+    { name = "safetensors", marker = "extra == 'cu126'", specifier = ">=0.4" },
+    { name = "safetensors", marker = "extra == 'cu128'", specifier = ">=0.4" },
+    { name = "torch", marker = "extra == 'cpu'", specifier = ">=2.7", index = "https://download.pytorch.org/whl/cpu", conflict = { package = "viewer-worker", extra = "cpu" } },
+    { name = "torch", marker = "extra == 'cu126'", specifier = ">=2.7", index = "https://download.pytorch.org/whl/cu126", conflict = { package = "viewer-worker", extra = "cu126" } },
+    { name = "torch", marker = "extra == 'cu128'", specifier = ">=2.7", index = "https://download.pytorch.org/whl/cu128", conflict = { package = "viewer-worker", extra = "cu128" } },
+]
+provides-extras = ["cpu", "cu126", "cu128"]

@@ -3,6 +3,8 @@ package images
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"image"
 	"image/png"
@@ -148,7 +150,8 @@ func TestOpenImageByHashFetchesFromStorage(t *testing.T) {
 	if stream.SizeBytes != int64(len("image-bytes")) {
 		t.Fatalf("size=%d", stream.SizeBytes)
 	}
-	if stream.Hash != "hash-a" {
+	wantDigest := sha256.Sum256([]byte("image-bytes"))
+	if stream.Hash != hex.EncodeToString(wantDigest[:]) {
 		t.Fatalf("hash=%q", stream.Hash)
 	}
 	if err := stream.Close(); err != nil {
@@ -331,7 +334,8 @@ func TestOpenImageByHashScaled(t *testing.T) {
 	if got := readStream(t, passthrough); !bytes.Equal(got, small) {
 		t.Fatalf("expected original bytes for a small image")
 	}
-	if passthrough.ContentType != "image/png" || passthrough.Hash != "hash-small" {
+	smallDigest := sha256.Sum256(small)
+	if passthrough.ContentType != "image/png" || passthrough.Hash != hex.EncodeToString(smallDigest[:]) {
 		t.Fatalf("passthrough metadata: %+v", passthrough)
 	}
 
@@ -341,10 +345,15 @@ func TestOpenImageByHashScaled(t *testing.T) {
 		t.Fatalf("scaled: %v", err)
 	}
 	defer scaled.Close()
-	if scaled.ContentType != "image/jpeg" || scaled.Hash != "hash-large:w320" {
+	if scaled.ContentType != "image/jpeg" {
 		t.Fatalf("scaled metadata: %+v", scaled)
 	}
-	config, _, err := image.DecodeConfig(bytes.NewReader(readStream(t, scaled)))
+	scaledData := readStream(t, scaled)
+	scaledDigest := sha256.Sum256(scaledData)
+	if scaled.Hash != hex.EncodeToString(scaledDigest[:]) {
+		t.Fatalf("scaled validator does not match bytes")
+	}
+	config, _, err := image.DecodeConfig(bytes.NewReader(scaledData))
 	if err != nil {
 		t.Fatalf("decode scaled: %v", err)
 	}

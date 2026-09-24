@@ -116,6 +116,20 @@ var migrations = []migration{
 		stmts:   nil,
 		fn:      migrateVectorsToQdrant,
 	},
+	{
+		version: 4,
+		name:    "webp_encoding",
+		stmts: []string{
+			`ALTER TABLE blobs ADD COLUMN encoding_status TEXT NOT NULL DEFAULT 'pending'`,
+			`ALTER TABLE blobs ADD COLUMN encoding_token TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE blobs ADD COLUMN encoding_lease_until INTEGER NOT NULL DEFAULT 0`,
+			`ALTER TABLE blobs ADD COLUMN encoding_stage_key TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE blobs ADD COLUMN encoding_error TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE blobs ADD COLUMN encoding_gate INTEGER NOT NULL DEFAULT 0`,
+			`UPDATE blobs SET encoding_status = 'skipped' WHERE content_type = 'image/webp'`,
+			`CREATE INDEX idx_blobs_encoding_priority ON blobs(encoding_status, size_bytes DESC, created_at, hash)`,
+		},
+	},
 }
 
 // addBlobLeaseColumnIfMissing adds the external-worker lease column to blobs.

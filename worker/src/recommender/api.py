@@ -5,19 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 
-import httpx
-
-
-class AuthError(Exception):
-    """401 — the token is wrong; fatal for the worker."""
-
-
-class TransientError(Exception):
-    """5xx / 429 / network trouble; worth retrying with backoff."""
-
-
-class BadRequestError(Exception):
-    """4xx other than 401 — the request itself is wrong; never retry."""
+from worker_common.http import AuthError, BadRequestError, TransientError, ViewerClient as BaseClient
 
 
 @dataclass(frozen=True)
@@ -58,12 +46,7 @@ def _parse_time(value: str) -> datetime:
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
-class ViewerClient:
-    def __init__(self, base_url: str, token: str, timeout: float):
-        headers = {"Authorization": f"Bearer {token}"} if token else {}
-        self._client = httpx.Client(
-            base_url=base_url, timeout=timeout, headers=headers, follow_redirects=False
-        )
+class ViewerClient(BaseClient):
 
     def claim(self, limit: int) -> ClaimResponse:
         body = self._post("/api/embedding/claim", {"limit": limit}).json()
@@ -96,20 +79,3 @@ class ViewerClient:
             updated=body["updated"],
             rejected=[Rejection(r["hash"], r["reason"]) for r in body.get("rejected", [])],
         )
-
-    def _post(self, path: str, payload: dict) -> httpx.Response:
-        try:
-            response = self._client.post(path, json=payload)
-        except httpx.TransportError as exc:
-            raise TransientError(str(exc)) from exc
-        return _check(response)
-
-
-def _check(response: httpx.Response) -> httpx.Response:
-    if response.status_code == 401:
-        raise AuthError("worker token rejected (401)")
-    if response.status_code == 429 or response.status_code >= 500:
-        raise TransientError(f"HTTP {response.status_code}")
-    if response.status_code >= 400:
-        raise BadRequestError(f"HTTP {response.status_code}: {response.text[:300]}")
-    return response

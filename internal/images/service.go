@@ -3,10 +3,13 @@ package images
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"image"
 	"image/jpeg"
 	"io"
+	"net/http"
 	"slices"
 	"strings"
 	"time"
@@ -29,8 +32,8 @@ type blobStore interface {
 	PresignGet(ctx context.Context, key string, ttl time.Duration) (string, error)
 }
 
-// Service resolves content hashes to the raw image bytes stored in S3 under
-// "blobs/<hash>".
+// Service resolves original-upload hashes to the current image bytes stored
+// in S3 under "blobs/<hash>".
 type Service struct {
 	catalog *catalog.Store
 	store   blobStore
@@ -76,30 +79,30 @@ func IsSupportedWidth(w int) bool {
 
 // newStream wraps fully-read blob bytes in a seekable stream. The reader stays
 // a *bytes.Reader so http.ServeContent can answer range requests.
-func newStream(data []byte, contentType, hash string) *ImageStream {
+func newStream(data []byte, contentType string) *ImageStream {
+	digest := sha256.Sum256(data)
 	return &ImageStream{
 		Content:     bytes.NewReader(data),
 		SizeBytes:   int64(len(data)),
 		ContentType: contentType,
-		Hash:        hash,
+		Hash:        hex.EncodeToString(digest[:]),
 	}
 }
 
-// OpenImageByHash fetches a content-addressed blob from S3 into memory and
+// OpenImageByHash fetches a blob from S3 into memory and
 // wraps it in a seekable reader.
 func (s *Service) OpenImageByHash(ctx context.Context, hash string) (*ImageStream, error) {
 	data, contentType, err := s.fetchBlob(ctx, hash)
 	if err != nil {
 		return nil, err
 	}
-	return newStream(data, contentType, hash), nil
+	return newStream(data, contentType), nil
 }
 
 // OpenImageByHashScaled returns a blob scaled to fit within width, preserving
 // aspect ratio. Images already no wider than the request are served with their
 // original bytes; anything larger becomes a JPEG so the scaled response stays
-// small. The content hash doubles as the response validator: scaled variants
-// append their width to the blob hash.
+// small. Each returned byte sequence gets its own digest validator.
 func (s *Service) OpenImageByHashScaled(ctx context.Context, hash string, width int) (*ImageStream, error) {
 	if !IsSupportedWidth(width) {
 		return nil, fmt.Errorf("%w: %d", ErrUnsupportedWidth, width)
@@ -116,13 +119,13 @@ func (s *Service) OpenImageByHashScaled(ctx context.Context, hash string, width 
 		return nil, fmt.Errorf("probe image %s: %w", hash, err)
 	}
 	if config.Width <= width {
-		return newStream(data, contentType, hash), nil
+		return newStream(data, contentType), nil
 	}
 	encoded, err := encodeScaledJPEG(data, width)
 	if err != nil {
 		return nil, err
 	}
-	return newStream(encoded, "image/jpeg", fmt.Sprintf("%s:w%d", hash, width)), nil
+	return newStream(encoded, "image/jpeg"), nil
 }
 
 // encodeScaledJPEG decodes an original image and resamples it to fit within
@@ -195,6 +198,12 @@ func (s *Service) fetchBlob(ctx context.Context, hash string) ([]byte, string, e
 	}
 	if closeErr != nil {
 		return nil, "", fmt.Errorf("close blob %s: %w", hash, closeErr)
+	}
+	if len(data) >= 12 && string(data[:4]) == "RIFF" && string(data[8:12]) == "WEBP" {
+		return data, "image/webp", nil
+	}
+	if detected := http.DetectContentType(data); detected == "image/jpeg" || detected == "image/png" {
+		return data, detected, nil
 	}
 
 	contentType = contentTypeOrFallback(contentType)

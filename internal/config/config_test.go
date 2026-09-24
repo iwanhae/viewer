@@ -288,10 +288,37 @@ func TestLoadRejectsBlankWorkerToken(t *testing.T) {
 	t.Setenv("S3_ACCESS_KEY", "ak")
 	t.Setenv("S3_SECRET_KEY", "sk")
 	t.Setenv("STATE_DIR", "/tmp/viewer-test")
-	t.Setenv("EMBEDDING_WORKER_TOKEN", "   ")
+	t.Setenv("WORKER_TOKEN", "   ")
 
 	if _, err := Load(); err == nil {
-		t.Fatalf("expected a blank EMBEDDING_WORKER_TOKEN to be rejected")
+		t.Fatalf("expected a blank WORKER_TOKEN to be rejected")
+	}
+}
+
+func TestWebPEncodingFollowsWorkerToken(t *testing.T) {
+	setS3Env(t)
+	t.Setenv("STATE_DIR", "/tmp/viewer-test")
+	t.Setenv("WORKER_TOKEN", "")
+	cfg, err := Load()
+	if err != nil || cfg.WebPEncodingEnabled {
+		t.Fatalf("encoding should be disabled without WORKER_TOKEN: cfg=%+v err=%v", cfg, err)
+	}
+	// The retired toggle no longer opts out. WORKER_TOKEN is the only switch.
+	t.Setenv("WEBP_ENCODING_ENABLED", "false")
+	t.Setenv("WORKER_TOKEN", "shared-secret")
+	cfg, err = Load()
+	if err != nil || !cfg.WebPEncodingEnabled || cfg.WorkerToken != "shared-secret" {
+		t.Fatalf("encoding config: %+v %v", cfg, err)
+	}
+}
+
+func TestOldEmbeddingWorkerTokenFailsInsteadOfOpeningAPI(t *testing.T) {
+	setS3Env(t)
+	t.Setenv("STATE_DIR", "/tmp/viewer-test")
+	t.Setenv("WORKER_TOKEN", "")
+	t.Setenv("EMBEDDING_WORKER_TOKEN", "old-secret")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "WORKER_TOKEN") {
+		t.Fatalf("expected migration error, got %v", err)
 	}
 }
 

@@ -42,11 +42,15 @@ const listObjectsXML = `<?xml version="1.0" encoding="UTF-8"?>
 </ListBucketResult>`
 
 type recordedRequest struct {
-	method string
-	host   string
-	path   string
-	query  string
-	body   string
+	method            string
+	host              string
+	path              string
+	query             string
+	body              string
+	copySource        string
+	copyMatch         string
+	metadataDirective string
+	contentType       string
 }
 
 func (r recordedRequest) String() string {
@@ -70,16 +74,23 @@ func newRecordingStoreAt(t *testing.T, endpointPath string, keyPrefix string) (*
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		requests = append(requests, recordedRequest{
-			method: r.Method,
-			host:   r.Host,
-			path:   r.URL.Path,
-			query:  r.URL.RawQuery,
-			body:   string(body),
+			method:            r.Method,
+			host:              r.Host,
+			path:              r.URL.Path,
+			query:             r.URL.RawQuery,
+			body:              string(body),
+			copySource:        r.Header.Get("X-Amz-Copy-Source"),
+			copyMatch:         r.Header.Get("X-Amz-Copy-Source-If-Match"),
+			metadataDirective: r.Header.Get("X-Amz-Metadata-Directive"),
+			contentType:       r.Header.Get("Content-Type"),
 		})
 		switch {
 		case r.URL.Query().Get("list-type") == "2":
 			w.Header().Set("Content-Type", "application/xml")
 			_, _ = io.WriteString(w, listObjectsXML)
+		case r.Header.Get("X-Amz-Copy-Source") != "":
+			w.Header().Set("Content-Type", "application/xml")
+			_, _ = io.WriteString(w, `<CopyObjectResult><ETag>"copied"</ETag><LastModified>2024-01-02T03:04:05Z</LastModified></CopyObjectResult>`)
 		case r.Method == http.MethodPost && r.URL.Query().Has("delete"):
 			w.Header().Set("Content-Type", "application/xml")
 			_, _ = io.WriteString(w, `<?xml version="1.0" encoding="UTF-8"?><DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"/>`)
@@ -108,6 +119,23 @@ func newRecordingStoreAt(t *testing.T, endpointPath string, keyPrefix string) (*
 		t.Fatalf("NewS3Store: %v", err)
 	}
 	return store, &requests
+}
+
+func TestCopyObjectIfMatchKeepsPrefixAndReplacesType(t *testing.T) {
+	store, requests := newRecordingStore(t, "viewer/")
+	if err := store.CopyObjectIfMatch(context.Background(), "encoding/hash/token.webp", "blobs/hash", `"stage-etag"`, "image/webp"); err != nil {
+		t.Fatal(err)
+	}
+	if len(*requests) != 1 {
+		t.Fatalf("requests=%d", len(*requests))
+	}
+	r := (*requests)[0]
+	if r.method != http.MethodPut || r.path != "/test-bucket/viewer/blobs/hash" {
+		t.Fatalf("copy destination: %+v", r)
+	}
+	if r.copySource != "test-bucket/viewer/encoding/hash/token.webp" || r.copyMatch != `"stage-etag"` || r.metadataDirective != "REPLACE" || r.contentType != "image/webp" {
+		t.Fatalf("copy headers: %+v", r)
+	}
 }
 
 // TestS3StoreKeyPrefixReachesEveryRequest is the whole point of S3_PREFIX: the

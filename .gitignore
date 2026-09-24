@@ -1,5 +1,6 @@
 /bin/
 .cache/
+.tmp/
 __pycache__/
 *.pyc
 frontend/node_modules/

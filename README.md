@@ -1,12 +1,13 @@
 # viewer
 
-Self-hosted photo album server. Upload a zip of photos; the server stores each image as a content-addressed blob in S3-compatible object storage, catalogs albums in SQLite, computes SigLIP2 image embeddings into an optional external Qdrant server, and serves a React frontend plus a JSON API from a single Go binary. Without Qdrant everything works except the "similar photos" recommendations, which answer with a 503.
+Self-hosted photo album server. Upload a zip of photos; the server stores each image under its original SHA-256 in S3-compatible object storage, catalogs albums in SQLite, computes SigLIP2 image embeddings into an optional external Qdrant server, and serves a React frontend plus a JSON API from a single Go binary. Without Qdrant everything works except the "similar photos" recommendations, which answer with a 503.
 
 ## Features
 
 - Zip batch upload via presigned PUT (1 GiB cap).
-- Deduplicated content-addressed storage: objects live at `blobs/<sha256>`, so identical images are stored once.
-- On-the-fly resized JPEGs (320/640/1024 widths), streamed from S3 and cached with blob-hash ETags.
+- Deduplicated storage: objects live at `blobs/<original-sha256>`, so identical uploaded images are stored once even after optional WebP encoding.
+- On-the-fly resized JPEGs (320/640/1024 widths), streamed from S3 and cached with response-byte ETags.
+- Optional external WebP encoder using `cwebp` Q85, preserving supported EXIF/ICC/XMP metadata and replacing only when smaller.
 - Semantic "similar photos" recommendations across albums (SigLIP2-base, 768-dim vectors in Qdrant).
 - Lease-based HTTP API so external GPU workers can drain the embedding backlog.
 - Admin dashboard with embedding stats and a re-embed recovery trigger.
@@ -15,13 +16,13 @@ Self-hosted photo album server. Upload a zip of photos; the server stores each i
 
 ## Architecture
 
-Object keys live under three prefixes: `uploads/` (staged zips), `blobs/` (content-addressed images), and `backups/` (catalog snapshots). Everything else is SQLite.
+Object keys live under `uploads/` (staged zips), `blobs/` (image payloads), `encoding/` (temporary WebP uploads), and `backups/` (catalog snapshots). Everything else is SQLite.
 
 1. `POST /api/albums` registers a QUEUED album and returns a presigned PUT for `uploads/<albumId>.zip`; the browser uploads the zip straight to object storage.
 2. `POST /api/albums/<id>/finalize` queues extraction.
 3. A single-slot worker downloads the zip and stores every image as `blobs/<sha256>`, recording entry name, hash, width, and height in SQLite.
 4. Embedding workers — the built-in GoMLX one in-process, plus optional external ones — embed pending blobs and write vectors to Qdrant; the catalog keeps only embedding status.
-5. Image requests resolve `(albumId, index)` to a blob hash and stream `blobs/<hash>` from S3, served with `ETag` and `Cache-Control: public, max-age=86400, immutable`.
+5. Image requests resolve `(albumId, index)` to a blob hash and stream `blobs/<hash>` from S3, served with a response-byte `ETag` and `Cache-Control: public, max-age=86400`.
 
 Metadata lives in SQLite at `$STATE_DIR/viewer.db`. The bucket snapshot `backups/viewer.db` is restored at startup when it is newer than the local catalog, so a wiped state volume recovers from the bucket alone. The SigLIP2 checkpoint is fetched at first start into `/app/siglip2`; inference runs in-process, with no separate inference service. A cold start degrades gracefully: the server serves, embeddings wait.
 
@@ -83,13 +84,15 @@ The viewer is deployed as a Docker image, and every setting is an environment va
 | `QDRANT_API_KEY` | no | (empty) | Sent as the `api-key` header on every Qdrant request. Sent only when set, so an unauthenticated server needs no placeholder. |
 | `QDRANT_COLLECTION` | when `QDRANT_URL` is set | — | Qdrant collection holding the per-photo embedding points. Deliberately no default: the viewer refuses to start with a URL but no collection. |
 | `SIGLIP2_MODEL_URL` | no | built-in mirror | Base URL the SigLIP2 checkpoint (`config.json`, `model.safetensors`, `tokenizer.json`) is fetched from on first start into `/app/siglip2`. Mount a prepared directory at `/app/siglip2` to skip the download. |
-| `EMBEDDING_WORKER_TOKEN` | no | (empty) | Bearer token required on the external embedding-worker API. Empty disables that check (trusted networks only); the rest of the API is unaffected. |
+| `WORKER_TOKEN` | no | (empty) | Shared bearer token for the external recommender and encoder APIs. Setting it enables WebP encoding and gates new non-WebP image embeddings until encoding finishes. |
 | `ADMIN_TOKEN` | no | (empty) | Basic-auth password for `/admin`. Empty keeps the admin UI disabled. |
 | `ALLOW_BACKUP_OVERWRITE` | no | `false` | Lets the catalog finalizer overwrite the bucket's `backups/viewer.db` with a local database it would otherwise refuse to write (untraceable stamp, or drastically smaller than the backup it would replace). |
 
 Notes:
 
-- Set-but-blank values of `QDRANT_URL`, `EMBEDDING_WORKER_TOKEN`, `QDRANT_API_KEY`, `QDRANT_COLLECTION`, and `ADMIN_TOKEN` are rejected at startup rather than silently meaning "off".
+- Set-but-blank values of `QDRANT_URL`, `WORKER_TOKEN`, `QDRANT_API_KEY`, `QDRANT_COLLECTION`, and `ADMIN_TOKEN` are rejected at startup rather than silently meaning "off".
+- `WEBP_ENCODING_ENABLED` is no longer read. Setting `WORKER_TOKEN` enables WebP encoding; there is no separate opt-out.
+- Existing deployments must rename `EMBEDDING_WORKER_TOKEN` to `WORKER_TOKEN`; a non-empty old variable now fails startup instead of leaving the worker API open.
 - Similarly, `QDRANT_API_KEY` or `QDRANT_COLLECTION` without `QDRANT_URL` is rejected: Qdrant is optional, but half-configured is a mistake, not an opt-out.
 - Some values are fixed constants, not environment variables: the 1 GiB upload cap, the 15 minute presign TTL, the `us-east-1` signing region, and the `/app/siglip2` checkpoint directory. See `internal/config/config.go`.
 
@@ -104,16 +107,17 @@ Notes:
 | GET | `/api/albums/{id}` | Album detail with photos. |
 | GET | `/api/albums/search` | Filename substring search. |
 | GET | `/api/feed` | Paged photo wall. |
-| GET | `/api/image/{hash}` | Blob content; `?w=320\|640\|1024` returns a resized JPEG keyed by hash + width in the ETag. |
+| GET | `/api/image/{hash}` | Blob content; `?w=320\|640\|1024` returns a resized JPEG. ETags identify the returned bytes. |
 | GET | `/api/recommendations/{albumId}/{index}` | Cross-album similar photos. |
 | GET | `/api/photos/search?q=&limit=` | Best photo per album for a natural-language description; requires `QDRANT_URL`. |
 | POST | `/api/photos/search-by-image` | Best photo per album for an uploaded picture; requires `QDRANT_URL`. |
-| POST | `/api/embedding/claim`, `/renew`, `/results` | External embedding-worker lease API (bearer-token when `EMBEDDING_WORKER_TOKEN` is set). |
+| POST | `/api/embedding/claim`, `/renew`, `/results` | External embedding-worker lease API (bearer-token when `WORKER_TOKEN` is set). |
+| POST | `/api/encoding/claim`, `/renew`, `/complete` | External WebP encoder lease API, enabled when `WORKER_TOKEN` is set. |
 | GET | `/admin` | Dashboard (stats + re-embed trigger); enabled only when `ADMIN_TOKEN` is set. |
 
 ## External embedding workers
 
-The built-in embedder is a single in-process goroutine. The same claim/renew/results lease API is open to external workers, so a fleet of GPU boxes can drain a large backlog: claims lease pending blobs, results write vectors to Qdrant and then status to SQLite, and expired leases keep blobs from being stranded. See `recommender/README.md` for a ready-made Python worker (`uv sync`, `.env`, `uv run recommender`).
+The built-in embedder is a single in-process goroutine. The same claim/renew/results lease API is open to external workers, so a fleet of GPU boxes can drain a large backlog: claims lease pending blobs, results write vectors to Qdrant and then status to SQLite, and expired leases keep blobs from being stranded. See `worker/README.md` for the Python workers (`uv run recommender` and `uv run encoder`).
 
 ## Development
 
@@ -131,6 +135,6 @@ The Go SigLIP2 port (`internal/vision`) is regression-tested against a PyTorch r
 cmd/viewer/                entry point
 internal/                  API, catalog, pipelines, vision, storage — see package docs for detail
 frontend/                  React + TypeScript + Vite SPA, built into internal/web/static and embedded
-recommender/               standalone Python embedding worker
+worker/                   Python recommender and WebP encoder workers
 scripts/vision-reference/  PyTorch reference model for the vision-port test
 ```

@@ -70,6 +70,7 @@ type Store interface {
 
 // Options configure a pipeline service.
 type Options struct {
+	WebPEncodingEnabled bool
 	// TempDir holds the downloaded zip while it is being unpacked. An empty
 	// value means os.TempDir(). Start removes ingest-*.zip leftovers of a
 	// crashed run from it before the worker comes up.
@@ -448,14 +449,17 @@ func (s *Service) extractEntry(ctx context.Context, albumID string, index int, e
 	hash := hex.EncodeToString(sum[:])
 	contentType := contentTypeFor(data, entry.Name)
 
-	if err := s.ensureBlob(ctx, hash, data, contentType); err != nil {
+	restored, err := s.ensureBlob(ctx, hash, data, contentType)
+	if err != nil {
 		return false, err
 	}
 
 	if err := s.catalog.UpsertBlob(ctx, catalog.Blob{
-		Hash:        hash,
-		SizeBytes:   int64(len(data)),
-		ContentType: contentType,
+		Hash:           hash,
+		SizeBytes:      int64(len(data)),
+		ContentType:    contentType,
+		EncodingGate:   s.opts.WebPEncodingEnabled && contentType != "image/webp",
+		SourceRestored: restored,
 	}); err != nil {
 		return false, err
 	}
@@ -477,18 +481,19 @@ func (s *Service) extractEntry(ctx context.Context, albumID string, index int, e
 
 // ensureBlob uploads the raw image bytes to S3 exactly once per content hash.
 // Repeated extractions of the same image reuse the stored object.
-func (s *Service) ensureBlob(ctx context.Context, hash string, data []byte, contentType string) error {
+func (s *Service) ensureBlob(ctx context.Context, hash string, data []byte, contentType string) (bool, error) {
 	key := BlobKey(hash)
 	exists, size, err := s.store.HeadObject(ctx, key)
 	if err != nil {
-		return fmt.Errorf("head blob %s: %w", key, err)
+		return false, fmt.Errorf("head blob %s: %w", key, err)
 	}
 	if !exists || size <= 0 {
 		if err := s.store.PutObject(ctx, key, bytes.NewReader(data), contentType); err != nil {
-			return fmt.Errorf("put blob %s: %w", key, err)
+			return false, fmt.Errorf("put blob %s: %w", key, err)
 		}
+		return true, nil
 	}
-	return nil
+	return false, nil
 }
 
 // imageEntries returns decodable image entries sorted the same way the legacy
@@ -514,6 +519,11 @@ func imageEntries(files []*zip.File) []*zip.File {
 }
 
 func contentTypeFor(data []byte, name string) string {
+	if len(data) >= 12 {
+		if detected := http.DetectContentType(data); detected == "image/jpeg" || detected == "image/png" || detected == "image/webp" {
+			return detected
+		}
+	}
 	if ct, ok := allowedContentTypes[strings.ToLower(filepath.Ext(name))]; ok {
 		return ct
 	}

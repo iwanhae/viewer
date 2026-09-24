@@ -6,7 +6,8 @@ import logging
 import signal
 import threading
 
-from . import api, config, env, weights
+from . import api, config, weights
+from worker_common import env
 
 log = logging.getLogger(__name__)
 
@@ -25,7 +26,7 @@ def main(argv=None) -> int:
     if not cfg.token:
         log.warning(
             "no worker token set; the server will 401 unless it runs without "
-            "EMBEDDING_WORKER_TOKEN"
+            "WORKER_TOKEN"
         )
 
     try:
@@ -57,7 +58,7 @@ def main(argv=None) -> int:
     try:
         Worker(cfg, client, model, device).run(stop, once=cfg.once)
     except api.AuthError as exc:
-        log.critical("%s; check VIEWER_WORKER_TOKEN", exc)
+        log.critical("%s; check WORKER_TOKEN", exc)
         return 2
     return 0
 

@@ -18,6 +18,7 @@ import (
 	"viewer/internal/admin"
 	"viewer/internal/albums"
 	"viewer/internal/catalog"
+	"viewer/internal/encoding"
 	"viewer/internal/feed"
 	"viewer/internal/images"
 	"viewer/internal/recommend"
@@ -29,6 +30,7 @@ type Server struct {
 	feed        *feed.Service
 	images      *images.Service
 	recommend   *recommend.Service
+	encoder     *encoding.Service
 	workerToken string
 	admin       *admin.Service
 	adminToken  string
@@ -50,6 +52,12 @@ func New(albumsService *albums.Service, feedService *feed.Service, imageService 
 		admin:       adminService,
 		adminToken:  adminToken,
 	}
+}
+
+// WithEncoder enables the external encoding routes when the feature is on.
+func (s *Server) WithEncoder(service *encoding.Service) *Server {
+	s.encoder = service
+	return s
 }
 
 func (s *Server) Router() http.Handler {
@@ -86,6 +94,11 @@ func (s *Server) Router() http.Handler {
 		r.Post("/api/embedding/claim", s.claimEmbeddings)
 		r.Post("/api/embedding/renew", s.renewLeases)
 		r.Post("/api/embedding/results", s.postEmbeddingResults)
+		if s.encoder != nil {
+			r.Post("/api/encoding/claim", s.claimEncoding)
+			r.Post("/api/encoding/renew", s.renewEncoding)
+			r.Post("/api/encoding/complete", s.completeEncoding)
+		}
 	})
 
 	// The admin surface is the operator's dashboard and the re-embed recovery
@@ -292,10 +305,9 @@ func (s *Server) getImageByHash(w http.ResponseWriter, r *http.Request) {
 	}
 	defer stream.Close()
 
-	// The content hash is immutable, so it is a stable validator for the
-	// response; scaled variants append their width.
+	// Encoding may replace bytes under the same URL. Validate the actual body.
 	w.Header().Set("Content-Type", stream.ContentType)
-	w.Header().Set("Cache-Control", "public, max-age=86400, immutable")
+	w.Header().Set("Cache-Control", "public, max-age=86400")
 	w.Header().Set("ETag", `"`+stream.Hash+`"`)
 	// A zero modtime keeps ServeContent from emitting a Last-Modified header;
 	// it still negotiates Content-Length, Range and If-None-Match.

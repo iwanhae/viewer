@@ -13,6 +13,7 @@ import (
 	"viewer/internal/catalog"
 	"viewer/internal/checkpoint"
 	cfgpkg "viewer/internal/config"
+	"viewer/internal/encoding"
 	"viewer/internal/feed"
 	"viewer/internal/httpapi"
 	"viewer/internal/images"
@@ -48,7 +49,7 @@ func Run(ctx context.Context) error {
 	if cfg.WorkerToken != "" {
 		log.Printf("viewer: embedding worker API requires a bearer token")
 	} else {
-		log.Printf("viewer: embedding worker API is UNAUTHENTICATED (set EMBEDDING_WORKER_TOKEN to protect it)")
+		log.Printf("viewer: embedding worker API is UNAUTHENTICATED (set WORKER_TOKEN to protect it)")
 	}
 	if cfg.AdminToken != "" {
 		log.Printf("viewer: admin UI enabled and requires Basic auth (password = ADMIN_TOKEN)")
@@ -96,6 +97,13 @@ func Run(ctx context.Context) error {
 		return fmt.Errorf("open metadata catalog: %w", err)
 	}
 	defer cat.Close()
+	var encodingService *encoding.Service
+	if cfg.WebPEncodingEnabled {
+		encodingService = encoding.New(cat, store)
+		if err := encodingService.Recover(ctx); err != nil {
+			return fmt.Errorf("recover WebP encoding: %w", err)
+		}
+	}
 
 	// The migration only guarantees the collection exists when it had vectors
 	// to move. Ensure it on every boot so a fresh or already-migrated catalog
@@ -149,6 +157,7 @@ func Run(ctx context.Context) error {
 	// served request on.
 	adminService := admin.NewService(cat, vectorStore, recommendService)
 	pipelineService := pipeline.NewService(cat, store, pipeline.Options{
+		WebPEncodingEnabled: cfg.WebPEncodingEnabled,
 		OnAlbumReady: func(albumID string) {
 			if err := recommendService.ReloadAlbum(context.Background(), albumID); err != nil {
 				log.Printf("viewer: reload recommendation index for album=%s failed: %v", albumID, err)
@@ -175,11 +184,16 @@ func Run(ctx context.Context) error {
 				if err := finalizer.Run(ctx); err != nil {
 					log.Printf("viewer: scheduled catalog backup failed: %v", err)
 				}
+				if encodingService != nil {
+					if err := encodingService.Recover(ctx); err != nil {
+						log.Printf("viewer: scheduled encoding recovery failed: %v", err)
+					}
+				}
 			}
 		}
 	}()
 
-	h := httpapi.New(albumService, feedService, imageService, recommendService, cfg.WorkerToken, adminService, cfg.AdminToken).Router()
+	h := httpapi.New(albumService, feedService, imageService, recommendService, cfg.WorkerToken, adminService, cfg.AdminToken).WithEncoder(encodingService).Router()
 	srv := &http.Server{
 		Addr:              fmt.Sprintf(":%d", cfg.Port),
 		Handler:           h,
