@@ -49,6 +49,7 @@ type Stats struct {
 	Photos         int64                   `json:"photos"`
 	Blobs          int64                   `json:"blobs"`
 	Embedding      catalog.EmbeddingCounts `json:"embedding"`
+	Encoding       EncodingStats           `json:"encoding"`
 	// ExpectedPoints is how many points the vector store should hold: one per
 	// photo whose blob embedding is ready. QdrantPoints is how many it
 	// actually holds, and Drift is the difference — non-zero means the two
@@ -66,13 +67,22 @@ type Stats struct {
 	ModelEnabled       bool `json:"modelEnabled"`
 }
 
+// EncodingStats combines queue and savings counts with the server-side
+// feature flag. Enabled means WORKER_TOKEN is configured; it does not claim
+// that an external worker process is currently connected.
+type EncodingStats struct {
+	Enabled bool `json:"enabled"`
+	catalog.EncodingCounts
+}
+
 // Service backs the admin page. Everything it reports is read straight out of
 // the catalog and the vector store on every request, so there is no state to
 // go stale and nothing to refresh on deploy.
 type Service struct {
-	cat       *catalog.Store
-	vectors   VectorCounter
-	recommend *recommend.Service
+	cat             *catalog.Store
+	vectors         VectorCounter
+	recommend       *recommend.Service
+	encodingEnabled bool
 }
 
 // NewService builds the admin service. A nil vectors counter reports the
@@ -82,6 +92,15 @@ type Service struct {
 // applies.
 func NewService(cat *catalog.Store, vectors VectorCounter, recommend *recommend.Service) *Service {
 	return &Service{cat: cat, vectors: vectors, recommend: recommend}
+}
+
+// WithEncodingEnabled records whether the server has WORKER_TOKEN configured
+// and therefore exposes the encoding worker API. Configure it before serving.
+func (s *Service) WithEncodingEnabled(enabled bool) *Service {
+	if s != nil {
+		s.encodingEnabled = enabled
+	}
+	return s
 }
 
 // Stats gathers one snapshot across the catalog and the vector store. It
@@ -113,6 +132,10 @@ func (s *Service) Stats(ctx context.Context) (Stats, error) {
 	if err != nil {
 		return Stats{}, fmt.Errorf("ready pair count: %w", err)
 	}
+	encoding, err := s.cat.EncodingCounts(ctx)
+	if err != nil {
+		return Stats{}, fmt.Errorf("encoding counts: %w", err)
+	}
 
 	stats := Stats{
 		Albums:         albums,
@@ -120,6 +143,7 @@ func (s *Service) Stats(ctx context.Context) (Stats, error) {
 		Photos:         photos,
 		Blobs:          blobs,
 		Embedding:      embedding,
+		Encoding:       EncodingStats{Enabled: s.encodingEnabled, EncodingCounts: encoding},
 		ExpectedPoints: expected,
 	}
 	if s.vectors != nil {

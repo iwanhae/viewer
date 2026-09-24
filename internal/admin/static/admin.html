@@ -78,6 +78,27 @@
   <tr><th>Total blobs</th><td class="num" id="embTotal">&ndash;</td></tr>
 </table>
 
+<h2>WebP encoding</h2>
+<p class="muted">
+  Counts are per unique blob. Savings compare the source and WebP sizes for
+  successful replacements; existing WebP images are excluded from candidates.
+</p>
+<table>
+  <tr><th>Feature</th><td id="encodingEnabled">&ndash;</td></tr>
+  <tr><th>Candidates</th><td class="num" id="encodingCandidates">&ndash;</td></tr>
+  <tr><th>Pending</th><td class="num" id="encodingPending">&ndash;</td></tr>
+  <tr><th>Processing</th><td class="num" id="encodingProcessing">&ndash;</td></tr>
+  <tr><th>Converted</th><td class="num" id="encodingConverted">&ndash;</td></tr>
+  <tr><th>Not smaller</th><td class="num" id="encodingNotSmaller">&ndash;</td></tr>
+  <tr><th>Failed</th><td class="num" id="encodingFailed">&ndash;</td></tr>
+  <tr><th>Already WebP (excluded)</th><td class="num" id="encodingAlreadyWebp">&ndash;</td></tr>
+  <tr><th>Remaining input</th><td class="num" id="encodingRemainingBytes">&ndash;</td></tr>
+  <tr><th>Converted source size</th><td class="num" id="encodingSourceBytes">&ndash;</td></tr>
+  <tr><th>Converted WebP size</th><td class="num" id="encodingOutputBytes">&ndash;</td></tr>
+  <tr><th>Capacity saved</th><td class="num" id="encodingBytesSaved">&ndash;</td></tr>
+  <tr><th>Reduction</th><td class="num" id="encodingSavedPercent">&ndash;</td></tr>
+</table>
+
 <h2>Vector store</h2>
 <table>
   <tr><th>Expected points (ready photo pairs)</th><td class="num" id="expected">&ndash;</td></tr>
@@ -128,6 +149,22 @@ function setCount(id, value) {
   $(id).textContent = (value === undefined || value === null) ? '–' : String(value);
 }
 
+function formatBytes(value) {
+  if (value === undefined || value === null || !Number.isFinite(Number(value))) return '–';
+  let bytes = Number(value);
+  const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+  let unit = 0;
+  while (Math.abs(bytes) >= 1024 && unit < units.length - 1) {
+    bytes /= 1024;
+    unit++;
+  }
+  return new Intl.NumberFormat(undefined, { maximumFractionDigits: unit === 0 ? 0 : 1 }).format(bytes) + ' ' + units[unit];
+}
+
+function setBytes(id, value) {
+  $(id).textContent = formatBytes(value);
+}
+
 function render(stats) {
   setCount('albums', stats.albums);
   setCount('photos', stats.photos);
@@ -149,6 +186,22 @@ function render(stats) {
   setCount('embReady', emb.ready);
   setCount('embFailed', emb.failed);
   setCount('embTotal', emb.total);
+
+  const enc = stats.encoding || {};
+  $('encodingEnabled').textContent = enc.enabled ? 'enabled' : 'disabled (WORKER_TOKEN unset)';
+  setCount('encodingCandidates', enc.candidates);
+  setCount('encodingPending', enc.pending);
+  setCount('encodingProcessing', enc.processing);
+  setCount('encodingConverted', enc.converted);
+  setCount('encodingNotSmaller', enc.notSmaller);
+  setCount('encodingFailed', enc.failed);
+  setCount('encodingAlreadyWebp', enc.alreadyWebp);
+  setBytes('encodingRemainingBytes', enc.remainingBytes);
+  setBytes('encodingSourceBytes', enc.sourceBytes);
+  setBytes('encodingOutputBytes', enc.outputBytes);
+  setBytes('encodingBytesSaved', enc.bytesSaved);
+  $('encodingSavedPercent').textContent = Number.isFinite(Number(enc.savedPercent))
+    ? Number(enc.savedPercent).toFixed(1) + '%' : '–';
 
   // Without a vector store the point figures are unmeasured zeros, so they
   // must not read as a green "in sync" — "disabled" is the honest rendering.

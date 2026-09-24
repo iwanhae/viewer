@@ -94,8 +94,8 @@ func newAdminTestRouter(t *testing.T, vectorPoints int) (http.Handler, *catalog.
 	t.Helper()
 	store := openAdminTestCatalog(t)
 	seedEmbeddingFixture(t, store)
-	adminService := admin.NewService(store, stubAdminVectorCounter{points: vectorPoints}, nil)
-	router := New(nil, nil, nil, nil, "", adminService, "sekrit").Router()
+	adminService := admin.NewService(store, stubAdminVectorCounter{points: vectorPoints}, nil).WithEncodingEnabled(true)
+	router := New(nil, nil, nil, nil, "worker-token", adminService, "sekrit").Router()
 	return router, store
 }
 
@@ -156,7 +156,7 @@ func TestAdminPageServesEmbeddedHTML(t *testing.T) {
 		t.Fatalf("content type=%q want text/html; charset=utf-8", contentType)
 	}
 	body := rec.Body.String()
-	for _, fragment := range []string{"Re-embed everything", "/admin/api/stats", "/admin/api/reindex"} {
+	for _, fragment := range []string{"Re-embed everything", "WebP encoding", "/admin/api/stats", "/admin/api/reindex"} {
 		if !strings.Contains(body, fragment) {
 			t.Fatalf("admin page missing %q", fragment)
 		}
@@ -179,7 +179,7 @@ func TestAdminStatsShape(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
 		t.Fatalf("decode stats: %v", err)
 	}
-	for _, key := range []string{"albums", "albumsByStatus", "photos", "blobs", "embedding", "expectedPoints", "qdrantPoints", "drift", "vectorStoreEnabled", "modelEnabled"} {
+	for _, key := range []string{"albums", "albumsByStatus", "photos", "blobs", "embedding", "encoding", "expectedPoints", "qdrantPoints", "drift", "vectorStoreEnabled", "modelEnabled"} {
 		if _, ok := payload[key]; !ok {
 			t.Fatalf("stats JSON missing key %q in %v", key, payload)
 		}
@@ -207,6 +207,13 @@ func TestAdminStatsShape(t *testing.T) {
 	if payload["modelEnabled"] != false {
 		t.Fatalf("modelEnabled=%v want=false", payload["modelEnabled"])
 	}
+	encoding, ok := payload["encoding"].(map[string]any)
+	if !ok {
+		t.Fatalf("encoding=%v want an object", payload["encoding"])
+	}
+	if encoding["enabled"] != true || encoding["candidates"] != float64(3) || encoding["pending"] != float64(3) || encoding["remainingBytes"] != float64(3) {
+		t.Fatalf("encoding stats=%v want enabled with three pending one-byte candidates", encoding)
+	}
 	if payload["vectorStoreEnabled"] != true {
 		t.Fatalf("vectorStoreEnabled=%v want=true (a vector counter is wired)", payload["vectorStoreEnabled"])
 	}
@@ -232,6 +239,9 @@ func TestAdminStatsShapeWithDisabledVectorStore(t *testing.T) {
 		QdrantPoints       int64 `json:"qdrantPoints"`
 		Drift              int64 `json:"drift"`
 		VectorStoreEnabled bool  `json:"vectorStoreEnabled"`
+		Encoding           struct {
+			Enabled bool `json:"enabled"`
+		} `json:"encoding"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
 		t.Fatalf("decode stats: %v", err)
@@ -244,6 +254,9 @@ func TestAdminStatsShapeWithDisabledVectorStore(t *testing.T) {
 	}
 	if payload.ExpectedPoints != 1 {
 		t.Fatalf("expectedPoints=%d want=1 (the fixture's one ready photo pair)", payload.ExpectedPoints)
+	}
+	if payload.Encoding.Enabled {
+		t.Fatal("encoding.enabled=true want=false without WORKER_TOKEN")
 	}
 }
 

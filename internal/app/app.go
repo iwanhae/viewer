@@ -150,12 +150,13 @@ func Run(ctx context.Context) error {
 		ModelID: cfgpkg.ModelDir,
 	}), finalizer.Run)
 
-	// The admin service reads only the catalog and the vector store, and its
-	// re-embed trigger only flips catalog rows the workers already drain, so
-	// it needs nothing built after this point. Creating it here — before the
+	// The admin service reads the catalog and vector store, and its re-embed
+	// trigger only flips catalog rows the workers already drain. Include the
+	// server-side encoder feature flag so the dashboard distinguishes disabled
+	// encoding from an empty queue. Creating it here — before the
 	// HTTP bind, like everything else — means /admin answers from the first
 	// served request on.
-	adminService := admin.NewService(cat, vectorStore, recommendService)
+	adminService := admin.NewService(cat, vectorStore, recommendService).WithEncodingEnabled(cfg.WorkerToken != "")
 	pipelineService := pipeline.NewService(cat, store, pipeline.Options{
 		WebPEncodingEnabled: cfg.WebPEncodingEnabled,
 		OnAlbumReady: func(albumID string) {

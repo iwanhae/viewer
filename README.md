@@ -113,7 +113,7 @@ Notes:
 | POST | `/api/photos/search-by-image` | Best photo per album for an uploaded picture; requires `QDRANT_URL`. |
 | POST | `/api/embedding/claim`, `/renew`, `/results` | External embedding-worker lease API (bearer-token when `WORKER_TOKEN` is set). |
 | POST | `/api/encoding/claim`, `/renew`, `/complete` | External WebP encoder lease API, enabled when `WORKER_TOKEN` is set. |
-| GET | `/admin` | Dashboard (stats + re-embed trigger); enabled only when `ADMIN_TOKEN` is set. |
+| GET | `/admin` | Dashboard (library, embedding and WebP encoding stats + re-embed trigger); enabled only when `ADMIN_TOKEN` is set. |
 
 ## External embedding workers
 

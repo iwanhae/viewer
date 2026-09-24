@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"hash/crc32"
 	"image"
 	"image/color"
@@ -25,11 +26,15 @@ import (
 const tinyWebP = "UklGRkAAAABXRUJQVlA4IDQAAADwAQCdASoBAAEAAQAcJaACdLoB+AAETAAA/vW4f/6aR40jxpHxcP/ugT90CfugT/3NoAAA"
 
 type memoryStore struct {
-	objects map[string][]byte
-	types   map[string]string
+	objects                     map[string][]byte
+	types                       map[string]string
+	copyReturnsErrorBeforeWrite bool
+	copyReturnsErrorAfterWrite  bool
 }
 
-func newMemoryStore() *memoryStore { return &memoryStore{map[string][]byte{}, map[string]string{}} }
+func newMemoryStore() *memoryStore {
+	return &memoryStore{objects: map[string][]byte{}, types: map[string]string{}}
+}
 func (m *memoryStore) GetObject(_ context.Context, key string) (io.ReadCloser, string, error) {
 	data, ok := m.objects[key]
 	if !ok {
@@ -56,8 +61,14 @@ func (m *memoryStore) CopyObjectIfMatch(ctx context.Context, from, to, etag, ct 
 	if !ok || info.ETag != etag {
 		return ErrLostLease
 	}
+	if m.copyReturnsErrorBeforeWrite {
+		return errors.New("copy request failed before object replacement")
+	}
 	m.objects[to] = bytes.Clone(m.objects[from])
 	m.types[to] = ct
+	if m.copyReturnsErrorAfterWrite {
+		return errors.New("copy response lost after object replacement")
+	}
 	return nil
 }
 func (m *memoryStore) DeleteObjects(_ context.Context, keys []string) error {
@@ -146,6 +157,13 @@ func TestEncodingCommitAndDuplicateUpload(t *testing.T) {
 	if err := cat.UpsertBlob(ctx, catalog.Blob{Hash: hash, SizeBytes: int64(len(source)), ContentType: "image/png"}); err != nil {
 		t.Fatal(err)
 	}
+	counts, err := cat.EncodingCounts(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if counts.Converted != 1 || counts.BytesSaved != int64(len(source)-len(encoded)) {
+		t.Fatalf("encoding counts after duplicate upload=%+v want savings %d", counts, len(source)-len(encoded))
+	}
 	blob, err := cat.GetBlob(ctx, hash)
 	if err != nil {
 		t.Fatal(err)
@@ -155,6 +173,151 @@ func TestEncodingCommitAndDuplicateUpload(t *testing.T) {
 	}
 	if pending, err := cat.ClaimPendingEmbeddings(ctx, 1, time.Now().Add(time.Minute)); err != nil || len(pending) != 1 {
 		t.Fatalf("encoded image not released to embedder: %+v %v", pending, err)
+	}
+}
+
+func TestEncodingReconcilesAmbiguousCopyError(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(filepath.Join(t.TempDir(), "catalog.db"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cat.Close()
+	source := sourcePNG(t)
+	sum := sha256.Sum256(source)
+	hash := hex.EncodeToString(sum[:])
+	encoded, err := base64.StdEncoding.DecodeString(tinyWebP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cat.UpsertBlob(ctx, catalog.Blob{Hash: hash, SizeBytes: int64(len(source)), ContentType: "image/png"}); err != nil {
+		t.Fatal(err)
+	}
+	store := newMemoryStore()
+	key := "blobs/" + hash
+	store.objects[key] = source
+	store.types[key] = "image/png"
+	svc := New(cat, store)
+	claimed, err := svc.Claim(ctx, 1)
+	if err != nil || len(claimed) != 1 {
+		t.Fatalf("claim: err=%v claimed=%+v", err, claimed)
+	}
+	job, err := cat.GetEncodingJob(ctx, hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.objects[job.StageKey] = encoded
+	store.copyReturnsErrorAfterWrite = true
+	status, err := svc.Complete(ctx, hash, job.Token, "uploaded", "")
+	if err != nil || status != "done" {
+		t.Fatalf("complete after ambiguous copy: status=%q err=%v", status, err)
+	}
+	if !bytes.Equal(store.objects[key], encoded) || store.types[key] != "image/webp" {
+		t.Fatal("ambiguous copy did not leave the WebP object at the original key")
+	}
+	counts, err := cat.EncodingCounts(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if counts.Converted != 1 || counts.BytesSaved != int64(len(source)-len(encoded)) {
+		t.Fatalf("encoding counts after ambiguous copy=%+v want savings %d", counts, len(source)-len(encoded))
+	}
+}
+
+func TestEncodingKeepsCommitLeasedWhenCopyIsNotYetVisible(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(filepath.Join(t.TempDir(), "catalog.db"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cat.Close()
+	source := sourcePNG(t)
+	sum := sha256.Sum256(source)
+	hash := hex.EncodeToString(sum[:])
+	encoded, err := base64.StdEncoding.DecodeString(tinyWebP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cat.UpsertBlob(ctx, catalog.Blob{Hash: hash, SizeBytes: int64(len(source)), ContentType: "image/png"}); err != nil {
+		t.Fatal(err)
+	}
+	store := newMemoryStore()
+	key := "blobs/" + hash
+	store.objects[key] = source
+	store.types[key] = "image/png"
+	store.copyReturnsErrorBeforeWrite = true
+	svc := New(cat, store)
+	claimed, err := svc.Claim(ctx, 1)
+	if err != nil || len(claimed) != 1 {
+		t.Fatalf("claim: err=%v claimed=%+v", err, claimed)
+	}
+	job, err := cat.GetEncodingJob(ctx, hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.objects[job.StageKey] = encoded
+	if status, err := svc.Complete(ctx, hash, job.Token, "uploaded", ""); err == nil || status != "" {
+		t.Fatalf("complete before delayed copy: status=%q err=%v want copy error", status, err)
+	}
+	job, err = cat.GetEncodingJob(ctx, hash)
+	if err != nil || job.Status != "committing" {
+		t.Fatalf("job after ambiguous error: %+v err=%v want committing", job, err)
+	}
+	if err := svc.Recover(ctx); err != nil {
+		t.Fatal(err)
+	}
+	job, err = cat.GetEncodingJob(ctx, hash)
+	if err != nil || job.Status != "committing" {
+		t.Fatalf("recovery before grace expiry: %+v err=%v want committing", job, err)
+	}
+
+	// Model the object-store request becoming visible after its client timed out.
+	store.objects[key] = encoded
+	if err := svc.Recover(ctx); err != nil {
+		t.Fatal(err)
+	}
+	counts, err := cat.EncodingCounts(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if counts.Processing != 1 || counts.Converted != 0 {
+		t.Fatalf("counts while commit lease is active=%+v want one processing, uncounted commit", counts)
+	}
+}
+
+func TestAlreadyWebPClaimIsExcludedFromConversionSavings(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(filepath.Join(t.TempDir(), "catalog.db"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cat.Close()
+	webp, err := base64.StdEncoding.DecodeString(tinyWebP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(webp)
+	hash := hex.EncodeToString(sum[:])
+	if err := cat.UpsertBlob(ctx, catalog.Blob{Hash: hash, SizeBytes: int64(len(webp)), ContentType: "image/png"}); err != nil {
+		t.Fatal(err)
+	}
+	store := newMemoryStore()
+	store.objects["blobs/"+hash] = webp
+	store.types["blobs/"+hash] = "image/webp"
+	claimed, err := New(cat, store).Claim(ctx, 1)
+	if err != nil || len(claimed) != 1 {
+		t.Fatalf("claim: err=%v claimed=%+v", err, claimed)
+	}
+	status, err := New(cat, store).Complete(ctx, hash, claimed[0].Token, "uploaded", "")
+	if err != nil || status != "skipped" {
+		t.Fatalf("complete already-WebP object: status=%q err=%v", status, err)
+	}
+	counts, err := cat.EncodingCounts(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if counts.Candidates != 0 || counts.AlreadyWebP != 1 || counts.Converted != 0 || counts.BytesSaved != 0 {
+		t.Fatalf("already-WebP stats=%+v want excluded from candidates and savings", counts)
 	}
 }
 
@@ -187,7 +350,7 @@ func TestEncodingLargestFirstAndStaleToken(t *testing.T) {
 	if newJobs[0].Hash != "large" || newJobs[0].Token == jobs[0].Token {
 		t.Fatalf("expected reclaimed large job: %+v", newJobs)
 	}
-	if ok, err := cat.BeginEncodingCommit(ctx, "large", jobs[0].Token); err != nil || ok {
+	if ok, err := cat.BeginEncodingCommit(ctx, "large", jobs[0].Token, jobs[0].SizeBytes, LeaseTTL); err != nil || ok {
 		t.Fatalf("stale token accepted: %v %v", ok, err)
 	}
 }
@@ -210,7 +373,7 @@ func TestRecoverCompletedCopy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if ok, err := cat.BeginEncodingCommit(ctx, hash, jobs[0].Token); err != nil || !ok {
+	if ok, err := cat.BeginEncodingCommit(ctx, hash, jobs[0].Token, int64(len(source)), 0); err != nil || !ok {
 		t.Fatalf("begin: %v %v", ok, err)
 	}
 	store := newMemoryStore()
@@ -221,5 +384,12 @@ func TestRecoverCompletedCopy(t *testing.T) {
 	job, err := cat.GetEncodingJob(ctx, hash)
 	if err != nil || job.Status != "done" || job.Type != "image/webp" {
 		t.Fatalf("recovery: %+v %v", job, err)
+	}
+	counts, err := cat.EncodingCounts(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if counts.Converted != 1 || counts.BytesSaved != int64(len(source)-len(encoded)) {
+		t.Fatalf("recovered encoding counts=%+v want one conversion saving %d bytes", counts, len(source)-len(encoded))
 	}
 }

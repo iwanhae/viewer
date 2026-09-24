@@ -130,6 +130,13 @@ var migrations = []migration{
 			`CREATE INDEX idx_blobs_encoding_priority ON blobs(encoding_status, size_bytes DESC, created_at, hash)`,
 		},
 	},
+	{
+		version: 5,
+		name:    "webp_encoding_source_size",
+		stmts: []string{
+			`ALTER TABLE blobs ADD COLUMN encoding_source_size_bytes INTEGER NOT NULL DEFAULT 0`,
+		},
+	},
 }
 
 // addBlobLeaseColumnIfMissing adds the external-worker lease column to blobs.

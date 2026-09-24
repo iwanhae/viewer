@@ -21,6 +21,60 @@ type EncodingJob struct {
 	LeaseUntil time.Time
 }
 
+// EncodingCounts summarizes the conversion queue and measured storage savings
+// across unique blobs. Already-WebP objects are excluded from Candidates.
+type EncodingCounts struct {
+	Candidates     int64   `json:"candidates"`
+	Pending        int64   `json:"pending"`
+	Processing     int64   `json:"processing"`
+	Converted      int64   `json:"converted"`
+	NotSmaller     int64   `json:"notSmaller"`
+	Failed         int64   `json:"failed"`
+	AlreadyWebP    int64   `json:"alreadyWebp"`
+	RemainingBytes int64   `json:"remainingBytes"`
+	SourceBytes    int64   `json:"sourceBytes"`
+	OutputBytes    int64   `json:"outputBytes"`
+	BytesSaved     int64   `json:"bytesSaved"`
+	SavedPercent   float64 `json:"savedPercent"`
+}
+
+// EncodingCounts reports queue progress and savings from completed WebP
+// replacements. The counters are per unique blob, not per photo row.
+func (s *Store) EncodingCounts(ctx context.Context) (EncodingCounts, error) {
+	var counts EncodingCounts
+	err := s.db.QueryRowContext(ctx, `
+		SELECT
+			COALESCE(SUM(CASE WHEN encoding_status='pending' AND content_type!='image/webp' THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN encoding_status IN ('leased','committing') AND content_type!='image/webp' THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN encoding_status='done' AND encoding_source_size_bytes>size_bytes THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN encoding_status='skipped' AND content_type!='image/webp' THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN encoding_status='failed' AND content_type!='image/webp' THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN encoding_status='skipped' AND content_type='image/webp' THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN encoding_status IN ('pending','leased','committing') AND content_type!='image/webp' THEN size_bytes ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN encoding_status='done' AND encoding_source_size_bytes>size_bytes THEN encoding_source_size_bytes ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN encoding_status='done' AND encoding_source_size_bytes>size_bytes THEN size_bytes ELSE 0 END), 0)
+		FROM blobs`).Scan(
+		&counts.Pending,
+		&counts.Processing,
+		&counts.Converted,
+		&counts.NotSmaller,
+		&counts.Failed,
+		&counts.AlreadyWebP,
+		&counts.RemainingBytes,
+		&counts.SourceBytes,
+		&counts.OutputBytes,
+	)
+	if err != nil {
+		return EncodingCounts{}, fmt.Errorf("encoding counts: %w", err)
+	}
+	counts.Candidates = counts.Pending + counts.Processing + counts.Converted + counts.NotSmaller + counts.Failed
+	counts.BytesSaved = counts.SourceBytes - counts.OutputBytes
+	if counts.SourceBytes > 0 {
+		counts.SavedPercent = float64(counts.BytesSaved) * 100 / float64(counts.SourceBytes)
+	}
+	return counts, nil
+}
+
 func newEncodingToken() (string, error) {
 	var raw [16]byte
 	if _, err := rand.Read(raw[:]); err != nil {
@@ -110,10 +164,15 @@ func (s *Store) RenewEncoding(ctx context.Context, hash, token string, ttl time.
 	return until, n == 1, err
 }
 
-func (s *Store) BeginEncodingCommit(ctx context.Context, hash, token string) (bool, error) {
-	result, err := s.db.ExecContext(ctx, `UPDATE blobs SET encoding_status='committing'
+// BeginEncodingCommit records the validated source size before the object
+// replacement and keeps the commit leased for reconcileAfter. Recover waits
+// for that lease to expire so an accepted but not-yet-visible object-store copy
+// is not mistaken for a failed copy.
+func (s *Store) BeginEncodingCommit(ctx context.Context, hash, token string, sourceSize int64, reconcileAfter time.Duration) (bool, error) {
+	leaseUntil := time.Now().Add(reconcileAfter)
+	result, err := s.db.ExecContext(ctx, `UPDATE blobs SET encoding_status='committing', encoding_source_size_bytes=?, encoding_lease_until=?
 		WHERE hash=? AND encoding_token=? AND encoding_status='leased' AND encoding_lease_until>=?`,
-		hash, token, time.Now().UnixMilli())
+		sourceSize, leaseUntil.UnixMilli(), hash, token, time.Now().UnixMilli())
 	if err != nil {
 		return false, err
 	}
@@ -132,7 +191,7 @@ func (s *Store) FinishEncoding(ctx context.Context, hash, token, status, content
 }
 
 func (s *Store) SkipEncoding(ctx context.Context, hash, token, status, contentType, errorText string, size int64) (bool, error) {
-	result, err := s.db.ExecContext(ctx, `UPDATE blobs SET encoding_status=?, content_type=?, size_bytes=?, encoding_error=?, encoding_lease_until=0
+	result, err := s.db.ExecContext(ctx, `UPDATE blobs SET encoding_status=?, content_type=?, size_bytes=?, encoding_error=?, encoding_lease_until=0, encoding_source_size_bytes=0
 		WHERE hash=? AND encoding_token=? AND encoding_status='leased' AND encoding_lease_until>=?`,
 		status, contentType, size, errorText, hash, token, time.Now().UnixMilli())
 	if err != nil {
@@ -169,7 +228,7 @@ func (s *Store) CommittingEncodings(ctx context.Context) ([]EncodingJob, error) 
 }
 
 func (s *Store) ResetCommittingEncoding(ctx context.Context, hash, token string) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE blobs SET encoding_status='pending', encoding_token='', encoding_stage_key='', encoding_lease_until=0
+	_, err := s.db.ExecContext(ctx, `UPDATE blobs SET encoding_status='pending', encoding_token='', encoding_stage_key='', encoding_lease_until=0, encoding_source_size_bytes=0
 		WHERE hash=? AND encoding_token=? AND encoding_status='committing'`, hash, token)
 	return err
 }

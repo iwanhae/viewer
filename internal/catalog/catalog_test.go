@@ -42,6 +42,48 @@ func seedBlobStatus(t *testing.T, store *Store, hash string, status EmbeddingSta
 	}
 }
 
+func TestEncodingCountsAggregateProgressAndSavings(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+	items := []struct {
+		hash        string
+		size        int64
+		contentType string
+		status      string
+		sourceSize  int64
+	}{
+		{hash: "pending", size: 600, contentType: "image/jpeg", status: "pending"},
+		{hash: "leased", size: 500, contentType: "image/png", status: "leased"},
+		{hash: "committing", size: 400, contentType: "image/png", status: "committing"},
+		{hash: "converted", size: 100, contentType: "image/webp", status: "done", sourceSize: 1000},
+		{hash: "not-smaller", size: 300, contentType: "image/jpeg", status: "skipped"},
+		{hash: "failed", size: 200, contentType: "image/png", status: "failed"},
+		{hash: "already-webp", size: 80, contentType: "image/webp", status: "skipped"},
+	}
+	for _, item := range items {
+		if err := store.UpsertBlob(ctx, Blob{Hash: item.hash, SizeBytes: item.size, ContentType: item.contentType}); err != nil {
+			t.Fatalf("upsert %s: %v", item.hash, err)
+		}
+		if _, err := store.db.ExecContext(ctx, `UPDATE blobs SET encoding_status=?, encoding_source_size_bytes=? WHERE hash=?`, item.status, item.sourceSize, item.hash); err != nil {
+			t.Fatalf("set encoding state for %s: %v", item.hash, err)
+		}
+	}
+
+	counts, err := store.EncodingCounts(ctx)
+	if err != nil {
+		t.Fatalf("encoding counts: %v", err)
+	}
+	want := EncodingCounts{
+		Candidates: 6, Pending: 1, Processing: 2, Converted: 1,
+		NotSmaller: 1, Failed: 1, AlreadyWebP: 1,
+		RemainingBytes: 1500, SourceBytes: 1000, OutputBytes: 100,
+		BytesSaved: 900, SavedPercent: 90,
+	}
+	if counts != want {
+		t.Fatalf("encoding counts=%+v want=%+v", counts, want)
+	}
+}
+
 func TestAlbumLifecycleAndStatusTransitions(t *testing.T) {
 	store := openTestStore(t)
 	ctx := context.Background()

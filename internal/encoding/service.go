@@ -145,13 +145,14 @@ func (s *Service) Complete(ctx context.Context, hash, token, outcome, detail str
 			return "", err
 		}
 		status, contentType := "skipped", job.Type
-		if isWebP(data) {
+		originalIsWebP := isWebP(data)
+		if originalIsWebP {
 			contentType = "image/webp"
 		}
-		if outcome == "already_webp" && !isWebP(data) {
+		if outcome == "already_webp" && !originalIsWebP {
 			return "", ErrInvalidOutput
 		}
-		if outcome == "failed" {
+		if outcome == "failed" && !originalIsWebP {
 			status = "failed"
 		}
 		if len(detail) > 512 {
@@ -187,14 +188,14 @@ func (s *Service) Complete(ctx context.Context, hash, token, outcome, detail str
 		return "", err
 	}
 	if isWebP(original) {
-		ok, err := s.cat.SkipEncoding(ctx, hash, token, "done", "image/webp", "", int64(len(original)))
+		ok, err := s.cat.SkipEncoding(ctx, hash, token, "skipped", "image/webp", "", int64(len(original)))
 		if err != nil {
 			return "", err
 		}
 		if !ok {
 			return "", ErrLostLease
 		}
-		return "done", nil
+		return "skipped", nil
 	}
 	sum := sha256.Sum256(original)
 	if hex.EncodeToString(sum[:]) != hash {
@@ -236,7 +237,7 @@ func (s *Service) Complete(ctx context.Context, hash, token, outcome, detail str
 	if !exists || currentInfo.ETag != originalInfo.ETag || currentInfo.Size != originalInfo.Size {
 		return "", ErrLostLease
 	}
-	ok, err := s.cat.BeginEncodingCommit(ctx, hash, token)
+	ok, err := s.cat.BeginEncodingCommit(ctx, hash, token, int64(len(original)), LeaseTTL)
 	if err != nil {
 		return "", err
 	}
@@ -244,7 +245,23 @@ func (s *Service) Complete(ctx context.Context, hash, token, outcome, detail str
 		return "", ErrLostLease
 	}
 	if err := s.store.CopyObjectIfMatch(ctx, job.StageKey, key, stagedInfo.ETag, "image/webp"); err != nil {
-		_ = s.cat.ResetCommittingEncoding(context.Background(), hash, token)
+		// A failed response may arrive before an accepted object-store copy
+		// becomes visible. Finalize only when the replacement is already
+		// observable; otherwise keep the commit lease and let Recover inspect
+		// it after the grace period instead of prematurely retrying the blob.
+		current, _, readErr := readObject(ctx, s.store, key)
+		if readErr == nil && isWebP(current) {
+			if _, finishErr := s.cat.FinishEncoding(ctx, hash, token, "done", "image/webp", "", int64(len(current))); finishErr != nil {
+				return "", fmt.Errorf("copy staged output: %w (finish observed replacement: %v)", err, finishErr)
+			}
+			if deleteErr := s.store.DeleteObjects(ctx, []string{job.StageKey}); deleteErr != nil {
+				log.Printf("encoding: delete staged %s: %v", job.StageKey, deleteErr)
+			}
+			return "done", nil
+		}
+		if readErr != nil {
+			return "", fmt.Errorf("copy staged output: %w (inspect current object: %v)", err, readErr)
+		}
 		return "", err
 	}
 	if _, err := s.cat.FinishEncoding(ctx, hash, token, "done", "image/webp", "", int64(len(encoded))); err != nil {
@@ -256,27 +273,38 @@ func (s *Service) Complete(ctx context.Context, hash, token, outcome, detail str
 	return "done", nil
 }
 
-// Recover reconciles a crash between the copy and the catalog update. The
-// object store decides the outcome; a source still in its old format retries.
+// Recover reconciles an interrupted copy after its commit grace lease expires.
+// The object store decides the outcome; a source still in its old format retries.
 func (s *Service) Recover(ctx context.Context) error {
 	jobs, err := s.cat.CommittingEncodings(ctx)
 	if err != nil {
 		return err
 	}
 	for _, job := range jobs {
-		data, _, err := readObject(ctx, s.store, pipeline.BlobKey(job.Hash))
-		if err != nil {
-			return err
+		if time.Now().Before(job.LeaseUntil) {
+			continue
 		}
-		if isWebP(data) {
-			if _, err := s.cat.FinishEncoding(ctx, job.Hash, job.Token, "done", "image/webp", "", int64(len(data))); err != nil {
-				return err
-			}
-		} else if err := s.cat.ResetCommittingEncoding(ctx, job.Hash, job.Token); err != nil {
+		if err := s.reconcileCommit(ctx, job); err != nil {
 			return err
 		}
 	}
 	return s.Cleanup(ctx)
+}
+
+// reconcileCommit uses the object currently stored at the stable blob key as
+// the source of truth after a process interruption or ambiguous copy result.
+func (s *Service) reconcileCommit(ctx context.Context, job catalog.EncodingJob) error {
+	data, _, err := readObject(ctx, s.store, pipeline.BlobKey(job.Hash))
+	if err != nil {
+		return err
+	}
+	if isWebP(data) {
+		if _, err := s.cat.FinishEncoding(ctx, job.Hash, job.Token, "done", "image/webp", "", int64(len(data))); err != nil {
+			return err
+		}
+		return nil
+	}
+	return s.cat.ResetCommittingEncoding(ctx, job.Hash, job.Token)
 }
 
 // Cleanup removes abandoned staged outputs after their signed URLs and leases
