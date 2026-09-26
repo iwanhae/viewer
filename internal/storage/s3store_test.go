@@ -123,7 +123,7 @@ func newRecordingStoreAt(t *testing.T, endpointPath string, keyPrefix string) (*
 
 func TestCopyObjectIfMatchKeepsPrefixAndReplacesType(t *testing.T) {
 	store, requests := newRecordingStore(t, "viewer/")
-	if err := store.CopyObjectIfMatch(context.Background(), "encoding/hash/token.webp", "blobs/hash", `"stage-etag"`, "image/webp"); err != nil {
+	if err := store.CopyObjectIfMatch(context.Background(), "encoding/hash_token.webp", "blobs/hash", `"stage-etag"`, "image/webp"); err != nil {
 		t.Fatal(err)
 	}
 	if len(*requests) != 1 {
@@ -133,7 +133,7 @@ func TestCopyObjectIfMatchKeepsPrefixAndReplacesType(t *testing.T) {
 	if r.method != http.MethodPut || r.path != "/test-bucket/viewer/blobs/hash" {
 		t.Fatalf("copy destination: %+v", r)
 	}
-	if r.copySource != "test-bucket/viewer/encoding/hash/token.webp" || r.copyMatch != `"stage-etag"` || r.metadataDirective != "REPLACE" || r.contentType != "image/webp" {
+	if r.copySource != "test-bucket/viewer/encoding/hash_token.webp" || r.copyMatch != `"stage-etag"` || r.metadataDirective != "REPLACE" || r.contentType != "image/webp" {
 		t.Fatalf("copy headers: %+v", r)
 	}
 }

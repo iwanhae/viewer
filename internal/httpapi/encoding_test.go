@@ -72,6 +72,9 @@ func TestEncodingWorkerRoutesUseSharedToken(t *testing.T) {
 	if len(payload.Claimed) != 1 || payload.Claimed[0].Hash != "source-hash" || payload.Claimed[0].Token == "" || payload.Claimed[0].GetURL == "" || payload.Claimed[0].PutURL == "" {
 		t.Fatalf("claim payload: %+v", payload)
 	}
+	if want := "memory://encoding/source-hash_" + payload.Claimed[0].Token + ".webp"; payload.Claimed[0].PutURL != want {
+		t.Fatalf("put URL=%q want=%q", payload.Claimed[0].PutURL, want)
+	}
 	if rec := request("shared-token"); rec.Code != http.StatusOK {
 		t.Fatalf("second claim: %d", rec.Code)
 	} else {

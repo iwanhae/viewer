@@ -123,7 +123,7 @@ func (s *Store) ClaimEncoding(ctx context.Context, limit int, ttl time.Duration)
 			return nil, err
 		}
 		jobs[i].Token = token
-		jobs[i].StageKey = fmt.Sprintf("encoding/%s/%s.webp", jobs[i].Hash, token)
+		jobs[i].StageKey = fmt.Sprintf("encoding/%s_%s.webp", jobs[i].Hash, token)
 		jobs[i].Status = "leased"
 		jobs[i].LeaseUntil = lease
 		if _, err := tx.ExecContext(ctx, `UPDATE blobs SET encoding_status='leased', encoding_token=?, encoding_stage_key=?, encoding_lease_until=? WHERE hash=?`,
