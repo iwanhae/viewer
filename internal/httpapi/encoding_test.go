@@ -33,7 +33,7 @@ type claimOnlyStore struct {
 func (claimOnlyStore) GetObject(context.Context, string) (io.ReadCloser, string, error) {
 	return nil, "", storage.ErrObjectNotFound
 }
-func (claimOnlyStore) PutObject(_ context.Context, _ string, body io.Reader, _ string) error {
+func (claimOnlyStore) PutObjectIfMatch(_ context.Context, _ string, body io.Reader, _, _ string) error {
 	_, err := io.Copy(io.Discard, body)
 	return err
 }
@@ -99,15 +99,20 @@ func (store *encodingOutputStore) GetObject(_ context.Context, key string) (io.R
 	return io.NopCloser(bytes.NewReader(bytes.Clone(data))), store.contentType[key], nil
 }
 
-func (store *encodingOutputStore) PutObject(_ context.Context, key string, body io.Reader, contentType string) error {
+func (store *encodingOutputStore) PutObjectIfMatch(ctx context.Context, key string, body io.Reader, contentType, etag string) error {
 	data, err := io.ReadAll(body)
 	if err != nil {
 		return err
 	}
 	store.mu.Lock()
+	defer store.mu.Unlock()
+	current, exists := store.objects[key]
+	sum := sha256.Sum256(current)
+	if !exists || hex.EncodeToString(sum[:]) != etag {
+		return encoding.ErrLostLease
+	}
 	store.objects[key] = data
 	store.contentType[key] = contentType
-	store.mu.Unlock()
 	return nil
 }
 
@@ -151,7 +156,7 @@ func TestEncodingWorkerRoutesUseSharedToken(t *testing.T) {
 	if err := cat.UpsertBlob(context.Background(), catalog.Blob{Hash: "source-hash", SizeBytes: 100, ContentType: "image/png"}); err != nil {
 		t.Fatal(err)
 	}
-	router := New(nil, nil, nil, nil, "shared-token", nil, "").WithEncoder(encoding.New(cat, claimOnlyStore{})).Router()
+	router := New(nil, nil, nil, nil, "shared-token", nil, "").WithEncoder(encoding.New(cat, claimOnlyStore{}, t.TempDir())).Router()
 	request := func(token string) *httptest.ResponseRecorder {
 		req := httptest.NewRequest(http.MethodPost, "/api/encoding/claim", bytes.NewBufferString(`{"limit":1}`))
 		req.Header.Set("Content-Type", "application/json")
@@ -203,7 +208,7 @@ func TestAPIOutputModeDoesNotPresignResultUploads(t *testing.T) {
 		t.Fatal(err)
 	}
 	putPresigns := 0
-	service := encoding.New(cat, claimOnlyStore{presignPutCalls: &putPresigns})
+	service := encoding.New(cat, claimOnlyStore{presignPutCalls: &putPresigns}, t.TempDir())
 	router := New(nil, nil, nil, nil, "shared-token", nil, "").WithEncoder(service).Router()
 	post := func(path, payload string) *httptest.ResponseRecorder {
 		req := httptest.NewRequest(http.MethodPost, path, bytes.NewBufferString(payload))
@@ -253,7 +258,7 @@ func TestEncodingOutputRouteUsesWorkerAuthAndReceivesRawBody(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer cat.Close()
-	api := New(nil, nil, nil, nil, "shared-token", nil, "").WithEncoder(encoding.New(cat, claimOnlyStore{}))
+	api := New(nil, nil, nil, nil, "shared-token", nil, "").WithEncoder(encoding.New(cat, claimOnlyStore{}, t.TempDir()))
 	receiver := &testEncodingOutputReceiver{}
 	api.encodingOutput = receiver
 	router := api.Router()
@@ -313,7 +318,7 @@ func TestEncodingOutputRouteAcceptsThroughEncodingService(t *testing.T) {
 	store.objects["blobs/"+hash] = source
 	store.contentType["blobs/"+hash] = "image/png"
 
-	service := encoding.New(cat, store)
+	service := encoding.New(cat, store, t.TempDir())
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	if err := service.Start(ctx); err != nil {
@@ -370,7 +375,7 @@ func TestEncodingOutputRouteValidatesHeaders(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer cat.Close()
-	api := New(nil, nil, nil, nil, "shared-token", nil, "").WithEncoder(encoding.New(cat, claimOnlyStore{}))
+	api := New(nil, nil, nil, nil, "shared-token", nil, "").WithEncoder(encoding.New(cat, claimOnlyStore{}, t.TempDir()))
 	receiver := &testEncodingOutputReceiver{}
 	api.encodingOutput = receiver
 	req := httptest.NewRequest(http.MethodPost, "/api/encoding/output", bytes.NewReader([]byte("body")))
@@ -407,7 +412,7 @@ func TestEncodingOutputRouteMapsServiceErrors(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer cat.Close()
-			api := New(nil, nil, nil, nil, "shared-token", nil, "").WithEncoder(encoding.New(cat, claimOnlyStore{}))
+			api := New(nil, nil, nil, nil, "shared-token", nil, "").WithEncoder(encoding.New(cat, claimOnlyStore{}, t.TempDir()))
 			api.encodingOutput = &testEncodingOutputReceiver{err: test.err}
 			req := httptest.NewRequest(http.MethodPost, "/api/encoding/output", bytes.NewReader([]byte("raw output")))
 			req.Header.Set("Authorization", "Bearer shared-token")

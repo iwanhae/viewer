@@ -36,8 +36,8 @@ FROM debian:bookworm-slim
 COPY --from=backend-build --chown=65532:65532 /out/viewer /app/viewer
 
 # /var/lib/viewer is the persistent state directory (the SQLite catalog).
-# Everything else the process writes - the staged zip being unpacked - goes to
-# the world-writable /tmp, which the container owns alone.
+# The bounded encoder result spool also lives here so accepted outputs survive
+# a container replacement. Staged zips being unpacked still go to /tmp.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends ca-certificates && \
     rm -rf /var/lib/apt/lists/* && \

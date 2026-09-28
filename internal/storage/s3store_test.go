@@ -49,6 +49,7 @@ type recordedRequest struct {
 	body              string
 	copySource        string
 	copyMatch         string
+	ifMatch           string
 	metadataDirective string
 	contentType       string
 }
@@ -81,6 +82,7 @@ func newRecordingStoreAt(t *testing.T, endpointPath string, keyPrefix string) (*
 			body:              string(body),
 			copySource:        r.Header.Get("X-Amz-Copy-Source"),
 			copyMatch:         r.Header.Get("X-Amz-Copy-Source-If-Match"),
+			ifMatch:           r.Header.Get("If-Match"),
 			metadataDirective: r.Header.Get("X-Amz-Metadata-Directive"),
 			contentType:       r.Header.Get("Content-Type"),
 		})
@@ -135,6 +137,20 @@ func TestCopyObjectIfMatchKeepsPrefixAndReplacesType(t *testing.T) {
 	}
 	if r.copySource != "test-bucket/viewer/encoding/hash_token.webp" || r.copyMatch != `"stage-etag"` || r.metadataDirective != "REPLACE" || r.contentType != "image/webp" {
 		t.Fatalf("copy headers: %+v", r)
+	}
+}
+
+func TestPutObjectIfMatchGuardsDestination(t *testing.T) {
+	store, requests := newRecordingStore(t, "viewer/")
+	if err := store.PutObjectIfMatch(context.Background(), "blobs/hash", strings.NewReader("encoded"), "image/webp", `"source-etag"`); err != nil {
+		t.Fatal(err)
+	}
+	if len(*requests) != 1 {
+		t.Fatalf("requests=%d", len(*requests))
+	}
+	r := (*requests)[0]
+	if r.method != http.MethodPut || r.path != "/test-bucket/viewer/blobs/hash" || r.ifMatch != `"source-etag"` || r.body != "encoded" || r.contentType != "image/webp" {
+		t.Fatalf("conditional put: %+v", r)
 	}
 }
 

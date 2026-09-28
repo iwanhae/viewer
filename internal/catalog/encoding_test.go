@@ -19,13 +19,13 @@ func TestMarkEncodingReceivedRequiresActiveLeaseAndCanReset(t *testing.T) {
 	}
 	job := claimed[0]
 
-	if received, err := store.MarkEncodingReceived(ctx, job.Hash, "wrong-token", time.Minute); err != nil || received {
+	if received, err := store.MarkEncodingReceived(ctx, job.Hash, "wrong-token"); err != nil || received {
 		t.Fatalf("wrong-token handoff: received=%v err=%v, want false nil", received, err)
 	}
 	if _, err := store.db.ExecContext(ctx, `UPDATE blobs SET encoding_lease_until=0 WHERE hash=?`, job.Hash); err != nil {
 		t.Fatalf("expire lease: %v", err)
 	}
-	if received, err := store.MarkEncodingReceived(ctx, job.Hash, job.Token, time.Minute); err != nil || received {
+	if received, err := store.MarkEncodingReceived(ctx, job.Hash, job.Token); err != nil || received {
 		t.Fatalf("expired handoff: received=%v err=%v, want false nil", received, err)
 	}
 
@@ -35,7 +35,7 @@ func TestMarkEncodingReceivedRequiresActiveLeaseAndCanReset(t *testing.T) {
 		t.Fatalf("reclaim expired encoding: jobs=%+v err=%v", claimed, err)
 	}
 	job = claimed[0]
-	if received, err := store.MarkEncodingReceived(ctx, job.Hash, job.Token, 2*time.Minute); err != nil || !received {
+	if received, err := store.MarkEncodingReceived(ctx, job.Hash, job.Token); err != nil || !received {
 		t.Fatalf("mark received: received=%v err=%v, want true nil", received, err)
 	}
 
@@ -43,11 +43,11 @@ func TestMarkEncodingReceivedRequiresActiveLeaseAndCanReset(t *testing.T) {
 	if err != nil || len(received) != 1 {
 		t.Fatalf("list received encodings: jobs=%+v err=%v", received, err)
 	}
-	if received[0].Status != "received" || received[0].Token != job.Token || received[0].StageKey != job.StageKey {
-		t.Fatalf("received job=%+v, want received job preserving lease identity and legacy stage key", received[0])
+	if received[0].Status != "received" || received[0].Token != job.Token || received[0].StageKey != "" {
+		t.Fatalf("received job=%+v, want server-owned result without a legacy stage key", received[0])
 	}
-	if !received[0].LeaseUntil.After(time.Now()) {
-		t.Fatalf("received lease expired unexpectedly: %v", received[0].LeaseUntil)
+	if received[0].LeaseUntil.UnixMilli() != 0 {
+		t.Fatalf("server-owned result still has a worker lease: %v", received[0].LeaseUntil)
 	}
 	claimed, err = store.ClaimEncoding(ctx, 1, time.Minute)
 	if err != nil || len(claimed) != 0 {
@@ -91,7 +91,7 @@ func TestBeginEncodingCommitAcceptsReceivedAndLegacyLeases(t *testing.T) {
 	}
 	receivedJob := byHash["received-hash"]
 	legacyJob := byHash["legacy-hash"]
-	if ok, err := store.MarkEncodingReceived(ctx, receivedJob.Hash, receivedJob.Token, time.Minute); err != nil || !ok {
+	if ok, err := store.MarkEncodingReceived(ctx, receivedJob.Hash, receivedJob.Token); err != nil || !ok {
 		t.Fatalf("mark received: ok=%v err=%v", ok, err)
 	}
 
@@ -122,11 +122,8 @@ func TestBeginEncodingCommitDoesNotExpireServerOwnedReceivedJob(t *testing.T) {
 		t.Fatalf("claim encoding: jobs=%+v err=%v", claimed, err)
 	}
 	job := claimed[0]
-	if ok, err := store.MarkEncodingReceived(ctx, job.Hash, job.Token, time.Minute); err != nil || !ok {
+	if ok, err := store.MarkEncodingReceived(ctx, job.Hash, job.Token); err != nil || !ok {
 		t.Fatalf("mark received: ok=%v err=%v", ok, err)
-	}
-	if _, err := store.db.ExecContext(ctx, `UPDATE blobs SET encoding_lease_until=0 WHERE hash=?`, job.Hash); err != nil {
-		t.Fatalf("expire old worker lease: %v", err)
 	}
 	if ok, err := store.BeginEncodingCommit(ctx, job.Hash, job.Token, 123, time.Minute); err != nil || !ok {
 		t.Fatalf("server-owned received result was rejected after worker lease expiry: ok=%v err=%v", ok, err)
@@ -155,7 +152,7 @@ func TestSkipEncodingAcceptsReceivedJob(t *testing.T) {
 		t.Fatalf("reclaim expired encoding: jobs=%+v err=%v", claimed, err)
 	}
 	job = claimed[0]
-	if ok, err := store.MarkEncodingReceived(ctx, job.Hash, job.Token, time.Minute); err != nil || !ok {
+	if ok, err := store.MarkEncodingReceived(ctx, job.Hash, job.Token); err != nil || !ok {
 		t.Fatalf("mark received: ok=%v err=%v", ok, err)
 	}
 

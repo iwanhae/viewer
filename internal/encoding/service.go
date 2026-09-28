@@ -41,7 +41,6 @@ const outputQueueSize = outputProcessors
 const outputScanInterval = 30 * time.Second
 const outputRetryInterval = 30 * time.Second
 
-const spoolDirectoryName = "viewer-encoding"
 const spoolFilePattern = "encoding-*.part"
 
 var ErrLostLease = errors.New("encoding lease is no longer current")
@@ -54,7 +53,7 @@ var ErrSpoolMissing = errors.New("accepted encoding output is missing from the s
 
 type Store interface {
 	GetObject(context.Context, string) (io.ReadCloser, string, error)
-	PutObject(context.Context, string, io.Reader, string) error
+	PutObjectIfMatch(context.Context, string, io.Reader, string, string) error
 	PresignGet(context.Context, string, time.Duration) (string, error)
 	PresignPut(context.Context, string, time.Duration) (string, error)
 	StatObject(context.Context, string) (storage.Object, bool, error)
@@ -71,21 +70,22 @@ type Service struct {
 	spoolSlots  chan struct{}
 	outputQueue chan catalog.EncodingJob
 
-	startMu     sync.Mutex
-	startInitMu sync.Mutex
-	started     bool
-	queueMu     sync.Mutex
-	queued      map[string]struct{}
-	uploadMu    sync.Mutex
-	uploads     map[string]struct{}
+	startMu  sync.Mutex
+	started  bool
+	queueMu  sync.Mutex
+	queued   map[string]struct{}
+	uploadMu sync.Mutex
+	uploads  map[string]struct{}
 }
 
-func New(cat *catalog.Store, store Store) *Service {
+// New takes a private spool directory. The app places it on the catalog's
+// persistent volume so accepted output survives a container restart.
+func New(cat *catalog.Store, store Store, spoolDir string) *Service {
 	return &Service{
 		cat:         cat,
 		store:       store,
 		commitSlots: make(chan struct{}, outputProcessors),
-		spoolDir:    filepath.Join(os.TempDir(), spoolDirectoryName),
+		spoolDir:    spoolDir,
 		spoolSlots:  make(chan struct{}, outputQueueSize),
 		outputQueue: make(chan catalog.EncodingJob, outputQueueSize),
 		queued:      make(map[string]struct{}),
@@ -174,26 +174,30 @@ func (s *Service) RenewLease(ctx context.Context, hash, token string) (time.Time
 }
 
 // Start launches the bounded spool processors and recovers accepted outputs.
-// The files live in /tmp, so the catalog is reconciled against the spool before
-// the HTTP server begins accepting work.
+// The catalog is reconciled against the private persistent spool before the
+// HTTP server begins accepting work.
 func (s *Service) Start(ctx context.Context) error {
-	if s == nil || s.cat == nil || s.store == nil {
+	if s == nil || s.cat == nil || s.store == nil || s.spoolDir == "" {
 		return fmt.Errorf("encoding service is not initialized")
 	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	s.startInitMu.Lock()
-	defer s.startInitMu.Unlock()
 	s.startMu.Lock()
+	defer s.startMu.Unlock()
 	if s.started {
-		s.startMu.Unlock()
 		return nil
 	}
-	s.startMu.Unlock()
 
 	if err := os.MkdirAll(s.spoolDir, 0o700); err != nil {
 		return fmt.Errorf("create encoding spool %s: %w", s.spoolDir, err)
+	}
+	info, err := os.Lstat(s.spoolDir)
+	if err != nil {
+		return fmt.Errorf("inspect encoding spool %s: %w", s.spoolDir, err)
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("encoding spool %s must be a directory, not a symlink", s.spoolDir)
 	}
 	if err := os.Chmod(s.spoolDir, 0o700); err != nil {
 		return fmt.Errorf("secure encoding spool %s: %w", s.spoolDir, err)
@@ -204,23 +208,24 @@ func (s *Service) Start(ctx context.Context) error {
 	if err := s.removeOrphanSpools(ctx); err != nil {
 		return err
 	}
-	if err := s.Recover(ctx); err != nil {
+	if err := s.reconcileExpiredCommits(ctx); err != nil {
+		return err
+	}
+	if err := s.Cleanup(ctx); err != nil {
 		return err
 	}
 	// Queue recoverable spool files before the processors start. The channel and
 	// slot semaphore are bounded, and the periodic scan will fill remaining
 	// capacity after the workers drain the initial batch.
-	if err := s.scheduleReceived(ctx); err != nil {
+	if err := s.scheduleSpoolOutputs(ctx); err != nil {
 		return err
 	}
 
-	s.startMu.Lock()
 	s.started = true
 	for i := 0; i < outputProcessors; i++ {
 		go s.runOutputProcessor(ctx)
 	}
 	go s.scanReceivedOutputs(ctx)
-	s.startMu.Unlock()
 	return nil
 }
 
@@ -357,7 +362,7 @@ func (s *Service) ReceiveOutput(ctx context.Context, hash, token string, body io
 	}
 	keepPart = true // rename moved the file; it is removed by the processor.
 
-	accepted, err := s.cat.MarkEncodingReceived(ctx, hash, token, LeaseTTL)
+	accepted, err := s.cat.MarkEncodingReceived(ctx, hash, token)
 	if err != nil {
 		_ = os.Remove(finalPath)
 		return fmt.Errorf("record received encoding output: %w", err)
@@ -372,7 +377,7 @@ func (s *Service) ReceiveOutput(ctx context.Context, hash, token string, body io
 	}
 
 	job.Status = "received"
-	job.LeaseUntil = time.Now().Add(LeaseTTL)
+	job.LeaseUntil = time.UnixMilli(0)
 	queued, err := s.enqueueReserved(ctx, job)
 	if err != nil {
 		// The catalog row and spool are recoverable; leave the slot to this
@@ -448,17 +453,26 @@ func (s *Service) enqueueReserved(ctx context.Context, job catalog.EncodingJob) 
 	}
 }
 
-func (s *Service) scheduleReceived(ctx context.Context) error {
+func (s *Service) scheduleSpoolOutputs(ctx context.Context) error {
 	jobs, err := s.cat.ReceivedEncodings(ctx)
 	if err != nil {
 		return err
 	}
+	// A process may have stopped while a PUT was committing. Those files also
+	// occupy disk capacity until their grace period ends and they are reconciled.
+	committing, err := s.cat.CommittingEncodings(ctx)
+	if err != nil {
+		return err
+	}
+	jobs = append(jobs, committing...)
 	for _, job := range jobs {
 		path := s.spoolPath(job.Hash, job.Token)
 		if _, err := os.Stat(path); err != nil {
 			if errors.Is(err, os.ErrNotExist) {
-				if resetErr := s.cat.ResetReceivedEncoding(ctx, job.Hash, job.Token); resetErr != nil {
-					return resetErr
+				if job.Status == "received" {
+					if resetErr := s.cat.ResetReceivedEncoding(ctx, job.Hash, job.Token); resetErr != nil {
+						return resetErr
+					}
 				}
 				continue
 			}
@@ -503,8 +517,8 @@ func (s *Service) scanReceivedOutputs(ctx context.Context) {
 			if err := s.reconcileExpiredCommits(ctx); err != nil {
 				log.Printf("encoding: reconcile expired commits failed: %v", err)
 			}
-			if err := s.scheduleReceived(ctx); err != nil {
-				log.Printf("encoding: scan received outputs failed: %v", err)
+			if err := s.scheduleSpoolOutputs(ctx); err != nil {
+				log.Printf("encoding: scan spooled outputs failed: %v", err)
 			}
 		}
 	}
@@ -673,13 +687,9 @@ func (s *Service) processReceived(ctx context.Context, job catalog.EncodingJob) 
 	if int64(len(original)) != originalInfo.Size {
 		return fmt.Errorf("%w: original blob size changed for %s", ErrInvalidSource, job.Hash)
 	}
-	sum := sha256.Sum256(original)
-	if hex.EncodeToString(sum[:]) != job.Hash {
-		return fmt.Errorf("%w: original bytes no longer match source hash %s", ErrInvalidSource, job.Hash)
-	}
-	originalConfig, _, err := image.DecodeConfig(bytes.NewReader(original))
+	originalConfig, err := validateSource(original, job.Hash)
 	if err != nil {
-		return fmt.Errorf("%w: decode original: %v", ErrInvalidSource, err)
+		return err
 	}
 
 	path := s.spoolPath(job.Hash, job.Token)
@@ -690,9 +700,6 @@ func (s *Service) processReceived(ctx context.Context, job catalog.EncodingJob) 
 		}
 		return fmt.Errorf("stat spooled output: %w", err)
 	}
-	if info.Size() <= 0 || info.Size() >= int64(len(original)) || info.Size() > MaxOutputBytes {
-		return ErrInvalidOutput
-	}
 	encodedFile, err := os.Open(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -701,25 +708,8 @@ func (s *Service) processReceived(ctx context.Context, job catalog.EncodingJob) 
 		return fmt.Errorf("open spooled output: %w", err)
 	}
 	defer encodedFile.Close()
-	header := make([]byte, 12)
-	if _, err := io.ReadFull(encodedFile, header); err != nil || string(header[:4]) != "RIFF" || string(header[8:12]) != "WEBP" {
-		return ErrInvalidOutput
-	}
-	if _, err := encodedFile.Seek(0, io.SeekStart); err != nil {
-		return fmt.Errorf("rewind spooled output: %w", err)
-	}
-	encodedConfig, _, err := image.DecodeConfig(encodedFile)
-	if err != nil || encodedConfig.Width != originalConfig.Width || encodedConfig.Height != originalConfig.Height {
-		return ErrInvalidOutput
-	}
-	if _, err := encodedFile.Seek(0, io.SeekStart); err != nil {
-		return fmt.Errorf("rewind spooled output: %w", err)
-	}
-	if _, _, err := image.Decode(encodedFile); err != nil {
-		return fmt.Errorf("%w: decode WebP output: %v", ErrInvalidOutput, err)
-	}
-	if _, err := encodedFile.Seek(0, io.SeekStart); err != nil {
-		return fmt.Errorf("rewind spooled output: %w", err)
+	if err := validateWebP(encodedFile, info.Size(), int64(len(original)), originalConfig); err != nil {
+		return err
 	}
 
 	currentInfo, exists, err := s.store.StatObject(ctx, key)
@@ -736,17 +726,19 @@ func (s *Service) processReceived(ctx context.Context, job catalog.EncodingJob) 
 	if !ok {
 		return ErrLostLease
 	}
-	if err := s.store.PutObject(ctx, key, encodedFile, "image/webp"); err != nil {
+	if err := s.store.PutObjectIfMatch(ctx, key, encodedFile, "image/webp", originalInfo.ETag); err != nil {
 		// A PUT may have succeeded even if its response was lost. Finalize only
 		// when the current object is byte-for-byte the validated spool file;
 		// otherwise retain the committing lease for normal reconciliation.
 		currentBytes, _, readErr := readObject(ctx, s.store, key)
 		if readErr == nil {
 			if _, seekErr := encodedFile.Seek(0, io.SeekStart); seekErr == nil {
-				encodedBytes, copyErr := io.ReadAll(encodedFile)
-				if copyErr == nil && isWebP(currentBytes) && bytes.Equal(currentBytes, encodedBytes) {
-					if _, finishErr := s.cat.FinishEncoding(ctx, job.Hash, job.Token, "done", "image/webp", "", int64(len(encodedBytes))); finishErr != nil {
+				match, compareErr := matchesEncodedFile(encodedFile, currentBytes)
+				if compareErr == nil && isWebP(currentBytes) && match {
+					if ok, finishErr := s.cat.FinishEncoding(ctx, job.Hash, job.Token, "done", "image/webp", "", int64(len(currentBytes))); finishErr != nil {
 						return fmt.Errorf("put encoded blob: %w (finish observed replacement: %v)", err, finishErr)
+					} else if !ok {
+						return ErrLostLease
 					}
 					return nil
 				}
@@ -757,10 +749,41 @@ func (s *Service) processReceived(ctx context.Context, job catalog.EncodingJob) 
 		}
 		return err
 	}
-	if _, err := s.cat.FinishEncoding(ctx, job.Hash, job.Token, "done", "image/webp", "", info.Size()); err != nil {
+	if ok, err := s.cat.FinishEncoding(ctx, job.Hash, job.Token, "done", "image/webp", "", info.Size()); err != nil {
 		return err
+	} else if !ok {
+		return ErrLostLease
 	}
 	return nil
+}
+
+// matchesEncodedFile compares a spooled result with an observed object without
+// allocating a second result-sized buffer on the PUT failure/recovery paths.
+func matchesEncodedFile(file *os.File, data []byte) (bool, error) {
+	buf := make([]byte, 32*1024)
+	for len(data) > 0 {
+		chunk := len(data)
+		if chunk > len(buf) {
+			chunk = len(buf)
+		}
+		_, err := io.ReadFull(file, buf[:chunk])
+		if err != nil {
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+				return false, nil
+			}
+			return false, err
+		}
+		if !bytes.Equal(buf[:chunk], data[:chunk]) {
+			return false, nil
+		}
+		data = data[chunk:]
+	}
+	var extra [1]byte
+	_, err := io.ReadFull(file, extra[:])
+	if err != nil && !errors.Is(err, io.EOF) {
+		return false, err
+	}
+	return errors.Is(err, io.EOF), nil
 }
 
 func (s *Service) removePartialSpools() error {
@@ -822,6 +845,47 @@ func readObject(ctx context.Context, store Store, key string) ([]byte, string, e
 
 func isWebP(data []byte) bool {
 	return len(data) >= 12 && string(data[:4]) == "RIFF" && string(data[8:12]) == "WEBP"
+}
+
+func validateSource(original []byte, hash string) (image.Config, error) {
+	sum := sha256.Sum256(original)
+	if hex.EncodeToString(sum[:]) != hash {
+		return image.Config{}, fmt.Errorf("%w: original bytes no longer match source hash %s", ErrInvalidSource, hash)
+	}
+	config, _, err := image.DecodeConfig(bytes.NewReader(original))
+	if err != nil {
+		return image.Config{}, fmt.Errorf("%w: decode original: %v", ErrInvalidSource, err)
+	}
+	return config, nil
+}
+
+// validateWebP uses the same checks for the in-memory legacy stage and the
+// spooled API upload. It rewinds the reader for the subsequent copy or PUT.
+func validateWebP(encoded io.ReadSeeker, size, sourceSize int64, source image.Config) error {
+	if size <= 0 || size >= sourceSize || size > MaxOutputBytes {
+		return ErrInvalidOutput
+	}
+	header := make([]byte, 12)
+	if _, err := io.ReadFull(encoded, header); err != nil || !isWebP(header) {
+		return ErrInvalidOutput
+	}
+	if _, err := encoded.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf("rewind encoded output: %w", err)
+	}
+	config, _, err := image.DecodeConfig(encoded)
+	if err != nil || config.Width != source.Width || config.Height != source.Height {
+		return ErrInvalidOutput
+	}
+	if _, err := encoded.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf("rewind encoded output: %w", err)
+	}
+	if _, _, err := image.Decode(encoded); err != nil {
+		return fmt.Errorf("%w: decode WebP output: %v", ErrInvalidOutput, err)
+	}
+	if _, err := encoded.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf("rewind encoded output: %w", err)
+	}
+	return nil
 }
 
 // Complete validates a worker result. "uploaded" is the only result that
@@ -902,13 +966,12 @@ func (s *Service) Complete(ctx context.Context, hash, token, outcome, detail str
 		}
 		return "skipped", nil
 	}
-	sum := sha256.Sum256(original)
-	if hex.EncodeToString(sum[:]) != hash {
-		return "", fmt.Errorf("original bytes no longer match source hash %s", hash)
+	if int64(len(original)) != originalInfo.Size {
+		return "", fmt.Errorf("original blob size changed for %s", hash)
 	}
-	originalConfig, _, err := image.DecodeConfig(bytes.NewReader(original))
+	originalConfig, err := validateSource(original, hash)
 	if err != nil {
-		return "", fmt.Errorf("decode original: %w", err)
+		return "", err
 	}
 	stagedInfo, exists, err := s.store.StatObject(ctx, job.StageKey)
 	if err != nil {
@@ -917,23 +980,19 @@ func (s *Service) Complete(ctx context.Context, hash, token, outcome, detail str
 	if !exists {
 		return "", fmt.Errorf("staged output missing: %s", job.StageKey)
 	}
-	if stagedInfo.Size >= int64(len(original)) || stagedInfo.Size <= 0 {
+	// Reject oversized staged objects before downloading them into memory.
+	if stagedInfo.Size <= 0 || stagedInfo.Size >= int64(len(original)) || stagedInfo.Size > MaxOutputBytes {
 		return "", ErrInvalidOutput
 	}
 	encoded, _, err := readObject(ctx, s.store, job.StageKey)
 	if err != nil {
 		return "", err
 	}
-	if !isWebP(encoded) || int64(len(encoded)) != stagedInfo.Size {
+	if int64(len(encoded)) != stagedInfo.Size {
 		return "", ErrInvalidOutput
 	}
-	encodedConfig, _, err := image.DecodeConfig(bytes.NewReader(encoded))
-	if err != nil || encodedConfig.Width != originalConfig.Width || encodedConfig.Height != originalConfig.Height {
-		return "", ErrInvalidOutput
-	}
-	// A full decode catches truncated output whose header alone looks valid.
-	if _, _, err := image.Decode(bytes.NewReader(encoded)); err != nil {
-		return "", fmt.Errorf("decode WebP output: %w", err)
+	if err := validateWebP(bytes.NewReader(encoded), stagedInfo.Size, int64(len(original)), originalConfig); err != nil {
+		return "", err
 	}
 	currentInfo, exists, err := s.store.StatObject(ctx, key)
 	if err != nil {
@@ -956,8 +1015,10 @@ func (s *Service) Complete(ctx context.Context, hash, token, outcome, detail str
 		// it after the grace period instead of prematurely retrying the blob.
 		current, _, readErr := readObject(ctx, s.store, key)
 		if readErr == nil && isWebP(current) {
-			if _, finishErr := s.cat.FinishEncoding(ctx, hash, token, "done", "image/webp", "", int64(len(current))); finishErr != nil {
+			if ok, finishErr := s.cat.FinishEncoding(ctx, hash, token, "done", "image/webp", "", int64(len(current))); finishErr != nil {
 				return "", fmt.Errorf("copy staged output: %w (finish observed replacement: %v)", err, finishErr)
+			} else if !ok {
+				return "", ErrLostLease
 			}
 			if deleteErr := s.store.DeleteObjects(ctx, []string{job.StageKey}); deleteErr != nil {
 				log.Printf("encoding: delete staged %s: %v", job.StageKey, deleteErr)
@@ -969,8 +1030,10 @@ func (s *Service) Complete(ctx context.Context, hash, token, outcome, detail str
 		}
 		return "", err
 	}
-	if _, err := s.cat.FinishEncoding(ctx, hash, token, "done", "image/webp", "", int64(len(encoded))); err != nil {
+	if ok, err := s.cat.FinishEncoding(ctx, hash, token, "done", "image/webp", "", int64(len(encoded))); err != nil {
 		return "", err
+	} else if !ok {
+		return "", ErrLostLease
 	}
 	if err := s.store.DeleteObjects(ctx, []string{job.StageKey}); err != nil {
 		log.Printf("encoding: delete staged %s: %v", job.StageKey, err)
@@ -991,7 +1054,7 @@ func (s *Service) Recover(ctx context.Context) error {
 	started := s.started
 	s.startMu.Unlock()
 	if started {
-		return s.scheduleReceived(ctx)
+		return s.scheduleSpoolOutputs(ctx)
 	}
 	return nil
 }
@@ -1003,6 +1066,15 @@ func (s *Service) reconcileExpiredCommits(ctx context.Context) error {
 	}
 	for _, job := range jobs {
 		if time.Now().Before(job.LeaseUntil) {
+			continue
+		}
+		// A large conditional PUT can outlive the grace window. Its processor
+		// owns reconciliation; the periodic scan must not reset the row while
+		// that PUT is still using the validated spool file.
+		s.queueMu.Lock()
+		_, active := s.queued[jobKey(job.Hash, job.Token)]
+		s.queueMu.Unlock()
+		if active {
 			continue
 		}
 		if err := s.reconcileCommit(ctx, job); err != nil {
@@ -1020,12 +1092,38 @@ func (s *Service) reconcileCommit(ctx context.Context, job catalog.EncodingJob) 
 		return err
 	}
 	if isWebP(data) {
-		if _, err := s.cat.FinishEncoding(ctx, job.Hash, job.Token, "done", "image/webp", "", int64(len(data))); err != nil {
+		// API uploads still have a local spool after an ambiguous PUT. Unlike a
+		// legacy copy, we can distinguish our output from another WebP written
+		// to the same key while the commit was in flight.
+		file, openErr := os.Open(s.spoolPath(job.Hash, job.Token))
+		if openErr == nil {
+			match, compareErr := matchesEncodedFile(file, data)
+			_ = file.Close()
+			if compareErr != nil {
+				return compareErr
+			}
+			if !match {
+				return s.resetCommit(ctx, job)
+			}
+		} else if errors.Is(openErr, os.ErrNotExist) && job.StageKey == "" {
+			// The API spool was lost. A WebP at this key may be somebody else's;
+			// retry the job rather than counting an unverified replacement.
+			return s.resetCommit(ctx, job)
+		} else if !errors.Is(openErr, os.ErrNotExist) {
+			return openErr
+		}
+		if ok, err := s.cat.FinishEncoding(ctx, job.Hash, job.Token, "done", "image/webp", "", int64(len(data))); err != nil {
 			return err
+		} else if !ok {
+			return ErrLostLease
 		}
 		_ = os.Remove(s.spoolPath(job.Hash, job.Token))
 		return nil
 	}
+	return s.resetCommit(ctx, job)
+}
+
+func (s *Service) resetCommit(ctx context.Context, job catalog.EncodingJob) error {
 	if err := s.cat.ResetCommittingEncoding(ctx, job.Hash, job.Token); err != nil {
 		return err
 	}

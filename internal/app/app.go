@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"path/filepath"
 	"time"
 
 	"viewer/internal/admin"
@@ -99,7 +100,7 @@ func Run(ctx context.Context) error {
 	defer cat.Close()
 	var encodingService *encoding.Service
 	if cfg.WebPEncodingEnabled {
-		encodingService = encoding.New(cat, store)
+		encodingService = encoding.New(cat, store, filepath.Join(cfg.StateDir, "encoding-spool"))
 		if err := encodingService.Start(ctx); err != nil {
 			return fmt.Errorf("start WebP encoding: %w", err)
 		}
@@ -186,8 +187,10 @@ func Run(ctx context.Context) error {
 					log.Printf("viewer: scheduled catalog backup failed: %v", err)
 				}
 				if encodingService != nil {
-					if err := encodingService.Recover(ctx); err != nil {
-						log.Printf("viewer: scheduled encoding recovery failed: %v", err)
+					// Commit reconciliation runs every 30 seconds in the encoder;
+					// only legacy staging objects need the hourly cleanup.
+					if err := encodingService.Cleanup(ctx); err != nil {
+						log.Printf("viewer: scheduled encoding cleanup failed: %v", err)
 					}
 				}
 			}

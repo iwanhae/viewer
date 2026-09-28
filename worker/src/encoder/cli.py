@@ -37,10 +37,7 @@ def parser() -> argparse.ArgumentParser:
 
 class EncoderClient(ViewerClient):
     def claim(self, limit: int) -> list[dict]:
-        claimed = self._post("/api/encoding/claim", {"limit": limit, "outputMode": "api"}).json()["claimed"]
-        # Keep accepting the legacy field during rollout, but the encoder now
-        # submits output through the authenticated API instead of that URL.
-        return [{key: value for key, value in job.items() if key != "putUrl"} for job in claimed]
+        return self._post("/api/encoding/claim", {"limit": limit, "outputMode": "api"}).json()["claimed"]
 
     def renew(self, job: dict) -> None:
         self._post("/api/encoding/renew", {

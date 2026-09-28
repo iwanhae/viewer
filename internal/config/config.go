@@ -80,9 +80,10 @@ type Config struct {
 	// it explicitly rather than relying on the false zero value.
 	S3UsePathStyle bool
 
-	// StateDir holds the SQLite catalog. It is the one directory that has to
-	// survive a container replacement: the album-to-photo mapping exists
-	// nowhere else, and staged zips are deleted after extraction, so albums
+	// StateDir holds the SQLite catalog and the bounded encoder spool. It is
+	// the one directory that has to survive a container replacement: the
+	// album-to-photo mapping exists nowhere else, and staged zips are deleted
+	// after extraction, so albums
 	// cannot be reconstructed from the blobs in S3. Everything else the
 	// process writes - the staged zip being unpacked - goes to the OS temp
 	// directory, because the bucket still holds the original.

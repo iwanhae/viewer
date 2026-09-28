@@ -16,12 +16,12 @@ Self-hosted photo album server. Upload a zip of photos; the server stores each i
 
 ## Architecture
 
-Object keys live under `uploads/` (staged zips), `blobs/` (image payloads), and `backups/` (catalog snapshots). The `encoding/` object prefix is retained only as a legacy compatibility path during the mixed-worker rollout; new encoder workers stream results to the API instead. The API temporarily spools each result under `/tmp`, then bounded background processing validates it and writes the accepted WebP to S3 with `Put`. Catalog metadata and queue state live in SQLite.
+Object keys live under `uploads/` (staged zips), `blobs/` (image payloads), and `backups/` (catalog snapshots). The `encoding/` object prefix is retained only as a legacy compatibility path during the mixed-worker rollout; new encoder workers stream results to the API instead. The API spools each result under `$STATE_DIR/encoding-spool`, then bounded background processing validates it and conditionally writes the accepted WebP to S3. Catalog metadata and queue state live in SQLite.
 
 1. `POST /api/albums` registers a QUEUED album and returns a presigned PUT for `uploads/<albumId>.zip`; the browser uploads the zip straight to object storage.
 2. `POST /api/albums/<id>/finalize` queues extraction.
 3. A single-slot worker downloads the zip and stores every image as `blobs/<sha256>`, recording entry name, hash, width, and height in SQLite.
-4. External WebP encoder workers stream results back to the API. Results are temporarily spooled under `/tmp`, asynchronously validated, and written to the original `blobs/<sha256>` key with S3 `Put`; only then is encoding marked complete. The `encoding/` object prefix remains available only for legacy workers during the mixed-worker rollout.
+4. External WebP encoder workers stream results back to the API. Results are spooled under `$STATE_DIR/encoding-spool`, asynchronously validated, and conditionally written to the original `blobs/<sha256>` key; only then is encoding marked complete. The `encoding/` object prefix remains available only for legacy workers during the mixed-worker rollout.
 5. Embedding workers — the built-in GoMLX one in-process, plus optional external ones — embed pending blobs and write vectors to Qdrant; the catalog keeps only embedding status.
 6. Image requests resolve `(albumId, index)` to a blob hash and stream `blobs/<hash>` from S3, served with a response-byte `ETag` and `Cache-Control: public, max-age=86400`.
 
@@ -79,7 +79,7 @@ The viewer is deployed as a Docker image, and every setting is an environment va
 | `S3_SECRET_KEY` | yes | — | Secret key. |
 | `S3_PREFIX` | no | (empty) | Key prefix so several deployments can share one bucket; surrounding slashes are trimmed. Objects become `<prefix>/uploads/...`, `<prefix>/blobs/...`, `<prefix>/backups/...`. |
 | `S3_USE_PATH_STYLE` | no | `true` | `true` addresses the bucket in the request path (`https://host/bucket/key` — what self-hosted stores expect); `false` uses a subdomain (`https://bucket.host/key`, needs wildcard DNS). |
-| `STATE_DIR` | no | `/var/lib/viewer` | Absolute directory holding the SQLite catalog (`viewer.db`) and the backup stamp. Must be an absolute path. Mount a volume here — the album-to-photo mapping cannot be rebuilt from the blobs. |
+| `STATE_DIR` | no | `/var/lib/viewer` | Absolute directory holding the SQLite catalog (`viewer.db`), backup stamp, and a bounded encoder spool (`encoding-spool/`, up to 2 GiB). Must be an absolute path. Mount a volume here — the album-to-photo mapping cannot be rebuilt from the blobs. |
 | `PORT` | no | `8080` | HTTP listen port. |
 | `QDRANT_URL` | no | (empty) | Base URL of the Qdrant server's REST API; must be an http/https URL with a host. Setting it turns photo recommendations on; leaving it empty runs the viewer without a vector store. |
 | `QDRANT_API_KEY` | no | (empty) | Sent as the `api-key` header on every Qdrant request. Sent only when set, so an unauthenticated server needs no placeholder. |
@@ -113,14 +113,16 @@ Notes:
 | GET | `/api/photos/search?q=&limit=` | Best photo per album for a natural-language description; requires `QDRANT_URL`. |
 | POST | `/api/photos/search-by-image` | Best photo per album for an uploaded picture; requires `QDRANT_URL`. |
 | POST | `/api/embedding/claim`, `/renew`, `/results` | External embedding-worker lease API (bearer-token when `WORKER_TOKEN` is set). |
-| POST | `/api/encoding/claim`, `/renew`, `/complete`, `/output` | External WebP encoder lease/result API, enabled when `WORKER_TOKEN` is set. New workers request `outputMode: "api"`; result streams go to `/output`, are temporarily spooled under `/tmp`, and are asynchronously validated before an S3 `Put`. Claims without that mode retain the legacy presigned-PUT contract during rollout. |
+| POST | `/api/encoding/claim`, `/renew`, `/complete`, `/output` | External WebP encoder lease/result API, enabled when `WORKER_TOKEN` is set. New workers request `outputMode: "api"`; result streams go to `/output`, are spooled under `$STATE_DIR/encoding-spool`, and are asynchronously validated before a conditional S3 write. Claims without that mode retain the legacy presigned-PUT contract during rollout. |
 | GET | `/admin` | Dashboard (library, embedding and WebP encoding stats + re-embed trigger); enabled only when `ADMIN_TOKEN` is set. |
 
 For an encoder rollout, deploy the API server before upgrading workers; old
 workers remain supported by the legacy claim mode. Do not roll back to a server
 version that predates API output uploads while catalog jobs are in `received`
 or `committing`: that version cannot finish those server-owned jobs. The API
-accepts at most 1 GiB per result, and retains a bounded two-result `/tmp` spool.
+accepts at most 1 GiB per result, and retains a bounded two-result spool on the
+state volume. A `202` confirms a local handoff, not a completed S3
+replacement; if the state volume is lost, missing results are re-queued.
 
 ## External embedding workers
 

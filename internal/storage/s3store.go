@@ -129,6 +129,23 @@ func (s *S3Store) PutObject(ctx context.Context, key string, body io.Reader, con
 	return nil
 }
 
+// PutObjectIfMatch replaces a blob only while its current ETag still matches
+// the source that was validated. A concurrent source restoration must not be
+// overwritten by an encoder whose validation ran against older bytes.
+func (s *S3Store) PutObjectIfMatch(ctx context.Context, key string, body io.Reader, contentType, etag string) error {
+	_, err := s.client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket:      aws.String(s.bucket),
+		Key:         aws.String(s.physicalKey(key)),
+		Body:        body,
+		ContentType: aws.String(contentType),
+		IfMatch:     aws.String(etag),
+	})
+	if err != nil {
+		return fmt.Errorf("put object %s if unchanged: %w", key, err)
+	}
+	return nil
+}
+
 // CopyObjectIfMatch promotes a validated staging object without moving its
 // bytes through the API server. The source ETag guards against a late rewrite
 // through a still-valid presigned staging URL.

@@ -167,12 +167,11 @@ func (s *Store) RenewEncoding(ctx context.Context, hash, token string, ttl time.
 // MarkEncodingReceived moves an active encoder lease into the received queue.
 // Only the current, unexpired lease owner can hand off the result for
 // background validation.
-func (s *Store) MarkEncodingReceived(ctx context.Context, hash, token string, ttl time.Duration) (bool, error) {
+func (s *Store) MarkEncodingReceived(ctx context.Context, hash, token string) (bool, error) {
 	now := time.Now()
-	leaseUntil := now.Add(ttl)
-	result, err := s.db.ExecContext(ctx, `UPDATE blobs SET encoding_status='received', encoding_lease_until=?
+	result, err := s.db.ExecContext(ctx, `UPDATE blobs SET encoding_status='received', encoding_stage_key='', encoding_lease_until=0
 		WHERE hash=? AND encoding_token=? AND encoding_status='leased' AND encoding_lease_until>=?`,
-		leaseUntil.UnixMilli(), hash, token, now.UnixMilli())
+		hash, token, now.UnixMilli())
 	if err != nil {
 		return false, err
 	}

@@ -48,7 +48,7 @@ class EncoderProtocolTests(unittest.TestCase):
         self.assertEqual(request.headers["x-encoding-token"], "lease-secret")
         self.assertEqual(request.content, payload)
 
-    def test_claim_and_renew_ignore_legacy_put_urls(self):
+    def test_claim_and_renew_do_not_use_legacy_put_urls(self):
         requests = []
 
         def handle(request: httpx.Request) -> httpx.Response:
@@ -79,7 +79,7 @@ class EncoderProtocolTests(unittest.TestCase):
         finally:
             api._client.close()
 
-        self.assertNotIn("putUrl", jobs[0])
+        self.assertIn("putUrl", jobs[0])  # A mixed rollout may include it; the worker ignores it.
         self.assertIsNone(renewed)
         self.assertEqual([request.url.path for request in requests], [
             "/api/encoding/claim", "/api/encoding/renew",

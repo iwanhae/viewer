@@ -31,6 +31,7 @@ type memoryStore struct {
 	types                       map[string]string
 	copyReturnsErrorBeforeWrite bool
 	copyReturnsErrorAfterWrite  bool
+	putReturnsErrorAfterWrite   bool
 	putStarted                  chan struct{}
 	putRelease                  chan struct{}
 	putFinished                 chan struct{}
@@ -53,7 +54,7 @@ func (m *memoryStore) PresignGet(_ context.Context, key string, _ time.Duration)
 func (m *memoryStore) PresignPut(_ context.Context, key string, _ time.Duration) (string, error) {
 	return "memory://" + key, nil
 }
-func (m *memoryStore) PutObject(_ context.Context, key string, body io.Reader, contentType string) error {
+func (m *memoryStore) PutObjectIfMatch(ctx context.Context, key string, body io.Reader, contentType, etag string) error {
 	m.putCalls++
 	if m.putStarted != nil {
 		close(m.putStarted)
@@ -61,12 +62,22 @@ func (m *memoryStore) PutObject(_ context.Context, key string, body io.Reader, c
 	if m.putRelease != nil {
 		<-m.putRelease
 	}
+	info, exists, err := m.StatObject(ctx, key)
+	if err != nil {
+		return err
+	}
+	if !exists || info.ETag != etag {
+		return ErrLostLease
+	}
 	data, err := io.ReadAll(body)
 	if err != nil {
 		return err
 	}
 	m.objects[key] = data
 	m.types[key] = contentType
+	if m.putReturnsErrorAfterWrite {
+		return errors.New("put response lost after object replacement")
+	}
 	if m.putFinished != nil {
 		close(m.putFinished)
 	}
@@ -177,8 +188,7 @@ func TestReceivedOutputIsValidatedAndPutAsynchronously(t *testing.T) {
 	store.putStarted = make(chan struct{})
 	store.putRelease = make(chan struct{})
 	store.putFinished = make(chan struct{})
-	svc := New(cat, store)
-	svc.spoolDir = t.TempDir()
+	svc := New(cat, store, t.TempDir())
 	if err := svc.Start(ctx); err != nil {
 		t.Fatalf("start: %v", err)
 	}
@@ -247,8 +257,7 @@ func TestInvalidReceivedOutputResetsWithoutReplacingBlob(t *testing.T) {
 	store := newMemoryStore()
 	store.objects["blobs/"+hash] = source
 	store.types["blobs/"+hash] = "image/png"
-	svc := New(cat, store)
-	svc.spoolDir = t.TempDir()
+	svc := New(cat, store, t.TempDir())
 	if err := svc.Start(ctx); err != nil {
 		t.Fatalf("start: %v", err)
 	}
@@ -269,7 +278,7 @@ func TestInvalidReceivedOutputResetsWithoutReplacingBlob(t *testing.T) {
 	}
 }
 
-func TestStartResetsReceivedOutputWhenTempFileWasLost(t *testing.T) {
+func TestStartResetsReceivedOutputWhenSpoolFileWasLost(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	cat, err := catalog.Open(filepath.Join(t.TempDir(), "catalog.db"), nil)
@@ -284,17 +293,336 @@ func TestStartResetsReceivedOutputWhenTempFileWasLost(t *testing.T) {
 	if err != nil || len(claimed) != 1 {
 		t.Fatalf("claim: jobs=%+v err=%v", claimed, err)
 	}
-	if ok, err := cat.MarkEncodingReceived(ctx, claimed[0].Hash, claimed[0].Token, LeaseTTL); err != nil || !ok {
+	if ok, err := cat.MarkEncodingReceived(ctx, claimed[0].Hash, claimed[0].Token); err != nil || !ok {
 		t.Fatalf("mark received: ok=%v err=%v", ok, err)
 	}
-	svc := New(cat, newMemoryStore())
-	svc.spoolDir = t.TempDir() // models a fresh/cleared OS temp directory
+	svc := New(cat, newMemoryStore(), t.TempDir()) // models a fresh/cleared spool directory
 	if err := svc.Start(ctx); err != nil {
 		t.Fatalf("start: %v", err)
 	}
 	job, err := cat.GetEncodingJob(ctx, claimed[0].Hash)
 	if err != nil || job.Status != "pending" {
-		t.Fatalf("missing /tmp result was not returned to pending: job=%+v err=%v", job, err)
+		t.Fatalf("missing spool result was not returned to pending: job=%+v err=%v", job, err)
+	}
+}
+
+func TestStartRejectsSymlinkedSpool(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "target")
+	if err := os.Mkdir(target, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Stat(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, "spool")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	cat, err := catalog.Open(filepath.Join(t.TempDir(), "catalog.db"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cat.Close()
+	svc := New(cat, newMemoryStore(), link)
+	if err := svc.Start(context.Background()); err == nil {
+		t.Fatal("symlinked spool was accepted")
+	}
+	info, err := os.Stat(target)
+	if err != nil || info.Mode().Perm() != before.Mode().Perm() {
+		t.Fatalf("symlink target was modified: info=%v err=%v", info, err)
+	}
+}
+
+func TestStartProcessesReceivedOutputFromPersistentSpool(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cat, err := catalog.Open(filepath.Join(t.TempDir(), "catalog.db"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cat.Close()
+	source := sourcePNG(t)
+	sum := sha256.Sum256(source)
+	hash := hex.EncodeToString(sum[:])
+	if err := cat.UpsertBlob(ctx, catalog.Blob{Hash: hash, SizeBytes: int64(len(source)), ContentType: "image/png"}); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := cat.ClaimEncoding(ctx, 1, LeaseTTL)
+	if err != nil || len(claimed) != 1 {
+		t.Fatalf("claim: jobs=%+v err=%v", claimed, err)
+	}
+	job := claimed[0]
+	encoded, err := base64.StdEncoding.DecodeString(tinyWebP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spoolDir := filepath.Join(t.TempDir(), "encoding-spool")
+	if err := os.MkdirAll(spoolDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(spoolDir, hash+"_"+job.Token+".webp"), encoded, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := cat.MarkEncodingReceived(ctx, hash, job.Token); err != nil || !ok {
+		t.Fatalf("mark received: ok=%v err=%v", ok, err)
+	}
+	store := newMemoryStore()
+	store.objects["blobs/"+hash] = source
+	store.types["blobs/"+hash] = "image/png"
+	svc := New(cat, store, spoolDir) // a new process reopening the same volume
+	if err := svc.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	waitForEncodingStatus(t, cat, hash, "done")
+	if !bytes.Equal(store.objects["blobs/"+hash], encoded) {
+		t.Fatal("restart did not commit the accepted spool file")
+	}
+}
+
+func TestAmbiguousConditionalPutFinishesOnlyMatchingOutput(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cat, err := catalog.Open(filepath.Join(t.TempDir(), "catalog.db"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cat.Close()
+	source := sourcePNG(t)
+	sum := sha256.Sum256(source)
+	hash := hex.EncodeToString(sum[:])
+	if err := cat.UpsertBlob(ctx, catalog.Blob{Hash: hash, SizeBytes: int64(len(source)), ContentType: "image/png"}); err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := base64.StdEncoding.DecodeString(tinyWebP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := newMemoryStore()
+	store.objects["blobs/"+hash] = source
+	store.types["blobs/"+hash] = "image/png"
+	store.putReturnsErrorAfterWrite = true
+	svc := New(cat, store, t.TempDir())
+	if err := svc.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := svc.ClaimForAPI(ctx, 1)
+	if err != nil || len(claimed) != 1 {
+		t.Fatalf("claim: jobs=%+v err=%v", claimed, err)
+	}
+	if err := svc.ReceiveOutput(ctx, hash, claimed[0].Token, bytes.NewReader(encoded)); err != nil {
+		t.Fatal(err)
+	}
+	waitForEncodingStatus(t, cat, hash, "done")
+	if store.putCalls != 1 || !bytes.Equal(store.objects["blobs/"+hash], encoded) {
+		t.Fatalf("ambiguous PUT did not finalize the observed output: calls=%d", store.putCalls)
+	}
+}
+
+func TestConditionalPutDoesNotOverwriteRestoredSource(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cat, err := catalog.Open(filepath.Join(t.TempDir(), "catalog.db"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cat.Close()
+	source := sourcePNG(t)
+	sum := sha256.Sum256(source)
+	hash := hex.EncodeToString(sum[:])
+	if err := cat.UpsertBlob(ctx, catalog.Blob{Hash: hash, SizeBytes: int64(len(source)), ContentType: "image/png"}); err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := base64.StdEncoding.DecodeString(tinyWebP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := newMemoryStore()
+	key := "blobs/" + hash
+	store.objects[key] = source
+	store.types[key] = "image/png"
+	store.putStarted = make(chan struct{})
+	store.putRelease = make(chan struct{})
+	svc := New(cat, store, t.TempDir())
+	if err := svc.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := svc.ClaimForAPI(ctx, 1)
+	if err != nil || len(claimed) != 1 {
+		t.Fatalf("claim: jobs=%+v err=%v", claimed, err)
+	}
+	job := claimed[0]
+	if err := svc.ReceiveOutput(ctx, hash, job.Token, bytes.NewReader(encoded)); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-store.putStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("background PUT did not start")
+	}
+	restored := append(bytes.Clone(source), []byte("new source version")...)
+	store.objects[key] = restored
+	if err := cat.UpsertBlob(ctx, catalog.Blob{Hash: hash, SizeBytes: int64(len(restored)), ContentType: "image/png", SourceRestored: true}); err != nil {
+		t.Fatal(err)
+	}
+	close(store.putRelease)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(svc.spoolPath(hash, job.Token)); errors.Is(err, os.ErrNotExist) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("stale upload was not discarded")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	current := waitForEncodingStatus(t, cat, hash, "pending")
+	if current.Token != "" || !bytes.Equal(store.objects[key], restored) || store.putCalls != 1 {
+		t.Fatalf("stale output replaced restored source: job=%+v putCalls=%d", current, store.putCalls)
+	}
+}
+
+func TestRecoveryRejectsDifferentWebPWhenSpoolExists(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(filepath.Join(t.TempDir(), "catalog.db"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cat.Close()
+	source := sourcePNG(t)
+	sum := sha256.Sum256(source)
+	hash := hex.EncodeToString(sum[:])
+	if err := cat.UpsertBlob(ctx, catalog.Blob{Hash: hash, SizeBytes: int64(len(source)), ContentType: "image/png"}); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := cat.ClaimEncoding(ctx, 1, LeaseTTL)
+	if err != nil || len(claimed) != 1 {
+		t.Fatalf("claim: jobs=%+v err=%v", claimed, err)
+	}
+	job := claimed[0]
+	if ok, err := cat.MarkEncodingReceived(ctx, hash, job.Token); err != nil || !ok {
+		t.Fatalf("mark received: ok=%v err=%v", ok, err)
+	}
+	if ok, err := cat.BeginEncodingCommit(ctx, hash, job.Token, int64(len(source)), 0); err != nil || !ok {
+		t.Fatalf("begin commit: ok=%v err=%v", ok, err)
+	}
+	encoded, err := base64.StdEncoding.DecodeString(tinyWebP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spoolDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(spoolDir, hash+"_"+job.Token+".webp"), encoded, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store := newMemoryStore()
+	otherWebP := append(bytes.Clone(encoded), 0)
+	store.objects["blobs/"+hash] = otherWebP
+	store.types["blobs/"+hash] = "image/webp"
+	svc := New(cat, store, spoolDir)
+	if err := svc.Recover(ctx); err != nil {
+		t.Fatal(err)
+	}
+	current := waitForEncodingStatus(t, cat, hash, "pending")
+	if current.Token != "" || !bytes.Equal(store.objects["blobs/"+hash], otherWebP) {
+		t.Fatalf("mismatched WebP was counted as our output: %+v", current)
+	}
+	// If the local spool is lost entirely, the empty API stage key still
+	// distinguishes this from a legacy copy and prevents a false conversion.
+	claimed, err = cat.ClaimEncoding(ctx, 1, LeaseTTL)
+	if err != nil || len(claimed) != 1 {
+		t.Fatalf("reclaim: jobs=%+v err=%v", claimed, err)
+	}
+	job = claimed[0]
+	if ok, err := cat.MarkEncodingReceived(ctx, hash, job.Token); err != nil || !ok {
+		t.Fatalf("mark received again: ok=%v err=%v", ok, err)
+	}
+	if ok, err := cat.BeginEncodingCommit(ctx, hash, job.Token, int64(len(source)), 0); err != nil || !ok {
+		t.Fatalf("begin commit again: ok=%v err=%v", ok, err)
+	}
+	if err := svc.Recover(ctx); err != nil {
+		t.Fatal(err)
+	}
+	waitForEncodingStatus(t, cat, hash, "pending")
+}
+
+func TestPeriodicRecoveryDoesNotInterruptActiveCommit(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(filepath.Join(t.TempDir(), "catalog.db"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cat.Close()
+	hash := strings.Repeat("a", 64)
+	if err := cat.UpsertBlob(ctx, catalog.Blob{Hash: hash, SizeBytes: 200, ContentType: "image/png"}); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := cat.ClaimEncoding(ctx, 1, LeaseTTL)
+	if err != nil || len(claimed) != 1 {
+		t.Fatalf("claim: jobs=%+v err=%v", claimed, err)
+	}
+	job := claimed[0]
+	if ok, err := cat.MarkEncodingReceived(ctx, hash, job.Token); err != nil || !ok {
+		t.Fatalf("mark received: ok=%v err=%v", ok, err)
+	}
+	if ok, err := cat.BeginEncodingCommit(ctx, hash, job.Token, 200, 0); err != nil || !ok {
+		t.Fatalf("begin commit: ok=%v err=%v", ok, err)
+	}
+	store := newMemoryStore()
+	store.objects["blobs/"+hash] = []byte("unreplaced original")
+	svc := New(cat, store, t.TempDir())
+	svc.queued[jobKey(hash, job.Token)] = struct{}{}
+	if err := svc.Recover(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if current, err := cat.GetEncodingJob(ctx, hash); err != nil || current.Status != "committing" {
+		t.Fatalf("active commit was reset: job=%+v err=%v", current, err)
+	}
+	delete(svc.queued, jobKey(hash, job.Token))
+	if err := svc.Recover(ctx); err != nil {
+		t.Fatal(err)
+	}
+	waitForEncodingStatus(t, cat, hash, "pending")
+}
+
+func TestRecoveredCommittingFilesCountTowardSpoolCapacity(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cat, err := catalog.Open(filepath.Join(t.TempDir(), "catalog.db"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cat.Close()
+	for _, char := range []string{"a", "b", "c"} {
+		if err := cat.UpsertBlob(ctx, catalog.Blob{Hash: strings.Repeat(char, 64), SizeBytes: 200, ContentType: "image/png"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	jobs, err := cat.ClaimEncoding(ctx, 3, LeaseTTL)
+	if err != nil || len(jobs) != 3 {
+		t.Fatalf("claim: jobs=%+v err=%v", jobs, err)
+	}
+	spoolDir := t.TempDir()
+	for _, job := range jobs[:2] {
+		if ok, err := cat.MarkEncodingReceived(ctx, job.Hash, job.Token); err != nil || !ok {
+			t.Fatalf("mark received: ok=%v err=%v", ok, err)
+		}
+		if ok, err := cat.BeginEncodingCommit(ctx, job.Hash, job.Token, 200, time.Hour); err != nil || !ok {
+			t.Fatalf("begin commit: ok=%v err=%v", ok, err)
+		}
+		if err := os.WriteFile(filepath.Join(spoolDir, job.Hash+"_"+job.Token+".webp"), []byte("spooled"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	svc := New(cat, newMemoryStore(), spoolDir)
+	if err := svc.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(svc.spoolSlots) != outputProcessors {
+		t.Fatalf("recovered committing files reserved %d of %d slots", len(svc.spoolSlots), outputProcessors)
+	}
+	if err := svc.ReceiveOutput(ctx, jobs[2].Hash, jobs[2].Token, strings.NewReader("new result")); !errors.Is(err, ErrSpoolBusy) {
+		t.Fatalf("new upload with a full recovered spool: %v, want ErrSpoolBusy", err)
 	}
 }
 
@@ -325,7 +653,7 @@ func TestEncodingCommitAndDuplicateUpload(t *testing.T) {
 	if pending, err := cat.ClaimPendingEmbeddings(ctx, 1, time.Now().Add(time.Minute)); err != nil || len(pending) != 0 {
 		t.Fatalf("new image embedded before encoding: %+v %v", pending, err)
 	}
-	svc := New(cat, store)
+	svc := New(cat, store, t.TempDir())
 	claimed, err := svc.Claim(ctx, 1)
 	if err != nil || len(claimed) != 1 {
 		t.Fatalf("claim: %v %+v", err, claimed)
@@ -388,7 +716,7 @@ func TestEncodingReconcilesAmbiguousCopyError(t *testing.T) {
 	key := "blobs/" + hash
 	store.objects[key] = source
 	store.types[key] = "image/png"
-	svc := New(cat, store)
+	svc := New(cat, store, t.TempDir())
 	claimed, err := svc.Claim(ctx, 1)
 	if err != nil || len(claimed) != 1 {
 		t.Fatalf("claim: err=%v claimed=%+v", err, claimed)
@@ -437,7 +765,7 @@ func TestEncodingKeepsCommitLeasedWhenCopyIsNotYetVisible(t *testing.T) {
 	store.objects[key] = source
 	store.types[key] = "image/png"
 	store.copyReturnsErrorBeforeWrite = true
-	svc := New(cat, store)
+	svc := New(cat, store, t.TempDir())
 	claimed, err := svc.Claim(ctx, 1)
 	if err != nil || len(claimed) != 1 {
 		t.Fatalf("claim: err=%v claimed=%+v", err, claimed)
@@ -495,11 +823,11 @@ func TestAlreadyWebPClaimIsExcludedFromConversionSavings(t *testing.T) {
 	store := newMemoryStore()
 	store.objects["blobs/"+hash] = webp
 	store.types["blobs/"+hash] = "image/webp"
-	claimed, err := New(cat, store).Claim(ctx, 1)
+	claimed, err := New(cat, store, t.TempDir()).Claim(ctx, 1)
 	if err != nil || len(claimed) != 1 {
 		t.Fatalf("claim: err=%v claimed=%+v", err, claimed)
 	}
-	status, err := New(cat, store).Complete(ctx, hash, claimed[0].Token, "uploaded", "")
+	status, err := New(cat, store, t.TempDir()).Complete(ctx, hash, claimed[0].Token, "uploaded", "")
 	if err != nil || status != "skipped" {
 		t.Fatalf("complete already-WebP object: status=%q err=%v", status, err)
 	}
@@ -569,7 +897,7 @@ func TestRecoverCompletedCopy(t *testing.T) {
 	}
 	store := newMemoryStore()
 	store.objects["blobs/"+hash] = encoded
-	if err := New(cat, store).Recover(ctx); err != nil {
+	if err := New(cat, store, t.TempDir()).Recover(ctx); err != nil {
 		t.Fatal(err)
 	}
 	job, err := cat.GetEncodingJob(ctx, hash)
