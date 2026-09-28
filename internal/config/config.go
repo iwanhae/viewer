@@ -41,9 +41,9 @@ const (
 	// MaxUploadBytes caps the staged zip size accepted by POST /api/albums.
 	MaxUploadBytes int64 = 1 << 30 // 1 GiB
 
-	// PresignTTL is how long a presigned URL stays valid - both the zip upload
-	// URL handed to the browser and the blob download URL handed to external
-	// embedding workers on claim.
+	// PresignTTL is how long a presigned URL stays valid: the zip upload URL
+	// handed to the browser, blob download URLs for external workers, and the
+	// legacy encoder result PUT used by workers that omit API-upload mode.
 	PresignTTL = 15 * time.Minute
 
 	// ModelDir is the local directory holding the SigLIP2 vision checkpoint.

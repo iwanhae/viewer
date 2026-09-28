@@ -45,12 +45,12 @@ func (s *Store) EncodingCounts(ctx context.Context) (EncodingCounts, error) {
 	err := s.db.QueryRowContext(ctx, `
 		SELECT
 			COALESCE(SUM(CASE WHEN encoding_status='pending' AND content_type!='image/webp' THEN 1 ELSE 0 END), 0),
-			COALESCE(SUM(CASE WHEN encoding_status IN ('leased','committing') AND content_type!='image/webp' THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN encoding_status IN ('leased','received','committing') AND content_type!='image/webp' THEN 1 ELSE 0 END), 0),
 			COALESCE(SUM(CASE WHEN encoding_status='done' AND encoding_source_size_bytes>size_bytes THEN 1 ELSE 0 END), 0),
 			COALESCE(SUM(CASE WHEN encoding_status='skipped' AND content_type!='image/webp' THEN 1 ELSE 0 END), 0),
 			COALESCE(SUM(CASE WHEN encoding_status='failed' AND content_type!='image/webp' THEN 1 ELSE 0 END), 0),
 			COALESCE(SUM(CASE WHEN encoding_status='skipped' AND content_type='image/webp' THEN 1 ELSE 0 END), 0),
-			COALESCE(SUM(CASE WHEN encoding_status IN ('pending','leased','committing') AND content_type!='image/webp' THEN size_bytes ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN encoding_status IN ('pending','leased','received','committing') AND content_type!='image/webp' THEN size_bytes ELSE 0 END), 0),
 			COALESCE(SUM(CASE WHEN encoding_status='done' AND encoding_source_size_bytes>size_bytes THEN encoding_source_size_bytes ELSE 0 END), 0),
 			COALESCE(SUM(CASE WHEN encoding_status='done' AND encoding_source_size_bytes>size_bytes THEN size_bytes ELSE 0 END), 0)
 		FROM blobs`).Scan(
@@ -164,6 +164,54 @@ func (s *Store) RenewEncoding(ctx context.Context, hash, token string, ttl time.
 	return until, n == 1, err
 }
 
+// MarkEncodingReceived moves an active encoder lease into the received queue.
+// Only the current, unexpired lease owner can hand off the result for
+// background validation.
+func (s *Store) MarkEncodingReceived(ctx context.Context, hash, token string, ttl time.Duration) (bool, error) {
+	now := time.Now()
+	leaseUntil := now.Add(ttl)
+	result, err := s.db.ExecContext(ctx, `UPDATE blobs SET encoding_status='received', encoding_lease_until=?
+		WHERE hash=? AND encoding_token=? AND encoding_status='leased' AND encoding_lease_until>=?`,
+		leaseUntil.UnixMilli(), hash, token, now.UnixMilli())
+	if err != nil {
+		return false, err
+	}
+	n, err := result.RowsAffected()
+	return n == 1, err
+}
+
+// ReceivedEncodings lists encoder results awaiting background validation.
+// Received jobs are deliberately not reclaimed by ClaimEncoding; they remain
+// owned by their token until committed or explicitly reset.
+func (s *Store) ReceivedEncodings(ctx context.Context) ([]EncodingJob, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT hash, size_bytes, content_type, encoding_status, encoding_token, encoding_stage_key, encoding_lease_until
+		FROM blobs WHERE encoding_status='received'`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var jobs []EncodingJob
+	for rows.Next() {
+		var job EncodingJob
+		var lease int64
+		if err := rows.Scan(&job.Hash, &job.SizeBytes, &job.Type, &job.Status, &job.Token, &job.StageKey, &lease); err != nil {
+			return nil, err
+		}
+		job.LeaseUntil = time.UnixMilli(lease)
+		jobs = append(jobs, job)
+	}
+	return jobs, rows.Err()
+}
+
+// ResetReceivedEncoding returns an uncommitted received result to the pending
+// queue when validation or upload cannot proceed. The token prevents an older
+// receiver from resetting a newer job.
+func (s *Store) ResetReceivedEncoding(ctx context.Context, hash, token string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE blobs SET encoding_status='pending', encoding_token='', encoding_stage_key='', encoding_lease_until=0
+		WHERE hash=? AND encoding_token=? AND encoding_status='received'`, hash, token)
+	return err
+}
+
 // BeginEncodingCommit records the validated source size before the object
 // replacement and keeps the commit leased for reconcileAfter. Recover waits
 // for that lease to expire so an accepted but not-yet-visible object-store copy
@@ -171,7 +219,7 @@ func (s *Store) RenewEncoding(ctx context.Context, hash, token string, ttl time.
 func (s *Store) BeginEncodingCommit(ctx context.Context, hash, token string, sourceSize int64, reconcileAfter time.Duration) (bool, error) {
 	leaseUntil := time.Now().Add(reconcileAfter)
 	result, err := s.db.ExecContext(ctx, `UPDATE blobs SET encoding_status='committing', encoding_source_size_bytes=?, encoding_lease_until=?
-		WHERE hash=? AND encoding_token=? AND encoding_status='leased' AND encoding_lease_until>=?`,
+		WHERE hash=? AND encoding_token=? AND ((encoding_status='leased' AND encoding_lease_until>=?) OR encoding_status='received')`,
 		sourceSize, leaseUntil.UnixMilli(), hash, token, time.Now().UnixMilli())
 	if err != nil {
 		return false, err
@@ -192,7 +240,7 @@ func (s *Store) FinishEncoding(ctx context.Context, hash, token, status, content
 
 func (s *Store) SkipEncoding(ctx context.Context, hash, token, status, contentType, errorText string, size int64) (bool, error) {
 	result, err := s.db.ExecContext(ctx, `UPDATE blobs SET encoding_status=?, content_type=?, size_bytes=?, encoding_error=?, encoding_lease_until=0, encoding_source_size_bytes=0
-		WHERE hash=? AND encoding_token=? AND encoding_status='leased' AND encoding_lease_until>=?`,
+		WHERE hash=? AND encoding_token=? AND ((encoding_status='leased' AND encoding_lease_until>=?) OR encoding_status='received')`,
 		status, contentType, size, errorText, hash, token, time.Now().UnixMilli())
 	if err != nil {
 		return false, err

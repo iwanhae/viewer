@@ -16,13 +16,14 @@ Self-hosted photo album server. Upload a zip of photos; the server stores each i
 
 ## Architecture
 
-Object keys live under `uploads/` (staged zips), `blobs/` (image payloads), `encoding/` (temporary WebP uploads), and `backups/` (catalog snapshots). Everything else is SQLite.
+Object keys live under `uploads/` (staged zips), `blobs/` (image payloads), and `backups/` (catalog snapshots). The `encoding/` object prefix is retained only as a legacy compatibility path during the mixed-worker rollout; new encoder workers stream results to the API instead. The API temporarily spools each result under `/tmp`, then bounded background processing validates it and writes the accepted WebP to S3 with `Put`. Catalog metadata and queue state live in SQLite.
 
 1. `POST /api/albums` registers a QUEUED album and returns a presigned PUT for `uploads/<albumId>.zip`; the browser uploads the zip straight to object storage.
 2. `POST /api/albums/<id>/finalize` queues extraction.
 3. A single-slot worker downloads the zip and stores every image as `blobs/<sha256>`, recording entry name, hash, width, and height in SQLite.
-4. Embedding workers — the built-in GoMLX one in-process, plus optional external ones — embed pending blobs and write vectors to Qdrant; the catalog keeps only embedding status.
-5. Image requests resolve `(albumId, index)` to a blob hash and stream `blobs/<hash>` from S3, served with a response-byte `ETag` and `Cache-Control: public, max-age=86400`.
+4. External WebP encoder workers stream results back to the API. Results are temporarily spooled under `/tmp`, asynchronously validated, and written to the original `blobs/<sha256>` key with S3 `Put`; only then is encoding marked complete. The `encoding/` object prefix remains available only for legacy workers during the mixed-worker rollout.
+5. Embedding workers — the built-in GoMLX one in-process, plus optional external ones — embed pending blobs and write vectors to Qdrant; the catalog keeps only embedding status.
+6. Image requests resolve `(albumId, index)` to a blob hash and stream `blobs/<hash>` from S3, served with a response-byte `ETag` and `Cache-Control: public, max-age=86400`.
 
 Metadata lives in SQLite at `$STATE_DIR/viewer.db`. The bucket snapshot `backups/viewer.db` is restored at startup when it is newer than the local catalog, so a wiped state volume recovers from the bucket alone. The SigLIP2 checkpoint is fetched at first start into `/app/siglip2`; inference runs in-process, with no separate inference service. A cold start degrades gracefully: the server serves, embeddings wait.
 
@@ -112,8 +113,14 @@ Notes:
 | GET | `/api/photos/search?q=&limit=` | Best photo per album for a natural-language description; requires `QDRANT_URL`. |
 | POST | `/api/photos/search-by-image` | Best photo per album for an uploaded picture; requires `QDRANT_URL`. |
 | POST | `/api/embedding/claim`, `/renew`, `/results` | External embedding-worker lease API (bearer-token when `WORKER_TOKEN` is set). |
-| POST | `/api/encoding/claim`, `/renew`, `/complete` | External WebP encoder lease API, enabled when `WORKER_TOKEN` is set. |
+| POST | `/api/encoding/claim`, `/renew`, `/complete`, `/output` | External WebP encoder lease/result API, enabled when `WORKER_TOKEN` is set. New workers request `outputMode: "api"`; result streams go to `/output`, are temporarily spooled under `/tmp`, and are asynchronously validated before an S3 `Put`. Claims without that mode retain the legacy presigned-PUT contract during rollout. |
 | GET | `/admin` | Dashboard (library, embedding and WebP encoding stats + re-embed trigger); enabled only when `ADMIN_TOKEN` is set. |
+
+For an encoder rollout, deploy the API server before upgrading workers; old
+workers remain supported by the legacy claim mode. Do not roll back to a server
+version that predates API output uploads while catalog jobs are in `received`
+or `committing`: that version cannot finish those server-owned jobs. The API
+accepts at most 1 GiB per result, and retains a bounded two-result `/tmp` spool.
 
 ## External embedding workers
 

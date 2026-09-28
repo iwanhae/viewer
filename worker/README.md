@@ -10,15 +10,25 @@ the encoder host. From `worker/`:
 
 ```sh
 uv sync
-uv run encoder                  # continuous claim -> encode -> complete loop
+uv run encoder                  # continuous claim -> encode -> submit output loop
 uv run encoder --workers 8      # number of concurrent cwebp processes
 ```
 
-The server claims the largest pending source blobs first. The encoder runs
-`cwebp -q 85 -alpha_q 100 -metadata all` and uploads only a smaller output to
-a temporary key. The server validates it before replacing the original blob.
-The output-size check includes copied EXIF, ICC, and XMP metadata. Already
-WebP images and outputs that are not smaller remain untouched.
+The encoder requests the API-upload claim mode, and the server claims the
+largest pending source blobs first. It runs
+`cwebp -q 85 -alpha_q 100 -metadata all` and POSTs only a smaller output as a
+raw `image/webp` body to `/api/encoding/output`, authenticated with the worker
+token and the claimed hash/lease token headers. It does not use the legacy
+`putUrl` returned to workers that omit API-upload mode. A `202` means the API
+accepted the output for asynchronous validation; it does not mean the original
+blob has been replaced. The worker reports accepted submissions separately and
+does not count their bytes as saved. The output-size check includes copied EXIF,
+ICC, and XMP metadata. Already WebP images, unsupported/failed encodes, and
+outputs that are not smaller continue to use `/api/encoding/complete` and
+remain untouched.
+Deploy the API server before upgrading encoder workers. The server still serves
+legacy workers, but an older API server cannot process jobs already handed off
+to its `received` state, so do not roll back while such jobs remain.
 
 ## Recommender
 

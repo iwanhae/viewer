@@ -42,3 +42,11 @@ class ViewerClient:
         except httpx.TransportError as exc:
             raise TransientError(str(exc)) from exc
         return check(response)
+
+    def _post_content(self, path: str, content, headers: dict[str, str]) -> httpx.Response:
+        """POST a raw body using this client's bearer auth and error handling."""
+        try:
+            response = self._client.post(path, content=content, headers=headers)
+        except httpx.TransportError as exc:
+            raise TransientError(str(exc)) from exc
+        return check(response)

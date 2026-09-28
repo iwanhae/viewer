@@ -26,14 +26,15 @@ import (
 )
 
 type Server struct {
-	albums      *albums.Service
-	feed        *feed.Service
-	images      *images.Service
-	recommend   *recommend.Service
-	encoder     *encoding.Service
-	workerToken string
-	admin       *admin.Service
-	adminToken  string
+	albums         *albums.Service
+	feed           *feed.Service
+	images         *images.Service
+	recommend      *recommend.Service
+	encoder        *encoding.Service
+	encodingOutput encodingOutputReceiver
+	workerToken    string
+	admin          *admin.Service
+	adminToken     string
 }
 
 // New wires the API together. An empty workerToken runs the external worker
@@ -57,6 +58,7 @@ func New(albumsService *albums.Service, feedService *feed.Service, imageService 
 // WithEncoder enables the external encoding routes when the feature is on.
 func (s *Server) WithEncoder(service *encoding.Service) *Server {
 	s.encoder = service
+	s.encodingOutput = service
 	return s
 }
 
@@ -98,6 +100,7 @@ func (s *Server) Router() http.Handler {
 			r.Post("/api/encoding/claim", s.claimEncoding)
 			r.Post("/api/encoding/renew", s.renewEncoding)
 			r.Post("/api/encoding/complete", s.completeEncoding)
+			r.Post("/api/encoding/output", s.receiveEncodingOutput)
 		}
 	})
 

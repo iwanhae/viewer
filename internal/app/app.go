@@ -100,8 +100,8 @@ func Run(ctx context.Context) error {
 	var encodingService *encoding.Service
 	if cfg.WebPEncodingEnabled {
 		encodingService = encoding.New(cat, store)
-		if err := encodingService.Recover(ctx); err != nil {
-			return fmt.Errorf("recover WebP encoding: %w", err)
+		if err := encodingService.Start(ctx); err != nil {
+			return fmt.Errorf("start WebP encoding: %w", err)
 		}
 	}
 

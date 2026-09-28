@@ -1,15 +1,26 @@
 package httpapi
 
 import (
+	"context"
 	"errors"
+	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"viewer/internal/encoding"
 )
 
+// encodingOutputReceiver is implemented by the encoding service. Keeping the
+// receiver as a small interface also lets the HTTP handler stay independent of
+// the service's storage details.
+type encodingOutputReceiver interface {
+	ReceiveOutput(ctx context.Context, hash, token string, body io.Reader) error
+}
+
 type encodingClaimRequest struct {
-	Limit int `json:"limit"`
+	Limit      int    `json:"limit"`
+	OutputMode string `json:"outputMode,omitempty"`
 }
 type encodingClaimResponse struct {
 	Claimed []encoding.Claimed `json:"claimed"`
@@ -22,7 +33,17 @@ func (s *Server) claimEncoding(w http.ResponseWriter, r *http.Request) {
 		writeBodyError(w, r, err)
 		return
 	}
-	claimed, err := s.encoder.Claim(r.Context(), req.Limit)
+	var claimed []encoding.Claimed
+	var err error
+	switch req.OutputMode {
+	case "":
+		claimed, err = s.encoder.Claim(r.Context(), req.Limit) // legacy S3 PUT protocol
+	case "api":
+		claimed, err = s.encoder.ClaimForAPI(r.Context(), req.Limit)
+	default:
+		writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", "unsupported encoding output mode")
+		return
+	}
 	if err != nil {
 		writeError(w, r, http.StatusInternalServerError, "INTERNAL", err.Error())
 		return
@@ -31,8 +52,9 @@ func (s *Server) claimEncoding(w http.ResponseWriter, r *http.Request) {
 }
 
 type encodingRenewRequest struct {
-	Hash  string `json:"hash"`
-	Token string `json:"token"`
+	Hash       string `json:"hash"`
+	Token      string `json:"token"`
+	OutputMode string `json:"outputMode,omitempty"`
 }
 
 func (s *Server) renewEncoding(w http.ResponseWriter, r *http.Request) {
@@ -46,6 +68,26 @@ func (s *Server) renewEncoding(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", "hash and token are required")
 		return
 	}
+	if req.OutputMode == "api" {
+		until, err := s.encoder.RenewLease(r.Context(), req.Hash, req.Token)
+		if errors.Is(err, encoding.ErrLostLease) {
+			writeError(w, r, http.StatusConflict, "LOST_LEASE", err.Error())
+			return
+		}
+		if err != nil {
+			writeError(w, r, http.StatusInternalServerError, "INTERNAL", err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, struct {
+			LeaseUntil time.Time `json:"leaseUntil"`
+			OutputMode string    `json:"outputMode"`
+		}{until, "api"})
+		return
+	}
+	if req.OutputMode != "" {
+		writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", "unsupported encoding output mode")
+		return
+	}
 	until, url, err := s.encoder.Renew(r.Context(), req.Hash, req.Token)
 	if errors.Is(err, encoding.ErrLostLease) {
 		writeError(w, r, http.StatusConflict, "LOST_LEASE", err.Error())
@@ -56,8 +98,8 @@ func (s *Server) renewEncoding(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, struct {
-		LeaseUntil any    `json:"leaseUntil"`
-		PutURL     string `json:"putUrl"`
+		LeaseUntil time.Time `json:"leaseUntil"`
+		PutURL     string    `json:"putUrl"`
 	}{until, url})
 }
 
@@ -99,4 +141,41 @@ func (s *Server) completeEncoding(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, struct {
 		Status string `json:"status"`
 	}{status})
+}
+
+func (s *Server) receiveEncodingOutput(w http.ResponseWriter, r *http.Request) {
+	hash := r.Header.Get("X-Encoding-Hash")
+	token := r.Header.Get("X-Encoding-Token")
+	if strings.TrimSpace(hash) == "" || strings.TrimSpace(token) == "" {
+		writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", "encoding hash and token are required")
+		return
+	}
+	if s.encodingOutput == nil {
+		writeError(w, r, http.StatusServiceUnavailable, "UNAVAILABLE", "encoding output receiver is not available")
+		return
+	}
+
+	if err := s.encodingOutput.ReceiveOutput(r.Context(), hash, token, r.Body); err != nil {
+		if errors.Is(err, encoding.ErrLostLease) {
+			writeError(w, r, http.StatusConflict, "LOST_LEASE", err.Error())
+			return
+		}
+		if errors.Is(err, encoding.ErrInvalidOutput) {
+			writeError(w, r, http.StatusUnprocessableEntity, "INVALID_OUTPUT", err.Error())
+			return
+		}
+		if errors.Is(err, encoding.ErrOutputTooLarge) {
+			writeError(w, r, http.StatusRequestEntityTooLarge, "OUTPUT_TOO_LARGE", err.Error())
+			return
+		}
+		if errors.Is(err, encoding.ErrSpoolBusy) {
+			writeError(w, r, http.StatusTooManyRequests, "SPOOL_BUSY", err.Error())
+			return
+		}
+		writeError(w, r, http.StatusInternalServerError, "INTERNAL", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusAccepted, struct {
+		Status string `json:"status"`
+	}{"received"})
 }

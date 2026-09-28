@@ -54,6 +54,7 @@ func TestEncodingCountsAggregateProgressAndSavings(t *testing.T) {
 	}{
 		{hash: "pending", size: 600, contentType: "image/jpeg", status: "pending"},
 		{hash: "leased", size: 500, contentType: "image/png", status: "leased"},
+		{hash: "received", size: 350, contentType: "image/png", status: "received"},
 		{hash: "committing", size: 400, contentType: "image/png", status: "committing"},
 		{hash: "converted", size: 100, contentType: "image/webp", status: "done", sourceSize: 1000},
 		{hash: "not-smaller", size: 300, contentType: "image/jpeg", status: "skipped"},
@@ -74,9 +75,9 @@ func TestEncodingCountsAggregateProgressAndSavings(t *testing.T) {
 		t.Fatalf("encoding counts: %v", err)
 	}
 	want := EncodingCounts{
-		Candidates: 6, Pending: 1, Processing: 2, Converted: 1,
+		Candidates: 7, Pending: 1, Processing: 3, Converted: 1,
 		NotSmaller: 1, Failed: 1, AlreadyWebP: 1,
-		RemainingBytes: 1500, SourceBytes: 1000, OutputBytes: 100,
+		RemainingBytes: 1850, SourceBytes: 1000, OutputBytes: 100,
 		BytesSaved: 900, SavedPercent: 90,
 	}
 	if counts != want {
