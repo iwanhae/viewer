@@ -63,6 +63,7 @@ class Worker:
         self._in_flight: set[str] = set()
         self._lease_until: datetime | None = None
         self._counts = {"embedded": 0, "failed": 0, "skipped": 0}
+        self._bytes_total = 0  # claimed blob bytes, for the average-throughput log
         self._started = time.monotonic()
 
         # Only one POST may be in flight at a time; taken without blocking so
@@ -123,6 +124,7 @@ class Worker:
     def _process_batch(self, response: api.ClaimResponse, stop: threading.Event) -> None:
         items = response.claimed
         total_bytes = sum(blob.size_bytes for blob in items)
+        self._bytes_total += total_bytes
         with self._state_lock:
             fresh = not self._in_flight
             self._in_flight.update(blob.hash for blob in items)
@@ -182,10 +184,10 @@ class Worker:
             embedded_total = self._counts["embedded"]
         elapsed = time.monotonic() - self._started
         rate = embedded_total / elapsed if elapsed > 0 else 0.0
-        mib_s = total_bytes / elapsed / (1024 * 1024) if elapsed > 0 else 0.0
+        mib_s = self._bytes_total / elapsed / (1024 * 1024) if elapsed > 0 else 0.0
         log.info(
             "batch done: claimed=%d failed=%d skipped=%d "
-            "(embedded total=%d, %.1f img/s, %.1f MiB/s)",
+            "(embedded total=%d, %.1f img/s avg, %.1f MiB/s avg)",
             len(items),
             failed,
             skipped,
@@ -361,6 +363,10 @@ class Worker:
                     with self._state_lock:
                         self._results[:0] = chunk
                         self._last_flush = time.monotonic()
+                    log.warning(
+                        "results upload failed; requeued %d results for retry",
+                        len(chunk),
+                    )
                     return
                 with self._state_lock:
                     for item in chunk:
@@ -385,7 +391,12 @@ class Worker:
             return
         renewed = response.renewed
         with self._state_lock:
-            lost = [blob_hash for blob_hash in hashes if blob_hash not in renewed]
+            # A blob posted while the renew was in flight is done, not lost.
+            lost = [
+                blob_hash
+                for blob_hash in hashes
+                if blob_hash not in renewed and blob_hash in self._in_flight
+            ]
             for blob_hash in lost:
                 self._in_flight.discard(blob_hash)
             self._lease_until = response.lease_until
