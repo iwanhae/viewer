@@ -9,6 +9,8 @@ import (
 	"io"
 	"net/http"
 	"strings"
+
+	"viewer/internal/admin"
 )
 
 // The handlers in this file are the operator surface: a dashboard over the
@@ -93,9 +95,10 @@ const maxAdminBodyBytes = 4 << 10
 
 // decodeAdminJSONBody decodes a strict JSON body into out, like jsonBody, with
 // one relaxation: an empty or absent body stands for the zero-value request.
-// The dashboard's bodyless buttons (retry-failed, encoding/reset) post with no
-// body at all, and a missing field must read as "operator did not ask for the
-// variant", never as a 400.
+// The recovery endpoint requires an explicit target, so an empty body decodes
+// to the zero target there and is rejected as unknown — but that rejection is
+// the dispatch's message, not a decode failure, and future admin endpoints
+// with optional bodies keep the leniency useful.
 func decodeAdminJSONBody(w http.ResponseWriter, r *http.Request, out any) error {
 	if r.Body == nil {
 		return nil
@@ -120,49 +123,76 @@ func decodeAdminJSONBody(w http.ResponseWriter, r *http.Request, out any) error 
 	return nil
 }
 
-// releaseEmbeddingsRequest is the body of POST /admin/api/embeddings/release.
-// ExpiredOnly false — the zero value, and what an absent field decodes to —
-// means force-release-all; the dashboard makes that a deliberate checkbox plus
-// confirm rather than a default, because it is the variant that cancels live
-// workers' in-flight work.
-type releaseEmbeddingsRequest struct {
-	ExpiredOnly bool `json:"expiredOnly"`
+// The recovery targets of POST /admin/api/recover, one deliberate flip each.
+// They are separate strings rather than flags on a shared action because the
+// four differ in blast radius, not just in which rows they touch: releasing
+// expired claims is the safe default, force-releasing live leases cancels
+// in-flight worker work, retrying failed re-runs the model on blobs that may
+// fail deterministically again, and the encoding reset leaves committing rows
+// to the encoding service's own reconciliation. The confirm dialog and the
+// test for each spell that out.
+const (
+	recoverReleaseExpiredClaims  = "release_expired_claims"
+	recoverReleaseAllClaims      = "release_all_claims"
+	recoverRetryFailedEmbeddings = "retry_failed_embeddings"
+	recoverResetStuckEncoding    = "reset_stuck_encoding"
+)
+
+// recoverRequest is the body of POST /admin/api/recover. Exactly one target
+// per request: a recovery is one narrow action whose effect the operator reads
+// in the confirmation and the refreshed counts. Accepting a list of targets
+// would invite a "run everything" habit the confirm dialogs exist to prevent,
+// and blur which flip produced which number.
+type recoverRequest struct {
+	Target string `json:"target"`
 }
 
-// adminReleaseEmbeddings hands stuck processing embeddings back to the pending
-// queue and answers with how many moved plus the fresh embedding counts.
-func (s *Server) adminReleaseEmbeddings(w http.ResponseWriter, r *http.Request) {
-	var req releaseEmbeddingsRequest
+// adminRecover dispatches one recovery target to its admin action and answers
+// with that action's typed result wrapped in the target it served. An unknown
+// target is a caller bug: 400, with the valid values quoted so a stale
+// dashboard build can be fixed from the error alone.
+func (s *Server) adminRecover(w http.ResponseWriter, r *http.Request) {
+	var req recoverRequest
 	if err := decodeAdminJSONBody(w, r, &req); err != nil {
 		writeBodyError(w, r, err)
 		return
 	}
-	result, err := s.admin.ReleaseStuckEmbeddings(r.Context(), req.ExpiredOnly)
-	if err != nil {
-		writeError(w, r, http.StatusInternalServerError, "INTERNAL", err.Error())
-		return
-	}
-	writeJSON(w, http.StatusOK, result)
-}
 
-// adminRetryFailed resets every failed embedding to pending and answers with
-// how many moved plus the fresh embedding counts.
-func (s *Server) adminRetryFailed(w http.ResponseWriter, r *http.Request) {
-	result, err := s.admin.RetryFailedEmbeddings(r.Context())
-	if err != nil {
-		writeError(w, r, http.StatusInternalServerError, "INTERNAL", err.Error())
-		return
-	}
-	writeJSON(w, http.StatusOK, result)
-}
-
-// adminResetEncodings returns stuck WebP encoding jobs to pending and answers
-// with the two-pass reset counts plus the fresh encoding stats, so the
-// response alone shows the queue the action drained.
-func (s *Server) adminResetEncodings(w http.ResponseWriter, r *http.Request) {
-	result, err := s.admin.ResetStuckEncodings(r.Context())
-	if err != nil {
-		writeError(w, r, http.StatusInternalServerError, "INTERNAL", err.Error())
+	result := admin.RecoverResult{Target: req.Target}
+	switch req.Target {
+	case recoverReleaseExpiredClaims:
+		res, err := s.admin.ReleaseStuckEmbeddings(r.Context(), true)
+		if err != nil {
+			writeError(w, r, http.StatusInternalServerError, "INTERNAL", err.Error())
+			return
+		}
+		result.Release = &res
+	case recoverReleaseAllClaims:
+		res, err := s.admin.ReleaseStuckEmbeddings(r.Context(), false)
+		if err != nil {
+			writeError(w, r, http.StatusInternalServerError, "INTERNAL", err.Error())
+			return
+		}
+		result.Release = &res
+	case recoverRetryFailedEmbeddings:
+		res, err := s.admin.RetryFailedEmbeddings(r.Context())
+		if err != nil {
+			writeError(w, r, http.StatusInternalServerError, "INTERNAL", err.Error())
+			return
+		}
+		result.Retry = &res
+	case recoverResetStuckEncoding:
+		res, err := s.admin.ResetStuckEncodings(r.Context())
+		if err != nil {
+			writeError(w, r, http.StatusInternalServerError, "INTERNAL", err.Error())
+			return
+		}
+		result.Encoding = &res
+	default:
+		writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST",
+			fmt.Sprintf("unknown recovery target %q (want one of: %s, %s, %s, %s)",
+				req.Target, recoverReleaseExpiredClaims, recoverReleaseAllClaims,
+				recoverRetryFailedEmbeddings, recoverResetStuckEncoding))
 		return
 	}
 	writeJSON(w, http.StatusOK, result)

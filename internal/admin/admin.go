@@ -296,6 +296,18 @@ type EncodingResetResult struct {
 	Encoding EncodingStats               `json:"encoding"`
 }
 
+// RecoverResult is one recovery target's outcome as the dashboard receives it.
+// Exactly one of the three pointers is set, matching the requested target.
+// The action-specific shapes stay typed instead of collapsing into a single
+// "rows moved" number: the encoding reset flips rows in two passes, and a
+// flat count would hide which pass did the work.
+type RecoverResult struct {
+	Target   string               `json:"target"`
+	Release  *ReleaseResult       `json:"release,omitempty"`
+	Retry    *RetryFailedResult   `json:"retry,omitempty"`
+	Encoding *EncodingResetResult `json:"encoding,omitempty"`
+}
+
 // ResetStuckEncodings is the operator's recovery switch for the WebP queue:
 // expired encoder leases and received-but-uncommitted results go back to
 // pending, and the response carries the fresh encoding stats. Committing rows

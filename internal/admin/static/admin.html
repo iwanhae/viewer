@@ -411,6 +411,9 @@ $('reindex').addEventListener('click', async () => {
   }
 });
 
+// All recovery buttons post to the single /admin/api/recover endpoint; the
+// target string names the exact flip, so the confirm the operator approved is
+// also what the access log records.
 $('releaseClaims').addEventListener('click', async () => {
   const expiredOnly = $('expiredOnly').checked;
   const ok = confirm(expiredOnly
@@ -420,11 +423,13 @@ $('releaseClaims').addEventListener('click', async () => {
       'including live leases: workers still working on them will have their ' +
       'results rejected (not_claimed) and the blobs get re-embedded. Continue?');
   if (!ok) return;
-  await runAction('release claims', '/admin/api/embeddings/release', {
+  await runAction('release claims', '/admin/api/recover', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ expiredOnly: expiredOnly }),
-  }, (res) => 'released ' + Number(res.released || 0) + ' claim(s)');
+    body: JSON.stringify({
+      target: expiredOnly ? 'release_expired_claims' : 'release_all_claims',
+    }),
+  }, (res) => 'released ' + Number((res.release || {}).released || 0) + ' claim(s)');
 });
 
 $('retryFailed').addEventListener('click', async () => {
@@ -432,9 +437,11 @@ $('retryFailed').addEventListener('click', async () => {
     'This resets all failed embeddings to pending so they get re-embedded. ' +
     'Continue?');
   if (!ok) return;
-  await runAction('retry failed', '/admin/api/embeddings/retry-failed',
-    { method: 'POST' },
-    (res) => 'reset ' + Number(res.reset || 0) + ' failed embedding(s)');
+  await runAction('retry failed', '/admin/api/recover', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ target: 'retry_failed_embeddings' }),
+  }, (res) => 'reset ' + Number((res.retry || {}).reset || 0) + ' failed embedding(s)');
 });
 
 $('resetEncoding').addEventListener('click', async () => {
@@ -443,14 +450,16 @@ $('resetEncoding').addEventListener('click', async () => {
     'received results) to pending. Committing jobs are left to the server\'s ' +
     'own reconciliation. Continue?');
   if (!ok) return;
-  await runAction('reset encoding', '/admin/api/encoding/reset',
-    { method: 'POST' },
-    (res) => {
-      const counts = res.counts || {};
-      return 'released ' + Number(counts.releasedExpiredLeased || 0) +
-        ' expired lease(s), reset ' + Number(counts.resetReceived || 0) +
-        ' received result(s)';
-    });
+  await runAction('reset encoding', '/admin/api/recover', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ target: 'reset_stuck_encoding' }),
+  }, (res) => {
+    const counts = ((res.encoding || {}).counts) || {};
+    return 'released ' + Number(counts.releasedExpiredLeased || 0) +
+      ' expired lease(s), reset ' + Number(counts.resetReceived || 0) +
+      ' received result(s)';
+  });
 });
 
 refresh();

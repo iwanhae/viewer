@@ -323,18 +323,12 @@ func TestAdminReindexResetsThroughAPI(t *testing.T) {
 func TestAdminActionEndpointsRequireAuth(t *testing.T) {
 	router, _ := newAdminTestRouter(t, 1)
 
-	for _, route := range []string{
-		"/admin/api/embeddings/release",
-		"/admin/api/embeddings/retry-failed",
-		"/admin/api/encoding/reset",
-	} {
-		rec := doAdminRequest(t, router, http.MethodPost, route, "")
-		if rec.Code != http.StatusUnauthorized {
-			t.Fatalf("%s: status=%d want=401 body=%s", route, rec.Code, rec.Body.String())
-		}
-		if !jsonBodyHasErrorCode(rec.Body.String(), "UNAUTHORIZED") {
-			t.Fatalf("%s: body=%s want UNAUTHORIZED error code", route, rec.Body.String())
-		}
+	rec := doAdminRequest(t, router, http.MethodPost, "/admin/api/recover", "")
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status=%d want=401 body=%s", rec.Code, rec.Body.String())
+	}
+	if !jsonBodyHasErrorCode(rec.Body.String(), "UNAUTHORIZED") {
+		t.Fatalf("body=%s want UNAUTHORIZED error code", rec.Body.String())
 	}
 }
 
@@ -342,7 +336,7 @@ func TestAdminActionEndpointsRequireAuth(t *testing.T) {
 // including the expiredOnly switch the dashboard's checkbox feeds: true
 // releases only the expired lease, false (and an empty body, which must decode
 // to the zero value rather than a 400) force-releases the rest.
-func TestAdminReleaseEmbeddingsEndpoint(t *testing.T) {
+func TestAdminRecoverReleaseClaimsEndpoint(t *testing.T) {
 	router, store := newAdminTestRouter(t, 1)
 	ctx := context.Background()
 
@@ -362,34 +356,40 @@ func TestAdminReleaseEmbeddingsEndpoint(t *testing.T) {
 		t.Fatalf("renew hash-live: renewed=%v err=%v", renewed, err)
 	}
 
-	// expiredOnly=true: the expired leases move, the live one survives.
-	rec := doAdminBodyRequest(t, router, http.MethodPost, "/admin/api/embeddings/release", basicAuthHeader("operator", "sekrit"), []byte(`{"expiredOnly":true}`))
+	// The expired-claims target moves only expired leases; the live one
+	// survives.
+	rec := doAdminBodyRequest(t, router, http.MethodPost, "/admin/api/recover", basicAuthHeader("operator", "sekrit"), []byte(`{"target":"release_expired_claims"}`))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expired-only status=%d want=200 body=%s", rec.Code, rec.Body.String())
 	}
 	var payload struct {
-		Released int64                   `json:"released"`
-		Counts   catalog.EmbeddingCounts `json:"counts"`
+		Target  string `json:"target"`
+		Release struct {
+			Released int64                   `json:"released"`
+			Counts   catalog.EmbeddingCounts `json:"counts"`
+		} `json:"release"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
-		t.Fatalf("decode release response: %v", err)
+		t.Fatalf("decode expired-only response: %v", err)
 	}
 	wantCounts := catalog.EmbeddingCounts{Total: 5, Ready: 1, Failed: 1, Processing: 1, Pending: 3}
-	if payload.Released != 2 || payload.Counts != wantCounts {
-		t.Fatalf("expired-only response={%d %+v} want released=2 counts=%+v", payload.Released, payload.Counts, wantCounts)
+	if payload.Target != "release_expired_claims" || payload.Release.Released != 2 || payload.Release.Counts != wantCounts {
+		t.Fatalf("expired-only response={%s %+v} want target=release_expired_claims released=2 counts=%+v",
+			payload.Target, payload.Release, wantCounts)
 	}
 
-	// expiredOnly=false force-releases what is left.
-	rec = doAdminBodyRequest(t, router, http.MethodPost, "/admin/api/embeddings/release", basicAuthHeader("operator", "sekrit"), []byte(`{"expiredOnly":false}`))
+	// The all-claims target force-releases what is left.
+	rec = doAdminBodyRequest(t, router, http.MethodPost, "/admin/api/recover", basicAuthHeader("operator", "sekrit"), []byte(`{"target":"release_all_claims"}`))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("forced status=%d want=200 body=%s", rec.Code, rec.Body.String())
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
-		t.Fatalf("decode forced release response: %v", err)
+		t.Fatalf("decode forced response: %v", err)
 	}
 	wantCounts = catalog.EmbeddingCounts{Total: 5, Ready: 1, Failed: 1, Pending: 3}
-	if payload.Released != 1 || payload.Counts != wantCounts {
-		t.Fatalf("forced response={%d %+v} want released=1 counts=%+v", payload.Released, payload.Counts, wantCounts)
+	if payload.Target != "release_all_claims" || payload.Release.Released != 1 || payload.Release.Counts != wantCounts {
+		t.Fatalf("forced response={%s %+v} want target=release_all_claims released=1 counts=%+v",
+			payload.Target, payload.Release, wantCounts)
 	}
 
 	after, err := store.EmbeddingCounts(ctx)
@@ -400,26 +400,16 @@ func TestAdminReleaseEmbeddingsEndpoint(t *testing.T) {
 		t.Fatalf("catalog counts=%+v want=%+v", after, wantCounts)
 	}
 
-	// An empty body is the zero-value request, not a decode error — the
-	// dashboard's bodyless POSTs must not read as "release everything".
-	rec = doAdminBodyRequest(t, router, http.MethodPost, "/admin/api/embeddings/release", basicAuthHeader("operator", "sekrit"), nil)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("empty body status=%d want=200 body=%s", rec.Code, rec.Body.String())
-	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
-		t.Fatalf("decode empty-body response: %v", err)
-	}
-	if payload.Released != 0 || payload.Counts != wantCounts {
-		t.Fatalf("empty-body response={%d %+v} want released=0 counts=%+v", payload.Released, payload.Counts, wantCounts)
-	}
-
-	// A broken body and an unknown field are caller bugs: 400 with the shared
+	// A broken body, an unknown field, an empty body (zero target), and an
+	// unknown target string are caller bugs: 400 with the shared
 	// invalid-request code.
 	for name, body := range map[string]string{
-		"not json":      `not json`,
-		"unknown field": `{"expiredOnly":true,"extra":1}`,
+		"not json":       `not json`,
+		"unknown field":  `{"target":"release_all_claims","extra":1}`,
+		"empty body":     ``,
+		"unknown target": `{"target":"nuke_everything"}`,
 	} {
-		rec := doAdminBodyRequest(t, router, http.MethodPost, "/admin/api/embeddings/release", basicAuthHeader("operator", "sekrit"), []byte(body))
+		rec := doAdminBodyRequest(t, router, http.MethodPost, "/admin/api/recover", basicAuthHeader("operator", "sekrit"), []byte(body))
 		if rec.Code != http.StatusBadRequest {
 			t.Fatalf("%s: status=%d want=400 body=%s", name, rec.Code, rec.Body.String())
 		}
@@ -432,7 +422,7 @@ func TestAdminReleaseEmbeddingsEndpoint(t *testing.T) {
 // TestAdminRetryFailedEndpoint drives the retry-failed endpoint: a bodyless
 // POST resets the fixture's one failed blob and answers with the post-reset
 // counts, which must match the catalog behind it.
-func TestAdminRetryFailedEndpoint(t *testing.T) {
+func TestAdminRecoverRetryFailedEndpoint(t *testing.T) {
 	router, store := newAdminTestRouter(t, 1)
 	ctx := context.Background()
 
@@ -444,21 +434,25 @@ func TestAdminRetryFailedEndpoint(t *testing.T) {
 		t.Fatalf("fixture counts=%+v want one failed blob", before)
 	}
 
-	rec := doAdminRequest(t, router, http.MethodPost, "/admin/api/embeddings/retry-failed", basicAuthHeader("operator", "sekrit"))
+	rec := doAdminBodyRequest(t, router, http.MethodPost, "/admin/api/recover", basicAuthHeader("operator", "sekrit"), []byte(`{"target":"retry_failed_embeddings"}`))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status=%d want=200 body=%s", rec.Code, rec.Body.String())
 	}
 
 	var payload struct {
-		Reset  int64                   `json:"reset"`
-		Counts catalog.EmbeddingCounts `json:"counts"`
+		Target string `json:"target"`
+		Retry  struct {
+			Reset  int64                   `json:"reset"`
+			Counts catalog.EmbeddingCounts `json:"counts"`
+		} `json:"retry"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
-		t.Fatalf("decode retry-failed response: %v", err)
+		t.Fatalf("decode retry response: %v", err)
 	}
 	want := catalog.EmbeddingCounts{Total: 3, Ready: 1, Pending: 2}
-	if payload.Reset != 1 || payload.Counts != want {
-		t.Fatalf("response={%d %+v} want reset=1 counts=%+v", payload.Reset, payload.Counts, want)
+	if payload.Target != "retry_failed_embeddings" || payload.Retry.Reset != 1 || payload.Retry.Counts != want {
+		t.Fatalf("response={%s %+v} want target=retry_failed_embeddings reset=1 counts=%+v",
+			payload.Target, payload.Retry, want)
 	}
 
 	after, err := store.EmbeddingCounts(ctx)
@@ -474,7 +468,7 @@ func TestAdminRetryFailedEndpoint(t *testing.T) {
 // stuck shapes (expired lease, received result) drain back to pending while a
 // committing row is left for the server-side Recover path, and the response
 // carries both the reset counts and the fresh encoding stats.
-func TestAdminResetEncodingsEndpoint(t *testing.T) {
+func TestAdminRecoverResetEncodingEndpoint(t *testing.T) {
 	router, store := newAdminTestRouter(t, 1)
 	ctx := context.Background()
 
@@ -510,31 +504,37 @@ func TestAdminResetEncodingsEndpoint(t *testing.T) {
 		t.Fatalf("claim expired lease: %v", err)
 	}
 
-	rec := doAdminRequest(t, router, http.MethodPost, "/admin/api/encoding/reset", basicAuthHeader("operator", "sekrit"))
+	rec := doAdminBodyRequest(t, router, http.MethodPost, "/admin/api/recover", basicAuthHeader("operator", "sekrit"), []byte(`{"target":"reset_stuck_encoding"}`))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status=%d want=200 body=%s", rec.Code, rec.Body.String())
 	}
 
 	var payload struct {
-		Counts   catalog.EncodingResetCounts `json:"counts"`
+		Target   string `json:"target"`
 		Encoding struct {
-			Enabled    bool  `json:"enabled"`
-			Pending    int64 `json:"pending"`
-			Processing int64 `json:"processing"`
+			Counts catalog.EncodingResetCounts `json:"counts"`
+			Stats  struct {
+				Enabled    bool  `json:"enabled"`
+				Pending    int64 `json:"pending"`
+				Processing int64 `json:"processing"`
+			} `json:"encoding"`
 		} `json:"encoding"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
 		t.Fatalf("decode reset response: %v", err)
 	}
+	if payload.Target != "reset_stuck_encoding" {
+		t.Fatalf("target=%s want=reset_stuck_encoding", payload.Target)
+	}
 	wantCounts := catalog.EncodingResetCounts{ReleasedExpiredLeased: 1, ResetReceived: 1}
-	if payload.Counts != wantCounts {
-		t.Fatalf("counts=%+v want=%+v", payload.Counts, wantCounts)
+	if payload.Encoding.Counts != wantCounts {
+		t.Fatalf("counts=%+v want=%+v", payload.Encoding.Counts, wantCounts)
 	}
 	// The fixture's three blobs are also encoding-pending, so the two reset
 	// rows land on top of them: 3 + 2 pending, with committing the only
 	// processing row left.
-	if !payload.Encoding.Enabled || payload.Encoding.Pending != 5 || payload.Encoding.Processing != 1 {
-		t.Fatalf("encoding=%+v want enabled with pending=5 processing=1 (committing untouched)", payload.Encoding)
+	if !payload.Encoding.Stats.Enabled || payload.Encoding.Stats.Pending != 5 || payload.Encoding.Stats.Processing != 1 {
+		t.Fatalf("encoding=%+v want enabled with pending=5 processing=1 (committing untouched)", payload.Encoding.Stats)
 	}
 
 	committing, err := store.CommittingEncodings(ctx)
