@@ -1143,6 +1143,190 @@ func (s *Store) ResetReadyEmbeddings(ctx context.Context) (int64, error) {
 	return affected, nil
 }
 
+// ReleaseStuckEmbeddingClaims flips processing rows back to pending and
+// returns how many rows moved. It is the runtime equivalent of the startup
+// reset at the bottom of Open: a lease belongs to the lifetime of one process,
+// so a worker that died mid-batch leaves its blobs stranded in processing until
+// the next restart — this lets an operator hand them back without one. The
+// error text is cleared along with the lease: a row going back into the queue
+// must not carry a stale failure message next to a pending status.
+// expiredOnly=true (the safe default) restricts the reset to rows whose lease
+// deadline has already passed, leaving live leases alone; expiredOnly=false
+// does the full startup-style reset for every processing row. Releasing a live
+// lease is not fatal: the worker that held it finishes its work, but the
+// write-back then finds a pending row and is rejected as not_claimed — the blob
+// is simply re-claimed and re-embedded by whoever gets there next, so the only
+// cost is wasted work. Only widen to expiredOnly=false once there is no worker
+// left to finish the in-flight batch.
+func (s *Store) ReleaseStuckEmbeddingClaims(ctx context.Context, expiredOnly bool) (int64, error) {
+	query := `
+		UPDATE blobs
+		SET embedding_status = ?, embedding_error = '', embedding_lease_until = 0
+		WHERE embedding_status = ?`
+	args := []any{string(EmbeddingStatusPending), string(EmbeddingStatusProcessing)}
+	if expiredOnly {
+		query += ` AND embedding_lease_until < ?`
+		args = append(args, time.Now().UnixMilli())
+	}
+	res, err := s.db.ExecContext(ctx, query, args...)
+	if err != nil {
+		return 0, fmt.Errorf("release stuck embedding claims: %w", err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("count released embedding claims: %w", err)
+	}
+	return affected, nil
+}
+
+// ResetFailedEmbeddings flips every failed embedding back to pending, clearing
+// the error text and lease, and returns how many rows moved. It is the retry
+// path for a blob whose embedding failed for a transient reason (a worker that
+// had a bad model checkpoint, an unavailable encoder): the claim loop picks the
+// pending blobs up and tries again. Ready rows must stay untouched — they are
+// terminal successes whose vectors the store already holds, and re-embedding
+// them would spend worker capacity reproducing work that is done — and
+// processing rows are excluded for the same reason ResetReadyEmbeddings
+// excludes them: a worker still holds that lease and flipping the row under it
+// would race its in-flight write-back.
+func (s *Store) ResetFailedEmbeddings(ctx context.Context) (int64, error) {
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE blobs
+		SET embedding_status = ?, embedding_error = '', embedding_lease_until = 0
+		WHERE embedding_status = ?`,
+		string(EmbeddingStatusPending), string(EmbeddingStatusFailed),
+	)
+	if err != nil {
+		return 0, fmt.Errorf("reset failed embeddings: %w", err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("count reset failed embeddings: %w", err)
+	}
+	return affected, nil
+}
+
+// EmbeddingLeaseHealth is the diagnostic snapshot of the processing rows: how
+// many there are, how many of those have already blown their lease deadline,
+// and the earliest deadline still recorded (epoch ms; zero when there are no
+// processing rows). It reads the pipeline's liveness out of one query:
+//   - Processing > 0 with LeaseExpired == Processing means no worker is
+//     claiming anything — every claim has expired and nobody picked the rows
+//     back up, which is the "embedding queue is stalled" signal.
+//   - Processing > 0 with LeaseExpired == 0 means workers hold live leases,
+//     so the rows are claimed but not finishing: the write-back is likely
+//     stuck upstream (the worker is alive but its result never lands).
+type EmbeddingLeaseHealth struct {
+	Processing        int64 `json:"processing"`
+	LeaseExpired      int64 `json:"leaseExpired"`
+	OldestLeaseUnixMs int64 `json:"oldestLeaseUnixMs"`
+}
+
+// EmbeddingLeaseHealth reports the processing-row lease picture described on
+// EmbeddingLeaseHealth. COALESCE keeps an empty catalog scanning as zeros
+// instead of NULLs, so the caller never has to special-case "no rows yet".
+func (s *Store) EmbeddingLeaseHealth(ctx context.Context) (EmbeddingLeaseHealth, error) {
+	var health EmbeddingLeaseHealth
+	err := s.db.QueryRowContext(ctx, `
+		SELECT
+			COUNT(*),
+			COALESCE(SUM(CASE WHEN embedding_lease_until < ? THEN 1 ELSE 0 END), 0),
+			COALESCE(MIN(embedding_lease_until), 0)
+		FROM blobs
+		WHERE embedding_status = ?`,
+		time.Now().UnixMilli(), string(EmbeddingStatusProcessing),
+	).Scan(&health.Processing, &health.LeaseExpired, &health.OldestLeaseUnixMs)
+	if err != nil {
+		return EmbeddingLeaseHealth{}, fmt.Errorf("embedding lease health: %w", err)
+	}
+	return health, nil
+}
+
+// PendingEncodingBreakdown groups the pending-embedding blobs by their encoding
+// state, showing how many are blocked by the encoding gate rather than by a
+// lack of embedding workers: the claim condition requires encoding_gate=0 OR
+// encoding_status IN ('done', 'skipped', 'failed'), so pending embeddings
+// sitting behind a pending/leased/received encoding cannot be claimed no matter
+// how idle the workers are. A breakdown dominated by non-terminal encoding
+// states means the stall is in the WebP queue, not the embedding one.
+func (s *Store) PendingEncodingBreakdown(ctx context.Context) (map[string]int64, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT encoding_status, COUNT(*) FROM blobs
+		WHERE embedding_status = ?
+		GROUP BY encoding_status`, string(EmbeddingStatusPending))
+	if err != nil {
+		return nil, fmt.Errorf("pending encoding breakdown: %w", err)
+	}
+	defer rows.Close()
+
+	byEncodingStatus := make(map[string]int64)
+	for rows.Next() {
+		var status string
+		var count int64
+		if err := rows.Scan(&status, &count); err != nil {
+			return nil, fmt.Errorf("scan pending encoding count: %w", err)
+		}
+		byEncodingStatus[status] = count
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate pending encoding counts: %w", err)
+	}
+	return byEncodingStatus, nil
+}
+
+// EmbeddingFailure is one distinct embedding failure reason with how many
+// blobs carry it and one representative hash, so an operator can jump from the
+// aggregate to a concrete broken row.
+type EmbeddingFailure struct {
+	Error      string `json:"error"`
+	Count      int64  `json:"count"`
+	SampleHash string `json:"sampleHash"`
+}
+
+// maxEmbeddingFailureReasons bounds EmbeddingFailureReasons' response. The
+// dashboard shows a fixed handful of rows and failure reasons are naturally
+// few, so a request larger than this is almost certainly a caller bug rather
+// than a genuine need to page through error messages.
+const maxEmbeddingFailureReasons = 20
+
+// EmbeddingFailureReasons summarizes the failed rows grouped by their error
+// text, most common first, with the smallest hash of each group as the sample
+// (MIN makes the representative deterministic across identical groups). The
+// limit is clamped into [1, maxEmbeddingFailureReasons] — callers are not
+// trusted to pass a sane value, and a clamped answer beats an SQL error on the
+// dashboard. The result is empty (non-nil) when nothing has failed.
+func (s *Store) EmbeddingFailureReasons(ctx context.Context, limit int) ([]EmbeddingFailure, error) {
+	if limit < 1 {
+		limit = 1
+	}
+	if limit > maxEmbeddingFailureReasons {
+		limit = maxEmbeddingFailureReasons
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT embedding_error, COUNT(*), MIN(hash) FROM blobs
+		WHERE embedding_status = ?
+		GROUP BY embedding_error
+		ORDER BY COUNT(*) DESC
+		LIMIT ?`, string(EmbeddingStatusFailed), limit)
+	if err != nil {
+		return nil, fmt.Errorf("embedding failure reasons: %w", err)
+	}
+	defer rows.Close()
+
+	failures := make([]EmbeddingFailure, 0)
+	for rows.Next() {
+		var failure EmbeddingFailure
+		if err := rows.Scan(&failure.Error, &failure.Count, &failure.SampleHash); err != nil {
+			return nil, fmt.Errorf("scan embedding failure reason: %w", err)
+		}
+		failures = append(failures, failure)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate embedding failure reasons: %w", err)
+	}
+	return failures, nil
+}
+
 // scanPhotoBlobPairs drains a photo/blob join query, converting the raw
 // embedding status string on the way.
 func scanPhotoBlobPairs(rows *sql.Rows) ([]PhotoWithBlob, error) {

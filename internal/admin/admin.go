@@ -50,6 +50,26 @@ type Stats struct {
 	Blobs          int64                   `json:"blobs"`
 	Embedding      catalog.EmbeddingCounts `json:"embedding"`
 	Encoding       EncodingStats           `json:"encoding"`
+	// The four fields below diagnose *why* the embedding counts above look
+	// wrong, one layer down each:
+	//   - EmbeddingLease reads the processing rows' leases: processing blobs
+	//     whose lease has expired mean no worker is claiming anything, while
+	//     live leases that never finish point at a stuck write-back.
+	//   - PendingByEncoding splits the pending blobs by their WebP encoding
+	//     state, because the claim gate requires terminal encoding — pending
+	//     blobs behind an unfinished encoding are stalled by the WebP queue,
+	//     not by a lack of embedding workers.
+	//   - Failures groups the failed blobs by error text (top reasons only),
+	//     turning "N failed" into "what to fix first".
+	//   - WorkerActivity is the recommend service's last-attempt stamps at the
+	//     pipeline entry points; zeros mean nobody has tried since process
+	//     start. The recommend type is used directly — its JSON tags are the
+	//     dashboard contract, and a re-declared copy in this package could
+	//     silently drift from the stamps the service actually records.
+	EmbeddingLease    catalog.EmbeddingLeaseHealth `json:"embeddingLease"`
+	PendingByEncoding map[string]int64             `json:"pendingByEncoding"`
+	Failures          []catalog.EmbeddingFailure   `json:"failures"`
+	WorkerActivity    recommend.WorkerActivity     `json:"workerActivity"`
 	// ExpectedPoints is how many points the vector store should hold: one per
 	// photo whose blob embedding is ready. QdrantPoints is how many it
 	// actually holds, and Drift is the difference — non-zero means the two
@@ -136,15 +156,34 @@ func (s *Service) Stats(ctx context.Context) (Stats, error) {
 	if err != nil {
 		return Stats{}, fmt.Errorf("encoding counts: %w", err)
 	}
+	lease, err := s.cat.EmbeddingLeaseHealth(ctx)
+	if err != nil {
+		return Stats{}, fmt.Errorf("embedding lease health: %w", err)
+	}
+	pendingByEncoding, err := s.cat.PendingEncodingBreakdown(ctx)
+	if err != nil {
+		return Stats{}, fmt.Errorf("pending encoding breakdown: %w", err)
+	}
+	// Five reasons: the dashboard renders a fixed handful of rows, and a
+	// failure list longer than that is noise an operator works through one
+	// fix at a time rather than a page to scroll. The store clamps the limit
+	// regardless, so this is a rendering choice, not a safety one.
+	failures, err := s.cat.EmbeddingFailureReasons(ctx, 5)
+	if err != nil {
+		return Stats{}, fmt.Errorf("embedding failure reasons: %w", err)
+	}
 
 	stats := Stats{
-		Albums:         albums,
-		AlbumsByStatus: byStatus,
-		Photos:         photos,
-		Blobs:          blobs,
-		Embedding:      embedding,
-		Encoding:       EncodingStats{Enabled: s.encodingEnabled, EncodingCounts: encoding},
-		ExpectedPoints: expected,
+		Albums:            albums,
+		AlbumsByStatus:    byStatus,
+		Photos:            photos,
+		Blobs:             blobs,
+		Embedding:         embedding,
+		Encoding:          EncodingStats{Enabled: s.encodingEnabled, EncodingCounts: encoding},
+		EmbeddingLease:    lease,
+		PendingByEncoding: pendingByEncoding,
+		Failures:          failures,
+		ExpectedPoints:    expected,
 	}
 	if s.vectors != nil {
 		points, err := s.vectors.CountVectors(ctx)
@@ -157,6 +196,13 @@ func (s *Service) Stats(ctx context.Context) (Stats, error) {
 		// "missing everything" that is really just "Qdrant is off".
 		stats.Drift = stats.QdrantPoints - stats.ExpectedPoints
 		stats.VectorStoreEnabled = true
+	}
+	// The recommend service is nil in setups without an embedding model; its
+	// WorkerActivity is nil-safe and would report zeros anyway, but the guard
+	// keeps that contract visible here — zeros mean "no attempts recorded",
+	// never "the model answered instantly".
+	if s.recommend != nil {
+		stats.WorkerActivity = s.recommend.WorkerActivity()
 	}
 	stats.ModelEnabled = s.recommend != nil && s.recommend.Enabled()
 	return stats, nil
@@ -180,4 +226,97 @@ func (s *Service) Reindex(ctx context.Context) (catalog.EmbeddingCounts, error) 
 		return catalog.EmbeddingCounts{}, fmt.Errorf("embedding counts after resetting %d blobs: %w", reset, err)
 	}
 	return counts, nil
+}
+
+// ReleaseResult reports how many processing rows ReleaseStuckEmbeddings handed
+// back to the pending queue, plus the fresh embedding counts so the caller
+// sees the effect without a second stats round-trip (the same pattern Reindex
+// uses).
+type ReleaseResult struct {
+	Released int64                   `json:"released"`
+	Counts   catalog.EmbeddingCounts `json:"counts"`
+}
+
+// ReleaseStuckEmbeddings returns processing embeddings to the pending queue so
+// a worker can claim them again. With expiredOnly the damage is bounded: only
+// rows whose lease deadline has already passed move, which is the shape of a
+// dead-worker recovery. With expiredOnly false every processing row moves,
+// including live leases — that is the operator's explicit choice (the UI makes
+// them confirm it), because it means a worker is still working: its write-back
+// will be rejected as not_claimed and the blob re-embedded. That is harmless
+// but wasteful, which is why the default is the narrow variant. Encoding rows
+// are never touched here; that queue has its own reset (ResetStuckEncodings).
+func (s *Service) ReleaseStuckEmbeddings(ctx context.Context, expiredOnly bool) (ReleaseResult, error) {
+	if s == nil || s.cat == nil {
+		return ReleaseResult{}, fmt.Errorf("catalog is not available")
+	}
+	released, err := s.cat.ReleaseStuckEmbeddingClaims(ctx, expiredOnly)
+	if err != nil {
+		return ReleaseResult{}, fmt.Errorf("release stuck embedding claims: %w", err)
+	}
+	counts, err := s.cat.EmbeddingCounts(ctx)
+	if err != nil {
+		return ReleaseResult{}, fmt.Errorf("embedding counts after releasing %d claims: %w", released, err)
+	}
+	return ReleaseResult{Released: released, Counts: counts}, nil
+}
+
+// RetryFailedResult reports how many failed rows RetryFailedEmbeddings moved
+// back to pending, plus the fresh embedding counts.
+type RetryFailedResult struct {
+	Reset  int64                   `json:"reset"`
+	Counts catalog.EmbeddingCounts `json:"counts"`
+}
+
+// RetryFailedEmbeddings flips every failed embedding back to pending and
+// returns the fresh counts. It is the retry path for transient failures (a bad
+// model checkpoint, an unavailable encoder); ready rows stay untouched, so no
+// completed work is re-spent, and processing rows are left to their lease for
+// the same reason Reindex leaves them alone.
+func (s *Service) RetryFailedEmbeddings(ctx context.Context) (RetryFailedResult, error) {
+	if s == nil || s.cat == nil {
+		return RetryFailedResult{}, fmt.Errorf("catalog is not available")
+	}
+	reset, err := s.cat.ResetFailedEmbeddings(ctx)
+	if err != nil {
+		return RetryFailedResult{}, fmt.Errorf("reset failed embeddings: %w", err)
+	}
+	counts, err := s.cat.EmbeddingCounts(ctx)
+	if err != nil {
+		return RetryFailedResult{}, fmt.Errorf("embedding counts after resetting %d blobs: %w", reset, err)
+	}
+	return RetryFailedResult{Reset: reset, Counts: counts}, nil
+}
+
+// EncodingResetResult reports what ResetStuckEncodings' two passes moved and
+// the fresh encoding stats, so the operator sees the queue they just drained
+// in the same response.
+type EncodingResetResult struct {
+	Counts   catalog.EncodingResetCounts `json:"counts"`
+	Encoding EncodingStats               `json:"encoding"`
+}
+
+// ResetStuckEncodings is the operator's recovery switch for the WebP queue:
+// expired encoder leases and received-but-uncommitted results go back to
+// pending, and the response carries the fresh encoding stats. Committing rows
+// are deliberately never touched — a committing row means an S3 object
+// replacement may be in flight, and only the encoding server's own Recover
+// path holds the bookkeeping to reconcile that uncertainty; an operator reset
+// here would turn "unknown outcome" into a certain loss.
+func (s *Service) ResetStuckEncodings(ctx context.Context) (EncodingResetResult, error) {
+	if s == nil || s.cat == nil {
+		return EncodingResetResult{}, fmt.Errorf("catalog is not available")
+	}
+	reset, err := s.cat.ResetStuckEncodings(ctx)
+	if err != nil {
+		return EncodingResetResult{}, fmt.Errorf("reset stuck encodings: %w", err)
+	}
+	encoding, err := s.cat.EncodingCounts(ctx)
+	if err != nil {
+		return EncodingResetResult{}, fmt.Errorf("encoding counts after resetting %d+%d rows: %w", reset.ReleasedExpiredLeased, reset.ResetReceived, err)
+	}
+	return EncodingResetResult{
+		Counts:   reset,
+		Encoding: EncodingStats{Enabled: s.encodingEnabled, EncodingCounts: encoding},
+	}, nil
 }

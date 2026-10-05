@@ -4,6 +4,9 @@ import (
 	"bytes"
 	"crypto/subtle"
 	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
 	"strings"
 )
@@ -81,4 +84,86 @@ func (s *Server) adminReindex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, counts)
+}
+
+// maxAdminBodyBytes bounds an admin action body. The biggest one the dashboard
+// ever sends is a single boolean, so a few kilobytes is generous; the tight
+// limit keeps a fat request from reaching the catalog at all.
+const maxAdminBodyBytes = 4 << 10
+
+// decodeAdminJSONBody decodes a strict JSON body into out, like jsonBody, with
+// one relaxation: an empty or absent body stands for the zero-value request.
+// The dashboard's bodyless buttons (retry-failed, encoding/reset) post with no
+// body at all, and a missing field must read as "operator did not ask for the
+// variant", never as a 400.
+func decodeAdminJSONBody(w http.ResponseWriter, r *http.Request, out any) error {
+	if r.Body == nil {
+		return nil
+	}
+	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxAdminBodyBytes))
+	if err != nil {
+		return err
+	}
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return nil
+	}
+	// Same strictness as jsonBody: unknown fields are a caller bug, and
+	// trailing content is a mangled request, not data to ignore.
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(out); err != nil {
+		return fmt.Errorf("invalid body: %w", err)
+	}
+	if err := dec.Decode(&struct{}{}); err != io.EOF {
+		return fmt.Errorf("invalid body: unexpected trailing content")
+	}
+	return nil
+}
+
+// releaseEmbeddingsRequest is the body of POST /admin/api/embeddings/release.
+// ExpiredOnly false — the zero value, and what an absent field decodes to —
+// means force-release-all; the dashboard makes that a deliberate checkbox plus
+// confirm rather than a default, because it is the variant that cancels live
+// workers' in-flight work.
+type releaseEmbeddingsRequest struct {
+	ExpiredOnly bool `json:"expiredOnly"`
+}
+
+// adminReleaseEmbeddings hands stuck processing embeddings back to the pending
+// queue and answers with how many moved plus the fresh embedding counts.
+func (s *Server) adminReleaseEmbeddings(w http.ResponseWriter, r *http.Request) {
+	var req releaseEmbeddingsRequest
+	if err := decodeAdminJSONBody(w, r, &req); err != nil {
+		writeBodyError(w, r, err)
+		return
+	}
+	result, err := s.admin.ReleaseStuckEmbeddings(r.Context(), req.ExpiredOnly)
+	if err != nil {
+		writeError(w, r, http.StatusInternalServerError, "INTERNAL", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+// adminRetryFailed resets every failed embedding to pending and answers with
+// how many moved plus the fresh embedding counts.
+func (s *Server) adminRetryFailed(w http.ResponseWriter, r *http.Request) {
+	result, err := s.admin.RetryFailedEmbeddings(r.Context())
+	if err != nil {
+		writeError(w, r, http.StatusInternalServerError, "INTERNAL", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+// adminResetEncodings returns stuck WebP encoding jobs to pending and answers
+// with the two-pass reset counts plus the fresh encoding stats, so the
+// response alone shows the queue the action drained.
+func (s *Server) adminResetEncodings(w http.ResponseWriter, r *http.Request) {
+	result, err := s.admin.ResetStuckEncodings(r.Context())
+	if err != nil {
+		writeError(w, r, http.StatusInternalServerError, "INTERNAL", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
 }

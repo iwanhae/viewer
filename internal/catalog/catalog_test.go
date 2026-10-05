@@ -1354,3 +1354,295 @@ func TestResetReadyEmbeddings(t *testing.T) {
 		t.Fatalf("second reset=%d err=%v want 0", reset, err)
 	}
 }
+
+// TestReleaseStuckEmbeddingClaims pins the operator's runtime equivalent of the
+// startup lease reset: expiredOnly=true touches only the processing rows whose
+// lease already lapsed and leaves live leases (and their error text) strictly
+// alone, while expiredOnly=false does the full startup-style reset. A released
+// row comes back pending with its lease and error text cleared, so the claim
+// loop can pick it up as if it had never been claimed.
+func TestReleaseStuckEmbeddingClaims(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+
+	for _, hash := range []string{"hash-expired", "hash-live", "hash-pending"} {
+		if err := store.UpsertBlob(ctx, Blob{Hash: hash, SizeBytes: 1}); err != nil {
+			t.Fatalf("upsert %s: %v", hash, err)
+		}
+	}
+	seedBlobStatus(t, store, "hash-expired", EmbeddingStatusProcessing)
+	seedBlobStatus(t, store, "hash-live", EmbeddingStatusProcessing)
+	// Lease values from time.Now() arithmetic, as the claim path itself would
+	// have written them; the pending row needs none.
+	seedBlobLease(t, store, "hash-expired", "stale worker error", time.Now().Add(-time.Minute).UnixMilli())
+	seedBlobLease(t, store, "hash-live", "worker still running", time.Now().Add(10*time.Minute).UnixMilli())
+
+	released, err := store.ReleaseStuckEmbeddingClaims(ctx, true)
+	if err != nil {
+		t.Fatalf("release expired: %v", err)
+	}
+	if released != 1 {
+		t.Fatalf("released=%d want=1 (only the expired lease)", released)
+	}
+	status, errText, lease := blobLeaseRow(t, store, "hash-expired")
+	if status != EmbeddingStatusPending || errText != "" || lease != 0 {
+		t.Fatalf("hash-expired=(%s %q %d) want (pending \"\" 0)", status, errText, lease)
+	}
+	// A live lease means a worker may still finish: the row keeps its claim,
+	// its error text and its lease untouched.
+	status, errText, lease = blobLeaseRow(t, store, "hash-live")
+	if status != EmbeddingStatusProcessing || errText != "worker still running" || lease <= time.Now().UnixMilli() {
+		t.Fatalf("hash-live=(%s %q %d) want untouched processing row with live lease", status, errText, lease)
+	}
+
+	released, err = store.ReleaseStuckEmbeddingClaims(ctx, false)
+	if err != nil {
+		t.Fatalf("release all: %v", err)
+	}
+	if released != 1 {
+		t.Fatalf("released=%d want=1 (the remaining live lease)", released)
+	}
+	status, errText, lease = blobLeaseRow(t, store, "hash-live")
+	if status != EmbeddingStatusPending || errText != "" || lease != 0 {
+		t.Fatalf("hash-live=(%s %q %d) want (pending \"\" 0) after full release", status, errText, lease)
+	}
+
+	// The untouched pending row stays pending with no lease, and a second full
+	// release has nothing left to move.
+	status, _, lease = blobLeaseRow(t, store, "hash-pending")
+	if status != EmbeddingStatusPending || lease != 0 {
+		t.Fatalf("hash-pending=(%s %d) want untouched pending row", status, lease)
+	}
+	released, err = store.ReleaseStuckEmbeddingClaims(ctx, false)
+	if err != nil || released != 0 {
+		t.Fatalf("second release=%d err=%v want 0", released, err)
+	}
+}
+
+// TestResetFailedEmbeddings pins the retry path: failed rows go back to pending
+// with their error text and lease cleared, while ready rows are untouched —
+// they are terminal successes whose vectors the store already holds, and
+// re-embedding them would only reproduce work that is done.
+func TestResetFailedEmbeddings(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+
+	for _, hash := range []string{"hash-failed-a", "hash-failed-b", "hash-ready", "hash-processing"} {
+		if err := store.UpsertBlob(ctx, Blob{Hash: hash, SizeBytes: 1}); err != nil {
+			t.Fatalf("upsert %s: %v", hash, err)
+		}
+	}
+	seedBlobStatus(t, store, "hash-failed-a", EmbeddingStatusFailed)
+	seedBlobStatus(t, store, "hash-failed-b", EmbeddingStatusFailed)
+	seedBlobStatus(t, store, "hash-ready", EmbeddingStatusReady)
+	seedBlobStatus(t, store, "hash-processing", EmbeddingStatusProcessing)
+	// Error text and lease on the rows that carry them, so the reset has
+	// something to clear (and the others prove nothing was touched).
+	seedBlobLease(t, store, "hash-failed-a", "encoder OOM", 111)
+	seedBlobLease(t, store, "hash-failed-b", "upstream timeout", 222)
+	seedBlobLease(t, store, "hash-ready", "must survive", 333)
+	seedBlobLease(t, store, "hash-processing", "worker still running", 444)
+
+	reset, err := store.ResetFailedEmbeddings(ctx)
+	if err != nil {
+		t.Fatalf("reset failed embeddings: %v", err)
+	}
+	if reset != 2 {
+		t.Fatalf("reset=%d want=2 (the two failed rows)", reset)
+	}
+	for _, hash := range []string{"hash-failed-a", "hash-failed-b"} {
+		status, errText, lease := blobLeaseRow(t, store, hash)
+		if status != EmbeddingStatusPending || errText != "" || lease != 0 {
+			t.Fatalf("%s=(%s %q %d) want (pending \"\" 0)", hash, status, errText, lease)
+		}
+	}
+	status, errText, lease := blobLeaseRow(t, store, "hash-ready")
+	if status != EmbeddingStatusReady || errText != "must survive" || lease != 333 {
+		t.Fatalf("hash-ready=(%s %q %d) want untouched ready row", status, errText, lease)
+	}
+	status, errText, lease = blobLeaseRow(t, store, "hash-processing")
+	if status != EmbeddingStatusProcessing || errText != "worker still running" || lease != 444 {
+		t.Fatalf("hash-processing=(%s %q %d) want untouched processing row", status, errText, lease)
+	}
+
+	// A second reset is a no-op: nothing failed is left to flip.
+	reset, err = store.ResetFailedEmbeddings(ctx)
+	if err != nil || reset != 0 {
+		t.Fatalf("second reset=%d err=%v want 0", reset, err)
+	}
+}
+
+// TestEmbeddingLeaseHealth pins the liveness read: only processing rows count,
+// so ready/pending rows carrying lease values are invisible. The expired
+// counter distinguishes "no worker is claiming" (everything expired) from
+// "workers hold leases" (nothing expired), and the oldest lease is the minimum
+// deadline across the processing rows.
+func TestEmbeddingLeaseHealth(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+
+	// Empty catalog scans as zeros, not NULLs.
+	empty, err := store.EmbeddingLeaseHealth(ctx)
+	if err != nil {
+		t.Fatalf("empty health: %v", err)
+	}
+	if empty != (EmbeddingLeaseHealth{}) {
+		t.Fatalf("empty health=%+v want all zeros", empty)
+	}
+
+	for _, hash := range []string{"proc-live", "proc-expired", "proc-older", "ready-ignored", "pending-ignored"} {
+		if err := store.UpsertBlob(ctx, Blob{Hash: hash, SizeBytes: 1}); err != nil {
+			t.Fatalf("upsert %s: %v", hash, err)
+		}
+	}
+	seedBlobStatus(t, store, "proc-live", EmbeddingStatusProcessing)
+	seedBlobStatus(t, store, "proc-expired", EmbeddingStatusProcessing)
+	seedBlobStatus(t, store, "proc-older", EmbeddingStatusProcessing)
+	seedBlobStatus(t, store, "ready-ignored", EmbeddingStatusReady)
+	// Non-processing rows must not leak into the counters even when they hold
+	// lease-shaped values.
+	seedBlobLease(t, store, "ready-ignored", "", time.Now().Add(-time.Hour).UnixMilli())
+
+	liveLease := time.Now().Add(10 * time.Minute).UnixMilli()
+	expiredLease := time.Now().Add(-time.Minute).UnixMilli()
+	olderLease := time.Now().Add(-5 * time.Minute).UnixMilli()
+	seedBlobLease(t, store, "proc-live", "", liveLease)
+	seedBlobLease(t, store, "proc-expired", "", expiredLease)
+	seedBlobLease(t, store, "proc-older", "", olderLease)
+
+	health, err := store.EmbeddingLeaseHealth(ctx)
+	if err != nil {
+		t.Fatalf("embedding lease health: %v", err)
+	}
+	want := EmbeddingLeaseHealth{
+		Processing:        3,
+		LeaseExpired:      2,
+		OldestLeaseUnixMs: olderLease,
+	}
+	if health != want {
+		t.Fatalf("health=%+v want=%+v", health, want)
+	}
+}
+
+// TestPendingEncodingBreakdown pins the gate diagnosis: the breakdown only
+// covers pending embeddings, and it splits them by encoding state, which is
+// what tells the operator how many are blocked behind the encoding gate.
+func TestPendingEncodingBreakdown(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+
+	// Empty catalog answers an empty (non-nil) map.
+	empty, err := store.PendingEncodingBreakdown(ctx)
+	if err != nil {
+		t.Fatalf("empty breakdown: %v", err)
+	}
+	if empty == nil || len(empty) != 0 {
+		t.Fatalf("empty breakdown=%v want empty non-nil map", empty)
+	}
+
+	seed := []struct {
+		hash          string
+		embedding     EmbeddingStatus
+		encodingState string
+	}{
+		{hash: "gate-pending-a", embedding: EmbeddingStatusPending, encodingState: "pending"},
+		{hash: "gate-pending-b", embedding: EmbeddingStatusPending, encodingState: "pending"},
+		{hash: "gate-leased", embedding: EmbeddingStatusPending, encodingState: "leased"},
+		{hash: "gate-received", embedding: EmbeddingStatusPending, encodingState: "received"},
+		{hash: "gate-done", embedding: EmbeddingStatusPending, encodingState: "done"},
+		{hash: "not-pending", embedding: EmbeddingStatusReady, encodingState: "pending"},
+	}
+	for _, item := range seed {
+		if err := store.UpsertBlob(ctx, Blob{Hash: item.hash, SizeBytes: 1, ContentType: "image/jpeg"}); err != nil {
+			t.Fatalf("upsert %s: %v", item.hash, err)
+		}
+		if _, err := store.db.ExecContext(ctx,
+			`UPDATE blobs SET embedding_status=?, encoding_status=? WHERE hash=?`,
+			string(item.embedding), item.encodingState, item.hash); err != nil {
+			t.Fatalf("seed %s: %v", item.hash, err)
+		}
+	}
+
+	breakdown, err := store.PendingEncodingBreakdown(ctx)
+	if err != nil {
+		t.Fatalf("pending encoding breakdown: %v", err)
+	}
+	want := map[string]int64{"pending": 2, "leased": 1, "received": 1, "done": 1}
+	if len(breakdown) != len(want) {
+		t.Fatalf("breakdown=%v want=%v", breakdown, want)
+	}
+	for status, count := range want {
+		if breakdown[status] != count {
+			t.Fatalf("breakdown[%s]=%d want=%d (full: %v)", status, breakdown[status], count, breakdown)
+		}
+	}
+}
+
+// TestEmbeddingFailureReasons pins the failure summary: grouped by error text
+// with the most common reason first and a deterministic MIN(hash) sample, the
+// limit clamped into [1, 20] so a caller bug cannot turn into an SQL error,
+// and an empty (non-nil) result when nothing has failed.
+func TestEmbeddingFailureReasons(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+
+	// Empty case first: no failed rows means an empty, non-nil slice.
+	empty, err := store.EmbeddingFailureReasons(ctx, 10)
+	if err != nil {
+		t.Fatalf("empty failure reasons: %v", err)
+	}
+	if empty == nil || len(empty) != 0 {
+		t.Fatalf("empty failure reasons=%v want empty non-nil slice", empty)
+	}
+
+	for _, hash := range []string{"f1", "f2", "f3", "f4"} {
+		if err := store.UpsertBlob(ctx, Blob{Hash: hash, SizeBytes: 1}); err != nil {
+			t.Fatalf("upsert %s: %v", hash, err)
+		}
+	}
+	seedBlobStatus(t, store, "f1", EmbeddingStatusFailed)
+	seedBlobStatus(t, store, "f2", EmbeddingStatusFailed)
+	seedBlobStatus(t, store, "f3", EmbeddingStatusFailed)
+	seedBlobStatus(t, store, "f4", EmbeddingStatusFailed)
+	seedBlobLease(t, store, "f1", "boom", 0)
+	seedBlobLease(t, store, "f2", "boom", 0)
+	seedBlobLease(t, store, "f3", "oom", 0)
+	// f4 stays ready-adjacent: set it ready so it must not appear at all.
+	seedBlobStatus(t, store, "f4", EmbeddingStatusReady)
+
+	failures, err := store.EmbeddingFailureReasons(ctx, 10)
+	if err != nil {
+		t.Fatalf("failure reasons: %v", err)
+	}
+	want := []EmbeddingFailure{
+		{Error: "boom", Count: 2, SampleHash: "f1"},
+		{Error: "oom", Count: 1, SampleHash: "f3"},
+	}
+	if len(failures) != len(want) {
+		t.Fatalf("failures=%+v want=%+v", failures, want)
+	}
+	for i, w := range want {
+		if failures[i] != w {
+			t.Fatalf("failure %d=%+v want=%+v", i, failures[i], w)
+		}
+	}
+
+	// The limit applies, and out-of-range limits are clamped rather than
+	// rejected: zero floors at one, large values cap at the sane maximum.
+	for _, tc := range []struct {
+		limit, wantLen int
+	}{
+		{limit: 1, wantLen: 1},
+		{limit: 0, wantLen: 1},
+		{limit: -5, wantLen: 1},
+		{limit: 100, wantLen: 2},
+	} {
+		got, err := store.EmbeddingFailureReasons(ctx, tc.limit)
+		if err != nil {
+			t.Fatalf("failure reasons (limit=%d): %v", tc.limit, err)
+		}
+		if len(got) != tc.wantLen {
+			t.Fatalf("failure reasons (limit=%d)=len %d want %d (%+v)", tc.limit, len(got), tc.wantLen, got)
+		}
+	}
+}

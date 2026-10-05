@@ -279,3 +279,54 @@ func (s *Store) ResetCommittingEncoding(ctx context.Context, hash, token string)
 		WHERE hash=? AND encoding_token=? AND encoding_status='committing'`, hash, token)
 	return err
 }
+
+// EncodingResetCounts reports how many rows each of ResetStuckEncodings' two
+// passes moved, so the admin dashboard can show an operator what the recovery
+// action actually did.
+type EncodingResetCounts struct {
+	ReleasedExpiredLeased int64 `json:"releasedExpiredLeased"`
+	ResetReceived         int64 `json:"resetReceived"`
+}
+
+// ResetStuckEncodings is the operator's recovery switch for the WebP queue,
+// the manual counterpart of what the normal claim loop already does for
+// expired leases. It runs two passes, in this order:
+//
+// Expired leased rows go back to pending. This is exactly the pre-expire step
+// ClaimEncoding already runs inside its transaction, surfaced as a standalone
+// action; running it here only matters when no encoder is claiming (or the
+// operator wants to see the queue drain without waiting for one).
+//
+// received rows go back to pending with no token guard. The per-token
+// ResetReceivedEncoding carries a token check because an old receiver must not
+// be able to reset a newer job it no longer owns; an operator issuing this
+// reset is authoritative over every job, so the guard does not apply here.
+//
+// committing rows are deliberately left untouched in both passes. A committing
+// row means the S3 object replacement may be in flight or may have landed with
+// an unknown outcome, and the row's encoding_source_size_bytes is the
+// bookkeeping the encoding service's Recover path needs to reconcile exactly
+// that uncertainty once the commit's grace lease expires (see
+// internal/encoding/service.go Recover). An operator reset would throw that
+// source size away and turn an "unknown outcome" into a certain loss.
+func (s *Store) ResetStuckEncodings(ctx context.Context) (EncodingResetCounts, error) {
+	var counts EncodingResetCounts
+	now := time.Now()
+	leased, err := s.db.ExecContext(ctx, `UPDATE blobs SET encoding_status='pending', encoding_token='', encoding_stage_key='', encoding_lease_until=0
+		WHERE encoding_status='leased' AND encoding_lease_until < ?`, now.UnixMilli())
+	if err != nil {
+		return EncodingResetCounts{}, fmt.Errorf("release expired encoding leases: %w", err)
+	}
+	if counts.ReleasedExpiredLeased, err = leased.RowsAffected(); err != nil {
+		return EncodingResetCounts{}, fmt.Errorf("count released encoding leases: %w", err)
+	}
+	received, err := s.db.ExecContext(ctx, `UPDATE blobs SET encoding_status='pending', encoding_token='', encoding_stage_key='', encoding_lease_until=0
+		WHERE encoding_status='received'`)
+	if err != nil {
+		return EncodingResetCounts{}, fmt.Errorf("reset received encodings: %w", err)
+	}
+	if counts.ResetReceived, err = received.RowsAffected(); err != nil {
+		return EncodingResetCounts{}, fmt.Errorf("count reset received encodings: %w", err)
+	}
+	return counts, nil
+}

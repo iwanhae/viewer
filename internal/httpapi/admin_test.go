@@ -1,14 +1,17 @@
 package httpapi
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"viewer/internal/admin"
 	"viewer/internal/catalog"
@@ -38,7 +41,19 @@ func basicAuthHeader(username, password string) string {
 
 func doAdminRequest(t *testing.T, router http.Handler, method, target, authorization string) *httptest.ResponseRecorder {
 	t.Helper()
-	req := httptest.NewRequest(method, target, nil)
+	return doAdminBodyRequest(t, router, method, target, authorization, nil)
+}
+
+// doAdminBodyRequest is doAdminRequest with a request body, for the action
+// endpoints that take JSON. A nil body posts bodyless, the way the
+// dashboard's buttons without options do.
+func doAdminBodyRequest(t *testing.T, router http.Handler, method, target, authorization string, body []byte) *httptest.ResponseRecorder {
+	t.Helper()
+	var reader io.Reader
+	if body != nil {
+		reader = bytes.NewReader(body)
+	}
+	req := httptest.NewRequest(method, target, reader)
 	if authorization != "" {
 		req.Header.Set("Authorization", authorization)
 	}
@@ -299,5 +314,231 @@ func TestAdminReindexResetsThroughAPI(t *testing.T) {
 	pairs, err := store.ReadyPairCount(ctx)
 	if err != nil || pairs != 0 {
 		t.Fatalf("ready pairs=%d err=%v want=0 after reset", pairs, err)
+	}
+}
+
+// TestAdminActionEndpointsRequireAuth extends the Basic auth contract to the
+// three action endpoints: without credentials each one is the same 401
+// challenge as the dashboard reads, never a partial action.
+func TestAdminActionEndpointsRequireAuth(t *testing.T) {
+	router, _ := newAdminTestRouter(t, 1)
+
+	for _, route := range []string{
+		"/admin/api/embeddings/release",
+		"/admin/api/embeddings/retry-failed",
+		"/admin/api/encoding/reset",
+	} {
+		rec := doAdminRequest(t, router, http.MethodPost, route, "")
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("%s: status=%d want=401 body=%s", route, rec.Code, rec.Body.String())
+		}
+		if !jsonBodyHasErrorCode(rec.Body.String(), "UNAUTHORIZED") {
+			t.Fatalf("%s: body=%s want UNAUTHORIZED error code", route, rec.Body.String())
+		}
+	}
+}
+
+// TestAdminReleaseEmbeddingsEndpoint drives the release endpoint end to end,
+// including the expiredOnly switch the dashboard's checkbox feeds: true
+// releases only the expired lease, false (and an empty body, which must decode
+// to the zero value rather than a 400) force-releases the rest.
+func TestAdminReleaseEmbeddingsEndpoint(t *testing.T) {
+	router, store := newAdminTestRouter(t, 1)
+	ctx := context.Background()
+
+	// The fixture leaves hash-c pending; sweeping it into the claim makes the
+	// arithmetic below self-contained. hash-live gets its lease renewed into
+	// the future, hash-expired keeps the expired claim lease.
+	if err := store.UpsertBlob(ctx, catalog.Blob{Hash: "hash-live", SizeBytes: 1}); err != nil {
+		t.Fatalf("upsert hash-live: %v", err)
+	}
+	if err := store.UpsertBlob(ctx, catalog.Blob{Hash: "hash-expired", SizeBytes: 1}); err != nil {
+		t.Fatalf("upsert hash-expired: %v", err)
+	}
+	if _, err := store.ClaimPendingEmbeddings(ctx, 8, time.Now().Add(-time.Minute)); err != nil {
+		t.Fatalf("claim pending blobs: %v", err)
+	}
+	if renewed, err := store.RenewEmbeddingLeases(ctx, []string{"hash-live"}, time.Now().Add(5*time.Minute)); err != nil || len(renewed) != 1 {
+		t.Fatalf("renew hash-live: renewed=%v err=%v", renewed, err)
+	}
+
+	// expiredOnly=true: the expired leases move, the live one survives.
+	rec := doAdminBodyRequest(t, router, http.MethodPost, "/admin/api/embeddings/release", basicAuthHeader("operator", "sekrit"), []byte(`{"expiredOnly":true}`))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expired-only status=%d want=200 body=%s", rec.Code, rec.Body.String())
+	}
+	var payload struct {
+		Released int64                   `json:"released"`
+		Counts   catalog.EmbeddingCounts `json:"counts"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode release response: %v", err)
+	}
+	wantCounts := catalog.EmbeddingCounts{Total: 5, Ready: 1, Failed: 1, Processing: 1, Pending: 3}
+	if payload.Released != 2 || payload.Counts != wantCounts {
+		t.Fatalf("expired-only response={%d %+v} want released=2 counts=%+v", payload.Released, payload.Counts, wantCounts)
+	}
+
+	// expiredOnly=false force-releases what is left.
+	rec = doAdminBodyRequest(t, router, http.MethodPost, "/admin/api/embeddings/release", basicAuthHeader("operator", "sekrit"), []byte(`{"expiredOnly":false}`))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("forced status=%d want=200 body=%s", rec.Code, rec.Body.String())
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode forced release response: %v", err)
+	}
+	wantCounts = catalog.EmbeddingCounts{Total: 5, Ready: 1, Failed: 1, Pending: 3}
+	if payload.Released != 1 || payload.Counts != wantCounts {
+		t.Fatalf("forced response={%d %+v} want released=1 counts=%+v", payload.Released, payload.Counts, wantCounts)
+	}
+
+	after, err := store.EmbeddingCounts(ctx)
+	if err != nil {
+		t.Fatalf("catalog counts: %v", err)
+	}
+	if after != wantCounts {
+		t.Fatalf("catalog counts=%+v want=%+v", after, wantCounts)
+	}
+
+	// An empty body is the zero-value request, not a decode error — the
+	// dashboard's bodyless POSTs must not read as "release everything".
+	rec = doAdminBodyRequest(t, router, http.MethodPost, "/admin/api/embeddings/release", basicAuthHeader("operator", "sekrit"), nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("empty body status=%d want=200 body=%s", rec.Code, rec.Body.String())
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode empty-body response: %v", err)
+	}
+	if payload.Released != 0 || payload.Counts != wantCounts {
+		t.Fatalf("empty-body response={%d %+v} want released=0 counts=%+v", payload.Released, payload.Counts, wantCounts)
+	}
+
+	// A broken body and an unknown field are caller bugs: 400 with the shared
+	// invalid-request code.
+	for name, body := range map[string]string{
+		"not json":      `not json`,
+		"unknown field": `{"expiredOnly":true,"extra":1}`,
+	} {
+		rec := doAdminBodyRequest(t, router, http.MethodPost, "/admin/api/embeddings/release", basicAuthHeader("operator", "sekrit"), []byte(body))
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("%s: status=%d want=400 body=%s", name, rec.Code, rec.Body.String())
+		}
+		if !jsonBodyHasErrorCode(rec.Body.String(), "INVALID_REQUEST") {
+			t.Fatalf("%s: body=%s want INVALID_REQUEST error code", name, rec.Body.String())
+		}
+	}
+}
+
+// TestAdminRetryFailedEndpoint drives the retry-failed endpoint: a bodyless
+// POST resets the fixture's one failed blob and answers with the post-reset
+// counts, which must match the catalog behind it.
+func TestAdminRetryFailedEndpoint(t *testing.T) {
+	router, store := newAdminTestRouter(t, 1)
+	ctx := context.Background()
+
+	before, err := store.EmbeddingCounts(ctx)
+	if err != nil {
+		t.Fatalf("counts before retry: %v", err)
+	}
+	if before.Failed != 1 {
+		t.Fatalf("fixture counts=%+v want one failed blob", before)
+	}
+
+	rec := doAdminRequest(t, router, http.MethodPost, "/admin/api/embeddings/retry-failed", basicAuthHeader("operator", "sekrit"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d want=200 body=%s", rec.Code, rec.Body.String())
+	}
+
+	var payload struct {
+		Reset  int64                   `json:"reset"`
+		Counts catalog.EmbeddingCounts `json:"counts"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode retry-failed response: %v", err)
+	}
+	want := catalog.EmbeddingCounts{Total: 3, Ready: 1, Pending: 2}
+	if payload.Reset != 1 || payload.Counts != want {
+		t.Fatalf("response={%d %+v} want reset=1 counts=%+v", payload.Reset, payload.Counts, want)
+	}
+
+	after, err := store.EmbeddingCounts(ctx)
+	if err != nil {
+		t.Fatalf("counts after retry: %v", err)
+	}
+	if after != want {
+		t.Fatalf("catalog counts=%+v want=%+v", after, want)
+	}
+}
+
+// TestAdminResetEncodingsEndpoint drives the encoding reset endpoint: the two
+// stuck shapes (expired lease, received result) drain back to pending while a
+// committing row is left for the server-side Recover path, and the response
+// carries both the reset counts and the fresh encoding stats.
+func TestAdminResetEncodingsEndpoint(t *testing.T) {
+	router, store := newAdminTestRouter(t, 1)
+	ctx := context.Background()
+
+	// Sizes steer ClaimEncoding (largest first) at one row per claim, in the
+	// order the fixture needs: received first on a live lease, committing
+	// second, and the expired lease last — any later claim would sweep an
+	// expired lease back to pending.
+	rows := []catalog.Blob{
+		{Hash: "hash-received", SizeBytes: 100, ContentType: "image/jpeg"},
+		{Hash: "hash-committing", SizeBytes: 90, ContentType: "image/jpeg"},
+		{Hash: "hash-leased", SizeBytes: 80, ContentType: "image/jpeg"},
+	}
+	for _, blob := range rows {
+		if err := store.UpsertBlob(ctx, blob); err != nil {
+			t.Fatalf("upsert %s: %v", blob.Hash, err)
+		}
+	}
+	liveJob, err := store.ClaimEncoding(ctx, 1, time.Minute)
+	if err != nil || len(liveJob) != 1 || liveJob[0].Hash != "hash-received" {
+		t.Fatalf("claim hash-received: jobs=%v err=%v", liveJob, err)
+	}
+	if ok, err := store.MarkEncodingReceived(ctx, "hash-received", liveJob[0].Token); err != nil || !ok {
+		t.Fatalf("mark hash-received received: ok=%v err=%v", ok, err)
+	}
+	committer, err := store.ClaimEncoding(ctx, 1, time.Minute)
+	if err != nil || len(committer) != 1 || committer[0].Hash != "hash-committing" {
+		t.Fatalf("claim hash-committing: jobs=%v err=%v", committer, err)
+	}
+	if ok, err := store.BeginEncodingCommit(ctx, "hash-committing", committer[0].Token, 90, time.Minute); err != nil || !ok {
+		t.Fatalf("begin commit: ok=%v err=%v", ok, err)
+	}
+	if _, err := store.ClaimEncoding(ctx, 1, -time.Minute); err != nil {
+		t.Fatalf("claim expired lease: %v", err)
+	}
+
+	rec := doAdminRequest(t, router, http.MethodPost, "/admin/api/encoding/reset", basicAuthHeader("operator", "sekrit"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d want=200 body=%s", rec.Code, rec.Body.String())
+	}
+
+	var payload struct {
+		Counts   catalog.EncodingResetCounts `json:"counts"`
+		Encoding struct {
+			Enabled    bool  `json:"enabled"`
+			Pending    int64 `json:"pending"`
+			Processing int64 `json:"processing"`
+		} `json:"encoding"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode reset response: %v", err)
+	}
+	wantCounts := catalog.EncodingResetCounts{ReleasedExpiredLeased: 1, ResetReceived: 1}
+	if payload.Counts != wantCounts {
+		t.Fatalf("counts=%+v want=%+v", payload.Counts, wantCounts)
+	}
+	// The fixture's three blobs are also encoding-pending, so the two reset
+	// rows land on top of them: 3 + 2 pending, with committing the only
+	// processing row left.
+	if !payload.Encoding.Enabled || payload.Encoding.Pending != 5 || payload.Encoding.Processing != 1 {
+		t.Fatalf("encoding=%+v want enabled with pending=5 processing=1 (committing untouched)", payload.Encoding)
+	}
+
+	committing, err := store.CommittingEncodings(ctx)
+	if err != nil || len(committing) != 1 || committing[0].Hash != "hash-committing" {
+		t.Fatalf("committing after reset=%v err=%v want hash-committing untouched", committing, err)
 	}
 }

@@ -304,3 +304,299 @@ func TestReindexNilCatalogErrors(t *testing.T) {
 		t.Fatalf("expected an error for a nil catalog")
 	}
 }
+
+// seedEmbeddingDiagnostics builds every diagnostic shape Stats reports at once:
+// two processing rows (one live lease, one expired), three failed rows carrying
+// two distinct error texts, and three gated pending rows sitting behind three
+// different encoding states. It returns nothing — the shape itself is the
+// fixture, and each test asserts the slice it cares about.
+func seedEmbeddingDiagnostics(t *testing.T, store *catalog.Store) {
+	t.Helper()
+	ctx := context.Background()
+
+	// Five blobs go through the claim path together: two stay processing
+	// under an expired claim lease (one gets renewed into the future), three
+	// take failed outcomes with their error texts.
+	for _, hash := range []string{"hash-live", "hash-expired", "hash-boom-a", "hash-boom-b", "hash-disk"} {
+		if err := store.UpsertBlob(ctx, catalog.Blob{Hash: hash, SizeBytes: 1}); err != nil {
+			t.Fatalf("upsert %s: %v", hash, err)
+		}
+	}
+	claimed, err := store.ClaimPendingEmbeddings(ctx, 8, time.Now().Add(-time.Minute))
+	if err != nil || len(claimed) != 5 {
+		t.Fatalf("claim five blobs: claimed=%v err=%v", claimed, err)
+	}
+	renewed, err := store.RenewEmbeddingLeases(ctx, []string{"hash-live"}, time.Now().Add(5*time.Minute))
+	if err != nil || len(renewed) != 1 || renewed[0] != "hash-live" {
+		t.Fatalf("renew hash-live: renewed=%v err=%v", renewed, err)
+	}
+	applied, rejected, err := store.ApplyEmbeddingResults(ctx, []catalog.EmbeddingResult{
+		{Hash: "hash-boom-a", Status: catalog.EmbeddingStatusFailed, Error: "boom"},
+		{Hash: "hash-boom-b", Status: catalog.EmbeddingStatusFailed, Error: "boom"},
+		{Hash: "hash-disk", Status: catalog.EmbeddingStatusFailed, Error: "disk full"},
+	})
+	if err != nil || len(applied) != 3 || len(rejected) != 0 {
+		t.Fatalf("apply failed outcomes: applied=%v rejected=%v err=%v", applied, rejected, err)
+	}
+
+	// Three gated pending rows behind different encoding states. The big
+	// sizes steer ClaimEncoding (largest first) at exactly the rows this
+	// fixture needs, one claim each: a negative TTL hands back an
+	// already-expired lease (the stuck shape the dashboard diagnoses), while
+	// the received row needs a live lease to hand off through.
+	gated := []catalog.Blob{
+		{Hash: "hash-gate-received", SizeBytes: 100, ContentType: "image/jpeg", EncodingGate: true},
+		{Hash: "hash-gate-leased", SizeBytes: 90, ContentType: "image/jpeg", EncodingGate: true},
+		{Hash: "hash-gate-pending", SizeBytes: 80, ContentType: "image/jpeg", EncodingGate: true},
+	}
+	for _, blob := range gated {
+		if err := store.UpsertBlob(ctx, blob); err != nil {
+			t.Fatalf("upsert %s: %v", blob.Hash, err)
+		}
+	}
+	// The received row is claimed and handed off while its lease is live
+	// (MarkEncodingReceived rejects an expired one); the expired-lease row is
+	// claimed last with a negative TTL, because any later ClaimEncoding call
+	// would sweep that expired lease back to pending and re-claim it.
+	liveJob, err := store.ClaimEncoding(ctx, 1, time.Minute)
+	if err != nil || len(liveJob) != 1 || liveJob[0].Hash != "hash-gate-received" {
+		t.Fatalf("claim live encoding: jobs=%v err=%v", liveJob, err)
+	}
+	if ok, err := store.MarkEncodingReceived(ctx, "hash-gate-received", liveJob[0].Token); err != nil || !ok {
+		t.Fatalf("mark hash-gate-received received: ok=%v err=%v", ok, err)
+	}
+	expiredJob, err := store.ClaimEncoding(ctx, 1, -time.Minute)
+	if err != nil || len(expiredJob) != 1 || expiredJob[0].Hash != "hash-gate-leased" {
+		t.Fatalf("claim expired encoding: jobs=%v err=%v", expiredJob, err)
+	}
+}
+
+func TestStatsEmbeddingDiagnostics(t *testing.T) {
+	store := openTestCatalog(t)
+	seedEmbeddingDiagnostics(t, store)
+	ctx := context.Background()
+
+	service := NewService(store, nil, nil)
+	stats, err := service.Stats(ctx)
+	if err != nil {
+		t.Fatalf("stats: %v", err)
+	}
+
+	// One live lease, one expired: the mixed picture, not the "everything
+	// expired" stall signature.
+	wantLease := catalog.EmbeddingLeaseHealth{Processing: 2, LeaseExpired: 1, OldestLeaseUnixMs: stats.EmbeddingLease.OldestLeaseUnixMs}
+	if stats.EmbeddingLease != wantLease {
+		t.Fatalf("embeddingLease=%+v want=%+v", stats.EmbeddingLease, wantLease)
+	}
+	if stats.EmbeddingLease.OldestLeaseUnixMs <= 0 {
+		t.Fatalf("oldestLeaseUnixMs=%d want a positive timestamp (two processing rows hold leases)", stats.EmbeddingLease.OldestLeaseUnixMs)
+	}
+
+	wantBreakdown := map[string]int64{"pending": 1, "leased": 1, "received": 1}
+	if len(stats.PendingByEncoding) != len(wantBreakdown) {
+		t.Fatalf("pendingByEncoding=%v want=%v", stats.PendingByEncoding, wantBreakdown)
+	}
+	for status, want := range wantBreakdown {
+		if stats.PendingByEncoding[status] != want {
+			t.Fatalf("pendingByEncoding[%s]=%d want=%d", status, stats.PendingByEncoding[status], want)
+		}
+	}
+
+	wantFailures := []catalog.EmbeddingFailure{
+		{Error: "boom", Count: 2, SampleHash: "hash-boom-a"},
+		{Error: "disk full", Count: 1, SampleHash: "hash-disk"},
+	}
+	if len(stats.Failures) != len(wantFailures) {
+		t.Fatalf("failures=%+v want=%+v", stats.Failures, wantFailures)
+	}
+	for i, want := range wantFailures {
+		if stats.Failures[i] != want {
+			t.Fatalf("failures[%d]=%+v want=%+v", i, stats.Failures[i], want)
+		}
+	}
+
+	// No recommend service wired: the activity must read as all zeros —
+	// "never attempted", not a fabricated timestamp.
+	if stats.WorkerActivity != (recommend.WorkerActivity{}) {
+		t.Fatalf("workerActivity=%+v want zeros (nil recommend service)", stats.WorkerActivity)
+	}
+
+	// An idle recommend service records no attempts either; the field is
+	// present with the same zero shape rather than being omitted.
+	idle := NewService(store, nil, recommend.NewService(store, nil, nil, nil, nil))
+	idleStats, err := idle.Stats(ctx)
+	if err != nil {
+		t.Fatalf("stats with idle recommend service: %v", err)
+	}
+	if idleStats.WorkerActivity != (recommend.WorkerActivity{}) {
+		t.Fatalf("idle workerActivity=%+v want zeros", idleStats.WorkerActivity)
+	}
+}
+
+func TestReleaseStuckEmbeddingsRespectsExpiredOnly(t *testing.T) {
+	store := openTestCatalog(t)
+	ctx := context.Background()
+
+	// Two processing rows: hash-live holds a renewed live lease, hash-expired
+	// keeps the already-expired claim lease.
+	if err := store.UpsertBlob(ctx, catalog.Blob{Hash: "hash-live", SizeBytes: 1}); err != nil {
+		t.Fatalf("upsert hash-live: %v", err)
+	}
+	if err := store.UpsertBlob(ctx, catalog.Blob{Hash: "hash-expired", SizeBytes: 1}); err != nil {
+		t.Fatalf("upsert hash-expired: %v", err)
+	}
+	if _, err := store.ClaimPendingEmbeddings(ctx, 8, time.Now().Add(-time.Minute)); err != nil {
+		t.Fatalf("claim both blobs: %v", err)
+	}
+	if renewed, err := store.RenewEmbeddingLeases(ctx, []string{"hash-live"}, time.Now().Add(5*time.Minute)); err != nil || len(renewed) != 1 {
+		t.Fatalf("renew hash-live: renewed=%v err=%v", renewed, err)
+	}
+
+	service := NewService(store, nil, nil)
+	result, err := service.ReleaseStuckEmbeddings(ctx, true)
+	if err != nil {
+		t.Fatalf("release expired only: %v", err)
+	}
+	// The live lease is untouched; only the expired one moves. Pending is
+	// derived as Total-Ready-Failed, so the surviving processing row still
+	// counts toward it.
+	want := catalog.EmbeddingCounts{Total: 2, Processing: 1, Pending: 2}
+	if result.Released != 1 || result.Counts != want {
+		t.Fatalf("expired-only result={%d %+v} want released=1 counts=%+v", result.Released, result.Counts, want)
+	}
+
+	forced, err := service.ReleaseStuckEmbeddings(ctx, false)
+	if err != nil {
+		t.Fatalf("force release: %v", err)
+	}
+	wantAll := catalog.EmbeddingCounts{Total: 2, Pending: 2}
+	if forced.Released != 1 || forced.Counts != wantAll {
+		t.Fatalf("forced result={%d %+v} want released=1 counts=%+v", forced.Released, forced.Counts, wantAll)
+	}
+
+	fresh, err := store.EmbeddingCounts(ctx)
+	if err != nil {
+		t.Fatalf("fresh embedding counts: %v", err)
+	}
+	if fresh != wantAll {
+		t.Fatalf("fresh embedding counts=%+v want=%+v", fresh, wantAll)
+	}
+}
+
+func TestRetryFailedEmbeddingsResetsOnlyFailed(t *testing.T) {
+	store := openTestCatalog(t)
+	ctx := context.Background()
+
+	// One ready and one failed blob through the public claim→apply path; the
+	// retry must move exactly the failed one.
+	if err := store.UpsertBlob(ctx, catalog.Blob{Hash: "hash-ready", SizeBytes: 1}); err != nil {
+		t.Fatalf("upsert hash-ready: %v", err)
+	}
+	if err := store.UpsertBlob(ctx, catalog.Blob{Hash: "hash-failed", SizeBytes: 1}); err != nil {
+		t.Fatalf("upsert hash-failed: %v", err)
+	}
+	if _, err := store.ClaimPendingEmbeddings(ctx, 8, time.Now().Add(-time.Minute)); err != nil {
+		t.Fatalf("claim both blobs: %v", err)
+	}
+	applied, rejected, err := store.ApplyEmbeddingResults(ctx, []catalog.EmbeddingResult{
+		{Hash: "hash-ready", Status: catalog.EmbeddingStatusReady, Vector: make([]float32, catalog.EmbeddingDim)},
+		{Hash: "hash-failed", Status: catalog.EmbeddingStatusFailed, Error: "boom"},
+	})
+	if err != nil || len(applied) != 2 || len(rejected) != 0 {
+		t.Fatalf("apply outcomes: applied=%v rejected=%v err=%v", applied, rejected, err)
+	}
+
+	service := NewService(store, nil, nil)
+	result, err := service.RetryFailedEmbeddings(ctx)
+	if err != nil {
+		t.Fatalf("retry failed: %v", err)
+	}
+	// The ready row is terminal success — re-embedding it would re-spend
+	// worker capacity on finished work — so only the failed row moves.
+	want := catalog.EmbeddingCounts{Total: 2, Ready: 1, Pending: 1}
+	if result.Reset != 1 || result.Counts != want {
+		t.Fatalf("result={%d %+v} want reset=1 counts=%+v", result.Reset, result.Counts, want)
+	}
+
+	fresh, err := store.EmbeddingCounts(ctx)
+	if err != nil {
+		t.Fatalf("fresh embedding counts: %v", err)
+	}
+	if fresh != want {
+		t.Fatalf("fresh embedding counts=%+v want=%+v", fresh, want)
+	}
+}
+
+func TestResetStuckEncodingsLeavesCommittingRowsAlone(t *testing.T) {
+	store := openTestCatalog(t)
+	ctx := context.Background()
+
+	// Three encoding rows: an expired lease, a received result, and a
+	// committing row whose S3 replacement may be in flight. The sizes steer
+	// ClaimEncoding (largest first) at exactly one row per claim.
+	rows := []catalog.Blob{
+		{Hash: "hash-received", SizeBytes: 100, ContentType: "image/jpeg"},
+		{Hash: "hash-committing", SizeBytes: 90, ContentType: "image/jpeg"},
+		{Hash: "hash-leased", SizeBytes: 80, ContentType: "image/jpeg"},
+	}
+	for _, blob := range rows {
+		if err := store.UpsertBlob(ctx, blob); err != nil {
+			t.Fatalf("upsert %s: %v", blob.Hash, err)
+		}
+	}
+	// Same ordering as the diagnostics fixture: the received row is claimed
+	// and handed off on a live lease, the committing row is claimed and
+	// promoted to committing, and the expired lease is claimed last — any
+	// later ClaimEncoding call would sweep it back to pending.
+	liveJob, err := store.ClaimEncoding(ctx, 1, time.Minute)
+	if err != nil || len(liveJob) != 1 || liveJob[0].Hash != "hash-received" {
+		t.Fatalf("claim live encoding: jobs=%v err=%v", liveJob, err)
+	}
+	if ok, err := store.MarkEncodingReceived(ctx, "hash-received", liveJob[0].Token); err != nil || !ok {
+		t.Fatalf("mark hash-received received: ok=%v err=%v", ok, err)
+	}
+	committer, err := store.ClaimEncoding(ctx, 1, time.Minute)
+	if err != nil || len(committer) != 1 || committer[0].Hash != "hash-committing" {
+		t.Fatalf("claim hash-committing: jobs=%v err=%v", committer, err)
+	}
+	if ok, err := store.BeginEncodingCommit(ctx, "hash-committing", committer[0].Token, 80, time.Minute); err != nil || !ok {
+		t.Fatalf("begin commit: ok=%v err=%v", ok, err)
+	}
+	if _, err := store.ClaimEncoding(ctx, 1, -time.Minute); err != nil {
+		t.Fatalf("claim expired encoding: %v", err)
+	}
+
+	service := NewService(store, nil, nil).WithEncodingEnabled(true)
+	result, err := service.ResetStuckEncodings(ctx)
+	if err != nil {
+		t.Fatalf("reset stuck encodings: %v", err)
+	}
+	wantCounts := catalog.EncodingResetCounts{ReleasedExpiredLeased: 1, ResetReceived: 1}
+	if result.Counts != wantCounts {
+		t.Fatalf("counts=%+v want=%+v", result.Counts, wantCounts)
+	}
+	// The two stuck rows drain back to pending; the committing row keeps
+	// counting as processing because the reset never touched it.
+	if !result.Encoding.Enabled || result.Encoding.Pending != 2 || result.Encoding.Processing != 1 {
+		t.Fatalf("encoding=%+v want enabled with pending=2 processing=1", result.Encoding)
+	}
+
+	committing, err := store.CommittingEncodings(ctx)
+	if err != nil || len(committing) != 1 || committing[0].Hash != "hash-committing" {
+		t.Fatalf("committing after reset=%v err=%v want hash-committing untouched", committing, err)
+	}
+}
+
+func TestActionNilCatalogErrors(t *testing.T) {
+	service := NewService(nil, nil, nil)
+	ctx := context.Background()
+	if _, err := service.ReleaseStuckEmbeddings(ctx, true); err == nil {
+		t.Fatalf("expected an error for a nil catalog")
+	}
+	if _, err := service.RetryFailedEmbeddings(ctx); err == nil {
+		t.Fatalf("expected an error for a nil catalog")
+	}
+	if _, err := service.ResetStuckEncodings(ctx); err == nil {
+		t.Fatalf("expected an error for a nil catalog")
+	}
+}

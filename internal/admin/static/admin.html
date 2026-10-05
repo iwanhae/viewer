@@ -45,6 +45,18 @@
     border: 1px solid #b91c1c;
     color: #b91c1c;
   }
+  #actionNote {
+    display: none;
+    margin: 1rem 0;
+    padding: .5rem .75rem;
+    border: 1px solid #15803d;
+  }
+  .ellip {
+    max-width: 22rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
 </style>
 </head>
 <body>
@@ -77,6 +89,25 @@
   <tr><th>Failed</th><td class="num" id="embFailed">&ndash;</td></tr>
   <tr><th>Total blobs</th><td class="num" id="embTotal">&ndash;</td></tr>
 </table>
+
+<h2>Pipeline health</h2>
+<table>
+  <tr><th>Expired leases</th><td id="leaseExpired">&ndash;</td></tr>
+  <tr><th>Oldest processing lease age</th><td id="oldestLease">&ndash;</td></tr>
+  <tr><th>Worker last activity</th><td id="workerActivity">&ndash;</td></tr>
+  <tr><th>Pending by encoding status</th><td id="pendingByEncoding">&ndash;</td></tr>
+</table>
+<p class="muted">
+  Expired leases: all expired = no worker claiming; none expired = leases held
+  (write-back stuck upstream). Worker activity is measured since last server
+  restart.
+</p>
+<p class="muted">Failure reasons among failed embeddings:</p>
+<table id="failures" hidden>
+  <thead><tr><th>Error</th><th>Count</th><th>Sample hash</th></tr></thead>
+  <tbody id="failureRows"></tbody>
+</table>
+<p id="noFailures" class="muted">none</p>
 
 <h2>WebP encoding</h2>
 <p class="muted">
@@ -112,6 +143,29 @@
   Resets every ready and failed embedding to pending. The background workers
   then re-embed the whole library from the stored originals &mdash; this is the
   recovery path for a lost vector store, and it takes a long time.
+</p>
+
+<div id="actionNote" class="ok" role="status"></div>
+
+<h2>Recovery actions</h2>
+<div class="row">
+  <button id="releaseClaims" type="button">Release stuck claims</button>
+  <label><input type="checkbox" id="expiredOnly" checked> only expired leases</label>
+</div>
+<p class="muted">
+  Returns processing embeddings to pending so a worker can claim them again.
+  With the box checked, only expired leases are released; unchecked, every
+  processing row is force-released &mdash; in-flight workers' results will be
+  rejected and those blobs get re-embedded.
+</p>
+<button id="retryFailed" type="button">Retry failed embeddings (&ndash;)</button>
+<p class="muted">
+  Resets failed embeddings to pending so they are re-embedded.
+</p>
+<button id="resetEncoding" type="button">Reset stuck encoding jobs</button>
+<p class="muted">
+  Returns expired encoder leases and received results to pending. Committing
+  jobs are deliberately left to the server's own reconciliation.
 </p>
 
 <script>
@@ -165,6 +219,45 @@ function setBytes(id, value) {
   $(id).textContent = formatBytes(value);
 }
 
+function formatRelative(unixMs) {
+  if (!unixMs) return 'never';
+  const secs = Math.max(0, Math.floor((Date.now() - unixMs) / 1000));
+  if (secs < 60) return secs + 's ago';
+  const mins = Math.floor(secs / 60);
+  if (mins < 60) return mins + 'm ago';
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return hours + 'h ago';
+  return Math.floor(hours / 24) + 'd ago';
+}
+
+// Two-unit humanization ("3h 12m ago") for the oldest-lease age, where the
+// coarser single-unit rounding in formatRelative would hide slow creep.
+function formatAge(unixMs) {
+  if (!unixMs) return '–';
+  let secs = Math.max(0, Math.floor((Date.now() - unixMs) / 1000));
+  const days = Math.floor(secs / 86400); secs -= days * 86400;
+  const hours = Math.floor(secs / 3600); secs -= hours * 3600;
+  const mins = Math.floor(secs / 60);
+  if (days > 0) return days + 'd ' + hours + 'h ago';
+  if (hours > 0) return hours + 'h ' + mins + 'm ago';
+  return formatRelative(unixMs);
+}
+
+function showConfirmation(message) {
+  $('actionNote').textContent = message;
+  $('actionNote').style.display = 'block';
+}
+
+async function runAction(name, url, options, describe) {
+  try {
+    const res = await fetchJSON(url, options);
+    await refresh();
+    showConfirmation(describe(res));
+  } catch (err) {
+    showError(name + ' failed: ' + err.message);
+  }
+}
+
 function render(stats) {
   setCount('albums', stats.albums);
   setCount('photos', stats.photos);
@@ -186,6 +279,66 @@ function render(stats) {
   setCount('embReady', emb.ready);
   setCount('embFailed', emb.failed);
   setCount('embTotal', emb.total);
+  $('retryFailed').textContent = 'Retry failed embeddings (' + Number(emb.failed || 0) + ')';
+
+  const lease = stats.embeddingLease;
+  const leaseEl = $('leaseExpired');
+  if (!lease) {
+    leaseEl.textContent = '–';
+    leaseEl.className = '';
+  } else {
+    leaseEl.textContent = (lease.leaseExpired || 0) + '/' + (lease.processing || 0);
+    // All processing rows expired while processing is nonzero means no worker
+    // is claiming; live leases mean the write-back is stuck upstream.
+    leaseEl.className =
+      (lease.processing > 0 && lease.leaseExpired >= lease.processing) ? 'bad' : '';
+  }
+  $('oldestLease').textContent = formatAge(lease && lease.oldestLeaseUnixMs);
+
+  const act = stats.workerActivity || {};
+  $('workerActivity').textContent =
+    'claim ' + formatRelative(act.lastClaimUnixMs) +
+    ' · renew ' + formatRelative(act.lastRenewUnixMs) +
+    ' · results ' + formatRelative(act.lastResultsUnixMs);
+
+  const pbe = stats.pendingByEncoding || {};
+  const pbeEl = $('pendingByEncoding');
+  const pbeKeys = Object.keys(pbe);
+  if (!pbeKeys.length) {
+    pbeEl.textContent = '–';
+  } else {
+    // Anything other than pending/done/skipped is a blob stuck at the
+    // WebP-encoding gate, so flag it.
+    const gateDone = new Set(['pending', 'done', 'skipped']);
+    pbeEl.textContent = '';
+    pbeKeys.forEach((status, i) => {
+      const span = document.createElement('span');
+      span.textContent = status + ': ' + pbe[status];
+      if (!gateDone.has(status)) span.className = 'bad';
+      pbeEl.appendChild(span);
+      if (i < pbeKeys.length - 1) pbeEl.appendChild(document.createTextNode(' · '));
+    });
+  }
+
+  const failures = Array.isArray(stats.failures) ? stats.failures : [];
+  $('failures').hidden = failures.length === 0;
+  $('noFailures').hidden = failures.length > 0;
+  const failureRows = $('failureRows');
+  failureRows.textContent = '';
+  for (const f of failures) {
+    const tr = document.createElement('tr');
+    const errTd = document.createElement('td');
+    errTd.className = 'ellip';
+    errTd.textContent = f.error || '';
+    errTd.title = f.error || '';
+    const countTd = document.createElement('td');
+    countTd.className = 'num';
+    countTd.textContent = String(f.count);
+    const hashTd = document.createElement('td');
+    hashTd.textContent = f.sampleHash || '';
+    tr.append(errTd, countTd, hashTd);
+    failureRows.appendChild(tr);
+  }
 
   const enc = stats.encoding || {};
   $('encodingEnabled').textContent = enc.enabled ? 'enabled' : 'disabled (WORKER_TOKEN unset)';
@@ -256,6 +409,48 @@ $('reindex').addEventListener('click', async () => {
   } catch (err) {
     showError('reindex failed: ' + err.message);
   }
+});
+
+$('releaseClaims').addEventListener('click', async () => {
+  const expiredOnly = $('expiredOnly').checked;
+  const ok = confirm(expiredOnly
+    ? 'This returns processing embeddings whose lease has expired back to ' +
+      'pending so a worker can claim them again. Continue?'
+    : 'This force-releases ALL processing embeddings back to pending, ' +
+      'including live leases: workers still working on them will have their ' +
+      'results rejected (not_claimed) and the blobs get re-embedded. Continue?');
+  if (!ok) return;
+  await runAction('release claims', '/admin/api/embeddings/release', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ expiredOnly: expiredOnly }),
+  }, (res) => 'released ' + Number(res.released || 0) + ' claim(s)');
+});
+
+$('retryFailed').addEventListener('click', async () => {
+  const ok = confirm(
+    'This resets all failed embeddings to pending so they get re-embedded. ' +
+    'Continue?');
+  if (!ok) return;
+  await runAction('retry failed', '/admin/api/embeddings/retry-failed',
+    { method: 'POST' },
+    (res) => 'reset ' + Number(res.reset || 0) + ' failed embedding(s)');
+});
+
+$('resetEncoding').addEventListener('click', async () => {
+  const ok = confirm(
+    'This returns stuck WebP encoding jobs (expired encoder leases and ' +
+    'received results) to pending. Committing jobs are left to the server\'s ' +
+    'own reconciliation. Continue?');
+  if (!ok) return;
+  await runAction('reset encoding', '/admin/api/encoding/reset',
+    { method: 'POST' },
+    (res) => {
+      const counts = res.counts || {};
+      return 'released ' + Number(counts.releasedExpiredLeased || 0) +
+        ' expired lease(s), reset ' + Number(counts.resetReceived || 0) +
+        ' received result(s)';
+    });
 });
 
 refresh();

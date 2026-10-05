@@ -8,6 +8,7 @@ import (
 	"math"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"viewer/internal/catalog"
@@ -91,6 +92,19 @@ type Service struct {
 	runActive    bool
 	runStartedAt time.Time
 	runEmbedded  int
+
+	// lastClaimMs, lastRenewMs and lastResultsMs are the admin dashboard's
+	// liveness stamps: the last time anyone attempted the matching pipeline
+	// entry point, as unix milliseconds (0 = no attempt since process start).
+	// They are written at method entry, before any guard can reject the call,
+	// because the dashboard's question is "is a worker alive and trying" —
+	// which even an always-failing worker (dead catalog, store outage) answers
+	// yes to. Whether the pipeline actually makes progress is diagnosed from
+	// the catalog's embedding counts instead. Atomic so worker goroutines can
+	// stamp while the dashboard reads, with no lock on the hot path.
+	lastClaimMs   atomic.Int64
+	lastRenewMs   atomic.Int64
+	lastResultsMs atomic.Int64
 }
 
 // NewService builds a recommendation service. A nil embedder switches the
@@ -381,7 +395,11 @@ func (s *Service) progressFrom(counts catalog.EmbeddingCounts) EmbeddingProgress
 // model is not loaded: external backfill must not depend on this process
 // having a usable checkpoint.
 func (s *Service) ClaimEmbeddings(ctx context.Context, limit int) ([]catalog.Blob, time.Time, error) {
-	if s == nil || s.catalog == nil {
+	if s == nil {
+		return nil, time.Time{}, fmt.Errorf("catalog is not available")
+	}
+	noteActivity(&s.lastClaimMs)
+	if s.catalog == nil {
 		return nil, time.Time{}, fmt.Errorf("catalog is not available")
 	}
 	leaseUntil := time.Now().Add(DefaultLeaseTTL)
@@ -398,7 +416,11 @@ func (s *Service) ClaimEmbeddings(ctx context.Context, limit int) ([]catalog.Blo
 // and the renewed list is how a worker finds out its lease was lost before it
 // wastes GPU hours on results that would be rejected anyway.
 func (s *Service) RenewLeases(ctx context.Context, hashes []string) (time.Time, []string, error) {
-	if s == nil || s.catalog == nil {
+	if s == nil {
+		return time.Time{}, nil, fmt.Errorf("catalog is not available")
+	}
+	noteActivity(&s.lastRenewMs)
+	if s.catalog == nil {
 		return time.Time{}, nil, fmt.Errorf("catalog is not available")
 	}
 	leaseUntil := time.Now().Add(DefaultLeaseTTL)
@@ -434,7 +456,11 @@ func (s *Service) ReleaseClaims(ctx context.Context, hashes []string) error {
 // Neither window can produce a duplicate or a vector the catalog does not know
 // about — the reverse order could.
 func (s *Service) ApplyEmbeddingResults(ctx context.Context, results []catalog.EmbeddingResult) (applied int, rejected []catalog.RejectedEmbedding, err error) {
-	if s == nil || s.catalog == nil {
+	if s == nil {
+		return 0, nil, fmt.Errorf("catalog is not available")
+	}
+	noteActivity(&s.lastResultsMs)
+	if s.catalog == nil {
 		return 0, nil, fmt.Errorf("catalog is not available")
 	}
 

@@ -114,6 +114,9 @@ func (s *Server) Router() http.Handler {
 			r.Get("/", admin.Page().ServeHTTP)
 			r.Get("/api/stats", s.adminStats)
 			r.Post("/api/reindex", s.adminReindex)
+			r.Post("/api/embeddings/release", s.adminReleaseEmbeddings)
+			r.Post("/api/embeddings/retry-failed", s.adminRetryFailed)
+			r.Post("/api/encoding/reset", s.adminResetEncodings)
 		})
 	}
 
