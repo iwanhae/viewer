@@ -273,15 +273,16 @@ def cmd_calibrate(args) -> dict:
 def cmd_embed(args) -> dict:
     import torch
 
-    phase = f"embed_b{args.budget}"
+    tag = args.out or f"b{args.budget}"
+    phase = f"embed_{tag}"
     model, proc = load_eg2(torch.bfloat16, "cuda")
     pairs = present_photos(photos())[: args.subset or None]
     names = [h for h, _ in pairs]
     embs, ms = eg2_embed(model, proc, [p for _, p in pairs], budget=args.budget, batch=args.batch)
-    save_npz(phase, f"eg2_b{args.budget}.npz", names, embs,
+    save_npz(phase, f"eg2_{tag}.npz", names, embs,
              {"budget": args.budget, "ms_per_img": round(ms, 1)})
-    summary = {"budget": args.budget, "photos": len(names), "ms_per_img": round(ms, 1),
-               "img_per_s": round(1000 / ms, 2)}
+    summary = {"budget": args.budget, "out": tag, "photos": len(names),
+               "ms_per_img": round(ms, 1), "img_per_s": round(1000 / ms, 2)}
     log(json.dumps(summary))
     return finish(phase, summary, args.force)
 
@@ -660,6 +661,7 @@ def main() -> None:
     p.add_argument("--budget", type=int, default=280)
     p.add_argument("--batch", type=int, default=32)
     p.add_argument("--subset", type=int, default=0, help="embed only the first N photos (0=all)")
+    p.add_argument("--out", default=None, help="output tag (default: b<budget>; use e.g. 'smoke' for tests)")
     p.set_defaults(func=cmd_embed)
 
     p = sub.add_parser("mrl")
