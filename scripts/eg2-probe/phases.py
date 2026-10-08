@@ -219,22 +219,70 @@ def load_eg2(dtype, device):
     return model, proc
 
 
-def eg2_embed(model, proc, paths, budget=280, batch=32, device="cuda"):
-    """Returns ((N,768) fp32, ms/img) for EG2 image embeddings."""
+def eg2_embed(model, proc, paths, budget=280, batch=32, device="cuda", workers=8):
+    """Returns ((N,768) fp32, ms/img) for EG2 image embeddings.
+
+    workers=0 runs the legacy serial pipeline (decode+process on the main
+    thread, GPU idle in between). workers=N decodes and preprocesses images on
+    a thread pool with a bounded window and feeds the GPU continuously.
+    Per-image processor output is bit-identical to batch processor output
+    (verified on GB10: pixel_values equal, attention_mask length fixed), so
+    concatenating per-image tensors is numerically exact.
+    """
     import torch
     import torch.nn.functional as F
+    from concurrent.futures import ThreadPoolExecutor, FIRST_COMPLETED, wait
     from PIL import Image
 
-    embs, t0 = [], time.time()
+    t0 = time.time()
+
+    def one(idx_path):
+        idx, p = idx_path
+        img = Image.open(p).convert("RGB")
+        t = proc(images=[[img]], return_tensors="pt", max_soft_tokens=budget)
+        return idx, t.data
+
+    embs = []
     with torch.no_grad():
-        for s in range(0, len(paths), batch):
-            imgs = [Image.open(p).convert("RGB") for p in paths[s : s + batch]]
-            inp = proc(images=[[i] for i in imgs], return_tensors="pt", max_soft_tokens=budget)
-            inp = {k: v.to(device) for k, v in inp.items()}
-            out = model(**inp)
-            m = inp["attention_mask"].float().unsqueeze(-1)
-            e = (out.last_hidden_state.float() * m).sum(1) / m.sum(1).clamp(min=1)
-            embs.append(F.normalize(e, dim=-1).cpu().numpy().astype(np.float32))
+        if not workers:
+            for s in range(0, len(paths), batch):
+                imgs = [Image.open(p).convert("RGB") for p in paths[s : s + batch]]
+                inp = proc(images=[[i] for i in imgs], return_tensors="pt", max_soft_tokens=budget)
+                inp = {k: v.to(device) for k, v in inp.items()}
+                out = model(**inp)
+                m = inp["attention_mask"].float().unsqueeze(-1)
+                e = (out.last_hidden_state.float() * m).sum(1) / m.sum(1).clamp(min=1)
+                embs.append(F.normalize(e, dim=-1).cpu().numpy().astype(np.float32))
+        else:
+            pending, ready, submitted, consumed = set(), {}, 0, 0
+            with ThreadPoolExecutor(workers) as ex:
+                while consumed < len(paths):
+                    while len(pending) < workers * 2 and submitted < len(paths):
+                        pending.add(ex.submit(one, (submitted, paths[submitted])))
+                        submitted += 1
+                    done, pending = wait(pending, return_when=FIRST_COMPLETED)
+                    for f in done:
+                        idx, data = f.result()
+                        ready[idx] = data
+                    if all(i in ready for i in range(consumed, min(consumed + batch, len(paths)))):
+                        chunk = [ready.pop(i) for i in range(consumed, min(consumed + batch, len(paths)))]
+                        consumed += len(chunk)
+                        # pixel_values / image_position_ids have a fixed token
+                        # grid; input_ids and attention_mask are variable-length
+                        # and zero-padded exactly like the batch processor would
+                        # (the model excludes padded positions from attention).
+                        width = max(int(c["attention_mask"].shape[1]) for c in chunk)
+                        pad = lambda t: F.pad(t, (0, width - t.shape[1]))  # noqa: E731
+                        inp = {
+                            "pixel_values": torch.cat([c["pixel_values"] for c in chunk], dim=0).to(device),
+                            "image_position_ids": torch.cat([c["image_position_ids"] for c in chunk], dim=0).to(device),
+                            "input_ids": torch.cat([pad(c["input_ids"]) for c in chunk], dim=0).to(device),
+                            "attention_mask": torch.cat([pad(c["attention_mask"]) for c in chunk], dim=0).to(device),
+                        }
+                        out = model(**inp)
+                        m = inp["attention_mask"].float().unsqueeze(-1)
+                        e = (out.last_hidden_state.float() * m).sum(1) / m.sum(1).clamp(min=1)
+                        embs.append(F.normalize(e, dim=-1).cpu().numpy().astype(np.float32))
     ms = (time.time() - t0) * 1000 / len(paths)
     return np.concatenate(embs), ms
 
@@ -278,7 +326,8 @@ def cmd_embed(args) -> dict:
     model, proc = load_eg2(torch.bfloat16, "cuda")
     pairs = present_photos(photos())[: args.subset or None]
     names = [h for h, _ in pairs]
-    embs, ms = eg2_embed(model, proc, [p for _, p in pairs], budget=args.budget, batch=args.batch)
+    embs, ms = eg2_embed(model, proc, [p for _, p in pairs], budget=args.budget,
+                         batch=args.batch, workers=args.workers)
     save_npz(phase, f"eg2_{tag}.npz", names, embs,
              {"budget": args.budget, "ms_per_img": round(ms, 1)})
     summary = {"budget": args.budget, "out": tag, "photos": len(names),
@@ -520,7 +569,6 @@ def cmd_sustained(args) -> dict:
     thread.start()
 
     from PIL import Image
-    import torch.nn.functional as F
 
     warmup_s, window_s = 120.0, 60.0
     started = time.time()
@@ -528,25 +576,15 @@ def cmd_sustained(args) -> dict:
     window_imgs, window_start = 0, started
     windows = []  # (window_start, imgs, rate)
 
-    def decode(batch):
-        return [Image.open(p).convert("RGB") for p in batch]
-
-    with torch.no_grad(), ThreadPoolExecutor(args.loader_threads) as decoders:
-        pending = decoders.submit(decode, [paths[i] for i in rng.integers(0, len(paths), args.batch)])
-        while time.time() < stop_at:
-            imgs = pending.result()
-            pending = decoders.submit(decode, [paths[i] for i in rng.integers(0, len(paths), args.batch)])
-            inp = proc(images=[[i] for i in imgs], return_tensors="pt", max_soft_tokens=args.budget)
-            inp = {k: v.to("cuda") for k, v in inp.items()}
-            outp = model(**inp)
-            m = inp["attention_mask"].float().unsqueeze(-1)
-            e = (outp.last_hidden_state.float() * m).sum(1) / m.sum(1).clamp(min=1)
-            F.normalize(e, dim=-1)  # keep the math honest; vectors are not kept
-            window_imgs += len(imgs)
-            if time.time() - window_start >= window_s:
-                windows.append((window_start, window_imgs, window_imgs / (time.time() - window_start)))
-                log(f"sustained: window {len(windows)} rate {windows[-1][2]:.1f} img/s")
-                window_start, window_imgs = time.time(), 0
+    while time.time() < stop_at:
+        batch_paths = [paths[i] for i in rng.integers(0, len(paths), args.batch)]
+        eg2_embed(model, proc, batch_paths, budget=args.budget, batch=args.batch,
+                  workers=args.loader_threads)
+        window_imgs += args.batch
+        if time.time() - window_start >= window_s:
+            windows.append((window_start, window_imgs, window_imgs / (time.time() - window_start)))
+            log(f"sustained: window {len(windows)} rate {windows[-1][2]:.1f} img/s")
+            window_start, window_imgs = time.time(), 0
     stop.set()
     thread.join(timeout=20)
 
@@ -662,6 +700,7 @@ def main() -> None:
     p.add_argument("--batch", type=int, default=32)
     p.add_argument("--subset", type=int, default=0, help="embed only the first N photos (0=all)")
     p.add_argument("--out", default=None, help="output tag (default: b<budget>; use e.g. 'smoke' for tests)")
+    p.add_argument("--workers", type=int, default=8, help="parallel decode+preprocess threads (0=serial)")
     p.set_defaults(func=cmd_embed)
 
     p = sub.add_parser("mrl")
