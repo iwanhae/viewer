@@ -36,9 +36,14 @@
 
 ### 사진 소스
 - `https://tmp.iwanhae.kr` = viewer 서버 배포본.
-  - 목록: `/api/feed?mode=latest&limit=200&after=<hash>` (hasNext로 연속)
+  - 피드: `/api/feed?mode=latest&limit=200&after=<nextCursor>` — **cursor는 응답의
+    `nextCursor` 필드(불투명 문자열)이다. 사진 hash를 넣으면 조용히 1페이지로
+    리셋되어 무한 루프(Phase 0에서 실제 발생, 수정 완료)**
+  - 앨범 내부: `/api/albums/{albumId}` → `{albumId, photos: [{i, name, hash, w, h}]}`
   - 다운로드: `/api/image/{hash}?w=1024`
-  - 각 item: `{hash, albumId, w, h, ...}` — **albumId가 클러스터링 weak ground truth**
+  - 피드는 앨범당 1장(커버)만 주므로, 클러스터링 약한 정답(albumId)을 얻으려면
+    앨범 상세까지 호출해서 앨범 내부 사진을 수집해야 한다 (`cmd_fetch`가 그렇게 함)
+  - 카탈로그 규모: 약 22,000 앨범
   - 읽기만 한다. 절대 쓰기 API 호출 금지.
 
 ## 3. 선행 결과 (반복 금지 — 이미 확인된 사실)

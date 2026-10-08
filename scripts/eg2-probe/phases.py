@@ -113,28 +113,60 @@ def pair_corr(a: np.ndarray, b: np.ndarray, samples: int = 200_000, seed: int = 
 # ---------------------------------------------------------------- fetch ----
 
 def cmd_fetch(args) -> dict:
-    """Walks the viewer feed API and downloads scaled photos. Idempotent."""
-    meta = json.loads(PHOTOS_META.read_text())["photos"] if PHOTOS_META.exists() else []
-    seen = {m["hash"] for m in meta}
-    if len(meta) < args.n:
-        after, cursor = True, ""
-        while after and len(meta) < args.n:
-            url = f"{SITE}/api/feed?mode=latest&limit=200" + (f"&after={cursor}" if cursor else "")
-            with urlopen(url, timeout=30) as r:
-                page = json.loads(r.read())
-            for item in page["items"]:
-                h = item["hash"]
-                if h not in seen:
-                    seen.add(h)
-                    meta.append({**item, "file": f"{h}.jpg"})
-                cursor = item["hash"]
-            after = page.get("hasNext", False)
-            log(f"catalog walk: {len(meta)} unique photos (cursor {cursor[:8]})")
-        OUT.mkdir(parents=True, exist_ok=True)
-        PHOTOS_META.write_text(json.dumps({"site": SITE, "fetched_at": time.time(), "photos": meta}))
-        log(f"catalog complete: {len(meta)} photos")
+    """Builds the photo corpus from the viewer API. Idempotent on downloads.
 
-    meta = meta[: args.n]
+    The feed lists one cover photo per album, so albumId would be a useless
+    label if we only took feed items. Instead we walk the feed for album ids
+    (cursor = response nextCursor, NOT the photo hash) and then pull every
+    album's detail endpoint to get the photos inside it. That yields real
+    multi-photo album labels for the clustering phase.
+    """
+    cursor, album_ids = "", []
+    while len(album_ids) < args.albums:
+        url = f"{SITE}/api/feed?mode=latest&limit=200" + (f"&after={cursor}" if cursor else "")
+        with urlopen(url, timeout=30) as r:
+            page = json.loads(r.read())
+        album_ids.extend(item["albumId"] for item in page["items"])
+        cursor = page.get("nextCursor", "")
+        if not page.get("hasNext") or not cursor:
+            break
+        if len(album_ids) % 2000 < 200:
+            log(f"album walk: {len(album_ids)} albums")
+    album_ids = list(dict.fromkeys(album_ids))[: args.albums]
+    log(f"album walk done: {len(album_ids)} albums")
+
+    def album_detail(album_id: str):
+        try:
+            with urlopen(f"{SITE}/api/albums/{album_id}", timeout=30) as r:
+                return json.loads(r.read())
+        except Exception as exc:  # noqa: BLE001 - logged, album skipped
+            log(f"album detail {album_id[:8]}: {exc}")
+            return None
+
+    meta, seen, failed_albums = [], set(), 0
+    with ThreadPoolExecutor(8) as pool:
+        for detail in pool.map(album_detail, album_ids):
+            if detail is None:
+                failed_albums += 1
+                continue
+            taken = 0
+            for ph in detail.get("photos", []):
+                h = ph.get("hash")
+                if not h or h in seen:
+                    continue
+                seen.add(h)
+                meta.append({"hash": h, "albumId": detail["albumId"], "i": ph.get("i", 0),
+                             "file": f"{h}.jpg"})
+                taken += 1
+                if taken >= args.per_album or len(meta) >= args.n:
+                    break
+            if len(meta) >= args.n:
+                break
+    log(f"catalog: {len(meta)} photos across {len({m['albumId'] for m in meta})} albums")
+    OUT.mkdir(parents=True, exist_ok=True)
+    PHOTOS_META.write_text(json.dumps({"site": SITE, "fetched_at": time.time(),
+                                       "albums": len(album_ids), "photos": meta}))
+
     todo = [m for m in meta if not (PHOTO_DIR / m["file"]).exists()]
     log(f"downloading {len(todo)}/{len(meta)} photos at w={IMAGE_W}")
     PHOTO_DIR.mkdir(parents=True, exist_ok=True)
@@ -160,10 +192,18 @@ def cmd_fetch(args) -> dict:
             for res in pool.map(grab, retry):
                 if res:
                     failures.append(res)
-    missing = [m for m in meta if not (PHOTO_DIR / m["file"]).exists()]
+    # Prune photos that could not be downloaded so every downstream phase sees
+    # a consistent, fully-present corpus (npz names, album labels, pools).
+    present = [m for m in meta if (PHOTO_DIR / m["file"]).exists()]
+    dropped = len(meta) - len(present)
+    if dropped:
+        log(f"pruning {dropped} undownloadable photos from photos.json")
+        PHOTOS_META.write_text(json.dumps({"site": SITE, "fetched_at": time.time(),
+                                           "albums": len(album_ids), "photos": present}))
     summary = {
-        "photos": len(meta), "downloaded": len(todo) - len(missing),
-        "failed": len(missing), "bytes": sum((PHOTO_DIR / m['file']).stat().st_size for m in meta if (PHOTO_DIR / m['file']).exists()),
+        "albums": len(album_ids), "failed_albums": failed_albums,
+        "photos": len(present), "downloaded": len(todo) - dropped, "dropped": dropped,
+        "bytes": sum((PHOTO_DIR / m["file"]).stat().st_size for m in present),
     }
     return finish("fetch", summary, args.force)
 
@@ -606,7 +646,9 @@ def main() -> None:
     sub = parser.add_subparsers(dest="phase", required=True)
 
     p = sub.add_parser("fetch")
-    p.add_argument("--n", type=int, default=PHOTOS_N)
+    p.add_argument("--n", type=int, default=20000, help="target photo count")
+    p.add_argument("--albums", type=int, default=5000, help="feed albums to walk")
+    p.add_argument("--per-album", type=int, default=12, help="photos kept per album")
     p.set_defaults(func=cmd_fetch)
 
     p = sub.add_parser("calibrate")
