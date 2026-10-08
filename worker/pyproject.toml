@@ -29,7 +29,7 @@ cu128 = ["torch>=2.7", "numpy>=1.26", "pillow>=10.1", "safetensors>=0.4"]
 cu130 = ["torch>=2.7", "numpy>=1.26", "pillow>=10.1", "safetensors>=0.4"]
 # probe = scripts/eg2-probe phases (EmbeddingGemma 2 via transformers); the
 # production recommender itself does not need transformers.
-probe = ["transformers>=5.19", "tokenizers>=0.22", "scikit-learn>=1.5"]
+probe = ["transformers>=5.19", "tokenizers>=0.22", "scikit-learn>=1.5", "torchvision>=0.20"]
 
 [tool.uv]
 conflicts = [
