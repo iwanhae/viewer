@@ -437,6 +437,167 @@ def cmd_siglip2(args) -> dict:
     return finish("siglip2", summary, args.force)
 
 
+# ------------------------------------------------------------- sustained ---
+
+def cmd_sustained(args) -> dict:
+    """Continuous embedding for sustained-throughput measurement.
+
+    Unlike the ms/img numbers from short runs this answers the production
+    question: what rate does GB10 hold over an hour, at what power, and what
+    that implies for re-embedding tens of millions of photos. Images are drawn
+    randomly (with replacement) from the pool so nothing is cached-friendly.
+    """
+    import subprocess
+    import threading
+    import torch
+
+    model, proc = load_eg2(torch.bfloat16, "cuda")
+    meta = photos()[: args.pool]
+    pairs = present_photos(meta)
+    paths = [p for _, p in pairs]
+    rng = np.random.default_rng(3)
+    out = OUT / "sustained"
+    out.mkdir(parents=True, exist_ok=True)
+
+    stop = threading.Event()
+    samples = []
+
+    def sampler():
+        while not stop.is_set():
+            try:
+                q = subprocess.run(
+                    ["nvidia-smi", "--query-gpu=power.draw,temperature.gpu,utilization.gpu,clocks.sm",
+                     "--format=csv,noheader,nounits"],
+                    capture_output=True, text=True, timeout=10)
+                p, t, u, c = (float(x) for x in q.stdout.strip().split("\n")[0].split(","))
+            except Exception:  # noqa: BLE001 - transient nvidia-smi hiccups are fine
+                p = t = u = c = float("nan")
+            samples.append((time.time(), p, t, u, c))
+            stop.wait(15)
+
+    thread = threading.Thread(target=sampler, daemon=True)
+    thread.start()
+
+    from PIL import Image
+    import torch.nn.functional as F
+
+    warmup_s, window_s = 120.0, 60.0
+    started = time.time()
+    stop_at = started + args.minutes * 60
+    window_imgs, window_start = 0, started
+    windows = []  # (window_start, imgs, rate)
+
+    def decode(batch):
+        return [Image.open(p).convert("RGB") for p in batch]
+
+    with torch.no_grad(), ThreadPoolExecutor(args.loader_threads) as decoders:
+        pending = decoders.submit(decode, [paths[i] for i in rng.integers(0, len(paths), args.batch)])
+        while time.time() < stop_at:
+            imgs = pending.result()
+            pending = decoders.submit(decode, [paths[i] for i in rng.integers(0, len(paths), args.batch)])
+            inp = proc(images=[[i] for i in imgs], return_tensors="pt", max_soft_tokens=args.budget)
+            inp = {k: v.to("cuda") for k, v in inp.items()}
+            outp = model(**inp)
+            m = inp["attention_mask"].float().unsqueeze(-1)
+            e = (outp.last_hidden_state.float() * m).sum(1) / m.sum(1).clamp(min=1)
+            F.normalize(e, dim=-1)  # keep the math honest; vectors are not kept
+            window_imgs += len(imgs)
+            if time.time() - window_start >= window_s:
+                windows.append((window_start, window_imgs, window_imgs / (time.time() - window_start)))
+                log(f"sustained: window {len(windows)} rate {windows[-1][2]:.1f} img/s")
+                window_start, window_imgs = time.time(), 0
+    stop.set()
+    thread.join(timeout=20)
+
+    with open(out / "samples.csv", "w") as f:
+        f.write("ts,power_w,temp_c,util_pct,clock_mhz\n")
+        for row in samples:
+            f.write(",".join(str(x) for x in row) + "\n")
+    with open(out / "windows.csv", "w") as f:
+        f.write("start,imgs,rate\n")
+        for w in windows:
+            f.write(",".join(str(x) for x in w) + "\n")
+
+    steady = [w[2] for w in windows if w[0] - started >= warmup_s]
+    rates = np.array(steady)
+    power = [s[1] for s in samples if np.isfinite(s[1]) and s[0] - started >= warmup_s]
+    rate = float(rates.mean()) if len(rates) else 0.0
+    pw = float(np.mean(power)) if power else float("nan")
+    summary = {
+        "budget": args.budget, "batch": args.batch, "minutes": args.minutes,
+        "windows": len(windows),
+        "img_per_s": {"mean": round(rate, 2), "p50": round(float(np.median(rates)), 2) if len(rates) else None,
+                      "p5": round(float(np.percentile(rates, 5)), 2) if len(rates) else None},
+        "power_w_mean": round(pw, 1) if np.isfinite(pw) else None,
+        "joules_per_1000_img": round(pw * 1000 / rate, 1) if rate else None,
+        "hours_for_photos": {str(n): round(n / rate / 3600, 1) for n in (10_000_000, 30_000_000, 50_000_000)},
+        "temp_c_max": max((s[2] for s in samples if np.isfinite(s[2])), default=None),
+    }
+    log(json.dumps(summary, ensure_ascii=False))
+    return finish("sustained", summary, args.force)
+
+
+# -------------------------------------------------------------- clustering --
+
+def cmd_cluster(args) -> dict:
+    """k-means clustering vs albumId weak ground truth across embedding configs."""
+    from sklearn.cluster import KMeans
+    from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score, silhouette_score
+
+    meta = photos()
+    name_to_album = {m["hash"]: m["albumId"] for m in meta}
+
+    def load_config(path, dim=0):
+        data = np.load(path)
+        names = [str(n) for n in data["names"]]
+        embs = data["embs"]
+        if dim:
+            embs = l2norm(embs[:, :dim].copy())
+        return names, l2norm(embs)
+
+    base = OUT
+    configs = {
+        "eg2_b280_768d": (base / "embed_b280" / "eg2_b280.npz", 0),
+        "eg2_b280_256d": (base / "embed_b280" / "eg2_b280.npz", 256),
+        "eg2_b280_128d": (base / "embed_b280" / "eg2_b280.npz", 128),
+        "eg2_b70_768d": (base / "embed_b70" / "eg2_b70.npz", 0),
+        "eg2_b1120_768d": (base / "embed_b1120" / "eg2_b1120.npz", 0),
+        "siglip2_768d": (base / "siglip2" / "siglip2.npz", 0),
+    }
+
+    summary = {"k_grid": args.k, "configs": {}}
+    medoids = None
+    for cname, (path, dim) in configs.items():
+        if not path.exists():
+            log(f"skip {cname}: {path} missing (phase not run?)")
+            continue
+        names, embs = load_config(path, dim)
+        albums = [name_to_album.get(n, "none") for n in names]
+        entry = {}
+        for k in args.k:
+            km = KMeans(n_clusters=k, n_init=3, random_state=0, max_iter=100).fit(embs)
+            nmi = normalized_mutual_info_score(albums, km.labels_)
+            ari = adjusted_rand_score(albums, km.labels_)
+            sil = silhouette_score(embs, km.labels_, sample_size=min(5000, len(embs)), random_state=0)
+            entry[str(k)] = {"nmi": round(float(nmi), 4), "ari": round(float(ari), 4),
+                             "silhouette": round(float(sil), 4)}
+            log(f"{cname} k={k}: nmi={nmi:.3f} ari={ari:.3f} sil={sil:.3f}")
+        summary["configs"][cname] = entry
+        if cname == "eg2_b280_768d" and 200 in args.k:
+            km = KMeans(n_clusters=200, n_init=3, random_state=0, max_iter=100).fit(embs)
+            cent = l2norm(km.cluster_centers_)
+            sims = embs @ cent.T  # (n, k) member-to-centroid similarity
+            medoids = {}
+            for c in range(200):
+                top = np.argsort(-sims[:, c])[:5]
+                medoids[str(c)] = [{"hash": names[i], "album": albums[i],
+                                    "cos": round(float(sims[i, c]), 4)} for i in top]
+    if medoids:
+        (OUT / "cluster").mkdir(parents=True, exist_ok=True)
+        (OUT / "cluster" / "medoids.json").write_text(json.dumps(medoids, ensure_ascii=False))
+    return finish("cluster", summary, args.force)
+
+
 # ------------------------------------------------------------------- cli ---
 
 def main() -> None:
@@ -477,6 +638,19 @@ def main() -> None:
     p = sub.add_parser("siglip2")
     p.add_argument("--eg2-budget", type=int, default=280)
     p.set_defaults(func=cmd_siglip2)
+
+    p = sub.add_parser("sustained")
+    p.add_argument("--minutes", type=int, default=90)
+    p.add_argument("--pool", type=int, default=20000)
+    p.add_argument("--budget", type=int, default=280)
+    p.add_argument("--batch", type=int, default=32)
+    p.add_argument("--loader-threads", type=int, default=8)
+    p.set_defaults(func=cmd_sustained)
+
+    p = sub.add_parser("cluster")
+    p.add_argument("--k", type=int, nargs="+", default=[50, 200, 1000])
+    p.add_argument("--force", action="store_true")
+    p.set_defaults(func=cmd_cluster)
 
     args = parser.parse_args()
     result = args.func(args)
