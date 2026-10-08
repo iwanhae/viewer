@@ -24,10 +24,16 @@ module-name = ["recommender", "encoder", "worker_common"]
 cpu = ["torch>=2.7", "numpy>=1.26", "pillow>=10.1", "safetensors>=0.4"]
 cu126 = ["torch>=2.7", "numpy>=1.26", "pillow>=10.1", "safetensors>=0.4"]
 cu128 = ["torch>=2.7", "numpy>=1.26", "pillow>=10.1", "safetensors>=0.4"]
+# Blackwell-class devices such as DGX Spark (GB10, aarch64) ship CUDA 13
+# drivers and need the cu130 wheels.
+cu130 = ["torch>=2.7", "numpy>=1.26", "pillow>=10.1", "safetensors>=0.4"]
+# probe = scripts/eg2-probe phases (EmbeddingGemma 2 via transformers); the
+# production recommender itself does not need transformers.
+probe = ["transformers>=5.19", "tokenizers>=0.22"]
 
 [tool.uv]
 conflicts = [
-    [{ extra = "cpu" }, { extra = "cu126" }, { extra = "cu128" }],
+    [{ extra = "cpu" }, { extra = "cu126" }, { extra = "cu128" }, { extra = "cu130" }],
 ]
 
 [tool.uv.sources]
@@ -35,6 +41,7 @@ torch = [
     { index = "pytorch-cpu", extra = "cpu" },
     { index = "pytorch-cu126", extra = "cu126" },
     { index = "pytorch-cu128", extra = "cu128" },
+    { index = "pytorch-cu130", extra = "cu130" },
 ]
 
 [[tool.uv.index]]
@@ -50,6 +57,11 @@ explicit = true
 [[tool.uv.index]]
 name = "pytorch-cu128"
 url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
 explicit = true
 
 [build-system]
