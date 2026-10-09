@@ -681,21 +681,22 @@ def cmd_cluster(args) -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--force", action="store_true", help="rerun even if summary.json exists")
+    force = argparse.ArgumentParser(add_help=False)
+    force.add_argument("--force", action="store_true", help="rerun even if summary.json exists")
     sub = parser.add_subparsers(dest="phase", required=True)
 
-    p = sub.add_parser("fetch")
+    p = sub.add_parser("fetch", parents=[force])
     p.add_argument("--n", type=int, default=20000, help="target photo count")
     p.add_argument("--albums", type=int, default=5000, help="feed albums to walk")
     p.add_argument("--per-album", type=int, default=12, help="photos kept per album")
     p.set_defaults(func=cmd_fetch)
 
-    p = sub.add_parser("calibrate")
+    p = sub.add_parser("calibrate", parents=[force])
     p.add_argument("--budget", type=int, default=280)
     p.add_argument("--batches", type=int, nargs="+", default=[8, 16, 32, 64])
     p.set_defaults(func=cmd_calibrate)
 
-    p = sub.add_parser("embed")
+    p = sub.add_parser("embed", parents=[force])
     p.add_argument("--budget", type=int, default=280)
     p.add_argument("--batch", type=int, default=32)
     p.add_argument("--subset", type=int, default=0, help="embed only the first N photos (0=all)")
@@ -703,26 +704,26 @@ def main() -> None:
     p.add_argument("--workers", type=int, default=8, help="parallel decode+preprocess threads (0=serial)")
     p.set_defaults(func=cmd_embed)
 
-    p = sub.add_parser("mrl")
+    p = sub.add_parser("mrl", parents=[force])
     p.add_argument("--base", type=int, default=280)
     p.add_argument("--dims", type=int, nargs="+", default=[512, 256, 128])
     p.set_defaults(func=cmd_mrl)
 
-    p = sub.add_parser("robust")
+    p = sub.add_parser("robust", parents=[force])
     p.add_argument("--budget", type=int, default=280)
     p.add_argument("--n", type=int, default=150)
     p.set_defaults(func=cmd_robust)
 
-    p = sub.add_parser("precision")
+    p = sub.add_parser("precision", parents=[force])
     p.add_argument("--budget", type=int, default=280)
     p.add_argument("--n", type=int, default=300)
     p.set_defaults(func=cmd_precision)
 
-    p = sub.add_parser("siglip2")
+    p = sub.add_parser("siglip2", parents=[force])
     p.add_argument("--eg2-budget", type=int, default=280)
     p.set_defaults(func=cmd_siglip2)
 
-    p = sub.add_parser("sustained")
+    p = sub.add_parser("sustained", parents=[force])
     p.add_argument("--minutes", type=int, default=90)
     p.add_argument("--pool", type=int, default=20000)
     p.add_argument("--budget", type=int, default=280)
@@ -730,9 +731,8 @@ def main() -> None:
     p.add_argument("--loader-threads", type=int, default=8)
     p.set_defaults(func=cmd_sustained)
 
-    p = sub.add_parser("cluster")
+    p = sub.add_parser("cluster", parents=[force])
     p.add_argument("--k", type=int, nargs="+", default=[50, 200, 1000])
-    p.add_argument("--force", action="store_true")
     p.set_defaults(func=cmd_cluster)
 
     args = parser.parse_args()
