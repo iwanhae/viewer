@@ -585,7 +585,7 @@ func TestPeriodicRecoveryDoesNotInterruptActiveCommit(t *testing.T) {
 	waitForEncodingStatus(t, cat, hash, "pending")
 }
 
-func TestRecoveredCommittingFilesCountTowardSpoolCapacity(t *testing.T) {
+func TestRecoveredCommittingFilesDoNotReserveSpoolSlots(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	cat, err := catalog.Open(filepath.Join(t.TempDir(), "catalog.db"), nil)
@@ -618,11 +618,135 @@ func TestRecoveredCommittingFilesCountTowardSpoolCapacity(t *testing.T) {
 	if err := svc.Start(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if len(svc.spoolSlots) != outputProcessors {
-		t.Fatalf("recovered committing files reserved %d of %d slots", len(svc.spoolSlots), outputProcessors)
+	// Recovered committing files no longer hold spool capacity: their PUT has
+	// already returned, so reconciling them is the scanner's job, not a
+	// processor's. Reserving slots for them starved new uploads whenever the
+	// object store kept failing conditional PUTs.
+	if reserved := len(svc.spoolSlots); reserved != 0 {
+		t.Fatalf("recovered committing files reserved %d of %d slots", reserved, outputQueueSize)
 	}
-	if err := svc.ReceiveOutput(ctx, jobs[2].Hash, jobs[2].Token, strings.NewReader("new result")); !errors.Is(err, ErrSpoolBusy) {
-		t.Fatalf("new upload with a full recovered spool: %v, want ErrSpoolBusy", err)
+	if err := svc.ReceiveOutput(ctx, jobs[2].Hash, jobs[2].Token, strings.NewReader("new result")); err != nil {
+		t.Fatalf("new upload alongside recovered commits: %v", err)
+	}
+}
+
+// TestAmbiguousCommitDoesNotParkSpoolSlots reproduces the incident where an
+// object store kept failing conditional PUTs after the write had landed: the
+// processor held its spool slot through the whole committing grace lease, so
+// both slots sat parked for ten minutes and every worker upload was rejected
+// with ErrSpoolBusy until the oldest lease expired.
+func TestAmbiguousCommitDoesNotParkSpoolSlots(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cat, err := catalog.Open(filepath.Join(t.TempDir(), "catalog.db"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cat.Close()
+	// Three blobs: parked holds a live ambiguous commit, expired holds one
+	// whose grace lease has already passed, and fresh is a claim whose output
+	// must still be accepted while the other two sit in committing.
+	blobs := map[string]string{
+		"parked":  strings.Repeat("a", 64),
+		"expired": strings.Repeat("b", 64),
+		"fresh":   strings.Repeat("c", 64),
+	}
+	for _, hash := range blobs {
+		if err := cat.UpsertBlob(ctx, catalog.Blob{Hash: hash, SizeBytes: 200, ContentType: "image/png"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	claimed, err := cat.ClaimEncoding(ctx, 3, LeaseTTL)
+	if err != nil || len(claimed) != 3 {
+		t.Fatalf("claim: jobs=%+v err=%v", claimed, err)
+	}
+	jobs := make(map[string]catalog.EncodingJob, len(claimed))
+	for _, job := range claimed {
+		jobs[job.Hash] = job
+	}
+	spoolDir := t.TempDir()
+	store := newMemoryStore()
+	store.objects["blobs/"+blobs["expired"]] = []byte("original")
+	svc := New(cat, store, spoolDir)
+
+	// The parked job exists before Start so the startup pass sees a live
+	// grace lease and leaves it committing.
+	parked := jobs[blobs["parked"]]
+	if ok, err := cat.MarkEncodingReceived(ctx, parked.Hash, parked.Token); err != nil || !ok {
+		t.Fatalf("mark received parked: ok=%v err=%v", ok, err)
+	}
+	if ok, err := cat.BeginEncodingCommit(ctx, parked.Hash, parked.Token, 200, time.Hour); err != nil || !ok {
+		t.Fatalf("begin commit parked: ok=%v err=%v", ok, err)
+	}
+	if err := os.WriteFile(filepath.Join(spoolDir, parked.Hash+"_"+parked.Token+".webp"), []byte("ambiguous"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// The expired job is created after Start so the startup reconcile does
+	// not reset it before the test exercises the handoff.
+	expired := jobs[blobs["expired"]]
+	if ok, err := cat.MarkEncodingReceived(ctx, expired.Hash, expired.Token); err != nil || !ok {
+		t.Fatalf("mark received expired: ok=%v err=%v", ok, err)
+	}
+	if ok, err := cat.BeginEncodingCommit(ctx, expired.Hash, expired.Token, 200, 0); err != nil || !ok {
+		t.Fatalf("begin commit expired: ok=%v err=%v", ok, err)
+	}
+	if err := os.WriteFile(filepath.Join(spoolDir, expired.Hash+"_"+expired.Token+".webp"), []byte("ambiguous"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Hand the parked job to a processor the way the queue path does: it owns
+	// the row and holds one spool slot while it works.
+	svc.spoolSlots <- struct{}{}
+	svc.queued[jobKey(parked.Hash, parked.Token)] = struct{}{}
+	parkedReturned := make(chan struct{})
+	go func() {
+		svc.processQueuedOutput(ctx, parked)
+		close(parkedReturned)
+	}()
+	select {
+	case <-parkedReturned:
+	case <-time.After(5 * time.Second):
+		t.Fatal("processor parked on the ambiguous commit instead of returning")
+	}
+	if reserved := len(svc.spoolSlots); reserved != 0 {
+		t.Fatalf("ambiguous commit still holds %d of %d spool slots", reserved, outputQueueSize)
+	}
+	// The upload that used to starve: with both slots free it is accepted.
+	if err := svc.ReceiveOutput(ctx, blobs["fresh"], jobs[blobs["fresh"]].Token, strings.NewReader("new result")); err != nil {
+		t.Fatalf("new upload while a commit waits out its grace lease: %v", err)
+	}
+	// A processor must not reconcile even an expired commit inline; that is
+	// the scanner's job, so the grace lease keeps fencing the row.
+	svc.spoolSlots <- struct{}{}
+	svc.queued[jobKey(expired.Hash, expired.Token)] = struct{}{}
+	expiredReturned := make(chan struct{})
+	go func() {
+		svc.processQueuedOutput(ctx, expired)
+		close(expiredReturned)
+	}()
+	select {
+	case <-expiredReturned:
+	case <-time.After(5 * time.Second):
+		t.Fatal("processor parked on the expired commit instead of returning")
+	}
+	if job, err := cat.GetEncodingJob(ctx, expired.Hash); err != nil || job.Status != "committing" {
+		t.Fatalf("processor reconciled an expired commit inline: job=%+v err=%v", job, err)
+	}
+	// The scanner owns the outcome: the expired commit is reset (its
+	// replacement never became observable) while the live one keeps its
+	// grace lease.
+	if err := svc.Recover(ctx); err != nil {
+		t.Fatal(err)
+	}
+	waitForEncodingStatus(t, cat, expired.Hash, "pending")
+	if _, err := os.Stat(filepath.Join(spoolDir, expired.Hash+"_"+expired.Token+".webp")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("reset commit left its spool file behind: %v", err)
+	}
+	if job, err := cat.GetEncodingJob(ctx, parked.Hash); err != nil || job.Status != "committing" {
+		t.Fatalf("recover did not respect the live grace lease: job=%+v err=%v", job, err)
 	}
 }
 

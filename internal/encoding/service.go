@@ -454,25 +454,26 @@ func (s *Service) enqueueReserved(ctx context.Context, job catalog.EncodingJob) 
 }
 
 func (s *Service) scheduleSpoolOutputs(ctx context.Context) error {
+	// Only received rows are queued here. Committing rows are deliberately
+	// left to reconcileExpiredCommits, which runs first on every scan: their
+	// PUT has already returned, so a processor would only observe the
+	// not-received state, hit the committing branch, and hand the row
+	// straight back — burning a spool slot cycle per scan on a job whose
+	// grace lease has not expired yet. Their spool files stay on disk
+	// (removeOrphanSpools keeps them) until the reconcile finishes.
 	jobs, err := s.cat.ReceivedEncodings(ctx)
 	if err != nil {
 		return err
 	}
-	// A process may have stopped while a PUT was committing. Those files also
-	// occupy disk capacity until their grace period ends and they are reconciled.
-	committing, err := s.cat.CommittingEncodings(ctx)
-	if err != nil {
-		return err
-	}
-	jobs = append(jobs, committing...)
 	for _, job := range jobs {
 		path := s.spoolPath(job.Hash, job.Token)
 		if _, err := os.Stat(path); err != nil {
 			if errors.Is(err, os.ErrNotExist) {
-				if job.Status == "received" {
-					if resetErr := s.cat.ResetReceivedEncoding(ctx, job.Hash, job.Token); resetErr != nil {
-						return resetErr
-					}
+				// The received row's result is gone (crash between rename and
+				// the DB update, or an operator cleanup); it can never be
+				// validated, so hand the blob back to the pending queue.
+				if resetErr := s.cat.ResetReceivedEncoding(ctx, job.Hash, job.Token); resetErr != nil {
+					return resetErr
 				}
 				continue
 			}
@@ -574,19 +575,20 @@ func (s *Service) processQueuedOutput(ctx context.Context, job catalog.EncodingJ
 
 		if current.Status == "committing" {
 			// A PUT with an ambiguous result is fenced by the committing grace
-			// lease. Reconcile as soon as that lease expires rather than leaving
-			// the outcome to the hourly maintenance pass.
-			if !waitUntil(ctx, current.LeaseUntil) {
-				return
-			}
-			if reconcileErr := s.reconcileCommit(ctx, current); reconcileErr != nil {
-				log.Printf("encoding: reconcile commit for %s failed; retrying: %v", job.Hash[:12], reconcileErr)
-				if !waitOutputRetry(ctx) {
-					return
-				}
-				continue
-			}
-			_ = os.Remove(s.spoolPath(job.Hash, job.Token))
+			// lease, and reconcileExpiredCommits — which runs first on every
+			// spool scan — owns that reconciliation once no processor holds the
+			// row. Waiting for the lease here used to park this processor and
+			// its spool slot for the whole grace window, which starved the
+			// queue: while every slot sat on a commit waiting to expire, every
+			// new worker upload was rejected with ErrSpoolBusy until the
+			// oldest lease released — an object store whose conditional PUTs
+			// keep failing turned two slots into a ten-minute pipeline stall.
+			// Returning now keeps uploads flowing; the spool file simply
+			// outlives its slot until the reconcile decides the outcome, so
+			// spool disk usage follows how many uploads can enter the grace
+			// window rather than the slot count.
+			log.Printf("encoding: commit for %s is ambiguous (%v); the scanner reconciles it when its grace lease expires at %s",
+				job.Hash[:12], err, current.LeaseUntil.UTC().Format(time.RFC3339))
 			return
 		}
 
@@ -598,6 +600,7 @@ func (s *Service) processQueuedOutput(ctx context.Context, job catalog.EncodingJ
 				}
 				continue
 			}
+			log.Printf("encoding: dropped output for %s back to pending: %v", job.Hash[:12], err)
 			_ = os.Remove(s.spoolPath(job.Hash, job.Token))
 			return
 		}
@@ -613,6 +616,7 @@ func (s *Service) processQueuedOutput(ctx context.Context, job catalog.EncodingJ
 				}
 				continue
 			}
+			log.Printf("encoding: output for %s failed validation: %v", job.Hash[:12], err)
 			_ = os.Remove(s.spoolPath(job.Hash, job.Token))
 			return
 		}
@@ -682,6 +686,7 @@ func (s *Service) processReceived(ctx context.Context, job catalog.EncodingJob) 
 		if !ok {
 			return ErrLostLease
 		}
+		log.Printf("encoding: original for %s is already WebP; skipped (%d bytes)", job.Hash[:12], len(original))
 		return nil
 	}
 	if int64(len(original)) != originalInfo.Size {
@@ -740,6 +745,8 @@ func (s *Service) processReceived(ctx context.Context, job catalog.EncodingJob) 
 					} else if !ok {
 						return ErrLostLease
 					}
+					log.Printf("encoding: commit for %s finalized from the observed replacement after a PUT error (%d bytes; put error: %v)",
+						job.Hash[:12], len(currentBytes), err)
 					return nil
 				}
 			}
@@ -754,6 +761,7 @@ func (s *Service) processReceived(ctx context.Context, job catalog.EncodingJob) 
 	} else if !ok {
 		return ErrLostLease
 	}
+	log.Printf("encoding: committed %s (%d -> %d bytes)", job.Hash[:12], len(original), info.Size())
 	return nil
 }
 
@@ -1068,9 +1076,12 @@ func (s *Service) reconcileExpiredCommits(ctx context.Context) error {
 		if time.Now().Before(job.LeaseUntil) {
 			continue
 		}
-		// A large conditional PUT can outlive the grace window. Its processor
-		// owns reconciliation; the periodic scan must not reset the row while
-		// that PUT is still using the validated spool file.
+		// A conditional PUT in flight inside processReceived can outlive the
+		// grace window; while a processor owns the row the scan must not reset
+		// it underneath the live request. Once the processor returns, the
+		// queued entry lapses and this scan reconciles the row on a later
+		// tick — processors hand ambiguous commits back instead of parking on
+		// them, so ownership here never blocks the spool slots.
 		s.queueMu.Lock()
 		_, active := s.queued[jobKey(job.Hash, job.Token)]
 		s.queueMu.Unlock()
@@ -1117,6 +1128,8 @@ func (s *Service) reconcileCommit(ctx context.Context, job catalog.EncodingJob) 
 		} else if !ok {
 			return ErrLostLease
 		}
+		log.Printf("encoding: reconciled commit for %s as done: the replacement landed despite the PUT error (%d bytes)",
+			job.Hash[:12], len(data))
 		_ = os.Remove(s.spoolPath(job.Hash, job.Token))
 		return nil
 	}
@@ -1127,6 +1140,9 @@ func (s *Service) resetCommit(ctx context.Context, job catalog.EncodingJob) erro
 	if err := s.cat.ResetCommittingEncoding(ctx, job.Hash, job.Token); err != nil {
 		return err
 	}
+	// The replacement never became observable within the grace window, so the
+	// blob returns to the pending queue and a worker encodes it again.
+	log.Printf("encoding: reconciled commit for %s as retry: the replacement was not observable", job.Hash[:12])
 	_ = os.Remove(s.spoolPath(job.Hash, job.Token))
 	return nil
 }
