@@ -628,6 +628,7 @@ func TestRecoveredCommittingFilesDoNotReserveSpoolSlots(t *testing.T) {
 	if err := svc.ReceiveOutput(ctx, jobs[2].Hash, jobs[2].Token, strings.NewReader("new result")); err != nil {
 		t.Fatalf("new upload alongside recovered commits: %v", err)
 	}
+	waitForEncodingStatus(t, cat, jobs[2].Hash, "failed")
 }
 
 // TestAmbiguousCommitDoesNotParkSpoolSlots reproduces the incident where an
@@ -718,6 +719,7 @@ func TestAmbiguousCommitDoesNotParkSpoolSlots(t *testing.T) {
 	if err := svc.ReceiveOutput(ctx, blobs["fresh"], jobs[blobs["fresh"]].Token, strings.NewReader("new result")); err != nil {
 		t.Fatalf("new upload while a commit waits out its grace lease: %v", err)
 	}
+	waitForEncodingStatus(t, cat, blobs["fresh"], "failed")
 	// A processor must not reconcile even an expired commit inline; that is
 	// the scanner's job, so the grace lease keeps fencing the row.
 	svc.spoolSlots <- struct{}{}
