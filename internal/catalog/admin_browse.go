@@ -45,43 +45,47 @@ type AdminAlbumFilters struct {
 // category so unknown future values remain inspectable. Missing blobs are
 // marked explicitly and have null size/type metadata and empty pipeline states.
 type AdminPhoto struct {
-	AlbumID        string  `json:"albumId"`
-	AlbumName      string  `json:"albumName"`
-	Index          int     `json:"idx"`
-	Name           string  `json:"name"`
-	Hash           string  `json:"hash"`
-	MissingBlob    bool    `json:"missingBlob"`
-	Width          int     `json:"width"`
-	Height         int     `json:"height"`
-	SizeBytes      *int64  `json:"sizeBytes"`
-	ContentType    *string `json:"contentType"`
-	EncodingRaw    string  `json:"encodingRaw"`
-	Encoding       string  `json:"encoding"`
-	EncodingError  string  `json:"encodingError"`
-	EmbeddingRaw   string  `json:"embeddingRaw"`
-	Embedding      string  `json:"embedding"`
-	EmbeddingError string  `json:"embeddingError"`
-	SkippedReason  string  `json:"skippedReason"`
-	BlockReason    string  `json:"blockReason"`
+	AlbumID              string            `json:"albumId"`
+	AlbumName            string            `json:"albumName"`
+	Index                int               `json:"idx"`
+	Name                 string            `json:"name"`
+	Hash                 string            `json:"hash"`
+	MissingBlob          bool              `json:"missingBlob"`
+	Width                int               `json:"width"`
+	Height               int               `json:"height"`
+	SizeBytes            *int64            `json:"sizeBytes"`
+	ContentType          *string           `json:"contentType"`
+	EncodingRaw          string            `json:"encodingRaw"`
+	Encoding             string            `json:"encoding"`
+	EncodingError        string            `json:"encodingError"`
+	EmbeddingRaw         string            `json:"embeddingRaw"`
+	Embedding            string            `json:"embedding"`
+	EmbeddingError       string            `json:"embeddingError"`
+	SkippedReason        string            `json:"skippedReason"`
+	BlockReason          string            `json:"blockReason"`
+	EncodingObservation  *StageObservation `json:"encodingObservation,omitempty"`
+	EmbeddingObservation *StageObservation `json:"embeddingObservation,omitempty"`
 }
 
 // AdminBlob is a blob plus bounded relation counts. Individual photos are
 // obtained through AdminPhotos with hash set, so a shared blob can never
 // produce an unbounded detail response.
 type AdminBlob struct {
-	Hash           string `json:"hash"`
-	SizeBytes      int64  `json:"sizeBytes"`
-	ContentType    string `json:"contentType"`
-	EncodingRaw    string `json:"encodingRaw"`
-	Encoding       string `json:"encoding"`
-	EncodingError  string `json:"encodingError"`
-	EmbeddingRaw   string `json:"embeddingRaw"`
-	Embedding      string `json:"embedding"`
-	EmbeddingError string `json:"embeddingError"`
-	SkippedReason  string `json:"skippedReason"`
-	BlockReason    string `json:"blockReason"`
-	PhotoCount     int64  `json:"photoCount"`
-	AlbumCount     int64  `json:"albumCount"`
+	Hash                 string            `json:"hash"`
+	SizeBytes            int64             `json:"sizeBytes"`
+	ContentType          string            `json:"contentType"`
+	EncodingRaw          string            `json:"encodingRaw"`
+	Encoding             string            `json:"encoding"`
+	EncodingError        string            `json:"encodingError"`
+	EmbeddingRaw         string            `json:"embeddingRaw"`
+	Embedding            string            `json:"embedding"`
+	EmbeddingError       string            `json:"embeddingError"`
+	SkippedReason        string            `json:"skippedReason"`
+	BlockReason          string            `json:"blockReason"`
+	PhotoCount           int64             `json:"photoCount"`
+	AlbumCount           int64             `json:"albumCount"`
+	EncodingObservation  *StageObservation `json:"encodingObservation,omitempty"`
+	EmbeddingObservation *StageObservation `json:"embeddingObservation,omitempty"`
 }
 
 // AdminAlbum is the bounded album-list projection. PhotoCount is counted from
@@ -186,13 +190,29 @@ func scanAdminPhoto(row interface{ Scan(...any) error }) (AdminPhoto, error) {
 
 // AdminPhotoAt returns one photo and its current pipeline state.
 func (s *Store) AdminPhotoAt(ctx context.Context, albumID string, index int) (AdminPhoto, error) {
-	row := s.db.QueryRowContext(ctx, adminPhotoSelect+` WHERE p.album_id = ? AND p.idx = ?`, albumID, index)
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return AdminPhoto{}, fmt.Errorf("begin admin photo detail: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	row := tx.QueryRowContext(ctx, adminPhotoSelect+` WHERE p.album_id = ? AND p.idx = ?`, albumID, index)
 	photo, err := scanAdminPhoto(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return AdminPhoto{}, fmt.Errorf("%w: %s:%d", ErrPhotoNotFound, albumID, index)
 	}
 	if err != nil {
 		return AdminPhoto{}, fmt.Errorf("get admin photo %s:%d: %w", albumID, index, err)
+	}
+	if !photo.MissingBlob {
+		observations, err := stageObservations(ctx, tx, photo.Hash)
+		if err != nil {
+			return AdminPhoto{}, err
+		}
+		photo.EncodingObservation = observationPointer(observations["encoding"])
+		photo.EmbeddingObservation = observationPointer(observations["embedding"])
+	}
+	if err := tx.Commit(); err != nil {
+		return AdminPhoto{}, fmt.Errorf("finish admin photo detail: %w", err)
 	}
 	return photo, nil
 }
@@ -265,6 +285,11 @@ func scanAdminBlob(row interface{ Scan(...any) error }) (AdminBlob, error) {
 // AdminBlobByHash returns blob metadata and relation counts; references remain
 // available through the paged photo list instead of being embedded here.
 func (s *Store) AdminBlobByHash(ctx context.Context, hash string) (AdminBlob, error) {
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return AdminBlob{}, fmt.Errorf("begin admin blob detail: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
 	query := `SELECT b.hash, b.size_bytes, b.content_type, b.encoding_status, ` + adminEncodingCategoryExpr + `, b.encoding_error,
 		b.embedding_status, ` + adminEmbeddingCategoryExpr + `, b.embedding_error,
 		CASE WHEN b.encoding_status = 'skipped' THEN ` + adminEncodingSkippedReasonExpr + ` ELSE '' END,
@@ -272,14 +297,27 @@ func (s *Store) AdminBlobByHash(ctx context.Context, hash string) (AdminBlob, er
 		(SELECT COUNT(*) FROM photos p WHERE p.hash = b.hash),
 		(SELECT COUNT(DISTINCT p.album_id) FROM photos p WHERE p.hash = b.hash)
 		FROM blobs b WHERE b.hash = ?`
-	blob, err := scanAdminBlob(s.db.QueryRowContext(ctx, query, hash))
+	blob, err := scanAdminBlob(tx.QueryRowContext(ctx, query, hash))
 	if errors.Is(err, sql.ErrNoRows) {
 		return AdminBlob{}, fmt.Errorf("%w: %s", ErrBlobNotFound, hash)
 	}
 	if err != nil {
 		return AdminBlob{}, fmt.Errorf("get admin blob %s: %w", hash, err)
 	}
+	observations, err := stageObservations(ctx, tx, hash)
+	if err != nil {
+		return AdminBlob{}, err
+	}
+	blob.EncodingObservation = observationPointer(observations["encoding"])
+	blob.EmbeddingObservation = observationPointer(observations["embedding"])
+	if err := tx.Commit(); err != nil {
+		return AdminBlob{}, fmt.Errorf("finish admin blob detail: %w", err)
+	}
 	return blob, nil
+}
+
+func observationPointer(observation StageObservation) *StageObservation {
+	return &observation
 }
 
 // AdminAlbums reads albums in id order. The correlated photo count uses the

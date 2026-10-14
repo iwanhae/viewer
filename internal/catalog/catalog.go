@@ -165,11 +165,45 @@ func Open(path string, sink VectorSink) (*Store, error) {
 	// those blobs straight back to the pending queue. This is runtime hygiene
 	// that runs on every open, not a migration — a crash mid-flight must not
 	// need a schema change to recover from.
-	if _, err := db.Exec(`
-		UPDATE blobs SET embedding_status = 'pending', embedding_lease_until = 0
-		WHERE embedding_status = 'processing'`); err != nil {
+	startupTx, err := db.Begin()
+	if err != nil {
 		db.Close()
-		return nil, fmt.Errorf("reset stale embedding leases: %w", err)
+		return nil, fmt.Errorf("begin stale embedding reset: %w", err)
+	}
+	if err := lockCatalogWriter(context.Background(), startupTx); err != nil {
+		_ = startupTx.Rollback()
+		db.Close()
+		return nil, fmt.Errorf("lock stale embedding reset: %w", err)
+	}
+	now := time.Now()
+	for {
+		staleHashes, err := queryBlobHashes(context.Background(), startupTx,
+			`SELECT hash FROM blobs WHERE embedding_status='processing' ORDER BY hash LIMIT 500`)
+		if err != nil {
+			_ = startupTx.Rollback()
+			db.Close()
+			return nil, fmt.Errorf("read stale embedding leases: %w", err)
+		}
+		if len(staleHashes) == 0 {
+			break
+		}
+		for _, hash := range staleHashes {
+			if _, err := startupTx.ExecContext(context.Background(), `UPDATE blobs SET embedding_status='pending', embedding_lease_until=0
+				WHERE hash=? AND embedding_status='processing'`, hash); err != nil {
+				_ = startupTx.Rollback()
+				db.Close()
+				return nil, fmt.Errorf("reset stale embedding lease: %w", err)
+			}
+			if _, err := observeStage(context.Background(), startupTx, hash, "embedding", "startup_reset", string(EmbeddingStatusPending), "", now, false, false, false, "", "unknown"); err != nil {
+				_ = startupTx.Rollback()
+				db.Close()
+				return nil, fmt.Errorf("record stale embedding reset: %w", err)
+			}
+		}
+	}
+	if err := startupTx.Commit(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("commit stale embedding reset: %w", err)
 	}
 	return &Store{db: db}, nil
 }
@@ -655,7 +689,19 @@ func (s *Store) UpsertBlob(ctx context.Context, blob Blob) error {
 	if blob.ContentType == "image/webp" {
 		encodingStatus = "skipped"
 	}
-	_, err := s.db.ExecContext(ctx, `
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := lockCatalogWriter(ctx, tx); err != nil {
+		return fmt.Errorf("lock blob upsert: %w", err)
+	}
+	var exists int
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM blobs WHERE hash=?)`, blob.Hash).Scan(&exists); err != nil {
+		return fmt.Errorf("check blob %s: %w", blob.Hash, err)
+	}
+	_, err = tx.ExecContext(ctx, `
 		INSERT INTO blobs (hash, size_bytes, content_type, embedding_status, embedding_error, created_at, encoding_status, encoding_gate)
 		VALUES (?, ?, ?, ?, '', ?, ?, ?)
 		ON CONFLICT(hash) DO UPDATE SET
@@ -667,6 +713,23 @@ func (s *Store) UpsertBlob(ctx context.Context, blob Blob) error {
 	)
 	if err != nil {
 		return fmt.Errorf("upsert blob %s: %w", blob.Hash, err)
+	}
+	if exists == 0 {
+		for _, seed := range []struct{ stage, status string }{
+			{"encoding", encodingStatus}, {"embedding", string(EmbeddingStatusPending)},
+		} {
+			if _, err := tx.ExecContext(ctx, `INSERT INTO blob_stage_observations (blob_hash, stage, status, retryability)
+				VALUES (?, ?, ?, 'unknown')`, blob.Hash, seed.stage, seed.status); err != nil {
+				return fmt.Errorf("initialize %s observation for %s: %w", seed.stage, blob.Hash, err)
+			}
+		}
+	} else if blob.SourceRestored {
+		if _, err := observeStage(ctx, tx, blob.Hash, "encoding", "source_restored", encodingStatus, "", time.Now(), false, true, true, "", "unknown"); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit blob upsert %s: %w", blob.Hash, err)
 	}
 	return nil
 }
@@ -742,46 +805,80 @@ type RejectedEmbedding struct {
 // ClaimPendingEmbeddings atomically moves up to limit blobs into the
 // processing state and returns them. Pending blobs and processing blobs whose
 // lease has already expired are both claimable, so a worker that dies mid-batch
-// is not able to strand its blobs: the next claim reclaims them. The statement
-// must run through QueryContext — RETURNING rows are dropped by ExecContext.
-// Rows come back in an unspecified order, so they are re-sorted by created_at.
+// is not able to strand its blobs: the next claim reclaims them. Candidate
+// selection, expiry observations, claim attempts, and updates share one
+// serialized write transaction. Returned rows are re-sorted by created_at.
 func (s *Store) ClaimPendingEmbeddings(ctx context.Context, limit int, leaseUntil time.Time) ([]Blob, error) {
 	now := time.Now()
-	rows, err := s.db.QueryContext(ctx, `
-		UPDATE blobs
-		SET embedding_status = ?1, embedding_lease_until = ?2
-		WHERE hash IN (
-			SELECT b.hash FROM blobs AS b
-			WHERE (embedding_status = ?3
-			   OR (embedding_status = ?1 AND embedding_lease_until < ?4))
-			  AND `+embeddingClaimGatePredicate+`
-			ORDER BY created_at ASC
-			LIMIT ?5
-		)
-		RETURNING hash, size_bytes, content_type, created_at`,
-		string(EmbeddingStatusProcessing), leaseUntil.UnixMilli(),
-		string(EmbeddingStatusPending), now.UnixMilli(), limit,
-	)
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return nil, fmt.Errorf("claim blobs for embedding: %w", err)
+		return nil, fmt.Errorf("begin embedding claim: %w", err)
 	}
-	defer rows.Close()
-
-	blobs := make([]Blob, 0)
+	defer func() { _ = tx.Rollback() }()
+	if err := lockCatalogWriter(ctx, tx); err != nil {
+		return nil, fmt.Errorf("lock embedding claim: %w", err)
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT b.hash, b.size_bytes, b.content_type, b.created_at, b.embedding_status
+		FROM blobs AS b
+		WHERE (b.embedding_status = ? OR (b.embedding_status = ? AND b.embedding_lease_until < ?))
+		  AND `+embeddingClaimGatePredicate+`
+		ORDER BY b.created_at ASC LIMIT ?`,
+		string(EmbeddingStatusPending), string(EmbeddingStatusProcessing), now.UnixMilli(), limit)
+	if err != nil {
+		return nil, fmt.Errorf("select blobs for embedding claim: %w", err)
+	}
+	type candidate struct {
+		blob        Blob
+		priorStatus EmbeddingStatus
+	}
+	candidates := make([]candidate, 0)
 	for rows.Next() {
-		var blob Blob
+		var item candidate
 		if err := rows.Scan(
-			&blob.Hash, &blob.SizeBytes, &blob.ContentType, &blob.CreatedAt,
+			&item.blob.Hash, &item.blob.SizeBytes, &item.blob.ContentType, &item.blob.CreatedAt, &item.priorStatus,
 		); err != nil {
+			_ = rows.Close()
 			return nil, fmt.Errorf("scan claimed blob: %w", err)
 		}
-		blob.EmbeddingStatus = EmbeddingStatusProcessing
-		blobs = append(blobs, blob)
+		candidates = append(candidates, item)
 	}
 	if err := rows.Err(); err != nil {
+		_ = rows.Close()
 		return nil, fmt.Errorf("iterate claimed blobs: %w", err)
 	}
+	_ = rows.Close()
+	blobs := make([]Blob, 0, len(candidates))
+	for _, item := range candidates {
+		if item.priorStatus == EmbeddingStatusProcessing {
+			if _, err := observeStage(ctx, tx, item.blob.Hash, "embedding", "lease_expired", string(EmbeddingStatusPending), "", now, false, true, false, "", "unknown"); err != nil {
+				return nil, err
+			}
+		}
+		update, err := tx.ExecContext(ctx, `UPDATE blobs SET embedding_status=?, embedding_lease_until=?
+			WHERE hash=? AND (embedding_status=? OR (embedding_status=? AND embedding_lease_until<?))
+			AND (encoding_gate=0 OR encoding_status IN ('done','skipped','failed'))`,
+			string(EmbeddingStatusProcessing), leaseUntil.UnixMilli(), item.blob.Hash,
+			string(EmbeddingStatusPending), string(EmbeddingStatusProcessing), now.UnixMilli())
+		if err != nil {
+			return nil, fmt.Errorf("claim blob %s for embedding: %w", item.blob.Hash, err)
+		}
+		changed, err := update.RowsAffected()
+		if err != nil {
+			return nil, err
+		}
+		if changed != 1 {
+			continue
+		}
+		if _, err := observeStage(ctx, tx, item.blob.Hash, "embedding", "claimed", string(EmbeddingStatusProcessing), "", now, true, false, false, "", "unknown"); err != nil {
+			return nil, err
+		}
+		item.blob.EmbeddingStatus = EmbeddingStatusProcessing
+		blobs = append(blobs, item.blob)
+	}
 	sort.Slice(blobs, func(i, j int) bool { return blobs[i].CreatedAt < blobs[j].CreatedAt })
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit embedding claim: %w", err)
+	}
 	return blobs, nil
 }
 
@@ -804,18 +901,54 @@ func (s *Store) RenewEmbeddingLeases(ctx context.Context, hashes []string, lease
 // when a worker gives up on a batch without recording an outcome (transient
 // failure, shutdown).
 func (s *Store) ReleaseEmbeddingClaims(ctx context.Context, hashes []string) error {
-	_, err := s.updateEmbeddingLeases(ctx, hashes, func(builder *strings.Builder, args []any) []any {
-		builder.WriteString(`
-			UPDATE blobs SET embedding_status = ?, embedding_lease_until = 0
-			WHERE embedding_status = ? AND hash IN (`)
-		args = append(args, string(EmbeddingStatusPending), string(EmbeddingStatusProcessing))
-		return args
-	})
-	return err
+	if len(hashes) == 0 {
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	const chunkSize = 500
+	now := time.Now()
+	for start := 0; start < len(hashes); start += chunkSize {
+		end := min(start+chunkSize, len(hashes))
+		chunk := hashes[start:end]
+		placeholders := strings.TrimSuffix(strings.Repeat("?, ", len(chunk)), ", ")
+		args := []any{string(EmbeddingStatusPending), string(EmbeddingStatusProcessing)}
+		for _, hash := range chunk {
+			args = append(args, hash)
+		}
+		rows, err := tx.QueryContext(ctx, `UPDATE blobs SET embedding_status=?, embedding_lease_until=0
+			WHERE embedding_status=? AND hash IN (`+placeholders+`) RETURNING hash`, args...)
+		if err != nil {
+			return fmt.Errorf("release embedding claims: %w", err)
+		}
+		var changed []string
+		for rows.Next() {
+			var hash string
+			if err := rows.Scan(&hash); err != nil {
+				_ = rows.Close()
+				return err
+			}
+			changed = append(changed, hash)
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		_ = rows.Close()
+		for _, hash := range changed {
+			if _, err := observeStage(ctx, tx, hash, "embedding", "released", string(EmbeddingStatusPending), "", now, false, true, false, "", "unknown"); err != nil {
+				return err
+			}
+		}
+	}
+	return tx.Commit()
 }
 
-// updateEmbeddingLeases runs one of the two lease rewrites above, chunking the
-// hash list so the IN clause stays far below SQLite's parameter limit. The
+// updateEmbeddingLeases runs the lease renewal, chunking the hash list so the
+// IN clause stays far below SQLite's parameter limit. The
 // statement RETURNs the hashes it actually touched, so a caller can tell a
 // renewal that landed from one that raced a reclaim. Rows must be drained for
 // RETURNING to run (QueryContext, not ExecContext), and the order is
@@ -923,6 +1056,10 @@ func (s *Store) ApplyEmbeddingResults(ctx context.Context, results []EmbeddingRe
 			return nil, nil, fmt.Errorf("count embedding result for %s: %w", hash, err)
 		}
 		if affected == 1 {
+			if _, err := observeStage(ctx, tx, hash, "embedding", string(result.Status), string(result.Status), "", time.Now(), false, true, true,
+				safeStageErrorCode("embedding", errorText), "unknown"); err != nil {
+				return nil, nil, err
+			}
 			applied = append(applied, hash)
 			continue
 		}
@@ -1127,20 +1264,48 @@ func (s *Store) BlobCount(ctx context.Context) (int64, error) {
 // Letting the in-flight batch finish costs nothing; its outcome is as good as
 // a fresh one.
 func (s *Store) ResetReadyEmbeddings(ctx context.Context) (int64, error) {
-	res, err := s.db.ExecContext(ctx, `
-		UPDATE blobs
-		SET embedding_status = ?, embedding_error = '', embedding_lease_until = 0
-		WHERE embedding_status IN (?, ?)`,
-		string(EmbeddingStatusPending), string(EmbeddingStatusReady), string(EmbeddingStatusFailed),
-	)
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return 0, fmt.Errorf("reset ready embeddings: %w", err)
+		return 0, fmt.Errorf("begin embedding reindex: %w", err)
 	}
-	affected, err := res.RowsAffected()
-	if err != nil {
-		return 0, fmt.Errorf("count reset embeddings: %w", err)
+	defer func() { _ = tx.Rollback() }()
+	if err := lockCatalogWriter(ctx, tx); err != nil {
+		return 0, err
 	}
-	return affected, nil
+	now := time.Now()
+	var count int64
+	for {
+		hashes, err := queryBlobHashes(ctx, tx, `SELECT hash FROM blobs WHERE embedding_status IN (?, ?) ORDER BY hash LIMIT 500`,
+			string(EmbeddingStatusReady), string(EmbeddingStatusFailed))
+		if err != nil {
+			return 0, fmt.Errorf("read embeddings for reindex: %w", err)
+		}
+		if len(hashes) == 0 {
+			break
+		}
+		for _, hash := range hashes {
+			result, err := tx.ExecContext(ctx, `UPDATE blobs SET embedding_status=?, embedding_error='', embedding_lease_until=0
+				WHERE hash=? AND embedding_status IN (?, ?)`, string(EmbeddingStatusPending), hash,
+				string(EmbeddingStatusReady), string(EmbeddingStatusFailed))
+			if err != nil {
+				return 0, err
+			}
+			changed, err := result.RowsAffected()
+			if err != nil {
+				return 0, err
+			}
+			if changed == 1 {
+				count++
+				if _, err := observeStage(ctx, tx, hash, "embedding", "reindex", string(EmbeddingStatusPending), "", now, false, true, false, "", "unknown"); err != nil {
+					return 0, err
+				}
+			}
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return count, nil
 }
 
 // ReleaseStuckEmbeddingClaims flips processing rows back to pending and
@@ -1159,24 +1324,62 @@ func (s *Store) ResetReadyEmbeddings(ctx context.Context) (int64, error) {
 // cost is wasted work. Only widen to expiredOnly=false once there is no worker
 // left to finish the in-flight batch.
 func (s *Store) ReleaseStuckEmbeddingClaims(ctx context.Context, expiredOnly bool) (int64, error) {
-	query := `
-		UPDATE blobs
-		SET embedding_status = ?, embedding_error = '', embedding_lease_until = 0
-		WHERE embedding_status = ?`
-	args := []any{string(EmbeddingStatusPending), string(EmbeddingStatusProcessing)}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := lockCatalogWriter(ctx, tx); err != nil {
+		return 0, err
+	}
+	now := time.Now()
+	event := "manual_release"
 	if expiredOnly {
-		query += ` AND embedding_lease_until < ?`
-		args = append(args, time.Now().UnixMilli())
+		event = "lease_expired"
 	}
-	res, err := s.db.ExecContext(ctx, query, args...)
-	if err != nil {
-		return 0, fmt.Errorf("release stuck embedding claims: %w", err)
+	var count int64
+	selectQuery := `SELECT hash FROM blobs WHERE embedding_status=?`
+	selectArgs := []any{string(EmbeddingStatusProcessing)}
+	updateQuery := `UPDATE blobs SET embedding_status=?, embedding_error='', embedding_lease_until=0 WHERE hash=? AND embedding_status=?`
+	if expiredOnly {
+		selectQuery += ` AND embedding_lease_until < ?`
+		selectArgs = append(selectArgs, now.UnixMilli())
+		updateQuery += ` AND embedding_lease_until < ?`
 	}
-	affected, err := res.RowsAffected()
-	if err != nil {
-		return 0, fmt.Errorf("count released embedding claims: %w", err)
+	selectQuery += ` ORDER BY hash LIMIT 500`
+	for {
+		hashes, err := queryBlobHashes(ctx, tx, selectQuery, selectArgs...)
+		if err != nil {
+			return 0, fmt.Errorf("read stuck embedding claims: %w", err)
+		}
+		if len(hashes) == 0 {
+			break
+		}
+		for _, hash := range hashes {
+			args := []any{string(EmbeddingStatusPending), hash, string(EmbeddingStatusProcessing)}
+			if expiredOnly {
+				args = append(args, now.UnixMilli())
+			}
+			result, err := tx.ExecContext(ctx, updateQuery, args...)
+			if err != nil {
+				return 0, err
+			}
+			changed, err := result.RowsAffected()
+			if err != nil {
+				return 0, err
+			}
+			if changed == 1 {
+				count++
+				if _, err := observeStage(ctx, tx, hash, "embedding", event, string(EmbeddingStatusPending), "", now, false, true, false, "", "unknown"); err != nil {
+					return 0, err
+				}
+			}
+		}
 	}
-	return affected, nil
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return count, nil
 }
 
 // ResetFailedEmbeddings flips every failed embedding back to pending, clearing
@@ -1190,20 +1393,46 @@ func (s *Store) ReleaseStuckEmbeddingClaims(ctx context.Context, expiredOnly boo
 // excludes them: a worker still holds that lease and flipping the row under it
 // would race its in-flight write-back.
 func (s *Store) ResetFailedEmbeddings(ctx context.Context) (int64, error) {
-	res, err := s.db.ExecContext(ctx, `
-		UPDATE blobs
-		SET embedding_status = ?, embedding_error = '', embedding_lease_until = 0
-		WHERE embedding_status = ?`,
-		string(EmbeddingStatusPending), string(EmbeddingStatusFailed),
-	)
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return 0, fmt.Errorf("reset failed embeddings: %w", err)
+		return 0, fmt.Errorf("begin failed embedding retry: %w", err)
 	}
-	affected, err := res.RowsAffected()
-	if err != nil {
-		return 0, fmt.Errorf("count reset failed embeddings: %w", err)
+	defer func() { _ = tx.Rollback() }()
+	if err := lockCatalogWriter(ctx, tx); err != nil {
+		return 0, err
 	}
-	return affected, nil
+	now := time.Now()
+	var count int64
+	for {
+		hashes, err := queryBlobHashes(ctx, tx, `SELECT hash FROM blobs WHERE embedding_status=? ORDER BY hash LIMIT 500`, string(EmbeddingStatusFailed))
+		if err != nil {
+			return 0, fmt.Errorf("read failed embeddings: %w", err)
+		}
+		if len(hashes) == 0 {
+			break
+		}
+		for _, hash := range hashes {
+			result, err := tx.ExecContext(ctx, `UPDATE blobs SET embedding_status=?, embedding_error='', embedding_lease_until=0
+				WHERE hash=? AND embedding_status=?`, string(EmbeddingStatusPending), hash, string(EmbeddingStatusFailed))
+			if err != nil {
+				return 0, err
+			}
+			changed, err := result.RowsAffected()
+			if err != nil {
+				return 0, err
+			}
+			if changed == 1 {
+				count++
+				if _, err := observeStage(ctx, tx, hash, "embedding", "manual_retry", string(EmbeddingStatusPending), "", now, false, true, false, "", "unknown"); err != nil {
+					return 0, err
+				}
+			}
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return count, nil
 }
 
 // EmbeddingLeaseHealth is the diagnostic snapshot of the processing rows: how

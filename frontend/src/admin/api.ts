@@ -44,6 +44,19 @@ export type Photo = {
   embeddingError: string
   skippedReason: string
   blockReason: string
+  encodingObservation?: StageObservation
+  embeddingObservation?: StageObservation
+}
+
+export type StageObservation = {
+  startedAt: string | null
+  finishedAt: string | null
+  statusChangedAt: string | null
+  status: string
+  phase: string | null
+  attempts: number
+  errorCode: string
+  retryability: 'retryable' | 'not_retryable' | 'unknown' | string
 }
 
 export type Blob = {
@@ -60,7 +73,23 @@ export type Blob = {
   blockReason: string
   photoCount: number
   albumCount: number
+  encodingObservation?: StageObservation
+  embeddingObservation?: StageObservation
 }
+
+export type PipelineEvent = {
+  id: number
+  stage: 'encoding' | 'embedding'
+  event: string
+  status: string
+  phase: string | null
+  attemptId: number
+  errorCode: string
+  retryability: string
+  occurredAt: string
+}
+
+export type HistoryPage = { events: PipelineEvent[]; nextCursor: string | null }
 
 export type Album = {
   id: string

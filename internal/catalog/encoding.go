@@ -96,10 +96,34 @@ func (s *Store) ClaimEncoding(ctx context.Context, limit int, ttl time.Duration)
 		return nil, err
 	}
 	defer tx.Rollback()
-	now := time.Now()
-	if _, err = tx.ExecContext(ctx, `UPDATE blobs SET encoding_status='pending', encoding_token='', encoding_stage_key='', encoding_lease_until=0
-		WHERE encoding_status='leased' AND encoding_lease_until < ?`, now.UnixMilli()); err != nil {
+	if err := lockCatalogWriter(ctx, tx); err != nil {
 		return nil, err
+	}
+	now := time.Now()
+	for {
+		expired, err := queryBlobHashes(ctx, tx, `SELECT hash FROM blobs WHERE encoding_status='leased' AND encoding_lease_until < ? ORDER BY hash LIMIT 500`, now.UnixMilli())
+		if err != nil {
+			return nil, err
+		}
+		if len(expired) == 0 {
+			break
+		}
+		for _, hash := range expired {
+			result, err := tx.ExecContext(ctx, `UPDATE blobs SET encoding_status='pending', encoding_token='', encoding_stage_key='', encoding_lease_until=0
+				WHERE hash=? AND encoding_status='leased' AND encoding_lease_until < ?`, hash, now.UnixMilli())
+			if err != nil {
+				return nil, err
+			}
+			changed, err := result.RowsAffected()
+			if err != nil {
+				return nil, err
+			}
+			if changed == 1 {
+				if _, err := observeStage(ctx, tx, hash, "encoding", "lease_expired", "pending", "", now, false, true, false, "", "unknown"); err != nil {
+					return nil, err
+				}
+			}
+		}
 	}
 	rows, err := tx.QueryContext(ctx, `SELECT hash, size_bytes, content_type FROM blobs
 		WHERE encoding_status='pending' AND content_type != 'image/webp'
@@ -133,6 +157,9 @@ func (s *Store) ClaimEncoding(ctx context.Context, limit int, ttl time.Duration)
 		jobs[i].LeaseUntil = lease
 		if _, err := tx.ExecContext(ctx, `UPDATE blobs SET encoding_status='leased', encoding_token=?, encoding_stage_key=?, encoding_lease_until=? WHERE hash=?`,
 			token, jobs[i].StageKey, lease.UnixMilli(), jobs[i].Hash); err != nil {
+			return nil, err
+		}
+		if _, err := observeStage(ctx, tx, jobs[i].Hash, "encoding", "claimed", "leased", "", now, true, false, false, "", "unknown"); err != nil {
 			return nil, err
 		}
 	}
@@ -174,14 +201,28 @@ func (s *Store) RenewEncoding(ctx context.Context, hash, token string, ttl time.
 // background validation.
 func (s *Store) MarkEncodingReceived(ctx context.Context, hash, token string) (bool, error) {
 	now := time.Now()
-	result, err := s.db.ExecContext(ctx, `UPDATE blobs SET encoding_status='received', encoding_stage_key='', encoding_lease_until=0
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `UPDATE blobs SET encoding_status='received', encoding_stage_key='', encoding_lease_until=0
 		WHERE hash=? AND encoding_token=? AND encoding_status='leased' AND encoding_lease_until>=?`,
 		hash, token, now.UnixMilli())
 	if err != nil {
 		return false, err
 	}
 	n, err := result.RowsAffected()
-	return n == 1, err
+	if err != nil || n != 1 {
+		return false, err
+	}
+	if _, err := observeStage(ctx, tx, hash, "encoding", "result_received", "received", "", now, false, false, false, "", "unknown"); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // ReceivedEncodings lists encoder results awaiting background validation.
@@ -211,9 +252,24 @@ func (s *Store) ReceivedEncodings(ctx context.Context) ([]EncodingJob, error) {
 // queue when validation or upload cannot proceed. The token prevents an older
 // receiver from resetting a newer job.
 func (s *Store) ResetReceivedEncoding(ctx context.Context, hash, token string) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE blobs SET encoding_status='pending', encoding_token='', encoding_stage_key='', encoding_lease_until=0
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `UPDATE blobs SET encoding_status='pending', encoding_token='', encoding_stage_key='', encoding_lease_until=0
 		WHERE hash=? AND encoding_token=? AND encoding_status='received'`, hash, token)
-	return err
+	if err != nil {
+		return err
+	}
+	n, err := result.RowsAffected()
+	if err != nil || n == 0 {
+		return err
+	}
+	if _, err := observeStage(ctx, tx, hash, "encoding", "released", "pending", "", time.Now(), false, true, false, "", "unknown"); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // BeginEncodingCommit records the validated source size before the object
@@ -222,41 +278,125 @@ func (s *Store) ResetReceivedEncoding(ctx context.Context, hash, token string) e
 // is not mistaken for a failed copy.
 func (s *Store) BeginEncodingCommit(ctx context.Context, hash, token string, sourceSize int64, reconcileAfter time.Duration) (bool, error) {
 	leaseUntil := time.Now().Add(reconcileAfter)
-	result, err := s.db.ExecContext(ctx, `UPDATE blobs SET encoding_status='committing', encoding_source_size_bytes=?, encoding_lease_until=?
+	now := time.Now()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `UPDATE blobs SET encoding_status='committing', encoding_source_size_bytes=?, encoding_lease_until=?
 		WHERE hash=? AND encoding_token=? AND ((encoding_status='leased' AND encoding_lease_until>=?) OR encoding_status='received')`,
-		sourceSize, leaseUntil.UnixMilli(), hash, token, time.Now().UnixMilli())
+		sourceSize, leaseUntil.UnixMilli(), hash, token, now.UnixMilli())
 	if err != nil {
 		return false, err
 	}
 	n, err := result.RowsAffected()
-	return n == 1, err
+	if err != nil || n != 1 {
+		return false, err
+	}
+	if _, err := observeStage(ctx, tx, hash, "encoding", "commit_started", "committing", "committing", now, false, false, false, "", "unknown"); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (s *Store) FinishEncoding(ctx context.Context, hash, token, status, contentType, errorText string, size int64) (bool, error) {
-	result, err := s.db.ExecContext(ctx, `UPDATE blobs SET encoding_status=?, content_type=?, size_bytes=?, encoding_error=?, encoding_lease_until=0
+	return s.finishEncoding(ctx, hash, token, status, contentType, errorText, size, false)
+}
+
+// FinishReconciledEncoding is the same token-fenced commit completion used by
+// FinishEncoding, tagged distinctly because the encoding service explicitly
+// verified an ambiguous object-store outcome.
+func (s *Store) FinishReconciledEncoding(ctx context.Context, hash, token, status, contentType, errorText string, size int64) (bool, error) {
+	return s.finishEncoding(ctx, hash, token, status, contentType, errorText, size, true)
+}
+
+func (s *Store) finishEncoding(ctx context.Context, hash, token, status, contentType, errorText string, size int64, reconciled bool) (bool, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `UPDATE blobs SET encoding_status=?, content_type=?, size_bytes=?, encoding_error=?, encoding_lease_until=0
 		WHERE hash=? AND encoding_token=? AND encoding_status='committing'`, status, contentType, size, errorText, hash, token)
 	if err != nil {
 		return false, err
 	}
 	n, err := result.RowsAffected()
-	return n == 1, err
+	if err != nil || n != 1 {
+		return false, err
+	}
+	event := "finished"
+	if status == "done" || status == "skipped" || status == "failed" {
+		event = status
+	}
+	if reconciled {
+		event = "reconciled_success"
+	}
+	code := safeStageErrorCode("encoding", errorText)
+	if _, err := observeStage(ctx, tx, hash, "encoding", event, status, "", time.Now(), false, true, true, code, "unknown"); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (s *Store) SkipEncoding(ctx context.Context, hash, token, status, contentType, errorText string, size int64) (bool, error) {
-	result, err := s.db.ExecContext(ctx, `UPDATE blobs SET encoding_status=?, content_type=?, size_bytes=?, encoding_error=?, encoding_lease_until=0, encoding_source_size_bytes=0
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `UPDATE blobs SET encoding_status=?, content_type=?, size_bytes=?, encoding_error=?, encoding_lease_until=0, encoding_source_size_bytes=0
 		WHERE hash=? AND encoding_token=? AND ((encoding_status='leased' AND encoding_lease_until>=?) OR encoding_status='received')`,
 		status, contentType, size, errorText, hash, token, time.Now().UnixMilli())
 	if err != nil {
 		return false, err
 	}
 	n, err := result.RowsAffected()
-	return n == 1, err
+	if err != nil || n != 1 {
+		return false, err
+	}
+	event := "skipped"
+	if status == "failed" {
+		event = "failed"
+	} else if status != "skipped" {
+		event = "finished"
+	}
+	if _, err := observeStage(ctx, tx, hash, "encoding", event, status, "", time.Now(), false, true, true,
+		safeStageErrorCode("encoding", errorText), "unknown"); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (s *Store) ReleaseEncoding(ctx context.Context, hash, token string) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE blobs SET encoding_status='pending', encoding_lease_until=0, encoding_token='', encoding_stage_key=''
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `UPDATE blobs SET encoding_status='pending', encoding_lease_until=0, encoding_token='', encoding_stage_key=''
 		WHERE hash=? AND encoding_token=? AND encoding_status='leased'`, hash, token)
-	return err
+	if err != nil {
+		return err
+	}
+	n, err := result.RowsAffected()
+	if err != nil || n == 0 {
+		return err
+	}
+	if _, err := observeStage(ctx, tx, hash, "encoding", "released", "pending", "", time.Now(), false, true, false, "", "unknown"); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *Store) CommittingEncodings(ctx context.Context) ([]EncodingJob, error) {
@@ -280,9 +420,56 @@ func (s *Store) CommittingEncodings(ctx context.Context) ([]EncodingJob, error) 
 }
 
 func (s *Store) ResetCommittingEncoding(ctx context.Context, hash, token string) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE blobs SET encoding_status='pending', encoding_token='', encoding_stage_key='', encoding_lease_until=0, encoding_source_size_bytes=0
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `UPDATE blobs SET encoding_status='pending', encoding_token='', encoding_stage_key='', encoding_lease_until=0, encoding_source_size_bytes=0
 		WHERE hash=? AND encoding_token=? AND encoding_status='committing'`, hash, token)
-	return err
+	if err != nil {
+		return err
+	}
+	n, err := result.RowsAffected()
+	if err != nil || n == 0 {
+		return err
+	}
+	if _, err := observeStage(ctx, tx, hash, "encoding", "reconciled_retry", "pending", "", time.Now(), false, true, false, "", "unknown"); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// MarkEncodingReconciling is called only by the encoding service when it has
+// observed an ambiguous commit or actively begins recovery. It does not touch
+// the lease, token, source size, or state-machine ownership.
+func (s *Store) MarkEncodingReconciling(ctx context.Context, hash, token string) (bool, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	if err := lockCatalogWriter(ctx, tx); err != nil {
+		return false, err
+	}
+	var phase sql.NullString
+	if err := tx.QueryRowContext(ctx, `SELECT o.phase FROM blobs b JOIN blob_stage_observations o ON o.blob_hash=b.hash AND o.stage='encoding'
+		WHERE b.hash=? AND b.encoding_token=? AND b.encoding_status='committing'`, hash, token).Scan(&phase); err != nil {
+		if err == sql.ErrNoRows {
+			return false, nil
+		}
+		return false, err
+	}
+	if phase.Valid && phase.String == "reconciling" {
+		return true, tx.Commit()
+	}
+	if _, err := observeStage(ctx, tx, hash, "encoding", "reconciliation_started", "committing", "reconciling", time.Now(), false, false, false, "", "unknown"); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // EncodingResetCounts reports how many rows each of ResetStuckEncodings' two
@@ -317,21 +504,68 @@ type EncodingResetCounts struct {
 func (s *Store) ResetStuckEncodings(ctx context.Context) (EncodingResetCounts, error) {
 	var counts EncodingResetCounts
 	now := time.Now()
-	leased, err := s.db.ExecContext(ctx, `UPDATE blobs SET encoding_status='pending', encoding_token='', encoding_stage_key='', encoding_lease_until=0
-		WHERE encoding_status='leased' AND encoding_lease_until < ?`, now.UnixMilli())
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return EncodingResetCounts{}, fmt.Errorf("release expired encoding leases: %w", err)
+		return counts, err
 	}
-	if counts.ReleasedExpiredLeased, err = leased.RowsAffected(); err != nil {
-		return EncodingResetCounts{}, fmt.Errorf("count released encoding leases: %w", err)
+	defer tx.Rollback()
+	if err := lockCatalogWriter(ctx, tx); err != nil {
+		return counts, err
 	}
-	received, err := s.db.ExecContext(ctx, `UPDATE blobs SET encoding_status='pending', encoding_token='', encoding_stage_key='', encoding_lease_until=0
-		WHERE encoding_status='received'`)
-	if err != nil {
-		return EncodingResetCounts{}, fmt.Errorf("reset received encodings: %w", err)
+	for {
+		leasedHashes, err := queryBlobHashes(ctx, tx, `SELECT hash FROM blobs WHERE encoding_status='leased' AND encoding_lease_until < ? ORDER BY hash LIMIT 500`, now.UnixMilli())
+		if err != nil {
+			return EncodingResetCounts{}, fmt.Errorf("read expired encoding leases: %w", err)
+		}
+		if len(leasedHashes) == 0 {
+			break
+		}
+		for _, hash := range leasedHashes {
+			result, err := tx.ExecContext(ctx, `UPDATE blobs SET encoding_status='pending', encoding_token='', encoding_stage_key='', encoding_lease_until=0
+				WHERE hash=? AND encoding_status='leased' AND encoding_lease_until < ?`, hash, now.UnixMilli())
+			if err != nil {
+				return EncodingResetCounts{}, fmt.Errorf("release expired encoding lease: %w", err)
+			}
+			changed, err := result.RowsAffected()
+			if err != nil {
+				return EncodingResetCounts{}, err
+			}
+			if changed == 1 {
+				counts.ReleasedExpiredLeased++
+				if _, err := observeStage(ctx, tx, hash, "encoding", "lease_expired", "pending", "", now, false, true, false, "", "unknown"); err != nil {
+					return EncodingResetCounts{}, err
+				}
+			}
+		}
 	}
-	if counts.ResetReceived, err = received.RowsAffected(); err != nil {
-		return EncodingResetCounts{}, fmt.Errorf("count reset received encodings: %w", err)
+	for {
+		receivedHashes, err := queryBlobHashes(ctx, tx, `SELECT hash FROM blobs WHERE encoding_status='received' ORDER BY hash LIMIT 500`)
+		if err != nil {
+			return EncodingResetCounts{}, fmt.Errorf("read received encodings: %w", err)
+		}
+		if len(receivedHashes) == 0 {
+			break
+		}
+		for _, hash := range receivedHashes {
+			result, err := tx.ExecContext(ctx, `UPDATE blobs SET encoding_status='pending', encoding_token='', encoding_stage_key='', encoding_lease_until=0
+				WHERE hash=? AND encoding_status='received'`, hash)
+			if err != nil {
+				return EncodingResetCounts{}, fmt.Errorf("reset received encoding: %w", err)
+			}
+			changed, err := result.RowsAffected()
+			if err != nil {
+				return EncodingResetCounts{}, err
+			}
+			if changed == 1 {
+				counts.ResetReceived++
+				if _, err := observeStage(ctx, tx, hash, "encoding", "manual_reset", "pending", "", now, false, true, false, "", "unknown"); err != nil {
+					return EncodingResetCounts{}, err
+				}
+			}
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return EncodingResetCounts{}, err
 	}
 	return counts, nil
 }

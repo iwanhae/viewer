@@ -736,3 +736,58 @@ func TestOpenToleratesNewerSchema(t *testing.T) {
 		t.Fatalf("counts on newer schema: %v", err)
 	}
 }
+
+func TestStageObservabilityMigrationDoesNotInventLegacyAttempts(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "catalog.db")
+	store, err := Open(path, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if err := store.UpsertBlob(ctx, Blob{Hash: "legacy-observation", SizeBytes: 10, ContentType: "image/jpeg"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(ctx, `UPDATE blobs SET encoding_status='leased', encoding_lease_until=?,
+		encoding_error='Authorization: Bearer hidden?signature=private', embedding_status='processing',
+		embedding_lease_until=?, embedding_error='https://private.invalid/?token=secret' WHERE hash=?`,
+		time.Now().Add(time.Hour).UnixMilli(), time.Now().Add(-time.Minute).UnixMilli(), "legacy-observation"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(ctx, `DROP TABLE pipeline_events`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(ctx, `DROP TABLE blob_stage_observations`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(ctx, `PRAGMA user_version=5`); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	migrated, err := Open(path, nil)
+	if err != nil {
+		t.Fatalf("reopen through migration 0006: %v", err)
+	}
+	defer migrated.Close()
+	observations, err := migrated.StageObservations(ctx, "legacy-observation")
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoding := observations["encoding"]
+	if encoding.Status != "leased" || encoding.Attempts != 0 || encoding.StartedAt != nil || encoding.FinishedAt != nil || encoding.StatusChangedAt != nil || encoding.Phase != nil || encoding.ErrorCode != "legacy_unknown" {
+		t.Fatalf("legacy encoding observation invented history: %+v", encoding)
+	}
+	embedding := observations["embedding"]
+	if embedding.Status != "pending" || embedding.Attempts != 0 || embedding.StartedAt != nil || embedding.FinishedAt != nil || embedding.StatusChangedAt == nil || embedding.ErrorCode != "legacy_unknown" {
+		t.Fatalf("startup reset observation=%+v", embedding)
+	}
+	history, err := migrated.PipelineHistory(ctx, "legacy-observation", "", 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(history.Events) != 1 || history.Events[0].Event != "startup_reset" || strings.Contains(history.Events[0].ErrorCode, "private") {
+		t.Fatalf("legacy history=%+v", history.Events)
+	}
+}

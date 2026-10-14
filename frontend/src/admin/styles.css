@@ -92,6 +92,12 @@ button:disabled { opacity: .6; cursor: wait; }
 .metadata dt { color: #65737c; }
 .metadata dd { margin: 0; overflow-wrap: anywhere; }
 .pipeline-detail .state-detail + .state-detail { border-top: 1px solid #e5eaed; margin-top: 1rem; padding-top: .5rem; }
+.observation-details { font-size: .84rem; }
+.pipeline-history .field { max-width: 240px; margin-bottom: .8rem; }
+.event-list { list-style: none; margin: .8rem 0; padding: 0; }
+.event-list li { display: grid; gap: .2rem; border-top: 1px solid #e5eaed; padding: .7rem 0; font-size: .88rem; }
+.event-list li:first-child { border-top: 0; }
+.event-list time, .event-list span { color: #64727c; }
 .state-detail p { margin: .35rem 0; overflow-wrap: anywhere; }
 .error-details { margin: .6rem 0; }
 .error-details pre { max-height: 24rem; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; padding: .75rem; background: #f6f7f8; border-radius: 5px; color: #7c2626; }

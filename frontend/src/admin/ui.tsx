@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, type FormEvent, type ReactNode } from 'react'
 import {
   Link,
   Route,
@@ -17,7 +17,9 @@ import {
   type Blob,
   type Overview,
   type Page,
+  type HistoryPage,
   type Photo,
+  type PipelineEvent,
   type PipelineCounts
 } from './api'
 
@@ -427,7 +429,7 @@ function PhotoDetailPage() {
           <dt>블롭 존재</dt><dd>{photo.missingBlob ? '아니요' : '예'}</dd>
         </dl>
       </section>
-      <PipelineDetails encoding={{ raw: photo.encodingRaw, state: photo.encoding, error: photo.encodingError, skippedReason: photo.skippedReason }} embedding={{ raw: photo.embeddingRaw, state: photo.embedding, error: photo.embeddingError, blockReason: photo.blockReason }} missing={photo.missingBlob} />
+      <PipelineDetails encoding={{ raw: photo.encodingRaw, state: photo.encoding, error: photo.encodingError, skippedReason: photo.skippedReason, observation: photo.encodingObservation }} embedding={{ raw: photo.embeddingRaw, state: photo.embedding, error: photo.embeddingError, blockReason: photo.blockReason, observation: photo.embeddingObservation }} missing={photo.missingBlob} />
     </div>}
   </>
 }
@@ -451,8 +453,9 @@ function BlobDetailPage() {
           <dt>앨범 수</dt><dd>{blob.albumCount}</dd>
         </dl>
       </section>
-      <PipelineDetails encoding={{ raw: blob.encodingRaw, state: blob.encoding, error: blob.encodingError, skippedReason: blob.skippedReason }} embedding={{ raw: blob.embeddingRaw, state: blob.embedding, error: blob.embeddingError, blockReason: blob.blockReason }} missing={false} />
+      <PipelineDetails encoding={{ raw: blob.encodingRaw, state: blob.encoding, error: blob.encodingError, skippedReason: blob.skippedReason, observation: blob.encodingObservation }} embedding={{ raw: blob.embeddingRaw, state: blob.embedding, error: blob.embeddingError, blockReason: blob.blockReason, observation: blob.embeddingObservation }} missing={false} />
     </div>}
+    {blob && <PipelineHistory hash={blob.hash} />}
   </>
 }
 
@@ -484,16 +487,16 @@ function AlbumDetailPage() {
 }
 
 function PipelineDetails({ encoding, embedding, missing }: {
-  encoding: { raw: string; state: string; error: string; skippedReason?: string }
-  embedding: { raw: string; state: string; error: string; blockReason?: string }
+  encoding: { raw: string; state: string; error: string; skippedReason?: string; observation?: import('./api').StageObservation }
+  embedding: { raw: string; state: string; error: string; blockReason?: string; observation?: import('./api').StageObservation }
   missing: boolean
 }) {
   return <section className="panel pipeline-detail">
     <h2>파이프라인 상태</h2>
     {missing ? <p className="notice warning">연결된 블롭이 없어 인코딩·임베딩 상태가 없습니다.</p> : <>
-      <StateDetail title="인코딩" raw={encoding.raw} state={encoding.state} error={encoding.error} filterKey="encodingRaw" />
+      <StateDetail title="인코딩" raw={encoding.raw} state={encoding.state} error={encoding.error} filterKey="encodingRaw" observation={encoding.observation} />
       {encoding.state === 'skipped' && <p className="muted">건너뜀 분류: 저장된 콘텐츠 형식 기준 {encoding.skippedReason || '확인 불가'} (건너뛴 이유 자체는 제공되지 않습니다).</p>}
-      <StateDetail title="임베딩" raw={embedding.raw} state={embedding.state} error={embedding.error} filterKey="embeddingRaw" />
+      <StateDetail title="임베딩" raw={embedding.raw} state={embedding.state} error={embedding.error} filterKey="embeddingRaw" observation={embedding.observation} />
       {embedding.blockReason === 'encoding_gate'
         ? <p className="notice warning">임베딩은 대기 중이지만 인코딩 게이트 때문에 작업자가 아직 가져가지 않습니다. 이는 일반 대기 상태와 구분됩니다.</p>
         : embedding.state === 'queued' && <p className="muted">대기 중이며 현재 인코딩 게이트로 차단된 상태는 아닙니다.</p>}
@@ -501,13 +504,104 @@ function PipelineDetails({ encoding, embedding, missing }: {
   </section>
 }
 
-function StateDetail({ title, raw, state, error, filterKey }: { title: string; raw: string; state: string; error: string; filterKey: 'encodingRaw' | 'embeddingRaw' }) {
+function StateDetail({ title, raw, state, error, filterKey, observation }: { title: string; raw: string; state: string; error: string; filterKey: 'encodingRaw' | 'embeddingRaw'; observation?: import('./api').StageObservation }) {
   const unknown = state === 'unknown' && raw !== ''
   return <div className="state-detail">
     <h3>{title}</h3><p>정규화 상태: <strong>{state || '—'}</strong></p>
     <p>원본 상태: {raw ? <>{raw}{unknown && <> · <Link to={filterURL(title === '인코딩' ? 'blobs' : 'blobs', { [filterKey]: raw })}>이 원본 상태 보기</Link></>}</> : '—'}</p>
+    <ObservationDetails observation={observation} />
     <ErrorDetails error={error} />
   </div>
+}
+
+function ObservationDetails({ observation }: { observation?: import('./api').StageObservation }) {
+  if (!observation) return <p className="muted">관측 기록 없음</p>
+  return <dl className="metadata observation-details">
+    <dt>시작</dt><dd>{observation.startedAt ? formatTime(observation.startedAt) : '—'}</dd>
+    <dt>완료</dt><dd>{observation.finishedAt ? formatTime(observation.finishedAt) : '—'}</dd>
+    <dt>상태 변경</dt><dd>{observation.statusChangedAt ? formatTime(observation.statusChangedAt) : '—'}</dd>
+    <dt>시도 횟수</dt><dd>{observation.attempts}</dd>
+    <dt>하위 단계</dt><dd>{observation.phase || '—'}</dd>
+    <dt>오류 코드</dt><dd>{observation.errorCode || '—'}</dd>
+    <dt>재시도 가능성</dt><dd>{observation.retryability || 'unknown'}</dd>
+  </dl>
+}
+
+function PipelineHistory({ hash }: { hash: string }) {
+  const [stage, setStage] = useState('')
+  const [moreEvents, setMoreEvents] = useState<PipelineEvent[]>([])
+  const [moreCursor, setMoreCursor] = useState<string | null>(null)
+  const [hasLoadedMore, setHasLoadedMore] = useState(false)
+  const [moreLoading, setMoreLoading] = useState(false)
+  const [moreError, setMoreError] = useState('')
+  const requestKey = `${hash}\0${stage}`
+  const requestIdentity = useRef({ key: requestKey, generation: 0 })
+  useLayoutEffect(() => {
+    if (requestIdentity.current.key !== requestKey) {
+      requestIdentity.current = {
+        key: requestKey,
+        generation: requestIdentity.current.generation + 1
+      }
+    }
+  }, [requestKey])
+  const requestGeneration = requestIdentity.current.generation +
+    (requestIdentity.current.key === requestKey ? 0 : 1)
+  const query = new URLSearchParams()
+  if (stage) query.set('stage', stage)
+  const path = apiPath(`blobs/${encodeURIComponent(hash)}/history`, query.size ? `?${query}` : '')
+  const state = useAdminData<HistoryPage>(path)
+  useEffect(() => {
+    if (requestIdentity.current.key !== requestKey || requestIdentity.current.generation !== requestGeneration) return
+    setMoreEvents([])
+    setMoreCursor(null)
+    setHasLoadedMore(false)
+    setMoreLoading(false)
+    setMoreError('')
+  }, [path, requestKey, requestGeneration])
+
+  const loadMore = async () => {
+    const cursor = hasLoadedMore ? moreCursor : state.data?.nextCursor
+    if (!cursor || moreLoading) return
+    const isCurrentRequest = () => requestIdentity.current.key === requestKey &&
+      requestIdentity.current.generation === requestGeneration
+    if (isCurrentRequest()) {
+      setMoreLoading((current) => isCurrentRequest() ? true : current)
+      setMoreError((current) => isCurrentRequest() ? '' : current)
+    }
+    try {
+      const params = new URLSearchParams(query)
+      params.set('limit', '50')
+      params.set('cursor', cursor)
+      const page = await adminGet<HistoryPage>(apiPath(`blobs/${encodeURIComponent(hash)}/history`, `?${params}`))
+      if (!isCurrentRequest()) return
+      setMoreEvents((current) => isCurrentRequest() ? [...current, ...page.events] : current)
+      setMoreCursor((current) => isCurrentRequest() ? page.nextCursor : current)
+      setHasLoadedMore((current) => isCurrentRequest() ? true : current)
+    } catch (cause) {
+      setMoreError((current) => isCurrentRequest() ? errorMessage(cause) : current)
+    } finally {
+      setMoreLoading((current) => isCurrentRequest() ? false : current)
+    }
+  }
+  const events = [...(state.data?.events || []), ...moreEvents]
+  const nextCursor = hasLoadedMore ? moreCursor : state.data?.nextCursor ?? null
+  return <section className="panel pipeline-history">
+    <h2>파이프라인 기록</h2>
+    <label className="field">단계<select value={stage} onChange={(event) => setStage(event.target.value)}>
+      <option value="">전체</option><option value="encoding">인코딩</option><option value="embedding">임베딩</option>
+    </select></label>
+    {state.error && <ErrorPanel message={state.error} />}
+    {state.loading && !state.data && <p role="status">기록 불러오는 중…</p>}
+    {moreError && <ErrorPanel message={moreError} />}
+    {events.length > 0 && <ol className="event-list">{events.map((event) => <li key={event.id}>
+      <time dateTime={event.occurredAt}>{formatTime(event.occurredAt)}</time>
+      <strong>{event.stage} · {event.event}</strong>
+      <span>상태 {event.status}{event.phase ? ` · 단계 ${event.phase}` : ''} · 시도 {event.attemptId}</span>
+      {event.errorCode && <span>오류 코드 {event.errorCode}</span>}
+    </li>)}</ol>}
+    {state.data && events.length === 0 && <p className="muted">마이그레이션 이후 기록된 이벤트가 없습니다.</p>}
+    {nextCursor && <button type="button" onClick={() => void loadMore()} disabled={moreLoading}>{moreLoading ? '불러오는 중…' : '다음 기록 더 보기'}</button>}
+  </section>
 }
 
 function RawState({ raw, filterKey }: { raw: string; filterKey: 'encodingRaw' | 'embeddingRaw' }) {

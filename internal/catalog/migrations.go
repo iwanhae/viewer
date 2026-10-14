@@ -137,6 +137,44 @@ var migrations = []migration{
 			`ALTER TABLE blobs ADD COLUMN encoding_source_size_bytes INTEGER NOT NULL DEFAULT 0`,
 		},
 	},
+	{
+		version: 6,
+		name:    "stage_observability",
+		stmts: []string{
+			`CREATE TABLE blob_stage_observations (
+				blob_hash TEXT NOT NULL REFERENCES blobs(hash) ON DELETE CASCADE,
+				stage TEXT NOT NULL CHECK (stage IN ('encoding', 'embedding')),
+				started_at TEXT,
+				finished_at TEXT,
+				status_changed_at TEXT,
+				status TEXT NOT NULL,
+				phase TEXT,
+				attempts INTEGER NOT NULL DEFAULT 0,
+				error_code TEXT NOT NULL DEFAULT '',
+				retryability TEXT NOT NULL DEFAULT 'unknown',
+				PRIMARY KEY (blob_hash, stage)
+			)`,
+			`CREATE TABLE pipeline_events (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				blob_hash TEXT NOT NULL REFERENCES blobs(hash) ON DELETE CASCADE,
+				stage TEXT NOT NULL CHECK (stage IN ('encoding', 'embedding')),
+				event TEXT NOT NULL,
+				status TEXT NOT NULL,
+				phase TEXT,
+				attempt_id INTEGER NOT NULL DEFAULT 0,
+				error_code TEXT NOT NULL DEFAULT '',
+				retryability TEXT NOT NULL DEFAULT 'unknown',
+				occurred_at TEXT NOT NULL
+			)`,
+			`CREATE INDEX idx_pipeline_events_blob_id ON pipeline_events(blob_hash, id)`,
+			`CREATE INDEX idx_pipeline_events_blob_stage_id ON pipeline_events(blob_hash, stage, id)`,
+			`CREATE INDEX idx_pipeline_events_occurred_at ON pipeline_events(occurred_at, id)`,
+			`INSERT INTO blob_stage_observations (blob_hash, stage, status, error_code)
+				SELECT hash, 'encoding', encoding_status, CASE WHEN encoding_error != '' THEN 'legacy_unknown' ELSE '' END FROM blobs`,
+			`INSERT INTO blob_stage_observations (blob_hash, stage, status, error_code)
+				SELECT hash, 'embedding', embedding_status, CASE WHEN embedding_error != '' THEN 'legacy_unknown' ELSE '' END FROM blobs`,
+		},
+	},
 }
 
 // addBlobLeaseColumnIfMissing adds the external-worker lease column to blobs.

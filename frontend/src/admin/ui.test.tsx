@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
 import AdminApp from './ui'
-import type { Overview, Photo } from './api'
+import type { Blob, Overview, Photo } from './api'
 
 const pipeline = { blobCount: 1, photoCount: 2, albumCount: 1 }
 const overview: Overview = {
@@ -25,6 +25,14 @@ const missingPhoto: Photo = {
   albumId: 'album-1', albumName: 'archive.zip', idx: 0, name: 'lost.jpg', hash: 'gone', missingBlob: true,
   width: 20, height: 30, sizeBytes: null, contentType: null, encodingRaw: '', encoding: '', encodingError: '',
   embeddingRaw: '', embedding: '', embeddingError: '', skippedReason: '', blockReason: ''
+}
+
+const detailBlob: Blob = {
+  hash: 'history-hash', sizeBytes: 10, contentType: 'image/jpeg', encodingRaw: 'pending', encoding: 'queued',
+  encodingError: '', embeddingRaw: 'pending', embedding: 'queued', embeddingError: '', skippedReason: '',
+  blockReason: '', photoCount: 0, albumCount: 0,
+  encodingObservation: { startedAt: null, finishedAt: null, statusChangedAt: null, status: 'pending', phase: null, attempts: 0, errorCode: '', retryability: 'unknown' },
+  embeddingObservation: { startedAt: '2026-10-14T12:00:00Z', finishedAt: null, statusChangedAt: '2026-10-14T12:00:00Z', status: 'processing', phase: null, attempts: 2, errorCode: 'legacy_unknown', retryability: 'unknown' }
 }
 
 function jsonResponse(body: unknown, status = 200) {
@@ -90,6 +98,75 @@ describe('admin React UI', () => {
     renderAt('/albums?status=FAILED')
     expect((await screen.findByRole('alert')).textContent).toContain('catalog unavailable')
     expect(screen.getByRole('combobox', { name: '앨범 상태' })).toHaveProperty('value', 'FAILED')
+  })
+
+  it('renders nullable observations as unavailable and pages safe blob history', async () => {
+    const fetchMock = mockFetch((url) => {
+      if (url === '/admin/api/blobs/history-hash') return jsonResponse(detailBlob)
+      if (url === '/admin/api/blobs/history-hash/history') return jsonResponse({
+        events: [{ id: 1, stage: 'encoding', event: 'claimed', status: 'leased', phase: null, attemptId: 1, errorCode: '', retryability: 'unknown', occurredAt: '2026-10-14T12:00:00Z' }],
+        nextCursor: '1'
+      })
+      if (url === '/admin/api/blobs/history-hash/history?limit=50&cursor=1') return jsonResponse({
+        events: [{ id: 2, stage: 'encoding', event: 'commit_started', status: 'committing', phase: 'committing', attemptId: 1, errorCode: '', retryability: 'unknown', occurredAt: '2026-10-14T12:01:00Z' }],
+        nextCursor: null
+      })
+      return jsonResponse({ events: [], nextCursor: null })
+    })
+    renderAt('/blobs/history-hash')
+
+    expect(await screen.findByText(/encoding · claimed/)).toBeTruthy()
+    expect(screen.getAllByText('—').length).toBeGreaterThan(0)
+    expect(screen.getAllByText('unknown').length).toBeGreaterThan(0)
+    expect(screen.getByText('legacy_unknown')).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: '다음 기록 더 보기' }))
+    expect(await screen.findByText(/encoding · commit_started/)).toBeTruthy()
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/admin/api/blobs/history-hash/history?limit=50&cursor=1', expect.anything()))
+  })
+
+  it('ignores load-more results and errors after the selected history stage changes', async () => {
+    const oldStageMore = deferred<Response>()
+    const encodingMore = deferred<Response>()
+    const event = (id: number, stage: string, name: string) => ({
+      id, stage, event: name, status: 'done', phase: null, attemptId: 1,
+      errorCode: '', retryability: 'unknown', occurredAt: '2026-10-14T12:00:00Z'
+    })
+    const fetchMock = mockFetch((url) => {
+      if (url === '/admin/api/blobs/history-hash') return jsonResponse(detailBlob)
+      if (url === '/admin/api/blobs/history-hash/history') return jsonResponse({ events: [event(1, 'encoding', 'all_initial')], nextCursor: '1' })
+      if (url === '/admin/api/blobs/history-hash/history?limit=50&cursor=1') return oldStageMore.promise
+      if (url === '/admin/api/blobs/history-hash/history?stage=encoding') return jsonResponse({ events: [event(2, 'encoding', 'encoding_filtered')], nextCursor: '10' })
+      if (url === '/admin/api/blobs/history-hash/history?stage=encoding&limit=50&cursor=10') return encodingMore.promise
+      if (url === '/admin/api/blobs/history-hash/history?stage=embedding') return jsonResponse({ events: [event(3, 'embedding', 'embedding_filtered')], nextCursor: null })
+      return jsonResponse({ events: [], nextCursor: null })
+    })
+    renderAt('/blobs/history-hash')
+
+    expect(await screen.findByText(/encoding · all_initial/)).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: '다음 기록 더 보기' }))
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/admin/api/blobs/history-hash/history?limit=50&cursor=1', expect.anything()))
+    fireEvent.change(screen.getByRole('combobox', { name: '단계' }), { target: { value: 'encoding' } })
+    expect(await screen.findByText(/encoding · encoding_filtered/)).toBeTruthy()
+
+    await act(async () => {
+      oldStageMore.resolve(jsonResponse({ events: [event(99, 'embedding', 'stale_all_stage_page')], nextCursor: null }))
+      await Promise.resolve()
+    })
+    expect(screen.queryByText(/stale_all_stage_page/)).toBeNull()
+
+    await waitFor(() => expect(screen.getByRole('button', { name: '다음 기록 더 보기' }).hasAttribute('disabled')).toBe(false))
+    fireEvent.click(screen.getByRole('button', { name: '다음 기록 더 보기' }))
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/admin/api/blobs/history-hash/history?stage=encoding&limit=50&cursor=10', expect.anything()))
+    fireEvent.change(screen.getByRole('combobox', { name: '단계' }), { target: { value: 'embedding' } })
+    expect(await screen.findByText(/embedding · embedding_filtered/)).toBeTruthy()
+
+    await act(async () => {
+      encodingMore.reject(new Error('stale encoding page failed'))
+      await Promise.resolve()
+    })
+    await waitFor(() => expect(screen.queryByRole('alert')).toBeNull())
+    expect(screen.queryByText(/stale encoding page failed/)).toBeNull()
+    expect(screen.queryByRole('button', { name: '다음 기록 더 보기' })).toBeNull()
   })
 
   it('does not show stale rows when a changed filter fails and the aborted request resolves late', async () => {

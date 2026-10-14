@@ -96,6 +96,7 @@ func TestAdminRoutesRequireBothServiceAndToken(t *testing.T) {
 		{http.MethodGet, "/admin/api/photos/a/0"},
 		{http.MethodGet, "/admin/api/blobs"},
 		{http.MethodGet, "/admin/api/blobs/hash"},
+		{http.MethodGet, "/admin/api/blobs/hash/history"},
 		{http.MethodGet, "/admin/api/albums"},
 		{http.MethodGet, "/admin/api/albums/a"},
 		{http.MethodPost, "/admin/api/reindex"},
@@ -470,6 +471,66 @@ func TestAdminResourceBrowseRoutesContractAndValidation(t *testing.T) {
 	router.ServeHTTP(malformedResponse, malformedQuery)
 	if malformedResponse.Code != http.StatusBadRequest {
 		t.Fatalf("malformed query status=%d want=400 body=%s", malformedResponse.Code, malformedResponse.Body.String())
+	}
+}
+
+func TestAdminBlobHistoryEndpointIsPagedAndValidatesStage(t *testing.T) {
+	store := openAdminTestCatalog(t)
+	ctx := context.Background()
+	if err := store.CreateAlbum(ctx, catalog.Album{ID: "history-album", OriginalFilename: "history.zip", Status: catalog.AlbumStatusReady}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertBlob(ctx, catalog.Blob{Hash: "history-hash", SizeBytes: 100, ContentType: "image/jpeg"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.InsertPhoto(ctx, catalog.Photo{AlbumID: "history-album", Index: 0, Name: "history.jpg", Hash: "history-hash", Width: 1, Height: 1}); err != nil {
+		t.Fatal(err)
+	}
+	jobs, err := store.ClaimEncoding(ctx, 1, time.Minute)
+	if err != nil || len(jobs) != 1 {
+		t.Fatalf("claim encoding: jobs=%+v err=%v", jobs, err)
+	}
+	if ok, err := store.BeginEncodingCommit(ctx, jobs[0].Hash, jobs[0].Token, 100, time.Minute); err != nil || !ok {
+		t.Fatalf("begin encoding: ok=%v err=%v", ok, err)
+	}
+	if ok, err := store.FinishEncoding(ctx, jobs[0].Hash, jobs[0].Token, "done", "image/webp", "", 50); err != nil || !ok {
+		t.Fatalf("finish encoding: ok=%v err=%v", ok, err)
+	}
+	service := admin.NewService(store, nil, nil)
+	router := New(nil, nil, nil, nil, "", service, "sekrit").Router()
+	auth := basicAuthHeader("operator", "sekrit")
+
+	detail := doAdminRequest(t, router, http.MethodGet, "/admin/api/blobs/history-hash", auth)
+	if detail.Code != http.StatusOK || !strings.Contains(detail.Body.String(), `"encodingObservation"`) || !strings.Contains(detail.Body.String(), `"attempts":1`) {
+		t.Fatalf("blob detail observations status=%d body=%s", detail.Code, detail.Body.String())
+	}
+	photoDetail := doAdminRequest(t, router, http.MethodGet, "/admin/api/photos/history-album/0", auth)
+	if photoDetail.Code != http.StatusOK || !strings.Contains(photoDetail.Body.String(), `"encodingObservation"`) || !strings.Contains(photoDetail.Body.String(), `"embeddingObservation"`) {
+		t.Fatalf("photo detail observations status=%d body=%s", photoDetail.Code, photoDetail.Body.String())
+	}
+	first := doAdminRequest(t, router, http.MethodGet, "/admin/api/blobs/history-hash/history?limit=1", auth)
+	if first.Code != http.StatusOK || !strings.Contains(first.Body.String(), `"event":"claimed"`) || !strings.Contains(first.Body.String(), `"nextCursor":"`) {
+		t.Fatalf("first history page status=%d body=%s", first.Code, first.Body.String())
+	}
+	var firstPage catalog.PipelineHistoryPage
+	if err := json.Unmarshal(first.Body.Bytes(), &firstPage); err != nil || firstPage.NextCursor == nil {
+		t.Fatalf("decode first history page=%+v err=%v", firstPage, err)
+	}
+	next := doAdminRequest(t, router, http.MethodGet, "/admin/api/blobs/history-hash/history?stage=encoding&limit=1&cursor="+*firstPage.NextCursor, auth)
+	if next.Code != http.StatusOK || !strings.Contains(next.Body.String(), `"event":"commit_started"`) {
+		t.Fatalf("second history page status=%d body=%s", next.Code, next.Body.String())
+	}
+	for _, target := range []string{
+		"/admin/api/blobs/history-hash/history?stage=unknown",
+		"/admin/api/blobs/history-hash/history?limit=101",
+		"/admin/api/blobs/history-hash/history?cursor=-1",
+	} {
+		if rec := doAdminRequest(t, router, http.MethodGet, target, auth); rec.Code != http.StatusBadRequest {
+			t.Errorf("invalid history request %s status=%d body=%s", target, rec.Code, rec.Body.String())
+		}
+	}
+	if rec := doAdminRequest(t, router, http.MethodGet, "/admin/api/blobs/missing/history", auth); rec.Code != http.StatusNotFound {
+		t.Fatalf("missing blob history status=%d want=404 body=%s", rec.Code, rec.Body.String())
 	}
 }
 

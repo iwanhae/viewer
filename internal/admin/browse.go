@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 
 	"viewer/internal/catalog"
@@ -75,6 +76,12 @@ type BlobPage struct {
 type AlbumPage struct {
 	Albums     []catalog.AdminAlbum `json:"albums"`
 	NextCursor *string              `json:"nextCursor"`
+}
+
+type HistoryOptions struct {
+	Stage  string
+	Limit  int
+	Cursor string
 }
 
 type photoCursor struct {
@@ -184,6 +191,33 @@ func (s *Service) BlobByHash(ctx context.Context, hash string) (catalog.AdminBlo
 		return catalog.AdminBlob{}, fmt.Errorf("catalog is not available")
 	}
 	return s.cat.AdminBlobByHash(ctx, hash)
+}
+
+// BlobHistory returns a bounded, monotonic event page for one blob. The cursor
+// is the last event ID returned, so newly appended events can be read without
+// an unbounded offset scan.
+func (s *Service) BlobHistory(ctx context.Context, hash string, options HistoryOptions) (catalog.PipelineHistoryPage, error) {
+	if s == nil || s.cat == nil {
+		return catalog.PipelineHistoryPage{}, fmt.Errorf("catalog is not available")
+	}
+	if err := validateLimit(options.Limit); err != nil {
+		return catalog.PipelineHistoryPage{}, err
+	}
+	if options.Limit > MaxBrowseLimit {
+		return catalog.PipelineHistoryPage{}, fmt.Errorf("%w: history limit must be at most %d", ErrInvalidBrowseRequest, MaxBrowseLimit)
+	}
+	if options.Stage != "" && options.Stage != "encoding" && options.Stage != "embedding" {
+		return catalog.PipelineHistoryPage{}, fmt.Errorf("%w: stage must be encoding or embedding", ErrInvalidBrowseRequest)
+	}
+	var after int64
+	if options.Cursor != "" {
+		parsed, err := strconv.ParseInt(options.Cursor, 10, 64)
+		if err != nil || parsed < 0 {
+			return catalog.PipelineHistoryPage{}, fmt.Errorf("%w: invalid history cursor", ErrInvalidBrowseRequest)
+		}
+		after = parsed
+	}
+	return s.cat.PipelineHistory(ctx, hash, options.Stage, after, options.Limit)
 }
 
 // ListAlbums returns a page ordered by album id. Per-row photo counts are

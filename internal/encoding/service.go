@@ -589,6 +589,9 @@ func (s *Service) processQueuedOutput(ctx context.Context, job catalog.EncodingJ
 			// window rather than the slot count.
 			log.Printf("encoding: commit for %s is ambiguous (%v); the scanner reconciles it when its grace lease expires at %s",
 				job.Hash[:12], err, current.LeaseUntil.UTC().Format(time.RFC3339))
+			if _, markErr := s.cat.MarkEncodingReconciling(ctx, job.Hash, job.Token); markErr != nil {
+				log.Printf("encoding: mark commit for %s reconciling failed: %v", job.Hash[:12], markErr)
+			}
 			return
 		}
 
@@ -742,7 +745,10 @@ func (s *Service) processReceived(ctx context.Context, job catalog.EncodingJob) 
 			if _, seekErr := encodedFile.Seek(0, io.SeekStart); seekErr == nil {
 				match, compareErr := matchesEncodedFile(encodedFile, currentBytes)
 				if compareErr == nil && isWebP(currentBytes) && match {
-					if ok, finishErr := s.cat.FinishEncoding(ctx, job.Hash, job.Token, "done", "image/webp", "", int64(len(currentBytes))); finishErr != nil {
+					if _, markErr := s.cat.MarkEncodingReconciling(ctx, job.Hash, job.Token); markErr != nil {
+						log.Printf("encoding: mark observed commit for %s reconciling failed: %v", job.Hash[:12], markErr)
+					}
+					if ok, finishErr := s.cat.FinishReconciledEncoding(ctx, job.Hash, job.Token, "done", "image/webp", "", int64(len(currentBytes))); finishErr != nil {
 						return fmt.Errorf("put encoded blob: %w (finish observed replacement: %v)", err, finishErr)
 					} else if !ok {
 						return ErrLostLease
@@ -1025,7 +1031,10 @@ func (s *Service) Complete(ctx context.Context, hash, token, outcome, detail str
 		// it after the grace period instead of prematurely retrying the blob.
 		current, _, readErr := readObject(ctx, s.store, key)
 		if readErr == nil && isWebP(current) {
-			if ok, finishErr := s.cat.FinishEncoding(ctx, hash, token, "done", "image/webp", "", int64(len(current))); finishErr != nil {
+			if _, markErr := s.cat.MarkEncodingReconciling(ctx, hash, token); markErr != nil {
+				log.Printf("encoding: mark observed commit for %s reconciling failed: %v", hash[:12], markErr)
+			}
+			if ok, finishErr := s.cat.FinishReconciledEncoding(ctx, hash, token, "done", "image/webp", "", int64(len(current))); finishErr != nil {
 				return "", fmt.Errorf("copy staged output: %w (finish observed replacement: %v)", err, finishErr)
 			} else if !ok {
 				return "", ErrLostLease
@@ -1100,6 +1109,9 @@ func (s *Service) reconcileExpiredCommits(ctx context.Context) error {
 // reconcileCommit uses the object currently stored at the stable blob key as
 // the source of truth after a process interruption or ambiguous copy result.
 func (s *Service) reconcileCommit(ctx context.Context, job catalog.EncodingJob) error {
+	if _, err := s.cat.MarkEncodingReconciling(ctx, job.Hash, job.Token); err != nil {
+		return err
+	}
 	data, _, err := readObject(ctx, s.store, pipeline.BlobKey(job.Hash))
 	if err != nil {
 		return err
@@ -1125,7 +1137,7 @@ func (s *Service) reconcileCommit(ctx context.Context, job catalog.EncodingJob) 
 		} else if !errors.Is(openErr, os.ErrNotExist) {
 			return openErr
 		}
-		if ok, err := s.cat.FinishEncoding(ctx, job.Hash, job.Token, "done", "image/webp", "", int64(len(data))); err != nil {
+		if ok, err := s.cat.FinishReconciledEncoding(ctx, job.Hash, job.Token, "done", "image/webp", "", int64(len(data))); err != nil {
 			return err
 		} else if !ok {
 			return ErrLostLease

@@ -120,7 +120,8 @@ Notes:
 | GET | `/admin/api/photos` | Paged photo rows with album metadata and current encoding/embedding state. |
 | GET | `/admin/api/photos/{albumId}/{idx}` | One photo row with current pipeline state. |
 | GET | `/admin/api/blobs` | Paged blob state and reference counts, including unreferenced blobs. |
-| GET | `/admin/api/blobs/{hash}` | One blob with relation counts; fetch references through the paged photo list. |
+| GET | `/admin/api/blobs/{hash}` | One blob with relation counts and current per-stage observations; fetch references through the paged photo list. |
+| GET | `/admin/api/blobs/{hash}/history` | Bounded, cursor-paged stage attempt and major-transition history. |
 | GET | `/admin/api/albums` | Paged album processing state, error, and actual photo-row count. |
 | GET | `/admin/api/albums/{id}` | Album processing state and overview-equivalent counts for its referenced blobs/photos. |
 
@@ -161,6 +162,28 @@ embedding, raw-state, and skipped-reason filters, plus `unreferenced=true|false`
 `limit`, and `cursor`. Blob details include `photoCount` and distinct
 `albumCount`, not embedded reference arrays. Use
 `GET /admin/api/photos?hash={hash}` to page through photos for a shared blob.
+Blob and photo detail responses include nullable `encodingObservation` and
+`embeddingObservation` objects with `startedAt`, `finishedAt`,
+`statusChangedAt`, `attempts`, `phase`, `errorCode`, and `retryability`.
+Observations and event history begin when migration 0006 is applied: existing
+rows are backfilled with their current status, zero observed claims, and null
+timestamps. No legacy timing or attempt counts are inferred. Existing failures
+that cannot be safely classified use `errorCode: "legacy_unknown"`; retryability
+is `unknown` unless safe typed evidence is available. An encoding phase of
+`reconciling` appears only after the encoding service explicitly marks an
+ambiguous commit for reconciliation; the worker lease and commit protocol are
+unchanged. The per-blob, per-stage claim sequence is the internal attempt
+correlation ID; no new worker token or lease generation is introduced.
+
+The history endpoint accepts optional `stage=encoding|embedding`, `limit` (1–100,
+default 50), and a numeric monotonic event-ID `cursor`. Pages are ordered by
+increasing event ID; pass `nextCursor` to fetch subsequent events. History reads
+show events from the last 90 days. Physical deletion is opportunistic: bounded
+batches of up to 500 expired rows are attempted periodically during event
+writes, so idle catalogs can retain older rows on disk beyond 90 days. History
+only stores structured event/status/error codes: worker tokens, stage keys,
+signed URLs, and raw error text are not copied into it. The detail UI renders
+null timestamps as unavailable and keeps history paging bounded.
 `GET /admin/api/albums` accepts a literal-substring `q`, `status` (`QUEUED`,
 `PROCESSING`, `SUCCEEDED`, or `FAILED`), `limit`, and `cursor`. Album detail
 pipeline breakdowns use the same category/raw-state meanings and count units as

@@ -228,8 +228,28 @@ func TestReceivedOutputIsValidatedAndPutAsynchronously(t *testing.T) {
 	if store.putCalls != 1 || !bytes.Equal(store.objects["blobs/"+hash], encoded) || store.types["blobs/"+hash] != "image/webp" {
 		t.Fatal("validated WebP was not put at the original blob key")
 	}
-	if _, err := os.Stat(svc.spoolPath(hash, job.Token)); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("spool file still exists after completion: %v", err)
+	waitForSpoolRemoval(t, svc.spoolPath(hash, job.Token))
+}
+
+func waitForSpoolRemoval(t *testing.T, path string) {
+	t.Helper()
+	deadline := time.NewTimer(5 * time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		_, err := os.Stat(path)
+		if errors.Is(err, os.ErrNotExist) {
+			return
+		}
+		if err != nil {
+			t.Fatalf("stat spool file: %v", err)
+		}
+		select {
+		case <-deadline.C:
+			t.Fatalf("spool file was not removed: %s", path)
+		case <-ticker.C:
+		}
 	}
 }
 
@@ -266,9 +286,7 @@ func TestInvalidReceivedOutputResetsWithoutReplacingBlob(t *testing.T) {
 	if store.putCalls != 0 || !bytes.Equal(store.objects["blobs/"+hash], source) {
 		t.Fatal("invalid output reached S3 or replaced the original blob")
 	}
-	if _, err := os.Stat(svc.spoolPath(hash, job.Token)); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("invalid spool file still exists: %v", err)
-	}
+	waitForSpoolRemoval(t, svc.spoolPath(hash, job.Token))
 }
 
 func TestStartResetsReceivedOutputWhenSpoolFileWasLost(t *testing.T) {
@@ -734,9 +752,7 @@ func TestAmbiguousCommitDoesNotParkSpoolSlots(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitForEncodingStatus(t, cat, expired.Hash, "pending")
-	if _, err := os.Stat(filepath.Join(spoolDir, expired.Hash+"_"+expired.Token+".webp")); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("reset commit left its spool file behind: %v", err)
-	}
+	waitForSpoolRemoval(t, filepath.Join(spoolDir, expired.Hash+"_"+expired.Token+".webp"))
 	if job, err := cat.GetEncodingJob(ctx, parked.Hash); err != nil || job.Status != "committing" {
 		t.Fatalf("recover did not respect the live grace lease: job=%+v err=%v", job, err)
 	}

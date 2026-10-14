@@ -101,6 +101,27 @@ func (s *Server) adminBlob(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, blob)
 }
 
+func (s *Server) adminBlobHistory(w http.ResponseWriter, r *http.Request) {
+	query, err := adminQuery(r, "stage", "limit", "cursor")
+	if err != nil {
+		writeBrowseBadRequest(w, r, err)
+		return
+	}
+	limit, err := browseLimit(query)
+	if err != nil {
+		writeBrowseBadRequest(w, r, err)
+		return
+	}
+	page, err := s.admin.BlobHistory(r.Context(), chi.URLParam(r, "hash"), admin.HistoryOptions{
+		Stage: query.Get("stage"), Limit: limit, Cursor: query.Get("cursor"),
+	})
+	if err != nil {
+		writeBrowseError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, page)
+}
+
 func (s *Server) adminAlbums(w http.ResponseWriter, r *http.Request) {
 	query, err := adminQuery(r, "q", "status", "limit", "cursor")
 	if err != nil {
