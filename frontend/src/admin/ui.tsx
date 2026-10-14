@@ -10,8 +10,10 @@ import {
 } from 'react-router-dom'
 import {
   adminGet,
+  adminPost,
   apiPath,
   imagePath,
+  AdminAPIError,
   type Diagnostics,
   type Album,
   type AlbumDetail,
@@ -29,7 +31,12 @@ import {
   type HistoryPage,
   type Photo,
   type PipelineEvent,
-  type PipelineCounts
+  type PipelineCounts,
+  type RecoveryAction,
+  type RecoveryOperation,
+  type RecoveryOperationsPage as RecoveryOperationsData,
+  type RecoveryPreview,
+  type RecoveryResultsPage
 } from './api'
 
 type LoadState<T> = { path: string; data: T | null; error: string; loading: boolean }
@@ -80,12 +87,13 @@ function AdminApp() {
           <Link to="/albums">앨범</Link>
           <Link to="/issues">이슈</Link>
           <Link to="/diagnostics">시스템 진단</Link>
-          <a href="/admin/legacy">기존 통계·복구</a>
+          <Link to="/?tab=recovery">복구 운영</Link>
+          <a className="legacy-danger-link" href="/admin/legacy">기존 통계·복구</a>
         </nav>
       </header>
       <main className="admin-main">
         <Routes>
-          <Route path="/" element={<OverviewPage />} />
+          <Route path="/" element={<AdminHomePage />} />
           <Route path="/photos" element={<PhotosPage />} />
           <Route path="/photos/:albumId/:idx" element={<PhotoDetailPage />} />
           <Route path="/blobs" element={<BlobsPage />} />
@@ -99,6 +107,15 @@ function AdminApp() {
       </main>
     </div>
   )
+}
+
+function AdminHomePage() {
+  const [params] = useSearchParams()
+  if (params.get('tab') === 'recovery') {
+    const operationID = params.get('operation') || ''
+    return operationID ? <RecoveryOperationDetail key={operationID} operationID={operationID} /> : <RecoveryOperationsPage />
+  }
+  return <OverviewPage />
 }
 
 export default AdminApp
@@ -422,17 +439,87 @@ function PhotosPage() {
   const path = apiPath('photos', location.search)
   const state = useAdminData<Page<Photo>>(path)
   const photos = state.data && 'photos' in state.data ? state.data.photos : []
+  const selectablePhotos = photos.filter((photo) => !photo.missingBlob)
+  const selectablePhotoKeys = selectablePhotos.map(photoKey)
   const nextCursor = state.data?.nextCursor || null
+  const selection = usePageSelection(`${location.pathname}${location.search}`)
+  const selectedPhotoKeys = new Set(selection.values)
+  const selectedPhotoCount = selectablePhotoKeys.filter((key) => selectedPhotoKeys.has(key)).length
+  const selectedPhotos = selectablePhotos
+    .filter((photo) => selectedPhotoKeys.has(photoKey(photo)))
+    .map((photo) => ({ albumId: photo.albumId, idx: photo.idx }))
+  const selectionKey = JSON.stringify(selectedPhotos)
+  const selectPageRef = useRef<HTMLInputElement>(null)
+  useEffect(() => {
+    if (selectPageRef.current) {
+      selectPageRef.current.indeterminate = selectedPhotoCount > 0 && selectedPhotoCount < selectablePhotos.length
+    }
+  }, [selectedPhotoCount, selectablePhotos.length])
   return <>
     <PageTitle title="사진" description="사진 행과 연결된 앨범·블롭·파이프라인 상태를 검색합니다." />
     <PhotoFilters />
     {state.error && <ErrorPanel message={state.error} />}
     {state.loading && !state.data && <p role="status">불러오는 중…</p>}
     {state.data && <>
-      <PhotoTable photos={photos} />
+      <div className="toolbar selection-toolbar">
+        <label className="select-visible-page">
+          <input
+            ref={selectPageRef}
+            type="checkbox"
+            aria-label="현재 페이지 복구 가능한 사진 모두 선택"
+            checked={selectablePhotos.length > 0 && selectedPhotoCount === selectablePhotos.length}
+            disabled={selectablePhotos.length === 0}
+            onChange={() => selection.toggleVisible(selectablePhotoKeys)}
+          />
+          현재 페이지 사진 모두 선택
+        </label>
+        <span className="muted">복구 가능한 사진 {selectedPhotoCount}/{selectablePhotos.length}개 선택 · 블롭 없는 행은 제외됩니다. 페이지나 필터를 바꾸면 선택이 초기화됩니다.</span>
+      </div>
+      <PhotoTable photos={photos} selected={selection.values} toggle={selection.toggle} />
       <Pagination nextCursor={nextCursor} />
+      {selectedPhotos.length > 0 && <RecoverySelectionPanel
+        key={`photos:${location.pathname}${location.search}`}
+        selection={{ photos: selectedPhotos }}
+        selectionKey={selectionKey}
+        selectedLabel={`선택한 사진 행 ${selectedPhotos.length}개 (동일 블롭은 서버에서 한 번만 처리)`}
+      />}
     </>}
   </>
+}
+
+type RecoverySelection =
+  | { hashes: string[] }
+  | { photos: { albumId: string; idx: number }[] }
+  | { albumIds: string[] }
+  | { filter: Record<string, string | boolean> }
+
+function photoKey(photo: Pick<Photo, 'albumId' | 'idx'>): string {
+  return `${photo.albumId}\0${photo.idx}`
+}
+
+function usePageSelection(scopeKey: string) {
+  const [state, setState] = useState<{ scopeKey: string; values: string[] }>({ scopeKey, values: [] })
+  const values = state.scopeKey === scopeKey ? state.values : []
+  useEffect(() => setState({ scopeKey, values: [] }), [scopeKey])
+  const toggle = (value: string) => {
+    setState((current) => {
+      const selected = current.scopeKey === scopeKey ? current.values : []
+      return { scopeKey, values: selected.includes(value) ? selected.filter((item) => item !== value) : [...selected, value] }
+    })
+  }
+  const toggleVisible = (visible: string[]) => {
+    setState((current) => {
+      const selected = current.scopeKey === scopeKey ? current.values : []
+      const allSelected = visible.length > 0 && visible.every((value) => selected.includes(value))
+      return { scopeKey, values: allSelected ? selected.filter((value) => !visible.includes(value)) : [...new Set([...selected, ...visible])] }
+    })
+  }
+  return {
+    values,
+    toggle,
+    toggleVisible,
+    allVisibleSelected: (visible: string[]) => visible.length > 0 && visible.every((value) => values.includes(value))
+  }
 }
 
 function PhotoFilters() {
@@ -472,25 +559,355 @@ function BlobsPage() {
   const path = apiPath('blobs', location.search)
   const state = useAdminData<Page<Blob>>(path)
   const blobs = state.data && 'blobs' in state.data ? state.data.blobs : []
+  const selection = usePageSelection(`${location.pathname}${location.search}`)
+  const [showFilterRecovery, setShowFilterRecovery] = useState(false)
+  const filterRecovery = blobFilterSelection(location.search)
+  const pageHashes = blobs.map((blob) => blob.hash)
+  const selectedHashes = selection.values
   return <>
     <PageTitle title="블롭" description="고유 콘텐츠 해시를 기준으로 인코딩·임베딩과 참조 수를 확인합니다." />
     <BlobFilters />
+    <section className="panel recovery-filter-panel">
+      <h2>현재 블롭 필터 전체</h2>
+      <p className="muted">현재 URL의 정확한 블롭 필터 전체를 서버에서 다시 평가합니다. 현재 보이는 페이지에만 적용되는 선택과 다릅니다. 최대 10,000개의 고유 블롭이며 초과 결과는 실행하지 않고 오류로 표시합니다.</p>
+      {filterRecovery.unsupported.length > 0 && <p className="notice warning">전체 필터 미리보기를 사용할 수 없습니다. 지원하지 않는 URL 매개변수: {filterRecovery.unsupported.join(', ')}. 검색어(q), 커서 및 알 수 없는 조건은 무시하지 않습니다.</p>}
+      <button type="button" disabled={filterRecovery.unsupported.length > 0} onClick={() => setShowFilterRecovery((shown) => !shown)}>
+        {showFilterRecovery ? '필터 작업 닫기' : '현재 블롭 필터 전체 작업 미리보기'}
+      </button>
+      {showFilterRecovery && filterRecovery.unsupported.length === 0 && <RecoverySelectionPanel
+        selection={{ filter: filterRecovery.filter }}
+        selectionKey={`filter:${JSON.stringify(filterRecovery.filter)}`}
+        selectedLabel="현재 URL의 블롭 필터 전체 (현재 페이지에 한정되지 않음)"
+      />}
+    </section>
     {state.error && <ErrorPanel message={state.error} />}
     {state.loading && !state.data && <p role="status">불러오는 중…</p>}
     {state.data && <>
-      <div className="table-wrap"><table className="data-table"><thead><tr><th>해시</th><th>형식</th><th>크기</th><th>인코딩</th><th>임베딩</th><th>사진</th><th>앨범</th></tr></thead><tbody>
+      <div className="toolbar selection-toolbar">
+        <button type="button" onClick={() => selection.toggleVisible(pageHashes)} disabled={!pageHashes.length}>
+          {selection.allVisibleSelected(pageHashes) ? '현재 페이지 선택 해제' : '현재 페이지 모두 선택'}
+        </button>
+        <span className="muted">현재 페이지의 해시만 선택합니다. 다음 페이지나 필터로 이동하면 선택이 초기화됩니다.</span>
+      </div>
+      <div className="table-wrap"><table className="data-table"><thead><tr><th>복구 선택</th><th>해시</th><th>형식</th><th>크기</th><th>인코딩</th><th>임베딩</th><th>사진</th><th>앨범</th></tr></thead><tbody>
         {blobs.map((blob) => <tr key={blob.hash}>
+          <td><input type="checkbox" aria-label={`${blob.hash} 복구 선택`} checked={selectedHashes.includes(blob.hash)} onChange={() => selection.toggle(blob.hash)} /></td>
           <td className="hash-cell"><Link to={`/blobs/${encodeURIComponent(blob.hash)}`} state={returnState(location)}>{blob.hash}</Link></td>
           <td>{blob.contentType || '—'}</td><td>{formatBytes(blob.sizeBytes)}</td>
           <td>{stateLabel(blob.encoding)} <RawState raw={blob.encodingRaw} filterKey="encodingRaw" /></td>
           <td>{stateLabel(blob.embedding)} <RawState raw={blob.embeddingRaw} filterKey="embeddingRaw" /></td>
           <td><CountLink value={blob.photoCount} to={filterURL('photos', { hash: blob.hash })} /></td><td>{blob.albumCount}</td>
         </tr>)}
-        {blobs.length === 0 && <EmptyRow columns={7} />}
+        {blobs.length === 0 && <EmptyRow columns={8} />}
       </tbody></table></div>
       <Pagination nextCursor={state.data.nextCursor} />
+      {selectedHashes.length > 0 && <RecoverySelectionPanel
+        selection={{ hashes: selectedHashes }}
+        selectionKey={JSON.stringify(selectedHashes)}
+        selectedLabel={`현재 페이지에서 선택한 고유 블롭 ${selectedHashes.length}개`}
+      />}
     </>}
   </>
+}
+
+const blobFilterKeys = [
+  'albumId', 'hash', 'encoding', 'embedding', 'encodingRaw', 'embeddingRaw', 'encodingErrorCode', 'embeddingErrorCode',
+  'encodingLeaseExpired', 'embeddingLeaseExpired', 'encodingPhase', 'skippedReason', 'unreferenced'
+]
+
+function blobFilterSelection(search: string): { filter: Record<string, string | boolean>; unsupported: string[] } {
+  const params = new URLSearchParams(search)
+  const supportedPageKeys = new Set([...blobFilterKeys, 'limit'])
+  const unsupported = [...new Set([...params.keys()].filter((key) => !supportedPageKeys.has(key)))]
+  for (const key of supportedPageKeys) if (params.getAll(key).length > 1) unsupported.push(`${key} (중복)`)
+  const filter: Record<string, string | boolean> = {}
+  for (const key of blobFilterKeys) {
+    const value = params.get(key)
+    if (value === null) continue
+    if (['unreferenced', 'encodingLeaseExpired', 'embeddingLeaseExpired'].includes(key)) {
+      if (value !== 'true' && value !== 'false') {
+        unsupported.push(`${key} (true/false 아님)`)
+        continue
+      }
+      filter[key] = value === 'true'
+    } else {
+      filter[key] = value
+    }
+  }
+  return { filter, unsupported }
+}
+
+const recoveryActions: { value: RecoveryAction; label: string; eligibility: string }[] = [
+  { value: 'retry_failed_encoding', label: '실패한 인코딩 재시도', eligibility: '원본 인코딩 상태가 failed이고 콘텐츠가 WebP가 아닌 블롭만 eligible입니다.' },
+  { value: 'retry_failed_embedding', label: '실패한 임베딩 재시도', eligibility: '원본 임베딩 상태가 failed인 블롭만 eligible입니다.' },
+  { value: 'release_expired_encoding', label: '만료된 인코딩 리스 해제', eligibility: '만료된 leased 상태만 eligible입니다. received/committing 작업은 안전을 위해 제외됩니다.' },
+  { value: 'release_expired_embedding', label: '만료된 임베딩 리스 해제', eligibility: '만료된 processing 상태만 eligible입니다. 아직 유효한 리스는 제외됩니다.' }
+]
+
+function recoveryActionLabel(action: RecoveryAction | string): string {
+  return recoveryActions.find((item) => item.value === action)?.label || action
+}
+
+function RecoverySelectionPanel({ selection, selectionKey, selectedLabel, albumScope = false }: {
+  selection: RecoverySelection
+  selectionKey: string
+  selectedLabel: string
+  albumScope?: boolean
+}) {
+  const navigate = useNavigate()
+  const [action, setAction] = useState<RecoveryAction>('retry_failed_embedding')
+  const binding = `${selectionKey}\0${action}`
+  const bindingRef = useRef(binding)
+  const [previewState, setPreviewState] = useState<{ binding: string; preview: RecoveryPreview; idempotencyKey: string } | null>(null)
+  const [confirmed, setConfirmed] = useState(false)
+  const [previewLoading, setPreviewLoading] = useState(false)
+  const [submitting, setSubmitting] = useState(false)
+  const [error, setError] = useState('')
+  const submitGuard = useRef(false)
+  useLayoutEffect(() => { bindingRef.current = binding }, [binding])
+  useEffect(() => {
+    setPreviewState(null)
+    setConfirmed(false)
+    setPreviewLoading(false)
+    setError('')
+  }, [selectionKey, action])
+  const activePreview = previewState?.binding === binding ? previewState : null
+  const selectedAction = recoveryActions.find((item) => item.value === action)!
+
+  const createPreview = async () => {
+    if (previewLoading || submitting) return
+    const requestedBinding = binding
+    setPreviewLoading(true)
+    setError('')
+    setConfirmed(false)
+    try {
+      const preview = await adminPost<RecoveryPreview>(apiPath('actions/preview'), { action, selection })
+      if (bindingRef.current === requestedBinding) {
+        setPreviewState({ binding: requestedBinding, preview, idempotencyKey: newIdempotencyKey() })
+      }
+    } catch (cause) {
+      if (bindingRef.current === requestedBinding) setError(recoveryRequestError(cause))
+    } finally {
+      if (bindingRef.current === requestedBinding) setPreviewLoading(false)
+    }
+  }
+
+  const queueOperation = async () => {
+    if (!activePreview || !confirmed || submitGuard.current) return
+    submitGuard.current = true
+    setSubmitting(true)
+    setError('')
+    try {
+      const operation = await adminPost<RecoveryOperation>(apiPath('operations'), {
+        previewId: activePreview.preview.previewId,
+        action: activePreview.preview.action
+      }, activePreview.idempotencyKey)
+      navigate(`/?tab=recovery&operation=${encodeURIComponent(operation.id)}`)
+    } catch (cause) {
+      const status = cause instanceof AdminAPIError ? cause.status : 0
+      if (status === 409) {
+        setPreviewState(null)
+        setConfirmed(false)
+      }
+      // A network failure or lost response keeps both preview and key so an
+      // identical retry replays the same durable operation rather than creating
+      // a second one.
+      setError(recoveryRequestError(cause))
+    } finally {
+      submitGuard.current = false
+      setSubmitting(false)
+    }
+  }
+
+  return <section className="panel recovery-action-panel">
+    <h2>범위 지정 복구</h2>
+    <p>{selectedLabel}</p>
+    {albumScope && <p className="notice warning">앨범 범위는 이 앨범이 참조하는 블롭 파이프라인에만 적용됩니다. <strong>아카이브 추출 재시도가 아닙니다.</strong> 안전한 내구성 있는 추출 큐가 없어 앨범 추출 복구는 아직 제공되지 않습니다.</p>}
+    <p className="muted">미리보기는 변경하지 않습니다. 정확한 대상과 건너뜀 사유를 확인한 뒤 별도 확인을 해야 작업이 큐에 등록됩니다. 대상은 최대 10,000개 고유 블롭이며 미리보기는 10분 후 만료됩니다.</p>
+    <div className="recovery-action-controls">
+      <label className="field">복구 동작<select aria-label="복구 동작" value={action} onChange={(event) => setAction(event.target.value as RecoveryAction)}>
+        {recoveryActions.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}
+      </select></label>
+      <p className="muted recovery-eligibility">{selectedAction.eligibility} 나머지 대상은 상태 변화, 유효한 lease, 불안전한 phase 등 사유와 함께 건너뜁니다.</p>
+      <button type="button" onClick={() => void createPreview()} disabled={previewLoading || submitting}>
+        {previewLoading ? '미리보기 생성 중…' : '미리보기 생성'}
+      </button>
+    </div>
+    {error && <div className="notice error" role="alert">{error}</div>}
+    {activePreview && <div className="recovery-preview" aria-label="복구 미리보기">
+      <h3>미리보기 · 변경 없음</h3>
+      <p><strong>{recoveryActionLabel(activePreview.preview.action)}</strong> · 생성 {formatTime(activePreview.preview.createdAt)} · 만료 {formatTime(activePreview.preview.expiresAt)}</p>
+      <p>대상 블롭 {activePreview.preview.targetCount.toLocaleString()} · 실행 가능 {activePreview.preview.eligibleCount.toLocaleString()} · 건너뜀 {activePreview.preview.skippedCount.toLocaleString()}</p>
+      <p>선택 범위 사진 행 {activePreview.preview.selectedPhotos.toLocaleString()} · 영향받는 전체 사진 행 {activePreview.preview.affectedPhotos.toLocaleString()} · 앨범 {activePreview.preview.affectedAlbums.toLocaleString()}</p>
+      {activePreview.preview.sharedBlobWarning && <p className="notice warning" role="alert">공유 블롭 영향: 선택한 범위 밖의 사진도 같은 콘텐츠 블롭을 참조합니다. 전체 사진 {activePreview.preview.affectedPhotos.toLocaleString()}개가 영향을 받을 수 있습니다.</p>}
+      {activePreview.preview.skippedCount > 0 && <div className="skip-reasons"><strong>건너뜀 사유</strong><ul>
+        {Object.entries(activePreview.preview.skippedReasons).map(([reason, count]) => <li key={reason}><code>{reason}</code>: {count.toLocaleString()}</li>)}
+      </ul></div>}
+      <p className="muted">작업자 라벨: {activePreview.preview.actor}. {activePreview.preview.actorNote || '토큰 보유자의 실제 개인 신원은 확인되지 않습니다.'}</p>
+      <label className="confirm-recovery"><input type="checkbox" checked={confirmed} onChange={(event) => setConfirmed(event.target.checked)} /> 미리보기를 확인했습니다. 이 작업을 명시적으로 큐에 등록합니다.</label>
+      <button type="button" className="danger-button" onClick={() => void queueOperation()} disabled={!confirmed || submitting}>
+        {submitting ? '작업 등록 중…' : '확인 후 작업 큐에 등록'}
+      </button>
+    </div>}
+  </section>
+}
+
+function newIdempotencyKey(): string {
+  const random = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`
+  return `admin-recovery-${random}`
+}
+
+function recoveryRequestError(cause: unknown): string {
+  if (cause instanceof AdminAPIError) {
+    if (cause.status === 409) return '미리보기가 만료되었거나 이미 사용되었고, 상태 또는 요청 바인딩이 변경되었습니다. 새 미리보기를 생성해 주세요.'
+    if (cause.status === 400 && /10000|10,000/.test(cause.message)) return '선택이 10,000개 고유 블롭 한도를 초과했습니다. 범위를 좁혀 새 미리보기를 생성해 주세요.'
+  }
+  return errorMessage(cause)
+}
+
+function RecoveryOperationsPage() {
+  const [params] = useSearchParams()
+  const navigate = useNavigate()
+  const cursor = params.get('cursor') || ''
+  const query = new URLSearchParams({ limit: '50' })
+  if (cursor) query.set('cursor', cursor)
+  const state = useAdminData<RecoveryOperationsData>(apiPath('operations', `?${query}`))
+  const nextCursor = state.data?.nextCursor || null
+  return <>
+    <PageTitle title="복구 운영 감사" description="범위 지정 미리보기, 명시적 작업 등록, 작업별 대상 결과를 확인합니다." />
+    <div className="notice warning"><strong>기존 전역 복구는 별도 위험 작업입니다.</strong> 아래 범위 지정 복구와 혼동하지 마세요. 기존 통계·복구 화면은 별도 링크에서 유지됩니다.</div>
+    <div className="toolbar"><button type="button" onClick={() => navigate('/?tab=recovery')} disabled={state.loading}>최신 감사 목록</button><span className="muted">최신 작업부터 커서 기반 50개씩 표시</span></div>
+    {state.error && <ErrorPanel message={state.error} />}
+    {state.loading && !state.data && <p role="status">복구 작업 감사 기록을 불러오는 중…</p>}
+    {state.data && <>
+      <div className="table-wrap"><table className="data-table recovery-audit-table"><thead><tr><th>작업 ID</th><th>동작</th><th>상태</th><th>작업자 라벨</th><th>대상</th><th>영향 사진</th><th>생성</th></tr></thead><tbody>
+        {state.data.operations.map((operation) => <tr key={operation.id}>
+          <th scope="row"><Link to={`/?tab=recovery&operation=${encodeURIComponent(operation.id)}`}>{operation.id}</Link></th>
+          <td>{recoveryActionLabel(operation.action)}</td><td>{operationStatusLabel(operation.status)}</td>
+          <td>{operation.actor}<small className="subline">개인 신원 미검증</small></td>
+          <td>{operation.eligible.toLocaleString()} / {operation.total.toLocaleString()} 실행 가능</td>
+          <td>{operation.affectedPhotos.toLocaleString()}{operation.sharedBlobWarning && <small className="subline warning-text">공유 블롭 영향</small>}</td>
+          <td>{formatTime(operation.createdAt)}</td>
+        </tr>)}
+        {state.data.operations.length === 0 && <EmptyRow columns={7} />}
+      </tbody></table></div>
+      <div className="pagination">
+        {cursor ? <Link className="button-link" to="/?tab=recovery">첫 페이지</Link> : <span className="muted">첫 페이지</span>}
+        {nextCursor ? <Link className="button-link" to={`/?tab=recovery&cursor=${encodeURIComponent(nextCursor)}`}>이전 작업 더 보기 →</Link> : <span className="muted">마지막 페이지</span>}
+      </div>
+    </>}
+  </>
+}
+
+type RecoveryDetailState = { key: string; page: RecoveryResultsPage | null; error: string; loading: boolean }
+
+function RecoveryOperationDetail({ operationID }: { operationID: string }) {
+  const [cursorStack, setCursorStack] = useState<string[]>([''])
+  const cursor = cursorStack[cursorStack.length - 1] || ''
+  const params = new URLSearchParams({ limit: '50' })
+  if (cursor) params.set('cursor', cursor)
+  const path = apiPath(`operations/${encodeURIComponent(operationID)}`, `?${params}`)
+  const [state, setState] = useState<RecoveryDetailState>({ key: path, page: null, error: '', loading: true })
+  const current = state.key === path ? state : { key: path, page: null, error: '', loading: true }
+  const statusRef = useRef('')
+  const results = current.page?.results || []
+  useEffect(() => {
+    const controller = new AbortController()
+    let active = true
+    let inFlight = false
+    statusRef.current = ''
+    setState((old) => old.key === path
+      ? { ...old, loading: old.page === null, error: '' }
+      : { key: path, page: null, error: '', loading: true })
+    const refresh = async () => {
+      if (!active || inFlight || document.visibilityState !== 'visible') return
+      if (statusRef.current && !['queued', 'running'].includes(statusRef.current)) return
+      inFlight = true
+      try {
+        const page = await adminGet<RecoveryResultsPage>(path, controller.signal)
+        if (!active || controller.signal.aborted) return
+        statusRef.current = page.operation.status
+        setState({ key: path, page, error: '', loading: false })
+      } catch (cause) {
+        if (active && !controller.signal.aborted) {
+          setState((old) => old.key === path
+            ? { ...old, error: errorMessage(cause), loading: false }
+            : { key: path, page: null, error: errorMessage(cause), loading: false })
+        }
+      } finally {
+        inFlight = false
+      }
+    }
+    void refresh()
+    const timer = window.setInterval(() => void refresh(), 20_000)
+    const onVisibility = () => { if (document.visibilityState === 'visible') void refresh() }
+    document.addEventListener('visibilitychange', onVisibility)
+    return () => {
+      active = false
+      controller.abort()
+      window.clearInterval(timer)
+      document.removeEventListener('visibilitychange', onVisibility)
+    }
+  }, [path])
+
+  const operation = current.page?.operation
+  return <>
+    <Link className="back-link" to="/?tab=recovery">← 복구 감사 목록</Link>
+    <PageTitle title="복구 작업 상세" description={operationID} />
+    {current.error && <div className="notice warning" role="alert">갱신 실패: {current.error}{current.page ? ' · 마지막 정상 결과를 계속 표시합니다.' : ''}</div>}
+    {current.loading && !current.page && <p role="status">작업 결과를 불러오는 중…</p>}
+    {operation && <>
+      <section className="panel">
+        <h2>{recoveryActionLabel(operation.action)} · {operationStatusLabel(operation.status)}</h2>
+        <div className="summary-grid compact">
+          <Stat label="대상 블롭" value={operation.total} />
+          <Stat label="실행 가능" value={operation.eligible} />
+          <Stat label="적용됨" value={operation.succeeded} />
+          <Stat label="충돌" value={operation.conflicts} />
+          <Stat label="건너뜀" value={operation.skipped} />
+          <Stat label="실패" value={operation.failed} />
+          <Stat label="영향 사진 행" value={operation.affectedPhotos} />
+          <Stat label="영향 앨범" value={operation.affectedAlbums} />
+        </div>
+        {operation.sharedBlobWarning && <p className="notice warning">공유 블롭 때문에 선택 범위 밖 사진도 영향을 받을 수 있습니다 (전체 영향 사진 {operation.affectedPhotos.toLocaleString()}개).</p>}
+        <p>작업자 라벨: <strong>{operation.actor}</strong> · {operation.actorNote || '개인 신원은 검증되지 않은 Basic-auth 사용자 라벨입니다.'}</p>
+        <p className="muted">생성 {formatTime(operation.createdAt)} · 갱신 {formatTime(operation.updatedAt)} · {['queued', 'running'].includes(operation.status) ? '진행 중이면 20초마다 갱신합니다.' : '작업 실행이 종료되었습니다.'}</p>
+        <p className="notice warning">작업 완료는 복구 실행이 종료되었다는 뜻입니다. ‘적용됨’ 대상은 파이프라인 대기열로 돌아갔으며, 인코딩이나 임베딩 자체가 성공했다는 의미는 아닙니다.</p>
+      </section>
+      <section className="panel">
+        <h2>대상별 결과</h2>
+        <p className="muted">서버가 안정적인 순번 커서로 50개씩 반환합니다. 진행 중에는 각 대상 상태가 바뀔 수 있습니다.</p>
+        <div className="table-wrap"><table className="data-table recovery-results-table"><thead><tr><th>순번</th><th>블롭 해시</th><th>결과</th><th>안전 사유 코드</th><th>갱신</th></tr></thead><tbody>
+          {results.map((result) => <tr key={result.ordinal}>
+            <th scope="row">{result.ordinal}</th>
+            <td className="hash-cell"><Link to={`/blobs/${encodeURIComponent(result.hash)}`}>{result.hash}</Link></td>
+            <td>{recoveryResultStatusLabel(result.status)}</td><td><code>{result.reason || '—'}</code></td><td>{formatTime(result.updatedAt)}</td>
+          </tr>)}
+          {results.length === 0 && <EmptyRow columns={5} />}
+        </tbody></table></div>
+        <div className="pagination">
+          {cursorStack.length > 1
+            ? <button type="button" onClick={() => setCursorStack((stack) => stack.slice(0, -1))}>← 이전 결과 페이지</button>
+            : <span className="muted">첫 결과 페이지</span>}
+          {current.page?.nextCursor
+            ? <button type="button" disabled={current.loading} onClick={() => setCursorStack((stack) => [...stack, current.page!.nextCursor!])}>다음 결과 페이지 →</button>
+            : <span className="muted">마지막 결과 페이지</span>}
+        </div>
+      </section>
+    </>}
+  </>
+}
+
+function operationStatusLabel(status: string): string {
+  const labels: Record<string, string> = { queued: '대기열', running: '실행 중', completed: '완료', partially_failed: '일부 실패', failed: '실패' }
+  return labels[status] || `${status} (새 상태)`
+}
+
+function recoveryResultStatusLabel(status: string): string {
+  const labels: Record<string, string> = {
+    queued: '대기열', succeeded: '적용됨', applied: '적용됨', conflict: '충돌', skipped: '건너뜀', failed: '실패'
+  }
+  return labels[status] || `${status} (새 상태)`
 }
 
 function BlobFilters() {
@@ -571,10 +988,11 @@ function AlbumFilters() {
   </FilterPanel>
 }
 
-function PhotoTable({ photos }: { photos: Photo[] }) {
+function PhotoTable({ photos, selected, toggle }: { photos: Photo[]; selected: string[]; toggle: (key: string) => void }) {
   const location = useLocation()
-  return <div className="table-wrap"><table className="data-table photo-table"><thead><tr><th>미리보기</th><th>사진</th><th>앨범</th><th>인코딩</th><th>임베딩</th><th>크기</th></tr></thead><tbody>
+  return <div className="table-wrap"><table className="data-table photo-table"><thead><tr><th>복구 선택</th><th>미리보기</th><th>사진</th><th>앨범</th><th>인코딩</th><th>임베딩</th><th>크기</th></tr></thead><tbody>
     {photos.map((photo) => <tr key={`${photo.albumId}:${photo.idx}`}>
+      <td><input type="checkbox" aria-label={`${photo.name} 복구 선택`} checked={!photo.missingBlob && selected.includes(photoKey(photo))} onChange={() => toggle(photoKey(photo))} disabled={photo.missingBlob} /></td>
       <td>{photo.missingBlob ? <span className="image-fallback">사용 불가</span> : <img className="thumbnail" src={imagePath(photo.hash)} loading="lazy" alt="" onError={(event) => showImageFallback(event.currentTarget)} />}</td>
       <td><Link to={`/photos/${encodeURIComponent(photo.albumId)}/${photo.idx}`} state={returnState(location)}>{photo.name}</Link><small className="subline">{photo.width} × {photo.height} · {photo.hash}</small></td>
       <td><Link to={`/albums/${encodeURIComponent(photo.albumId)}`} state={returnState(location)}>{photo.albumName}</Link></td>
@@ -582,7 +1000,7 @@ function PhotoTable({ photos }: { photos: Photo[] }) {
       <td>{photo.missingBlob ? '블롭 없음' : stateLabel(photo.embedding)}{photo.blockReason === 'encoding_gate' && <small className="subline warning-text">인코딩 게이트 대기</small>}<RawState raw={photo.embeddingRaw} filterKey="embeddingRaw" /></td>
       <td>{photo.sizeBytes === null ? '—' : formatBytes(photo.sizeBytes)}</td>
     </tr>)}
-    {photos.length === 0 && <EmptyRow columns={6} />}
+    {photos.length === 0 && <EmptyRow columns={7} />}
   </tbody></table></div>
 }
 
@@ -610,6 +1028,11 @@ function PhotoDetailPage() {
       </section>
       <PipelineDetails encoding={{ raw: photo.encodingRaw, state: photo.encoding, error: photo.encodingError, skippedReason: photo.skippedReason, observation: photo.encodingObservation }} embedding={{ raw: photo.embeddingRaw, state: photo.embedding, error: photo.embeddingError, blockReason: photo.blockReason, observation: photo.embeddingObservation }} missing={photo.missingBlob} />
     </div>}
+    {photo && !photo.missingBlob && <RecoverySelectionPanel
+      selection={{ photos: [{ albumId: photo.albumId, idx: photo.idx }] }}
+      selectionKey={`${photo.albumId}:${photo.idx}:${photo.hash}`}
+      selectedLabel={`이 사진 한 행 · 블롭 ${photo.hash}`}
+    />}
   </>
 }
 
@@ -634,6 +1057,7 @@ function BlobDetailPage() {
       </section>
       <PipelineDetails encoding={{ raw: blob.encodingRaw, state: blob.encoding, error: blob.encodingError, skippedReason: blob.skippedReason, observation: blob.encodingObservation }} embedding={{ raw: blob.embeddingRaw, state: blob.embedding, error: blob.embeddingError, blockReason: blob.blockReason, observation: blob.embeddingObservation }} missing={false} />
     </div>}
+    {blob && <RecoverySelectionPanel selection={{ hashes: [blob.hash] }} selectionKey={`blob:${blob.hash}`} selectedLabel={`블롭 ${blob.hash} 하나`} />}
     {blob && <PipelineHistory hash={blob.hash} />}
   </>
 }
@@ -658,6 +1082,12 @@ function AlbumDetailPage() {
         <p><Link to={filterURL('photos', { albumId: album.id })} state={returnState(location)}>앨범의 사진을 페이지로 보기</Link></p>
         <ErrorDetails error={album.error} />
       </section>
+      <RecoverySelectionPanel
+        selection={{ albumIds: [album.id] }}
+        selectionKey={`album:${album.id}`}
+        selectedLabel={`앨범 ${album.originalFilename}의 사진이 참조하는 고유 블롭 대상`}
+        albumScope
+      />
       <CategorySection title="앨범 인코딩 상태" categories={album.encoding.categories} rawStates={album.encoding.rawStates} filterKey="encoding" albumId={album.id} />
       <section className="panel"><h2>건너뜀 형식</h2><CountTable counts={album.encoding.skippedReasons} filterKey="skippedReason" albumId={album.id} /></section>
       <CategorySection title="앨범 임베딩 상태" categories={album.embedding.categories} rawStates={album.embedding.rawStates} filterKey="embedding" albumId={album.id} />

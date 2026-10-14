@@ -207,8 +207,11 @@ photo count (assuming photo rows reference existing albums). The overview's
 `library.missingBlobPhotos` and album detail's `missingBlobPhotos` are counted
 in their respective catalog read transactions.
 
-The admin browser has **이슈** (`/admin/issues`) and **시스템 진단**
-(`/admin/diagnostics`) tabs. `GET /admin/api/issues` is a read-only snapshot:
+The admin browser has **이슈** (`/admin/issues`), **시스템 진단**
+(`/admin/diagnostics`), and **복구 운영** tabs. Recovery operations use the
+existing admin root as `/?tab=recovery`; operation details add an `operation`
+query parameter. Keeping this tab on the registered root route avoids adding a
+server route. `GET /admin/api/issues` is a read-only snapshot:
 encoding and embedding groups include only blobs whose *current* stage status is
 `failed`, and group by the safe observation `errorCode` (missing/legacy codes
 are `legacy_unknown`). A blob that failed both stages appears in both groups;
@@ -375,6 +378,31 @@ The operation executor starts only when `ADMIN_TOKEN` is nonempty. While the
 admin service is disabled, durable operations stay paused and no targets are
 executed; enabling the admin service at startup requeues interrupted operations
 and resumes queued work.
+
+The **복구 운영** frontend shows a cursor-paged audit list and cursor-paged
+per-blob operation results, with links to blob details. Photo and blob browse
+lists allow row checkboxes and “select visible page” only; selection is cleared
+when URL filters or page paths change. Photos submit explicit `(albumId, idx)`
+identities and the backend deduplicates shared blob hashes. Blob lists also
+offer a separate whole-filter preview using only exact supported blob filters;
+`q`, `cursor`, duplicate, and unknown query parameters disable that action
+rather than being discarded. Filter previews are capped at 10,000 distinct
+blobs and oversized requests are rejected, not truncated.
+
+Every scoped action follows preview → review → explicit confirmation → queued
+operation. The preview shows eligibility, skipped reasons, expiry, and
+photo/album impact including shared-blob impact. Changing the action or
+selection invalidates the preview. A network failure while queueing retains
+that preview's idempotency key so the exact request can safely be retried.
+Queued/running operation details refresh every 20 seconds while visible,
+without overlapping requests. Per-target `succeeded` results are labeled as
+applied; operation completion means recovery execution ended. Applied targets
+were returned to pipeline queues, not that encoding or embedding finished
+successfully. The audit actor is only
+the HTTP Basic username label and does not verify an individual token holder.
+The existing global recovery screen remains separately labeled as a dangerous
+legacy action. Album detail recovery scopes blob pipeline actions to that album;
+archive extraction retry is unavailable and is not implied by this UI.
 
 The operation actor is the username label from HTTP Basic credentials, not a
 verified individual: deployments share an admin token, and the API explicitly

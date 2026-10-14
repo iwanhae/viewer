@@ -169,6 +169,57 @@ export type PipelineEvent = {
 
 export type HistoryPage = { events: PipelineEvent[]; nextCursor: string | null }
 
+export type RecoveryAction = 'retry_failed_encoding' | 'retry_failed_embedding' | 'release_expired_encoding' | 'release_expired_embedding'
+
+export type RecoveryPreview = {
+  previewId: string
+  actor: string
+  actorNote: string
+  action: RecoveryAction
+  createdAt: string
+  expiresAt: string
+  targetCount: number
+  eligibleCount: number
+  skippedCount: number
+  skippedReasons: Record<string, number>
+  selectedPhotos: number
+  affectedPhotos: number
+  affectedAlbums: number
+  sharedBlobWarning: boolean
+}
+
+export type RecoveryOperation = {
+  id: string
+  previewId: string
+  actor: string
+  actorNote: string
+  action: RecoveryAction
+  status: 'queued' | 'running' | 'completed' | 'partially_failed' | 'failed' | string
+  createdAt: string
+  updatedAt: string
+  total: number
+  eligible: number
+  succeeded: number
+  conflicts: number
+  skipped: number
+  failed: number
+  selectedPhotos: number
+  affectedPhotos: number
+  affectedAlbums: number
+  sharedBlobWarning: boolean
+}
+
+export type RecoveryResult = {
+  ordinal: number
+  hash: string
+  status: 'queued' | 'succeeded' | 'applied' | 'conflict' | 'skipped' | 'failed' | string
+  reason?: string
+  updatedAt: string
+}
+
+export type RecoveryOperationsPage = { operations: RecoveryOperation[]; nextCursor: string | null }
+export type RecoveryResultsPage = { operation: RecoveryOperation; results: RecoveryResult[]; nextCursor: string | null }
+
 export type Album = {
   id: string
   originalFilename: string
@@ -253,9 +304,43 @@ export async function adminGet<T>(path: string, signal?: AbortSignal): Promise<T
   }
   if (!response.ok) {
     const error = body as { error?: { message?: string } }
-    throw new Error(error.error?.message || `요청 실패 (HTTP ${response.status})`)
+    throw new AdminAPIError(error.error?.message || `요청 실패 (HTTP ${response.status})`, response.status)
   }
   return body as T
+}
+
+export class AdminAPIError extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message)
+    this.name = 'AdminAPIError'
+  }
+}
+
+export async function adminPost<T>(path: string, body: unknown, idempotencyKey?: string): Promise<T> {
+  const headers: Record<string, string> = {
+    Accept: 'application/json',
+    'Content-Type': 'application/json',
+    'X-Admin-Action': '1'
+  }
+  if (idempotencyKey) headers['Idempotency-Key'] = idempotencyKey
+  const response = await fetch(path, {
+    method: 'POST',
+    credentials: 'same-origin',
+    cache: 'no-store',
+    headers,
+    body: JSON.stringify(body)
+  })
+  let result: unknown
+  try {
+    result = await response.json()
+  } catch {
+    throw new AdminAPIError(`서버 응답을 읽을 수 없습니다 (HTTP ${response.status})`, response.status)
+  }
+  if (!response.ok) {
+    const error = result as { error?: { message?: string } }
+    throw new AdminAPIError(error.error?.message || `요청 실패 (HTTP ${response.status})`, response.status)
+  }
+  return result as T
 }
 
 export function apiPath(resource: string, search = ''): string {

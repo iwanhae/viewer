@@ -64,6 +64,12 @@ function mockFetch(responder: (url: string) => Response | Promise<Response>) {
   return fetchMock
 }
 
+function mockFetchWithInit(responder: (url: string, init?: RequestInit) => Response | Promise<Response>) {
+  const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => Promise.resolve(responder(String(input), init)))
+  vi.stubGlobal('fetch', fetchMock)
+  return fetchMock
+}
+
 function deferred<T>() {
   let resolve!: (value: T) => void
   let reject!: (reason?: unknown) => void
@@ -77,6 +83,20 @@ function deferred<T>() {
 function renderAt(path: string) {
   return render(<MemoryRouter initialEntries={[path]} future={{ v7_startTransition: true, v7_relativeSplatPath: true }}><AdminApp /></MemoryRouter>)
 }
+
+const recoveryPreview = (overrides: Record<string, unknown> = {}) => ({
+  previewId: 'preview-1', actor: 'operator', actorNote: 'Basic-auth username label; token holder is not individually verified',
+  action: 'retry_failed_embedding', createdAt: '2026-10-14T12:00:00Z', expiresAt: '2026-10-14T12:10:00Z',
+  targetCount: 4, eligibleCount: 2, skippedCount: 2, skippedReasons: { not_failed: 2 },
+  selectedPhotos: 1, affectedPhotos: 3, affectedAlbums: 2, sharedBlobWarning: true, ...overrides
+})
+
+const recoveryOperation = (overrides: Record<string, unknown> = {}) => ({
+  id: 'operation-1', previewId: 'preview-1', actor: 'operator', actorNote: 'Basic-auth username label; token holder is not individually verified',
+  action: 'retry_failed_embedding', status: 'queued', createdAt: '2026-10-14T12:00:00Z', updatedAt: '2026-10-14T12:00:00Z',
+  total: 4, eligible: 2, succeeded: 0, conflicts: 0, skipped: 2, failed: 0,
+  selectedPhotos: 1, affectedPhotos: 3, affectedAlbums: 2, sharedBlobWarning: true, ...overrides
+})
 
 describe('admin React UI', () => {
   afterEach(() => { cleanup(); vi.unstubAllGlobals(); vi.restoreAllMocks() })
@@ -365,6 +385,307 @@ describe('admin React UI', () => {
     expect(await screen.findByText('bad.jpg')).toBeTruthy()
     expect(screen.getByText(/최신 추출 실행 실패 항목/)).toBeTruthy()
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/admin/api/extraction-failures?reasonCode=invalid_image&limit=50', expect.anything()))
+  })
+
+  it('previews only explicitly selected photos from the visible page and requires confirmation before queueing', async () => {
+    const first: Photo = { ...missingPhoto, albumId: 'album-1', idx: 0, hash: 'hash-a', name: 'a.jpg', missingBlob: false, sizeBytes: 5, contentType: 'image/jpeg' }
+    const second: Photo = { ...first, idx: 1, hash: 'hash-b', name: 'b.jpg' }
+    let previewBody: Record<string, unknown> | null = null
+    const fetchMock = mockFetchWithInit((url, init) => {
+      if (url === '/admin/api/photos') return jsonResponse({ photos: [first, second], nextCursor: 'next-page' })
+      if (url === '/admin/api/actions/preview') {
+        previewBody = JSON.parse(String(init?.body)) as Record<string, unknown>
+        return jsonResponse(recoveryPreview({ targetCount: 2, eligibleCount: 1, skippedCount: 1, selectedPhotos: 2, affectedPhotos: 5, sharedBlobWarning: true }), 201)
+      }
+      return jsonResponse({ photos: [], nextCursor: null })
+    })
+    renderAt('/photos')
+
+    fireEvent.click(await screen.findByRole('checkbox', { name: '현재 페이지 복구 가능한 사진 모두 선택' }))
+    expect((screen.getByRole('checkbox', { name: 'a.jpg 복구 선택' }) as HTMLInputElement).checked).toBe(true)
+    expect((screen.getByRole('checkbox', { name: 'b.jpg 복구 선택' }) as HTMLInputElement).checked).toBe(true)
+    fireEvent.click(screen.getByRole('button', { name: '미리보기 생성' }))
+    expect(await screen.findByText(/대상 블롭 2 · 실행 가능 1 · 건너뜀 1/)).toBeTruthy()
+    expect(screen.getByText(/공유 블롭 영향: 선택한 범위 밖의 사진도 같은 콘텐츠 블롭/)).toBeTruthy()
+    expect(screen.getByText('not_failed')).toBeTruthy()
+    expect(screen.getByRole('button', { name: '확인 후 작업 큐에 등록' })).toHaveProperty('disabled', true)
+    expect(previewBody).toEqual({
+      action: 'retry_failed_embedding',
+      selection: { photos: [{ albumId: 'album-1', idx: 0 }, { albumId: 'album-1', idx: 1 }] }
+    })
+    expect(fetchMock.mock.calls.some(([url, init]) => String(url) === '/admin/api/operations' && init?.method === 'POST')).toBe(false)
+    expect(screen.getByText(/복구 가능한 사진 2\/2개 선택/)).toBeTruthy()
+  })
+
+  it('clears page selection when the photo URL filters change', async () => {
+    const first: Photo = { ...missingPhoto, albumId: 'album-1', idx: 0, hash: 'hash-a', name: 'a.jpg', missingBlob: false }
+    const fetchMock = mockFetch((url) => url.startsWith('/admin/api/photos')
+      ? jsonResponse({ photos: [first], nextCursor: null })
+      : jsonResponse({ photos: [], nextCursor: null }))
+    renderAt('/photos?hash=first')
+    fireEvent.click(await screen.findByRole('checkbox', { name: '현재 페이지 복구 가능한 사진 모두 선택' }))
+    expect(await screen.findByRole('heading', { name: '범위 지정 복구' })).toBeTruthy()
+
+    fireEvent.change(screen.getByLabelText('해시'), { target: { value: 'second' } })
+    fireEvent.click(screen.getByRole('button', { name: '검색' }))
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/admin/api/photos?hash=second', expect.anything()))
+    await waitFor(() => expect(screen.queryByRole('heading', { name: '범위 지정 복구' })).toBeNull())
+    expect(screen.getByText(/페이지나 필터를 바꾸면 선택이 초기화됩니다/)).toBeTruthy()
+  })
+
+  it('bulk-selects only blob-backed photos and disables page selection when all rows are missing blobs', async () => {
+    const first: Photo = { ...missingPhoto, missingBlob: false, hash: 'hash-a', name: 'a.jpg', idx: 0 }
+    const second: Photo = { ...first, hash: 'hash-b', name: 'b.jpg', idx: 1 }
+    const missing: Photo = { ...missingPhoto, idx: 2, name: 'missing.jpg' }
+    let previewSelection: unknown = null
+    let previewPosts = 0
+    const fetchMock = mockFetchWithInit((url, init) => {
+      if (url === '/admin/api/photos') return jsonResponse({ photos: [first, second, missing], nextCursor: 'next-page' })
+      if (url === '/admin/api/actions/preview') {
+        previewPosts++
+        previewSelection = (JSON.parse(String(init?.body)) as { selection: unknown }).selection
+        return jsonResponse(recoveryPreview({ targetCount: 2, eligibleCount: 2, skippedCount: 0, selectedPhotos: 2 }), 201)
+      }
+      return jsonResponse({ photos: [], nextCursor: null })
+    })
+    renderAt('/photos')
+
+    const selectVisible = await screen.findByRole('checkbox', { name: '현재 페이지 복구 가능한 사진 모두 선택' })
+    expect((screen.getByRole('checkbox', { name: 'missing.jpg 복구 선택' }) as HTMLInputElement).disabled).toBe(true)
+    fireEvent.click(screen.getByRole('checkbox', { name: 'a.jpg 복구 선택' }))
+    await waitFor(() => expect((selectVisible as HTMLInputElement).indeterminate).toBe(true))
+    expect(screen.getByText(/복구 가능한 사진 1\/2개 선택/)).toBeTruthy()
+    fireEvent.click(selectVisible)
+    expect((screen.getByRole('checkbox', { name: 'a.jpg 복구 선택' }) as HTMLInputElement).checked).toBe(true)
+    expect((screen.getByRole('checkbox', { name: 'b.jpg 복구 선택' }) as HTMLInputElement).checked).toBe(true)
+    expect((screen.getByRole('checkbox', { name: 'missing.jpg 복구 선택' }) as HTMLInputElement).checked).toBe(false)
+    expect((selectVisible as HTMLInputElement).checked).toBe(true)
+    expect(screen.getByText(/복구 가능한 사진 2\/2개 선택/)).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: '미리보기 생성' }))
+    await screen.findByRole('heading', { name: '미리보기 · 변경 없음' })
+    expect(previewSelection).toEqual({ photos: [{ albumId: 'album-1', idx: 0 }, { albumId: 'album-1', idx: 1 }] })
+
+    cleanup()
+    previewPosts = 0
+    mockFetchWithInit((url) => {
+      if (url === '/admin/api/photos') return jsonResponse({ photos: [missing], nextCursor: null })
+      if (url === '/admin/api/actions/preview') previewPosts++
+      return jsonResponse({ photos: [], nextCursor: null })
+    })
+    renderAt('/photos')
+    const allMissingSelect = await screen.findByRole('checkbox', { name: '현재 페이지 복구 가능한 사진 모두 선택' })
+    expect((allMissingSelect as HTMLInputElement).disabled).toBe(true)
+    expect(screen.queryByRole('heading', { name: '범위 지정 복구' })).toBeNull()
+    expect(previewPosts).toBe(0)
+    expect(fetchMock.mock.calls.some(([url]) => String(url) === '/admin/api/photos')).toBe(true)
+  })
+
+  it('selects only visible blob hashes and previews those hashes rather than the full filter', async () => {
+    const blobs = ['hash-a', 'hash-b'].map((hash) => ({ ...detailBlob, hash }))
+    let selectionBody: Record<string, unknown> | null = null
+    const fetchMock = mockFetchWithInit((url, init) => {
+      if (url === '/admin/api/blobs?encoding=failed') return jsonResponse({ blobs, nextCursor: 'next-hash-page' })
+      if (url === '/admin/api/actions/preview') {
+        selectionBody = JSON.parse(String(init?.body)) as Record<string, unknown>
+        return jsonResponse(recoveryPreview(), 201)
+      }
+      return jsonResponse({ blobs: [], nextCursor: null })
+    })
+    renderAt('/blobs?encoding=failed')
+    fireEvent.click(await screen.findByRole('button', { name: '현재 페이지 모두 선택' }))
+    expect((screen.getByRole('checkbox', { name: 'hash-a 복구 선택' }) as HTMLInputElement).checked).toBe(true)
+    expect((screen.getByRole('checkbox', { name: 'hash-b 복구 선택' }) as HTMLInputElement).checked).toBe(true)
+    fireEvent.click(screen.getByRole('button', { name: '미리보기 생성' }))
+    await screen.findByRole('heading', { name: '미리보기 · 변경 없음' })
+    expect(selectionBody).toEqual({ action: 'retry_failed_embedding', selection: { hashes: ['hash-a', 'hash-b'] } })
+    expect(screen.getByText(/현재 페이지의 해시만 선택합니다/)).toBeTruthy()
+    expect(fetchMock.mock.calls.some(([url, init]) => String(url) === '/admin/api/actions/preview' && String(init?.body).includes('filter'))).toBe(false)
+  })
+
+  it('uses albumIds for album pipeline scope and explicitly says archive extraction retry is unavailable', async () => {
+    let previewBody: Record<string, unknown> | null = null
+    const fetchMock = mockFetchWithInit((url, init) => {
+      if (url === '/admin/api/albums/album-1') return jsonResponse({ ...albumDetail, extractionRecorded: false, latestExtraction: null })
+      if (url === '/admin/api/albums/album-1/extractions?limit=20') return jsonResponse({ runs: [], nextCursor: null })
+      if (url === '/admin/api/actions/preview') {
+        previewBody = JSON.parse(String(init?.body)) as Record<string, unknown>
+        return jsonResponse(recoveryPreview(), 201)
+      }
+      return jsonResponse({})
+    })
+    renderAt('/albums/album-1')
+    expect(await screen.findByText(/아카이브 추출 재시도가 아닙니다/)).toBeTruthy()
+    expect(screen.getByText(/아직 제공되지 않습니다/)).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: '미리보기 생성' }))
+    await screen.findByRole('heading', { name: '미리보기 · 변경 없음' })
+    expect(previewBody).toEqual({ action: 'retry_failed_embedding', selection: { albumIds: ['album-1'] } })
+    expect(fetchMock.mock.calls.some(([url]) => String(url) === '/admin/api/recover')).toBe(false)
+  })
+
+  it('invalidates a preview when the action changes and does not silently apply blob q/cursor filters', async () => {
+    const fetchMock = mockFetchWithInit((url) => {
+      if (url.startsWith('/admin/api/blobs')) return jsonResponse({ blobs: [], nextCursor: null })
+      if (url === '/admin/api/actions/preview') return jsonResponse(recoveryPreview(), 201)
+      return jsonResponse({})
+    })
+    renderAt('/blobs?encoding=failed&q=needle&cursor=abc')
+    expect(await screen.findByText(/지원하지 않는 URL 매개변수: q, cursor/)).toBeTruthy()
+    expect(screen.getByRole('button', { name: '현재 블롭 필터 전체 작업 미리보기' })).toHaveProperty('disabled', true)
+    expect(fetchMock.mock.calls.some(([url, init]) => String(url) === '/admin/api/actions/preview' && init?.method === 'POST')).toBe(false)
+
+    cleanup()
+    renderAt('/blobs?encoding=failed')
+    fireEvent.click(await screen.findByRole('button', { name: '현재 블롭 필터 전체 작업 미리보기' }))
+    fireEvent.click(screen.getByRole('button', { name: '미리보기 생성' }))
+    expect(await screen.findByRole('heading', { name: '미리보기 · 변경 없음' })).toBeTruthy()
+    const previews = fetchMock.mock.calls.filter(([url, init]) => String(url) === '/admin/api/actions/preview' && init?.method === 'POST')
+    expect(previews[previews.length - 1]?.[1]?.body).toBe(JSON.stringify({ action: 'retry_failed_embedding', selection: { filter: { encoding: 'failed' } } }))
+    expect(screen.queryByRole('button', { name: '확인 후 작업 큐에 등록' })).toHaveProperty('disabled', true)
+    fireEvent.change(screen.getByRole('combobox', { name: '복구 동작' }), { target: { value: 'retry_failed_encoding' } })
+    await waitFor(() => expect(screen.queryByRole('heading', { name: '미리보기 · 변경 없음' })).toBeNull())
+    expect(screen.queryByLabelText(/미리보기를 확인했습니다/)).toBeNull()
+  })
+
+  it('explains the 10,000-target cap and expires a preview on a 409 without queueing it', async () => {
+    let operationCalls = 0
+    const fetchMock = mockFetchWithInit((url, init) => {
+      if (url.startsWith('/admin/api/blobs')) return jsonResponse({ blobs: [], nextCursor: null })
+      if (url === '/admin/api/actions/preview') return jsonResponse({ error: { message: 'invalid recovery selection: selection exceeds 10000 distinct blobs' } }, 400)
+      if (url === '/admin/api/operations') {
+        operationCalls++
+        return jsonResponse({ error: { message: 'preview expired' } }, 409)
+      }
+      return jsonResponse({})
+    })
+    renderAt('/blobs?encoding=failed')
+    fireEvent.click(await screen.findByRole('button', { name: '현재 블롭 필터 전체 작업 미리보기' }))
+    fireEvent.click(screen.getByRole('button', { name: '미리보기 생성' }))
+    expect(await screen.findByText(/10,000개 고유 블롭 한도를 초과/)).toBeTruthy()
+    expect(operationCalls).toBe(0)
+
+    cleanup()
+    mockFetchWithInit((url, init) => {
+      if (url === '/admin/api/photos') return jsonResponse({ photos: [{ ...missingPhoto, missingBlob: false, hash: 'hash-one' }], nextCursor: null })
+      if (url === '/admin/api/actions/preview') return jsonResponse(recoveryPreview(), 201)
+      if (url === '/admin/api/operations') return jsonResponse({ error: { message: 'preview, target generation, expiry, or idempotency binding changed' } }, 409)
+      return jsonResponse({ photos: [], nextCursor: null })
+    })
+    renderAt('/photos')
+    fireEvent.click(await screen.findByRole('checkbox', { name: 'lost.jpg 복구 선택' }))
+    fireEvent.click(screen.getByRole('button', { name: '미리보기 생성' }))
+    fireEvent.click(await screen.findByLabelText(/미리보기를 확인했습니다/))
+    fireEvent.click(screen.getByRole('button', { name: '확인 후 작업 큐에 등록' }))
+    expect(await screen.findByText(/미리보기가 만료되었거나 이미 사용/)).toBeTruthy()
+    expect(screen.queryByRole('heading', { name: '미리보기 · 변경 없음' })).toBeNull()
+  })
+
+  it('guards double submits and reuses the same idempotency key after a lost operation response', async () => {
+    const firstOperationRequest = deferred<Response>()
+    let operationPosts = 0
+    const keys: string[] = []
+    const operation = recoveryOperation()
+    const fetchMock = mockFetchWithInit((url, init) => {
+      if (url === '/admin/api/photos') return jsonResponse({ photos: [{ ...missingPhoto, missingBlob: false, hash: 'hash-one' }], nextCursor: null })
+      if (url === '/admin/api/actions/preview') return jsonResponse(recoveryPreview(), 201)
+      if (url === '/admin/api/operations' && init?.method === 'POST') {
+        operationPosts++
+        keys.push(new Headers(init.headers).get('Idempotency-Key') || '')
+        return operationPosts === 1 ? firstOperationRequest.promise : jsonResponse(operation, 202)
+      }
+      if (url === '/admin/api/operations/operation-1?limit=50') return jsonResponse({ operation, results: [], nextCursor: null })
+      return jsonResponse({ photos: [], nextCursor: null })
+    })
+    renderAt('/photos')
+    fireEvent.click(await screen.findByRole('checkbox', { name: 'lost.jpg 복구 선택' }))
+    fireEvent.click(screen.getByRole('button', { name: '미리보기 생성' }))
+    fireEvent.click(await screen.findByLabelText(/미리보기를 확인했습니다/))
+    const submit = screen.getByRole('button', { name: '확인 후 작업 큐에 등록' })
+    fireEvent.click(submit)
+    fireEvent.click(submit)
+    await waitFor(() => expect(operationPosts).toBe(1))
+    const firstInit = fetchMock.mock.calls.find(([url, init]) => String(url) === '/admin/api/operations' && init?.method === 'POST')?.[1]
+    expect(firstInit?.credentials).toBe('same-origin')
+    expect(new Headers(firstInit?.headers).get('X-Admin-Action')).toBe('1')
+    expect(new Headers(firstInit?.headers).get('Content-Type')).toBe('application/json')
+
+    await act(async () => {
+      firstOperationRequest.reject(new Error('connection lost'))
+      await Promise.resolve()
+    })
+    expect(await screen.findByText('connection lost')).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: '확인 후 작업 큐에 등록' }))
+    expect(await screen.findByRole('heading', { name: '복구 작업 상세' })).toBeTruthy()
+    await waitFor(() => expect(operationPosts).toBe(2))
+    expect(keys[0]).toBeTruthy()
+    expect(keys[1]).toBe(keys[0])
+    expect(fetchMock.mock.calls.some(([url, init]) => String(url) === '/admin/api/operations/operation-1?limit=50' && init?.method === 'GET')).toBe(true)
+  })
+
+  it('aborts old operation polling and ignores a late result after selecting a different operation', async () => {
+    const oldOperation = deferred<Response>()
+    const clearIntervalSpy = vi.spyOn(window, 'clearInterval')
+    const fetchMock = mockFetch((url) => {
+      if (url === '/admin/api/operations?limit=50') return jsonResponse({ operations: [
+        recoveryOperation({ id: 'operation-a' }), recoveryOperation({ id: 'operation-b' })
+      ], nextCursor: null })
+      if (url === '/admin/api/operations/operation-a?limit=50') return oldOperation.promise
+      if (url === '/admin/api/operations/operation-b?limit=50') return jsonResponse({
+        operation: recoveryOperation({ id: 'operation-b', status: 'completed' }),
+        results: [{ ordinal: 2, hash: 'hash-b', status: 'succeeded', reason: '', updatedAt: '2026-10-14T12:00:00Z' }], nextCursor: null
+      })
+      return jsonResponse({ operations: [], nextCursor: null })
+    })
+    const view = renderAt('/?tab=recovery')
+    fireEvent.click(await screen.findByRole('link', { name: 'operation-a' }))
+    expect(await screen.findByRole('heading', { name: '복구 작업 상세' })).toBeTruthy()
+    fireEvent.click(screen.getByRole('link', { name: '← 복구 감사 목록' }))
+    fireEvent.click(await screen.findByRole('link', { name: 'operation-b' }))
+    expect(await screen.findByRole('link', { name: 'hash-b' })).toBeTruthy()
+    expect(clearIntervalSpy).toHaveBeenCalled()
+
+    await act(async () => {
+      oldOperation.resolve(jsonResponse({
+        operation: recoveryOperation({ id: 'operation-a', status: 'running' }),
+        results: [{ ordinal: 1, hash: 'stale-hash-a', status: 'queued', updatedAt: '2026-10-14T12:00:00Z' }], nextCursor: null
+      }))
+      await Promise.resolve()
+    })
+    expect(screen.queryByRole('link', { name: 'stale-hash-a' })).toBeNull()
+    expect(screen.getByRole('link', { name: 'hash-b' })).toBeTruthy()
+    view.unmount()
+    expect(fetchMock.mock.calls.some(([url]) => String(url) === '/admin/api/operations/operation-a?limit=50')).toBe(true)
+  })
+
+  it('pages operation results by stable cursor and refreshes changed target statuses without appending stale rows', async () => {
+    let firstPageCalls = 0
+    const fetchMock = mockFetch((url) => {
+      if (url === '/admin/api/operations/operation-page?limit=50') {
+        firstPageCalls++
+        const completed = firstPageCalls > 1
+        return jsonResponse({
+          operation: recoveryOperation({ id: 'operation-page', status: completed ? 'completed' : 'running', succeeded: completed ? 1 : 0 }),
+          results: [{ ordinal: 1, hash: 'hash-page-1', status: completed ? 'succeeded' : 'queued', updatedAt: '2026-10-14T12:00:00Z' }],
+          nextCursor: completed ? null : 'NTA'
+        })
+      }
+      if (url === '/admin/api/operations/operation-page?limit=50&cursor=NTA') return jsonResponse({
+        operation: recoveryOperation({ id: 'operation-page', status: 'running' }),
+        results: [{ ordinal: 51, hash: 'hash-page-2', status: 'conflict', reason: 'state_changed', updatedAt: '2026-10-14T12:00:01Z' }], nextCursor: null
+      })
+      return jsonResponse({ operations: [], nextCursor: null })
+    })
+    renderAt('/?tab=recovery&operation=operation-page')
+    expect(await screen.findByRole('link', { name: 'hash-page-1' })).toBeTruthy()
+    expect(screen.getByText('대기열')).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: '다음 결과 페이지 →' }))
+    expect(await screen.findByRole('link', { name: 'hash-page-2' })).toBeTruthy()
+    expect(screen.getAllByText('충돌').length).toBeGreaterThan(0)
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/admin/api/operations/operation-page?limit=50&cursor=NTA', expect.anything()))
+    fireEvent.click(screen.getByRole('button', { name: '← 이전 결과 페이지' }))
+    expect(await screen.findByRole('link', { name: 'hash-page-1' })).toBeTruthy()
+    expect(screen.queryByRole('link', { name: 'hash-page-2' })).toBeNull()
+    expect(screen.getAllByText('적용됨').length).toBeGreaterThan(0)
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3))
   })
 
   it('labels diagnostics as measurements rather than worker heartbeats or full vector sync', async () => {
