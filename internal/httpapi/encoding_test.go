@@ -33,7 +33,7 @@ type claimOnlyStore struct {
 func (claimOnlyStore) GetObject(context.Context, string) (io.ReadCloser, string, error) {
 	return nil, "", storage.ErrObjectNotFound
 }
-func (claimOnlyStore) PutObjectIfMatch(_ context.Context, _ string, body io.Reader, _, _ string) error {
+func (claimOnlyStore) PutObject(_ context.Context, _ string, body io.Reader, _ string) error {
 	_, err := io.Copy(io.Discard, body)
 	return err
 }
@@ -99,18 +99,13 @@ func (store *encodingOutputStore) GetObject(_ context.Context, key string) (io.R
 	return io.NopCloser(bytes.NewReader(bytes.Clone(data))), store.contentType[key], nil
 }
 
-func (store *encodingOutputStore) PutObjectIfMatch(ctx context.Context, key string, body io.Reader, contentType, etag string) error {
+func (store *encodingOutputStore) PutObject(_ context.Context, key string, body io.Reader, contentType string) error {
 	data, err := io.ReadAll(body)
 	if err != nil {
 		return err
 	}
 	store.mu.Lock()
 	defer store.mu.Unlock()
-	current, exists := store.objects[key]
-	sum := sha256.Sum256(current)
-	if !exists || hex.EncodeToString(sum[:]) != etag {
-		return encoding.ErrLostLease
-	}
 	store.objects[key] = data
 	store.contentType[key] = contentType
 	return nil

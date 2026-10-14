@@ -54,20 +54,13 @@ func (m *memoryStore) PresignGet(_ context.Context, key string, _ time.Duration)
 func (m *memoryStore) PresignPut(_ context.Context, key string, _ time.Duration) (string, error) {
 	return "memory://" + key, nil
 }
-func (m *memoryStore) PutObjectIfMatch(ctx context.Context, key string, body io.Reader, contentType, etag string) error {
+func (m *memoryStore) PutObject(_ context.Context, key string, body io.Reader, contentType string) error {
 	m.putCalls++
 	if m.putStarted != nil {
 		close(m.putStarted)
 	}
 	if m.putRelease != nil {
 		<-m.putRelease
-	}
-	info, exists, err := m.StatObject(ctx, key)
-	if err != nil {
-		return err
-	}
-	if !exists || info.ETag != etag {
-		return ErrLostLease
 	}
 	data, err := io.ReadAll(body)
 	if err != nil {
@@ -381,7 +374,7 @@ func TestStartProcessesReceivedOutputFromPersistentSpool(t *testing.T) {
 	}
 }
 
-func TestAmbiguousConditionalPutFinishesOnlyMatchingOutput(t *testing.T) {
+func TestAmbiguousPutFinishesOnlyMatchingOutput(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	cat, err := catalog.Open(filepath.Join(t.TempDir(), "catalog.db"), nil)
@@ -420,7 +413,7 @@ func TestAmbiguousConditionalPutFinishesOnlyMatchingOutput(t *testing.T) {
 	}
 }
 
-func TestConditionalPutDoesNotOverwriteRestoredSource(t *testing.T) {
+func TestPutOverwritesObjectChangedAfterPreflight(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	cat, err := catalog.Open(filepath.Join(t.TempDir(), "catalog.db"), nil)
@@ -463,9 +456,6 @@ func TestConditionalPutDoesNotOverwriteRestoredSource(t *testing.T) {
 	}
 	restored := append(bytes.Clone(source), []byte("new source version")...)
 	store.objects[key] = restored
-	if err := cat.UpsertBlob(ctx, catalog.Blob{Hash: hash, SizeBytes: int64(len(restored)), ContentType: "image/png", SourceRestored: true}); err != nil {
-		t.Fatal(err)
-	}
 	close(store.putRelease)
 	deadline := time.Now().Add(5 * time.Second)
 	for {
@@ -473,13 +463,13 @@ func TestConditionalPutDoesNotOverwriteRestoredSource(t *testing.T) {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("stale upload was not discarded")
+			t.Fatal("completed upload was not cleaned up")
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	current := waitForEncodingStatus(t, cat, hash, "pending")
-	if current.Token != "" || !bytes.Equal(store.objects[key], restored) || store.putCalls != 1 {
-		t.Fatalf("stale output replaced restored source: job=%+v putCalls=%d", current, store.putCalls)
+	current := waitForEncodingStatus(t, cat, hash, "done")
+	if !bytes.Equal(store.objects[key], encoded) || store.types[key] != "image/webp" || store.putCalls != 1 {
+		t.Fatalf("unconditional PUT did not replace the object: job=%+v putCalls=%d", current, store.putCalls)
 	}
 }
 

@@ -140,17 +140,17 @@ func TestCopyObjectIfMatchKeepsPrefixAndReplacesType(t *testing.T) {
 	}
 }
 
-func TestPutObjectIfMatchGuardsDestination(t *testing.T) {
+func TestPutObjectOmitsIfMatch(t *testing.T) {
 	store, requests := newRecordingStore(t, "viewer/")
-	if err := store.PutObjectIfMatch(context.Background(), "blobs/hash", strings.NewReader("encoded"), "image/webp", `"source-etag"`); err != nil {
+	if err := store.PutObject(context.Background(), "blobs/hash", strings.NewReader("encoded"), "image/webp"); err != nil {
 		t.Fatal(err)
 	}
 	if len(*requests) != 1 {
 		t.Fatalf("requests=%d", len(*requests))
 	}
 	r := (*requests)[0]
-	if r.method != http.MethodPut || r.path != "/test-bucket/viewer/blobs/hash" || r.ifMatch != `"source-etag"` || r.body != "encoded" || r.contentType != "image/webp" {
-		t.Fatalf("conditional put: %+v", r)
+	if r.method != http.MethodPut || r.path != "/test-bucket/viewer/blobs/hash" || r.ifMatch != "" || r.body != "encoded" || r.contentType != "image/webp" {
+		t.Fatalf("unconditional put: %+v", r)
 	}
 }
 

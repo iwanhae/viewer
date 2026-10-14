@@ -53,7 +53,7 @@ var ErrSpoolMissing = errors.New("accepted encoding output is missing from the s
 
 type Store interface {
 	GetObject(context.Context, string) (io.ReadCloser, string, error)
-	PutObjectIfMatch(context.Context, string, io.Reader, string, string) error
+	PutObject(context.Context, string, io.Reader, string) error
 	PresignGet(context.Context, string, time.Duration) (string, error)
 	PresignPut(context.Context, string, time.Duration) (string, error)
 	StatObject(context.Context, string) (storage.Object, bool, error)
@@ -731,7 +731,9 @@ func (s *Service) processReceived(ctx context.Context, job catalog.EncodingJob) 
 	if !ok {
 		return ErrLostLease
 	}
-	if err := s.store.PutObjectIfMatch(ctx, key, encodedFile, "image/webp", originalInfo.ETag); err != nil {
+	// Use an unconditional PUT so SDK retries can write the same validated
+	// output again without failing on the ETag changed by the first attempt.
+	if err := s.store.PutObject(ctx, key, encodedFile, "image/webp"); err != nil {
 		// A PUT may have succeeded even if its response was lost. Finalize only
 		// when the current object is byte-for-byte the validated spool file;
 		// otherwise retain the committing lease for normal reconciliation.
