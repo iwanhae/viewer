@@ -87,6 +87,9 @@ func TestAdminRoutesRequireBothServiceAndToken(t *testing.T) {
 	}{
 		{http.MethodGet, "/admin"},
 		{http.MethodGet, "/admin/"},
+		{http.MethodGet, "/admin/assets/nonexistent.js"},
+		{http.MethodGet, "/admin/photos/album-a/0"},
+		{http.MethodGet, "/admin/legacy"},
 		{http.MethodGet, "/admin/api/stats"},
 		{http.MethodGet, "/admin/api/overview"},
 		{http.MethodGet, "/admin/api/photos"},
@@ -193,9 +196,39 @@ func TestAdminPageServesEmbeddedHTML(t *testing.T) {
 		t.Fatalf("content type=%q want text/html; charset=utf-8", contentType)
 	}
 	body := rec.Body.String()
-	for _, fragment := range []string{"Re-embed everything", "WebP encoding", "/admin/api/stats", "/admin/api/reindex"} {
+	for _, fragment := range []string{"admin-root", "/admin/assets/", "lang=\"ko\""} {
 		if !strings.Contains(body, fragment) {
 			t.Fatalf("admin page missing %q", fragment)
+		}
+	}
+	assetStart := strings.Index(body, "/admin/assets/")
+	assetPath := body[assetStart:]
+	if assetEnd := strings.IndexByte(assetPath, '"'); assetEnd >= 0 {
+		assetPath = assetPath[:assetEnd]
+	}
+	assetUnauthorized := doAdminRequest(t, router, http.MethodGet, assetPath, "")
+	if assetUnauthorized.Code != http.StatusUnauthorized {
+		t.Fatalf("admin asset %s status=%d want=401", assetPath, assetUnauthorized.Code)
+	}
+	assetAuthorized := doAdminRequest(t, router, http.MethodGet, assetPath, basicAuthHeader("operator", "sekrit"))
+	if assetAuthorized.Code != http.StatusOK {
+		t.Fatalf("admin asset %s status=%d want=200", assetPath, assetAuthorized.Code)
+	}
+
+	refresh := doAdminRequest(t, router, http.MethodGet, "/admin/photos/album-a/0", basicAuthHeader("operator", "sekrit"))
+	if refresh.Code != http.StatusOK || !strings.Contains(refresh.Body.String(), `<div id="admin-root">`) {
+		t.Fatalf("nested admin route status=%d body=%s", refresh.Code, refresh.Body.String())
+	}
+
+	legacy := doAdminRequest(t, router, http.MethodGet, "/admin/legacy", basicAuthHeader("operator", "sekrit"))
+	if legacy.Code != http.StatusOK || !strings.Contains(legacy.Body.String(), "Re-embed everything") || !strings.Contains(legacy.Body.String(), "/admin/api/recover") {
+		t.Fatalf("legacy dashboard status=%d body missing existing recovery UI", legacy.Code)
+	}
+
+	for _, target := range []string{"/admin/photos/album-a/0", "/admin/blobs/hash", "/admin/albums/album-a"} {
+		protected := doAdminRequest(t, router, http.MethodGet, target, "")
+		if protected.Code != http.StatusUnauthorized {
+			t.Errorf("nested admin route %s status=%d want=401", target, protected.Code)
 		}
 	}
 }

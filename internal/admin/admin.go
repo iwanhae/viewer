@@ -19,12 +19,10 @@ import (
 //go:embed static/admin.html
 var pageHTML []byte
 
-// Page serves the embedded admin dashboard. It is one self-contained HTML
-// file — inline CSS and JavaScript, no build step — so the admin surface adds
-// nothing to the frontend toolchain and keeps working even when the SPA bundle
-// is stale or broken. no-store keeps a cached page from polling an API whose
-// response shape has moved on.
-func Page() http.Handler {
+// LegacyPage serves the original stats and recovery dashboard. Keep it
+// available while the replacement browse UI is rolled out; its write actions
+// remain useful until a later admin stage replaces them.
+func LegacyPage() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.Header().Set("Cache-Control", "no-store")

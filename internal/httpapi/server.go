@@ -111,7 +111,16 @@ func (s *Server) Router() http.Handler {
 	if s.admin != nil && s.adminToken != "" {
 		r.Route("/admin", func(r chi.Router) {
 			r.Use(s.requireAdminToken)
-			r.Get("/", admin.Page().ServeHTTP)
+			adminPage := web.AdminHandler()
+			r.Get("/", adminPage.ServeHTTP)
+			r.Get("/assets/*", adminPage.ServeHTTP)
+			r.Get("/photos", adminPage.ServeHTTP)
+			r.Get("/photos/*", adminPage.ServeHTTP)
+			r.Get("/blobs", adminPage.ServeHTTP)
+			r.Get("/blobs/*", adminPage.ServeHTTP)
+			r.Get("/albums", adminPage.ServeHTTP)
+			r.Get("/albums/*", adminPage.ServeHTTP)
+			r.Get("/legacy", admin.LegacyPage().ServeHTTP)
 			r.Get("/api/stats", s.adminStats)
 			r.Get("/api/overview", s.adminOverview)
 			r.Get("/api/photos", s.adminPhotos)
@@ -126,13 +135,11 @@ func (s *Server) Router() http.Handler {
 	}
 
 	staticHandler := web.Handler()
-	// serveAPINotFound answers misses on the machine-facing surfaces with
-	// JSON. /admin joins /api there when the admin surface is disabled: the
-	// SPA fallback would otherwise serve the frontend's index.html for it,
-	// which reads as "the page exists but is broken" when the truth is "this
-	// deployment has no admin UI".
+	// serveAPINotFound answers misses on machine-facing and admin paths with
+	// JSON. The independent admin SPA gets explicit client-route patterns above;
+	// falling through must never return the public viewer's index.html.
 	serveAPINotFound := func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasPrefix(r.URL.Path, "/api/") || (!s.adminEnabled() && isAdminPath(r.URL.Path)) {
+		if strings.HasPrefix(r.URL.Path, "/api/") || isAdminPath(r.URL.Path) {
 			writeError(w, r, http.StatusNotFound, "NOT_FOUND", "resource not found")
 			return
 		}
@@ -140,18 +147,17 @@ func (s *Server) Router() http.Handler {
 	}
 	r.NotFound(serveAPINotFound)
 	// A method no registered route carries gets chi's bare 405 before NotFound
-	// ever runs. For a disabled admin surface that bare 405 would advertise
-	// that /admin exists under some other method, so it is folded into the
-	// same 404 the missing route produces; every other path keeps the default.
+	// ever runs. Admin misses are folded into the same 404 as unmatched admin
+	// paths rather than exposing the viewer SPA or an accidental method hint.
 	r.MethodNotAllowed(func(w http.ResponseWriter, r *http.Request) {
-		if !s.adminEnabled() && isAdminPath(r.URL.Path) {
+		if isAdminPath(r.URL.Path) {
 			serveAPINotFound(w, r)
 			return
 		}
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	})
 	r.Get("/*", func(w http.ResponseWriter, r *http.Request) {
-		if !s.adminEnabled() && isAdminPath(r.URL.Path) {
+		if isAdminPath(r.URL.Path) {
 			serveAPINotFound(w, r)
 			return
 		}

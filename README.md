@@ -10,7 +10,7 @@ Self-hosted photo album server. Upload a zip of photos; the server stores each i
 - Optional external WebP encoder using `cwebp` Q85, preserving supported EXIF/ICC/XMP metadata and replacing only when smaller.
 - Semantic "similar photos" recommendations across albums (SigLIP2-base, 768-dim vectors in Qdrant).
 - Lease-based HTTP API so external GPU workers can drain the embedding backlog.
-- Admin dashboard with embedding stats and a re-embed recovery trigger.
+- Protected admin browser for catalog, photo, blob, and album pipeline inspection; existing stats and recovery actions remain at `/admin/legacy`.
 - SQLite catalog backed up to the bucket and auto-restored on startup.
 - Upload drop zone: zips copied straight into the `uploads/` prefix (e.g. with `mc` or `aws s3 cp`) are picked up without a restart.
 
@@ -114,7 +114,8 @@ Notes:
 | POST | `/api/photos/search-by-image` | Best photo per album for an uploaded picture; requires `QDRANT_URL`. |
 | POST | `/api/embedding/claim`, `/renew`, `/results` | External embedding-worker lease API (bearer-token when `WORKER_TOKEN` is set). |
 | POST | `/api/encoding/claim`, `/renew`, `/complete`, `/output` | External WebP encoder lease/result API, enabled when `WORKER_TOKEN` is set. New workers request `outputMode: "api"`; result streams go to `/output`, are spooled under `$STATE_DIR/encoding-spool`, and are asynchronously validated before a conditional S3 write. Claims without that mode retain the legacy presigned-PUT contract during rollout. |
-| GET | `/admin` | Dashboard (library, embedding and WebP encoding stats + re-embed trigger); enabled only when `ADMIN_TOKEN` is set. |
+| GET | `/admin` | Independent React admin browser; enabled only when `ADMIN_TOKEN` is set. |
+| GET | `/admin/legacy` | Existing operational stats and embedding/encoding recovery dashboard, preserved during the admin UI rollout. |
 | GET | `/admin/api/overview` | Catalog-only pipeline totals and normalized/raw state breakdowns. |
 | GET | `/admin/api/photos` | Paged photo rows with album metadata and current encoding/embedding state. |
 | GET | `/admin/api/photos/{albumId}/{idx}` | One photo row with current pipeline state. |
@@ -123,8 +124,12 @@ Notes:
 | GET | `/admin/api/albums` | Paged album processing state, error, and actual photo-row count. |
 | GET | `/admin/api/albums/{id}` | Album processing state and overview-equivalent counts for its referenced blobs/photos. |
 
-The admin resource APIs require the same HTTP Basic password (`ADMIN_TOKEN`) as
-the dashboard, and are absent when the admin service or token is disabled. List
+The admin document, legacy dashboard, and resource APIs require the same HTTP
+Basic password (`ADMIN_TOKEN`), and are absent when the admin service or token
+is disabled. Vite bundles are static code served by the existing asset pipeline
+and may be fetched from `/assets` without authentication; they contain no
+catalog data or credentials. The React admin entry is separate from the viewer
+SPA and uses isolated styles and routes. List
 responses use `{photos|blobs|albums, nextCursor}`; `nextCursor` is `null` at the
 end. `limit` defaults to 50 and accepts 1–100. Cursors are URL-safe opaque
 keyset positions bound to the resource, filters, and limit; send the same
@@ -192,6 +197,7 @@ The built-in embedder is a single in-process goroutine. The same claim/renew/res
 
 - `make build` — builds the frontend if stale (`FORCE=1` to force), then `bin/viewer`.
 - `make test` — Go unit and integration tests; no credentials or env file needed.
+- `make frontend-test` — React admin UI tests (Vitest + Testing Library).
 - `make typecheck` — frontend `tsc --noEmit`.
 - `make run` — runs `bin/viewer` with `./.env`.
 - `make clean`.
@@ -203,7 +209,7 @@ The Go SigLIP2 port (`internal/vision`) is regression-tested against a PyTorch r
 ```
 cmd/viewer/                entry point
 internal/                  API, catalog, pipelines, vision, storage — see package docs for detail
-frontend/                  React + TypeScript + Vite SPA, built into internal/web/static and embedded
+frontend/                  React + TypeScript + Vite viewer SPA and independent admin entry, built into internal/web/static and embedded
 worker/                   Python recommender and WebP encoder workers
 scripts/vision-reference/  PyTorch reference model for the vision-port test
 ```

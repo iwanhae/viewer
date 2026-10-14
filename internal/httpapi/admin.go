@@ -52,16 +52,8 @@ func (s *Server) requireAdminToken(next http.Handler) http.Handler {
 	})
 }
 
-// adminEnabled reports whether the /admin surface is registered at all. It is
-// the single place that defines "disabled", so the router's registration check
-// and the SPA fallback's 404 rule cannot drift apart.
-func (s *Server) adminEnabled() bool {
-	return s.admin != nil && s.adminToken != ""
-}
-
-// isAdminPath reports whether path lives under the /admin surface. The SPA
-// fallback uses it to keep serving the frontend's index.html for a dashboard
-// this deployment does not have.
+// isAdminPath reports whether a path belongs to the protected admin surface.
+// Unmatched admin paths must not fall through to the public viewer SPA.
 func isAdminPath(path string) bool {
 	return path == "/admin" || strings.HasPrefix(path, "/admin/")
 }

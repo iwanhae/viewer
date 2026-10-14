@@ -13,7 +13,7 @@ GO_TEST_PKGS := ./cmd/... ./internal/...
 export GOCACHE ?= $(GO_CACHE_DIR)
 export NPM_CONFIG_CACHE ?= $(NPM_CACHE_DIR)
 
-.PHONY: build build-frontend typecheck build-backend test run clean
+.PHONY: build build-frontend typecheck frontend-test build-backend test run clean
 
 # build compiles the Go binaries. The frontend is rebuilt only when its sources
 # are present and newer than the committed bundle in internal/web/static, so a
@@ -31,7 +31,7 @@ build-frontend:
 		echo "no committed $(FRONTEND_STATIC); building frontend"; \
 		npm --prefix $(FRONTEND_DIR) ci; \
 		npm --prefix $(FRONTEND_DIR) run build; \
-	elif [ -n "$$(find $(FRONTEND_DIR)/src $(FRONTEND_DIR)/index.html -newer $(FRONTEND_STATIC)/index.html -print -quit 2>/dev/null)" ]; then \
+	elif [ -n "$$(find $(FRONTEND_DIR)/src $(FRONTEND_DIR)/index.html $(FRONTEND_DIR)/admin.html $(FRONTEND_DIR)/vite.config.ts $(FRONTEND_DIR)/package.json $(FRONTEND_DIR)/package-lock.json -newer $(FRONTEND_STATIC)/index.html -print -quit 2>/dev/null)" ]; then \
 		echo "frontend sources are newer than $(FRONTEND_STATIC); rebuilding"; \
 		npm --prefix $(FRONTEND_DIR) ci; \
 		npm --prefix $(FRONTEND_DIR) run build; \
@@ -43,6 +43,9 @@ build-frontend:
 # frontend-only pass can fail fast without producing a bundle.
 typecheck:
 	npm --prefix $(FRONTEND_DIR) run typecheck
+
+frontend-test:
+	npm --prefix $(FRONTEND_DIR) test
 
 build-backend:
 	mkdir -p bin
