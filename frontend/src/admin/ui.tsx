@@ -18,6 +18,7 @@ import {
   type Album,
   type AlbumDetail,
   type Blob,
+  type BlobCounts,
   type BlockedQueueDiagnostics,
   type ExtractionEntriesPage,
   type ExtractionEntry,
@@ -184,20 +185,16 @@ function OverviewPage() {
             <Stat label="앨범" value={lastGood.library.albums} to="/albums" />
             <Stat label="사진" value={lastGood.library.photos} to="/photos" />
             <Stat label="고유 블롭" value={lastGood.library.blobs} to="/blobs" />
-            <Stat label="미참조 블롭" value={lastGood.library.unreferencedBlobs} to="/blobs?unreferenced=true" />
           </div>
-          {lastGood.library.missingBlobPhotos > 0 && <div className="notice warning">
-            블롭이 없는 사진 {lastGood.library.missingBlobPhotos}개가 있습니다. 현재 API는 이 항목만 거르는 필터를 제공하지 않습니다.
-          </div>}
-          <p className="muted">파이프라인의 사진 수는 블롭이 존재하는 사진 행 기준이며, 앨범 수는 범주 간 중복될 수 있습니다.</p>
+          <p className="muted">앨범과 사진은 라이브러리 전체 재고 수입니다. 파이프라인 표는 상태별 고유 블롭 수를 표시하며 사진·앨범 참조 수를 상태별로 나누지 않습니다. 무결성 검사는 시스템 진단에서 확인할 수 있습니다.</p>
         </section>
-        <CategorySection title="WebP 인코딩" categories={lastGood.encoding.categories} rawStates={lastGood.encoding.rawStates} filterKey="encoding" />
+        <CategorySection title="WebP 인코딩" categories={lastGood.encoding.categories} rawStates={lastGood.encoding.rawStates} filterKey="encoding" blobOnly />
         <section className="panel">
           <h2>건너뜀: 저장된 콘텐츠 형식 기준</h2>
           <p className="muted">건너뛴 이유를 추측하지 않습니다. 저장된 콘텐츠 형식이 WebP인지 여부만 표시합니다.</p>
-          <CountTable counts={lastGood.encoding.skippedReasons} filterKey="skippedReason" />
+          <BlobCountTable counts={lastGood.encoding.skippedReasons} filterKey="skippedReason" />
         </section>
-        <CategorySection title="임베딩" categories={lastGood.embedding.categories} rawStates={lastGood.embedding.rawStates} filterKey="embedding" />
+        <CategorySection title="임베딩" categories={lastGood.embedding.categories} rawStates={lastGood.embedding.rawStates} filterKey="embedding" blobOnly />
       </>}
     </>
   )
@@ -217,7 +214,7 @@ function IssuesPage() {
       {state.data.truncated && <div className="notice warning">상위 100개 그룹만 표시합니다. 나머지 {state.data.remainingGroups.toLocaleString()}개 그룹은 응답에서 생략되었습니다.</div>}
       {state.data.groups.length === 0
         ? <section className="panel"><p>현재 기록된 실패 이슈가 없습니다.</p></section>
-        : <div className="table-wrap"><table className="data-table"><thead><tr><th>단계</th><th>안전한 오류 코드</th><th>실패 수</th><th>블롭</th><th>사진 행</th><th>앨범</th><th>확인</th></tr></thead><tbody>
+        : <div className="table-wrap"><table className="data-table"><thead><tr><th>단계</th><th>안전한 오류 코드</th><th>실패 수</th><th>개수 단위</th><th>확인</th></tr></thead><tbody>
           {state.data.groups.map((group) => <IssueRow key={`${group.stage}:${group.errorCode}`} group={group} />)}
         </tbody></table></div>}
       {state.data.groups.some((group) => group.errorCode === 'legacy_unknown') && <div className="notice warning">
@@ -230,7 +227,6 @@ function IssuesPage() {
 
 function IssueRow({ group }: { group: IssueGroup }) {
   let target = ''
-  let failureLinkText = group.failureCount
   if (group.stage === 'encoding') {
     target = filterURL('blobs', { encoding: 'failed', encodingErrorCode: group.errorCode })
   } else if (group.stage === 'embedding') {
@@ -239,18 +235,16 @@ function IssueRow({ group }: { group: IssueGroup }) {
     target = '/albums?status=FAILED'
   } else if (group.stage === 'extraction_entry') {
     target = `/issues?entryReasonCode=${encodeURIComponent(group.errorCode)}`
-    failureLinkText = group.entryCount ?? group.failureCount
   }
   const stageLabel: Record<string, string> = {
     encoding: '인코딩', embedding: '임베딩', album_extraction: '아카이브 추출', extraction_entry: '추출 항목'
   }
+  const unitLabel: Record<string, string> = { blobs: '고유 블롭', albums: '앨범', entries: '실패 항목' }
   return <tr>
     <th scope="row">{stageLabel[group.stage] || group.stage}</th>
     <td><code>{group.errorCode}</code></td>
-    <td>{target ? <CountLink value={failureLinkText} to={target} /> : failureLinkText.toLocaleString()}</td>
-    <td>{group.blobCount.toLocaleString()}</td>
-    <td>{group.photoCount.toLocaleString()}</td>
-    <td>{group.albumCount.toLocaleString()}</td>
+    <td>{target ? <CountLink value={group.failureCount} to={target} /> : group.failureCount.toLocaleString()}</td>
+    <td>{unitLabel[group.countUnit] || group.countUnit}</td>
     <td>{target ? <Link to={target}>페이지 보기</Link> : '—'}</td>
   </tr>
 }
@@ -298,6 +292,10 @@ function DiagnosticsPage() {
         <Stat label="임베딩 모델 활성화" value={data.modelEnabled ? '활성' : '비활성'} />
         <Stat label="벡터 저장소 연결" value={data.vectorStoreEnabled ? '설정됨' : '비활성'} />
       </div><p className="muted">활성화 여부는 워커 프로세스의 실행 상태를 뜻하지 않습니다.</p></section>
+      <section className="panel"><h2>카탈로그 무결성</h2><div className="summary-grid">
+        <Stat label="미참조 블롭" value={data.integrity.unreferencedBlobs} to="/blobs?unreferenced=true" />
+        <Stat label="블롭 없는 사진" value={data.integrity.missingBlobPhotos} />
+      </div><p className="muted">개요에서는 무결성 검사를 생략합니다. 미참조 블롭은 정확한 블롭 필터로 볼 수 있으며, 블롭 없는 사진은 별도 목록 필터를 제공하지 않습니다.</p></section>
       <section className="panel"><h2>만료된 리스</h2><div className="summary-grid">
         <Stat label="인코딩 만료 리스" value={data.encodingExpiredLeases} to="/blobs?encodingLeaseExpired=true" />
         <Stat label="임베딩 만료 리스" value={data.embeddingExpiredLeases} to="/blobs?embeddingLeaseExpired=true" />
@@ -355,43 +353,54 @@ function formatActivity(unixMs: number): string {
   return unixMs > 0 ? formatTime(new Date(unixMs).toISOString()) : '프로세스 시작 이후 기록 없음'
 }
 
-function CategorySection({ title, categories, rawStates, filterKey, albumId }: {
+function CategorySection({ title, categories, rawStates, filterKey, albumId, blobOnly = false }: {
   title: string
-  categories: Record<string, PipelineCounts>
-  rawStates: Record<string, PipelineCounts>
+  categories: Record<string, PipelineCounts | BlobCounts>
+  rawStates: Record<string, PipelineCounts | BlobCounts>
   filterKey: 'encoding' | 'embedding'
   albumId?: string
+  blobOnly?: boolean
 }) {
   const order = filterKey === 'encoding'
     ? ['queued', 'processing', 'validating', 'committing', 'completed', 'skipped', 'failed', 'unknown']
     : ['queued', 'blocked', 'processing', 'completed', 'failed', 'unknown']
   const states = [...new Set([...order, ...Object.keys(categories)])]
+  const resource = blobOnly ? 'blobs' : 'photos'
   return <section className="panel">
     <h2>{title}</h2>
     {filterKey === 'embedding' && <p className="muted">대기(queued)는 처리 가능 상태입니다. 차단(blocked)은 인코딩 게이트가 끝날 때까지 임베딩 작업자가 가져가지 않는 대기 항목입니다.</p>}
-    <table className="data-table"><thead><tr><th>상태</th><th>사진 행</th><th>고유 블롭</th><th>앨범 (필터 없음)</th></tr></thead>
+    {blobOnly && <p className="muted">각 블롭은 해당 단계의 정규화 상태 하나에 한 번만 집계됩니다.</p>}
+    <table className="data-table"><thead><tr><th>상태</th>{blobOnly ? <th>고유 블롭</th> : <><th>사진 행</th><th>고유 블롭</th><th>앨범 (필터 없음)</th></>}</tr></thead>
       <tbody>{states.map((state) => <tr key={state}>
-        <th scope="row"><Link to={filterURL('photos', { [filterKey]: state, ...(albumId ? { albumId } : {}) })}>{stateLabel(state)}</Link></th>
-        <td><CountLink value={categories[state]?.photoCount || 0} to={filterURL('photos', { [filterKey]: state, ...(albumId ? { albumId } : {}) })} /></td>
-        <td><CountLink value={categories[state]?.blobCount || 0} to={filterURL('blobs', { [filterKey]: state, ...(albumId ? { albumId } : {}) })} /></td>
-        <td>{categories[state]?.albumCount || 0}</td>
+        <th scope="row"><Link to={filterURL(resource, { [filterKey]: state, ...(albumId ? { albumId } : {}) })}>{stateLabel(state)}</Link></th>
+        {blobOnly
+          ? <td><CountLink value={categories[state]?.blobCount || 0} to={filterURL('blobs', { [filterKey]: state, ...(albumId ? { albumId } : {}) })} /></td>
+          : <>
+            <td><CountLink value={categories[state] && 'photoCount' in categories[state] ? categories[state].photoCount : 0} to={filterURL('photos', { [filterKey]: state, ...(albumId ? { albumId } : {}) })} /></td>
+            <td><CountLink value={categories[state]?.blobCount || 0} to={filterURL('blobs', { [filterKey]: state, ...(albumId ? { albumId } : {}) })} /></td>
+            <td>{categories[state] && 'albumCount' in categories[state] ? categories[state].albumCount : 0}</td>
+          </>}
       </tr>)}</tbody>
     </table>
-    <RawStateTable states={rawStates} filterKey={filterKey} albumId={albumId} />
+    <RawStateTable states={rawStates} filterKey={filterKey} albumId={albumId} blobOnly={blobOnly} />
   </section>
 }
 
-function RawStateTable({ states, filterKey, albumId }: { states: Record<string, PipelineCounts>; filterKey: 'encoding' | 'embedding'; albumId?: string }) {
+function RawStateTable({ states, filterKey, albumId, blobOnly = false }: { states: Record<string, PipelineCounts | BlobCounts>; filterKey: 'encoding' | 'embedding'; albumId?: string; blobOnly?: boolean }) {
   const entries = Object.entries(states).sort(([left], [right]) => left.localeCompare(right))
   if (entries.length === 0) return null
   return <details className="raw-states">
     <summary>원본 상태 값 ({entries.length})</summary>
-    <table className="data-table"><thead><tr><th>저장된 상태</th><th>사진 행</th><th>고유 블롭</th><th>앨범</th></tr></thead>
+    <table className="data-table"><thead><tr><th>저장된 상태</th>{blobOnly ? <th>고유 블롭</th> : <><th>사진 행</th><th>고유 블롭</th><th>앨범</th></>}</tr></thead>
       <tbody>{entries.map(([raw, counts]) => <tr key={raw}>
         <th scope="row">{raw || '(빈 값)'}</th>
-        <td>{raw ? <CountLink value={counts.photoCount} to={filterURL('photos', { [`${filterKey}Raw`]: raw, ...(albumId ? { albumId } : {}) })} /> : counts.photoCount}</td>
-        <td>{raw ? <CountLink value={counts.blobCount} to={filterURL('blobs', { [`${filterKey}Raw`]: raw, ...(albumId ? { albumId } : {}) })} /> : counts.blobCount}</td>
-        <td>{counts.albumCount}</td>
+        {blobOnly
+          ? <td>{raw ? <CountLink value={counts.blobCount} to={filterURL('blobs', { [`${filterKey}Raw`]: raw, ...(albumId ? { albumId } : {}) })} /> : counts.blobCount}</td>
+          : <>
+            <td>{raw && 'photoCount' in counts ? <CountLink value={counts.photoCount} to={filterURL('photos', { [`${filterKey}Raw`]: raw, ...(albumId ? { albumId } : {}) })} /> : ('photoCount' in counts ? counts.photoCount : 0)}</td>
+            <td>{raw ? <CountLink value={counts.blobCount} to={filterURL('blobs', { [`${filterKey}Raw`]: raw, ...(albumId ? { albumId } : {}) })} /> : counts.blobCount}</td>
+            <td>{'albumCount' in counts ? counts.albumCount : 0}</td>
+          </>}
       </tr>)}</tbody>
     </table>
   </details>
@@ -404,6 +413,15 @@ function CountTable({ counts, filterKey, albumId }: { counts: Record<string, Pip
       <td><CountLink value={count.photoCount} to={filterURL('photos', { encoding: 'skipped', [filterKey]: reason, ...(albumId ? { albumId } : {}) })} /></td>
       <td><CountLink value={count.blobCount} to={filterURL('blobs', { encoding: 'skipped', [filterKey]: reason, ...(albumId ? { albumId } : {}) })} /></td>
       <td>{count.albumCount}</td>
+    </tr>)}</tbody>
+  </table>
+}
+
+function BlobCountTable({ counts, filterKey }: { counts: Record<string, BlobCounts>; filterKey: 'skippedReason' }) {
+  return <table className="data-table"><thead><tr><th>콘텐츠 형식</th><th>고유 블롭</th></tr></thead>
+    <tbody>{Object.entries(counts).map(([reason, count]) => <tr key={reason}>
+      <th scope="row">{reason}</th>
+      <td><CountLink value={count.blobCount} to={filterURL('blobs', { encoding: 'skipped', [filterKey]: reason })} /></td>
     </tr>)}</tbody>
   </table>
 }

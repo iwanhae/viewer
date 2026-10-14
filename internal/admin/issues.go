@@ -18,10 +18,7 @@ type IssueGroup struct {
 	Stage        string `json:"stage"`
 	ErrorCode    string `json:"errorCode"`
 	FailureCount int64  `json:"failureCount"`
-	BlobCount    int64  `json:"blobCount"`
-	PhotoCount   int64  `json:"photoCount"`
-	AlbumCount   int64  `json:"albumCount"`
-	EntryCount   int64  `json:"entryCount,omitempty"`
+	CountUnit    string `json:"countUnit"`
 }
 
 type Issues struct {
@@ -44,9 +41,7 @@ func (s *Service) Issues(ctx context.Context) (Issues, error) {
 	groups := make([]IssueGroup, len(snapshot.Groups))
 	for i, group := range snapshot.Groups {
 		groups[i] = IssueGroup{
-			Stage: group.Stage, ErrorCode: group.ErrorCode, FailureCount: group.FailureCount,
-			BlobCount: group.BlobCount, PhotoCount: group.PhotoCount, AlbumCount: group.AlbumCount,
-			EntryCount: group.EntryCount,
+			Stage: group.Stage, ErrorCode: group.ErrorCode, FailureCount: group.FailureCount, CountUnit: group.CountUnit,
 		}
 	}
 	remaining := snapshot.TotalGroups - int64(len(groups))
@@ -56,7 +51,7 @@ func (s *Service) Issues(ctx context.Context) (Issues, error) {
 	return Issues{
 		MeasuredAt: time.Now().UTC().Format(time.RFC3339Nano), Groups: groups, TotalGroups: snapshot.TotalGroups,
 		RemainingGroups: remaining, Truncated: remaining > 0,
-		CountScope: "Each group is counted independently. Blob-stage groups may overlap; archive failures use current FAILED album status; extraction-entry groups use failed entries from each album's latest recorded run only.",
+		CountScope: "failureCount counts the explicit countUnit: unique blobs for encoding/embedding, albums for archive failures, and failed entries for extraction-entry groups. Groups are independent and may overlap; extraction entries use each album's latest recorded run only.",
 	}, nil
 }
 
@@ -182,9 +177,15 @@ type Diagnostics struct {
 	EmbeddingQueue         QueueDiagnostics          `json:"embeddingQueue"`
 	EmbeddingBlockedQueue  BlockedQueueDiagnostics   `json:"embeddingBlockedQueue"`
 	EncodingCommit         EncodingCommitDiagnostics `json:"encodingCommit"`
+	Integrity              IntegrityDiagnostics      `json:"integrity"`
 	WorkerActivity         WorkerActivityDiagnostics `json:"workerActivity"`
 	WorkerActivityScope    string                    `json:"workerActivityScope"`
 	VectorCount            VectorCountDiagnostics    `json:"vectorCount"`
+}
+
+type IntegrityDiagnostics struct {
+	UnreferencedBlobs int64 `json:"unreferencedBlobs"`
+	MissingBlobPhotos int64 `json:"missingBlobPhotos"`
 }
 
 type WorkerActivityDiagnostics struct {
@@ -209,6 +210,9 @@ func (s *Service) Diagnostics(ctx context.Context) (Diagnostics, error) {
 		EncodingQueue:         queueDiagnostics(snapshot.EncodingQueue, measuredAtTime),
 		EmbeddingQueue:        queueDiagnostics(snapshot.EmbeddingQueue, measuredAtTime),
 		EmbeddingBlockedQueue: blockedQueueDiagnostics(snapshot.EmbeddingBlockedQueue, measuredAtTime),
+		Integrity: IntegrityDiagnostics{
+			UnreferencedBlobs: snapshot.UnreferencedBlobs, MissingBlobPhotos: snapshot.MissingBlobPhotos,
+		},
 		EncodingCommit: EncodingCommitDiagnostics{
 			CommittingCount:      snapshot.EncodingCommit.CommittingCount,
 			ReconcilingCount:     snapshot.EncodingCommit.ReconcilingCount,

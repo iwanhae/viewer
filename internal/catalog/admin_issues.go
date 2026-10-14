@@ -7,17 +7,13 @@ import (
 	"time"
 )
 
-// AdminIssueGroup is one current failure reason. Counts are scoped to this
-// group and are not additive across pipeline stages: a blob may have failed
-// in both encoding and embedding.
+// AdminIssueGroup is one current failure reason. FailureCount's dimension is
+// explicit because stages count different entities and groups may overlap.
 type AdminIssueGroup struct {
 	Stage        string `json:"stage"`
 	ErrorCode    string `json:"errorCode"`
 	FailureCount int64  `json:"failureCount"`
-	BlobCount    int64  `json:"blobCount"`
-	PhotoCount   int64  `json:"photoCount"`
-	AlbumCount   int64  `json:"albumCount"`
-	EntryCount   int64  `json:"entryCount,omitempty"`
+	CountUnit    string `json:"countUnit"`
 }
 
 // AdminIssuesSnapshot contains a bounded reason catalog and the exact number
@@ -40,36 +36,31 @@ func (s *Store) AdminIssues(ctx context.Context) (AdminIssuesSnapshot, error) {
 	query := `WITH issue_groups AS (
 		SELECT 'encoding' AS stage,
 			CASE WHEN COALESCE(o.error_code, '') = '' THEN 'legacy_unknown' ELSE o.error_code END AS error_code,
-			COUNT(DISTINCT b.hash) AS failure_count, COUNT(p.hash) AS photo_count,
-			COUNT(DISTINCT p.album_id) AS album_count, 0 AS entry_count
+			COUNT(*) AS failure_count, 'blobs' AS count_unit
 		FROM blobs b
 		LEFT JOIN blob_stage_observations o ON o.blob_hash=b.hash AND o.stage='encoding'
-		LEFT JOIN photos p ON p.hash=b.hash
 		WHERE b.encoding_status='failed'
 		GROUP BY error_code
 		UNION ALL
 		SELECT 'embedding',
 			CASE WHEN COALESCE(o.error_code, '') = '' THEN 'legacy_unknown' ELSE o.error_code END,
-			COUNT(DISTINCT b.hash), COUNT(p.hash), COUNT(DISTINCT p.album_id), 0
+			COUNT(*), 'blobs'
 		FROM blobs b
 		LEFT JOIN blob_stage_observations o ON o.blob_hash=b.hash AND o.stage='embedding'
-		LEFT JOIN photos p ON p.hash=b.hash
 		WHERE b.embedding_status='failed'
 		GROUP BY 2
 		UNION ALL
-		SELECT 'album_extraction', 'legacy_unknown', COUNT(DISTINCT a.id),
-			COUNT(p.hash), COUNT(DISTINCT a.id), 0
-		FROM albums a LEFT JOIN photos p ON p.album_id=a.id
-		WHERE a.status='FAILED'
-		HAVING COUNT(DISTINCT a.id)>0
+		SELECT 'album_extraction', 'legacy_unknown', COUNT(*), 'albums'
+		FROM albums WHERE status='FAILED'
+		HAVING COUNT(*)>0
 		UNION ALL
-		SELECT 'extraction_entry', e.reason_code, COUNT(*), 0, COUNT(DISTINCT r.album_id), COUNT(*)
+		SELECT 'extraction_entry', e.reason_code, COUNT(*), 'entries'
 		FROM extraction_entry_outcomes e
 		JOIN extraction_runs r ON r.id=e.run_id
 		WHERE e.outcome='failed' AND r.status!='running' AND r.id=(SELECT MAX(latest.id) FROM extraction_runs latest WHERE latest.album_id=r.album_id)
 		GROUP BY e.reason_code
 	)
-	SELECT stage, error_code, failure_count, photo_count, album_count, entry_count
+	SELECT stage, error_code, failure_count, count_unit
 	FROM issue_groups
 	ORDER BY failure_count DESC, stage ASC, error_code ASC LIMIT ?`
 	rows, err := tx.QueryContext(ctx, query, maxAdminIssueGroups+1)
@@ -79,16 +70,9 @@ func (s *Store) AdminIssues(ctx context.Context) (AdminIssuesSnapshot, error) {
 	groups := make([]AdminIssueGroup, 0, maxAdminIssueGroups+1)
 	for rows.Next() {
 		var group AdminIssueGroup
-		if err := rows.Scan(&group.Stage, &group.ErrorCode, &group.FailureCount, &group.PhotoCount, &group.AlbumCount, &group.EntryCount); err != nil {
+		if err := rows.Scan(&group.Stage, &group.ErrorCode, &group.FailureCount, &group.CountUnit); err != nil {
 			_ = rows.Close()
 			return AdminIssuesSnapshot{}, fmt.Errorf("scan admin issue group: %w", err)
-		}
-		if group.Stage == "encoding" || group.Stage == "embedding" {
-			group.BlobCount = group.FailureCount
-		} else if group.Stage == "album_extraction" {
-			group.BlobCount = 0
-			// Failed albums' blob references are counted distinctly in a single
-			// grouped read below; this placeholder is overwritten there.
 		}
 		groups = append(groups, group)
 	}
@@ -98,19 +82,6 @@ func (s *Store) AdminIssues(ctx context.Context) (AdminIssuesSnapshot, error) {
 	}
 	if err := rows.Close(); err != nil {
 		return AdminIssuesSnapshot{}, fmt.Errorf("close admin issue groups: %w", err)
-	}
-
-	// Album failures form one deliberately unclassified legacy bucket. Count
-	// distinct referenced blobs across its albums without exposing raw errors.
-	var failedAlbumBlobs int64
-	if err := tx.QueryRowContext(ctx, `SELECT COUNT(DISTINCT p.hash) FROM albums a JOIN photos p ON p.album_id=a.id
-		JOIN blobs b ON b.hash=p.hash WHERE a.status='FAILED'`).Scan(&failedAlbumBlobs); err != nil {
-		return AdminIssuesSnapshot{}, fmt.Errorf("count failed-album blobs: %w", err)
-	}
-	for i := range groups {
-		if groups[i].Stage == "album_extraction" {
-			groups[i].BlobCount = failedAlbumBlobs
-		}
 	}
 
 	var total int64
@@ -182,6 +153,8 @@ func (s *Store) AdminLatestExtractionFailures(ctx context.Context, reasonCode, a
 // unknown instead of falling back to blob.created_at.
 type AdminDiagnosticsSnapshot struct {
 	ExpectedVectorPoints   int64
+	UnreferencedBlobs      int64
+	MissingBlobPhotos      int64
 	EncodingExpiredLeases  int64
 	EmbeddingExpiredLeases int64
 	EncodingQueue          AdminQueueDiagnostics
@@ -215,9 +188,12 @@ func (s *Store) AdminDiagnostics(ctx context.Context) (AdminDiagnosticsSnapshot,
 	var result AdminDiagnosticsSnapshot
 	if err := tx.QueryRowContext(ctx, `SELECT
 		(SELECT COUNT(*) FROM photos p JOIN blobs b ON b.hash=p.hash WHERE b.embedding_status='ready'),
+		(SELECT COUNT(*) FROM blobs b WHERE NOT EXISTS (SELECT 1 FROM photos p WHERE p.hash=b.hash)),
+		(SELECT COUNT(*) FROM photos p WHERE NOT EXISTS (SELECT 1 FROM blobs b WHERE b.hash=p.hash)),
 		(SELECT COUNT(*) FROM blobs WHERE encoding_status='leased' AND encoding_lease_until < ?),
 		(SELECT COUNT(*) FROM blobs WHERE embedding_status='processing' AND embedding_lease_until < ?)`,
-		now.UnixMilli(), now.UnixMilli()).Scan(&result.ExpectedVectorPoints, &result.EncodingExpiredLeases, &result.EmbeddingExpiredLeases); err != nil {
+		now.UnixMilli(), now.UnixMilli()).Scan(&result.ExpectedVectorPoints, &result.UnreferencedBlobs, &result.MissingBlobPhotos,
+		&result.EncodingExpiredLeases, &result.EmbeddingExpiredLeases); err != nil {
 		return AdminDiagnosticsSnapshot{}, fmt.Errorf("read admin diagnostics counts: %w", err)
 	}
 	result.EncodingQueue, err = queryAdminQueueDiagnostics(ctx, tx, "encoding", adminEncodingCategoryExpr, "queued")

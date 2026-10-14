@@ -116,7 +116,7 @@ Notes:
 | POST | `/api/encoding/claim`, `/renew`, `/complete`, `/output` | External WebP encoder lease/result API, enabled when `WORKER_TOKEN` is set. New workers request `outputMode: "api"`; result streams go to `/output`, are spooled under `$STATE_DIR/encoding-spool`, and are asynchronously validated before a conditional S3 write. Claims without that mode retain the legacy presigned-PUT contract during rollout. |
 | GET | `/admin` | Independent React admin browser; enabled only when `ADMIN_TOKEN` is set. |
 | GET | `/admin/legacy` | Existing operational stats and embedding/encoding recovery dashboard, preserved during the admin UI rollout. |
-| GET | `/admin/api/overview` | Catalog-only pipeline totals and normalized/raw state breakdowns. |
+| GET | `/admin/api/overview` | Catalog-only inventory totals and unique-blob normalized/raw pipeline breakdowns. |
 | GET | `/admin/api/issues` | Bounded groups of current pipeline/archive failures and latest-run failed extraction entries. |
 | GET | `/admin/api/diagnostics` | Read-only lease, queue-age, commit, activity, feature-flag, and optional vector-count snapshot. |
 | GET | `/admin/api/photos` | Paged photo rows with album metadata and current encoding/embedding state. |
@@ -125,7 +125,7 @@ Notes:
 | GET | `/admin/api/blobs/{hash}` | One blob with relation counts and current per-stage observations; fetch references through the paged photo list. |
 | GET | `/admin/api/blobs/{hash}/history` | Bounded, cursor-paged stage attempt and major-transition history. |
 | GET | `/admin/api/albums` | Paged album processing state, error, and actual photo-row count. |
-| GET | `/admin/api/albums/{id}` | Album processing state and overview-equivalent counts for its referenced blobs/photos. |
+| GET | `/admin/api/albums/{id}` | Album processing state and exact scoped counts for its referenced blobs/photos. |
 | GET | `/admin/api/albums/{id}/extractions` | Cursor-paged append-only extraction runs, newest first. |
 | GET | `/admin/api/albums/{id}/entries` | Cursor-paged outcomes for the latest run, or a requested `runId`; supports `outcome`. |
 | GET | `/admin/api/extraction-failures` | Cursor-paged failed entries from each album's latest run when terminal, filtered by `reasonCode`. |
@@ -196,16 +196,25 @@ only stores structured event/status/error codes: worker tokens, stage keys,
 signed URLs, and raw error text are not copied into it. The detail UI renders
 null timestamps as unavailable and keeps history paging bounded.
 `GET /admin/api/albums` accepts a literal-substring `q`, `status` (`QUEUED`,
-`PROCESSING`, `SUCCEEDED`, or `FAILED`), `limit`, and `cursor`. Album detail
-pipeline breakdowns use the same category/raw-state meanings and count units as
-the overview, scoped to that album; its referenced photos are available through
-`GET /admin/api/photos?albumId={id}`.
-`library.photos` and album `photoCount` include every photo row, while pipeline
-category photo counts include only rows with a blob. Therefore the encoding or
-embedding category `photoCount` sum plus `missingBlobPhotos` equals the total
-photo count (assuming photo rows reference existing albums). The overview's
-`library.missingBlobPhotos` and album detail's `missingBlobPhotos` are counted
-in their respective catalog read transactions.
+`PROCESSING`, `SUCCEEDED`, or `FAILED`), `limit`, and `cursor`. The overview's
+library `albums`, `photos`, and `blobs` are inventory totals. Its encoding and
+embedding categories, skipped-content-type reasons, and raw-state maps each
+count every unique blob exactly once in their respective partition; each item
+is `{blobCount}` only. The grouped overview query reads `blobs` without joining
+photos, so shared references, dangling photo rows, and unreferenced blobs do not
+change pipeline counts. Overview links open the corresponding blob filter.
+Library photo/album totals are not apportioned across pipeline states.
+
+Album detail retains the exact scoped `PipelineCounts` contract: `blobCount`
+counts distinct blobs, `photoCount` counts photo rows that have a matching blob,
+and `albumCount` counts distinct referencing albums (within that album scope).
+Its referenced photos are available through `GET /admin/api/photos?albumId={id}`.
+Album detail also retains its scoped `missingBlobPhotos` integrity count. The
+overview omits the expensive unreferenced-blob and missing-blob-photo checks;
+those explicit integrity counts are available on demand in
+`GET /admin/api/diagnostics` under `integrity`. `unreferencedBlobs` links to the
+exact blob-list filter; there is not currently a list filter for dangling
+photo rows.
 
 The admin browser has **이슈** (`/admin/issues`), **시스템 진단**
 (`/admin/diagnostics`), and **복구 운영** tabs. Recovery operations use the
@@ -214,17 +223,20 @@ query parameter. Keeping this tab on the registered root route avoids adding a
 server route. `GET /admin/api/issues` is a read-only snapshot:
 encoding and embedding groups include only blobs whose *current* stage status is
 `failed`, and group by the safe observation `errorCode` (missing/legacy codes
-are `legacy_unknown`). A blob that failed both stages appears in both groups;
-counts are independent per group and must not be added across stages. Blob,
-photo-row, and distinct album counts are reported where applicable. Current
-`FAILED` album rows form one `album_extraction / legacy_unknown` group: raw album
+are `legacy_unknown`). Each group reports `failureCount` and an explicit
+`countUnit: "blobs"`; a blob that failed both stages appears in both groups and
+groups are independent. Current `FAILED` album rows form one
+`album_extraction / legacy_unknown` group with `countUnit: "albums"`: raw album
 errors are not classified or returned by this endpoint. Failed extraction
 entries come only from each album's latest run, and only once that run is
-**terminal**, grouped by their validated reason code; a running latest run does
-not fall back to failures from an older run.
-Groups are ordered by failure count and capped at 100. `truncated` and
+**terminal**, grouped by their validated reason code with `countUnit: "entries"`;
+a running latest run does not fall back to failures from an older run. Issue
+groups contain no photo, album-reference, or related-blob counts.
+Groups are ordered by `failureCount` and capped at 100. `truncated` and
 `remainingGroups` explicitly report omitted reason groups rather than silently
-dropping them. Group counts overlap where rows share blobs or albums.
+dropping them. Counts use different units by stage and are not comparable or
+additive across stages. The UI links each count to the matching blob, album, or
+latest-extraction-entry list.
 
 Pipeline issue links use `encodingErrorCode` and `embeddingErrorCode` on both
 `GET /admin/api/photos` and `/admin/api/blobs`. Each filter is exact and only
@@ -252,9 +264,11 @@ history is append-only, but only its latest run contributes to current issue
 groups after it becomes terminal; older runs are not substituted while the
 latest run is in progress.
 
-`GET /admin/api/diagnostics` does not mutate queues or start scans. Its catalog
-measurements include stage-specific expired lease counts; encoding-queued,
-embedding-queued, and embedding-blocked counts with their oldest available
+`GET /admin/api/diagnostics` does not mutate queues or start background work.
+This endpoint is loaded only when the diagnostics page is opened. Its catalog
+measurements include the explicit integrity counts `integrity.unreferencedBlobs`
+and `integrity.missingBlobPhotos`, plus stage-specific expired lease counts;
+encoding-queued, embedding-queued, and embedding-blocked counts with their oldest available
 `status_changed_at` ages; and the encoding `committing` and
 `reconciling` counts. Each queue's `unknownAgeCount` counts rows in that exact
 reported category without a matching recorded pending observation timestamp.

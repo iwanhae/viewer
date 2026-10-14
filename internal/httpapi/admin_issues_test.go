@@ -21,6 +21,7 @@ func seedIssueCatalog(t *testing.T, store *catalog.Store) {
 		{ID: "album-a", OriginalFilename: "alpha.zip", Status: catalog.AlbumStatusReady},
 		{ID: "album-b", OriginalFilename: "beta.zip", Status: catalog.AlbumStatusFailed, Error: "extract password=must-not-appear"},
 		{ID: "album-c", OriginalFilename: "gamma.zip", Status: catalog.AlbumStatusReady},
+		{ID: "album-empty-failed", OriginalFilename: "empty.zip", Status: catalog.AlbumStatusFailed},
 	} {
 		if err := store.CreateAlbum(ctx, album); err != nil {
 			t.Fatal(err)
@@ -163,24 +164,29 @@ func TestAdminIssuesGroupsOnlyCurrentFailuresAndPagesLatestExtractionEntries(t *
 		groups[group.Stage+":"+group.ErrorCode] = group
 	}
 	encoding := groups["encoding:invalid_source"]
-	if encoding.FailureCount != 1 || encoding.BlobCount != 1 || encoding.PhotoCount != 3 || encoding.AlbumCount != 2 {
-		t.Fatalf("shared encoding issue counts=%+v; want one blob, 3 photos, 2 albums", encoding)
+	if encoding.FailureCount != 1 || encoding.CountUnit != "blobs" {
+		t.Fatalf("shared encoding issue counts=%+v; want one blob", encoding)
 	}
 	embedding := groups["embedding:embedding_failed"]
-	if embedding.FailureCount != 1 || embedding.BlobCount != 1 || embedding.PhotoCount != 3 || embedding.AlbumCount != 2 {
+	if embedding.FailureCount != 1 || embedding.CountUnit != "blobs" {
 		t.Fatalf("shared embedding issue counts=%+v; same blob should be independently counted", embedding)
 	}
 	legacy := groups["encoding:legacy_unknown"]
-	if legacy.FailureCount != 1 || legacy.PhotoCount != 1 || legacy.AlbumCount != 1 {
+	if legacy.FailureCount != 1 || legacy.CountUnit != "blobs" {
 		t.Fatalf("legacy issue=%+v", legacy)
 	}
 	archive := groups["album_extraction:legacy_unknown"]
-	if archive.FailureCount != 1 || archive.AlbumCount != 1 || archive.PhotoCount != 2 || archive.BlobCount != 2 {
+	if archive.FailureCount != 2 || archive.CountUnit != "albums" {
 		t.Fatalf("failed album issue=%+v; raw album errors must not split groups", archive)
 	}
 	entries := groups["extraction_entry:invalid_image"]
-	if entries.FailureCount != 2 || entries.EntryCount != 2 || entries.AlbumCount != 2 {
+	if entries.FailureCount != 2 || entries.CountUnit != "entries" {
 		t.Fatalf("latest extraction entry issue=%+v; resolved old run must not count", entries)
+	}
+	for _, removedKey := range []string{`"blobCount"`, `"photoCount"`, `"albumCount"`, `"entryCount"`} {
+		if strings.Contains(issuesResponse.Body.String(), removedKey) {
+			t.Fatalf("issues contract contains obsolete relation count %s: %s", removedKey, issuesResponse.Body.String())
+		}
 	}
 	if _, exists := groups["embedding:legacy_unknown"]; exists {
 		t.Fatalf("resolved failed embedding was reported current: %+v", groups)

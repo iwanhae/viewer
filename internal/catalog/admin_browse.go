@@ -113,21 +113,21 @@ type AdminAlbum struct {
 	PhotoCount       int64  `json:"photoCount"`
 }
 
-// AdminEncodingBreakdown mirrors the overview's encoding shape for one album.
+// AdminEncodingBreakdown exposes relation-aware pipeline counts scoped to one album.
 type AdminEncodingBreakdown struct {
 	Categories     map[string]PipelineCounts `json:"categories"`
 	SkippedReasons map[string]PipelineCounts `json:"skippedReasons"`
 	RawStates      map[string]PipelineCounts `json:"rawStates"`
 }
 
-// AdminEmbeddingBreakdown mirrors the overview's embedding shape for one album.
+// AdminEmbeddingBreakdown exposes relation-aware pipeline counts scoped to one album.
 type AdminEmbeddingBreakdown struct {
 	Categories map[string]PipelineCounts `json:"categories"`
 	RawStates  map[string]PipelineCounts `json:"rawStates"`
 }
 
-// AdminAlbumDetail adds the overview-shaped pipeline breakdowns for the
-// distinct blobs and photo rows referenced by one album.
+// AdminAlbumDetail adds exact pipeline breakdowns for blobs and photo rows
+// referenced by one album.
 type AdminAlbumDetail struct {
 	ID                 string                  `json:"id"`
 	OriginalFilename   string                  `json:"originalFilename"`
@@ -400,8 +400,8 @@ func (s *Store) AdminAlbums(ctx context.Context, filters AdminAlbumFilters, afte
 	return albums, nil
 }
 
-// AdminAlbumByID returns processing metadata and overview-equivalent counts for
-// blobs/photos referenced by the album. All component reads share one snapshot.
+// AdminAlbumByID returns processing metadata and exact scoped counts for blobs
+// and photos referenced by the album. All component reads share one snapshot.
 func (s *Store) AdminAlbumByID(ctx context.Context, albumID string) (AdminAlbumDetail, error) {
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {

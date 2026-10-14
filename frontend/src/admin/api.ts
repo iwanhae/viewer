@@ -4,6 +4,8 @@ export type PipelineCounts = {
   albumCount: number
 }
 
+export type BlobCounts = { blobCount: number }
+
 export type Overview = {
   measuredAt: string
   units: { counts: string; measuredAt: string }
@@ -11,17 +13,15 @@ export type Overview = {
     albums: number
     photos: number
     blobs: number
-    unreferencedBlobs: number
-    missingBlobPhotos: number
   }
   encoding: {
-    categories: Record<string, PipelineCounts>
-    skippedReasons: Record<string, PipelineCounts>
-    rawStates: Record<string, PipelineCounts>
+    categories: Record<string, BlobCounts>
+    skippedReasons: Record<string, BlobCounts>
+    rawStates: Record<string, BlobCounts>
   }
   embedding: {
-    categories: Record<string, PipelineCounts>
-    rawStates: Record<string, PipelineCounts>
+    categories: Record<string, BlobCounts>
+    rawStates: Record<string, BlobCounts>
   }
 }
 
@@ -29,10 +29,7 @@ export type IssueGroup = {
   stage: 'encoding' | 'embedding' | 'album_extraction' | 'extraction_entry' | string
   errorCode: string
   failureCount: number
-  blobCount: number
-  photoCount: number
-  albumCount: number
-  entryCount?: number
+  countUnit: 'blobs' | 'albums' | 'entries'
 }
 
 export type Issues = {
@@ -87,6 +84,7 @@ export type Diagnostics = {
     oldestKnownStartedAt: string | null
     unknownStartCount: number
   }
+  integrity: { unreferencedBlobs: number; missingBlobPhotos: number }
   workerActivity: { lastClaimUnixMs: number; lastRenewUnixMs: number; lastResultsUnixMs: number }
   workerActivityScope: string
   vectorCount: {

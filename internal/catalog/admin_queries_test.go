@@ -2,6 +2,7 @@ package catalog
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -72,44 +73,37 @@ func TestAdminOverviewPipelineBreakdownsAndClaimEligibility(t *testing.T) {
 	if err != nil {
 		t.Fatalf("admin overview: %v", err)
 	}
-	if snapshot.Albums != 2 || snapshot.Photos != 13 || snapshot.Blobs != 11 || snapshot.UnreferencedBlobs != 1 || snapshot.MissingBlobPhotos != 1 {
-		t.Fatalf("library counts=%+v want albums=2 photos=13 blobs=11 unreferenced=1 missingBlobPhotos=1", snapshot)
+	if snapshot.Albums != 2 || snapshot.Photos != 13 || snapshot.Blobs != 11 {
+		t.Fatalf("library counts=%+v want albums=2 photos=13 blobs=11", snapshot)
 	}
 
-	// Category blob/photo totals partition the catalog. AlbumCount is distinct
-	// per category, so the shared blob can make those category counts overlap.
-	assertPipelineTotals(t, "encoding", snapshot.EncodingCategories, 11, 12)
-	assertPipelineTotals(t, "embedding", snapshot.EmbeddingCategories, 11, 12)
-	assertPipelineTotals(t, "encoding raw states", snapshot.EncodingRawStates, 11, 12)
-	assertPipelineTotals(t, "embedding raw states", snapshot.EmbeddingRawStates, 11, 12)
-	var pipelinePhotoRows int64
-	for _, counts := range snapshot.EncodingCategories {
-		pipelinePhotoRows += counts.PhotoCount
-	}
-	if pipelinePhotoRows+snapshot.MissingBlobPhotos != snapshot.Photos {
-		t.Fatalf("photo accounting pipeline=%d missingBlobPhotos=%d total=%d", pipelinePhotoRows, snapshot.MissingBlobPhotos, snapshot.Photos)
-	}
+	// Each blob is counted once per partition, regardless of repeated photo
+	// references or albums. The shared blob is present in three photo rows.
+	assertBlobTotals(t, "encoding", snapshot.EncodingCategories, 11)
+	assertBlobTotals(t, "embedding", snapshot.EmbeddingCategories, 11)
+	assertBlobTotals(t, "encoding raw states", snapshot.EncodingRawStates, 11)
+	assertBlobTotals(t, "embedding raw states", snapshot.EmbeddingRawStates, 11)
 
-	assertCounts(t, "encoding queued", snapshot.EncodingCategories["queued"], 2, 4, 2)
-	assertCounts(t, "encoding processing", snapshot.EncodingCategories["processing"], 1, 1, 1)
-	assertCounts(t, "encoding validating", snapshot.EncodingCategories["validating"], 1, 1, 1)
-	assertCounts(t, "encoding committing", snapshot.EncodingCategories["committing"], 1, 1, 1)
-	assertCounts(t, "encoding completed", snapshot.EncodingCategories["completed"], 1, 1, 1)
-	assertCounts(t, "encoding skipped", snapshot.EncodingCategories["skipped"], 2, 2, 1)
-	assertCounts(t, "encoding failed", snapshot.EncodingCategories["failed"], 2, 2, 2)
-	assertCounts(t, "encoding unknown includes unreferenced", snapshot.EncodingCategories["unknown"], 1, 0, 0)
-	assertCounts(t, "skipped WebP", snapshot.EncodingSkippedReasons["webp"], 1, 1, 1)
-	assertCounts(t, "skipped non-WebP", snapshot.EncodingSkippedReasons["nonWebp"], 1, 1, 1)
+	assertBlobCount(t, "encoding queued", snapshot.EncodingCategories["queued"], 2)
+	assertBlobCount(t, "encoding processing", snapshot.EncodingCategories["processing"], 1)
+	assertBlobCount(t, "encoding validating", snapshot.EncodingCategories["validating"], 1)
+	assertBlobCount(t, "encoding committing", snapshot.EncodingCategories["committing"], 1)
+	assertBlobCount(t, "encoding completed", snapshot.EncodingCategories["completed"], 1)
+	assertBlobCount(t, "encoding skipped", snapshot.EncodingCategories["skipped"], 2)
+	assertBlobCount(t, "encoding failed", snapshot.EncodingCategories["failed"], 2)
+	assertBlobCount(t, "encoding unknown includes unreferenced", snapshot.EncodingCategories["unknown"], 1)
+	assertBlobCount(t, "skipped WebP", snapshot.EncodingSkippedReasons["webp"], 1)
+	assertBlobCount(t, "skipped non-WebP", snapshot.EncodingSkippedReasons["nonWebp"], 1)
 	if _, ok := snapshot.EncodingRawStates["future-encoding"]; !ok {
 		t.Fatalf("unknown encoding raw state was lost: %v", snapshot.EncodingRawStates)
 	}
 
-	assertCounts(t, "embedding queued", snapshot.EmbeddingCategories["queued"], 4, 6, 2)
-	assertCounts(t, "embedding blocked", snapshot.EmbeddingCategories["blocked"], 2, 2, 2)
-	assertCounts(t, "embedding processing", snapshot.EmbeddingCategories["processing"], 1, 1, 1)
-	assertCounts(t, "embedding completed", snapshot.EmbeddingCategories["completed"], 2, 2, 2)
-	assertCounts(t, "embedding failed", snapshot.EmbeddingCategories["failed"], 1, 1, 1)
-	assertCounts(t, "embedding unknown", snapshot.EmbeddingCategories["unknown"], 1, 0, 0)
+	assertBlobCount(t, "embedding queued", snapshot.EmbeddingCategories["queued"], 4)
+	assertBlobCount(t, "embedding blocked", snapshot.EmbeddingCategories["blocked"], 2)
+	assertBlobCount(t, "embedding processing", snapshot.EmbeddingCategories["processing"], 1)
+	assertBlobCount(t, "embedding completed", snapshot.EmbeddingCategories["completed"], 2)
+	assertBlobCount(t, "embedding failed", snapshot.EmbeddingCategories["failed"], 1)
+	assertBlobCount(t, "embedding unknown", snapshot.EmbeddingCategories["unknown"], 1)
 	if _, ok := snapshot.EmbeddingRawStates["future-embedding"]; !ok {
 		t.Fatalf("unknown embedding raw state was lost: %v", snapshot.EmbeddingRawStates)
 	}
@@ -140,21 +134,73 @@ func TestAdminOverviewPipelineBreakdownsAndClaimEligibility(t *testing.T) {
 	}
 }
 
-func assertPipelineTotals(t *testing.T, name string, groups map[string]PipelineCounts, blobs, photos int64) {
-	t.Helper()
-	var gotBlobs, gotPhotos int64
-	for _, counts := range groups {
-		gotBlobs += counts.BlobCount
-		gotPhotos += counts.PhotoCount
+func TestAdminOverviewEmbeddingGateClassificationMatchesClaimsForAllCombinations(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "catalog.db"), nil)
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
 	}
-	if gotBlobs != blobs || gotPhotos != photos {
-		t.Fatalf("%s totals blobs=%d photos=%d want blobs=%d photos=%d (%v)", name, gotBlobs, gotPhotos, blobs, photos, groups)
+	t.Cleanup(func() { _ = store.Close() })
+	ctx := context.Background()
+	encodingStates := []string{"pending", "leased", "received", "committing", "done", "skipped", "failed", "future"}
+	for _, encodingStatus := range encodingStates {
+		for _, gate := range []bool{false, true} {
+			hash := fmt.Sprintf("%s-gate-%t", encodingStatus, gate)
+			if err := store.UpsertBlob(ctx, Blob{Hash: hash, ContentType: "image/jpeg", EncodingGate: gate}); err != nil {
+				t.Fatalf("upsert %s: %v", hash, err)
+			}
+			if _, err := store.db.ExecContext(ctx, `UPDATE blobs SET encoding_status=?, embedding_status='pending' WHERE hash=?`, encodingStatus, hash); err != nil {
+				t.Fatalf("set state for %s: %v", hash, err)
+			}
+		}
+	}
+
+	snapshot, err := store.AdminOverview(ctx)
+	if err != nil {
+		t.Fatalf("admin overview: %v", err)
+	}
+	if got := snapshot.EmbeddingCategories["queued"].BlobCount; got != 11 {
+		t.Fatalf("queued blobs=%d want 11 for gate=0 plus done/skipped/failed gate=1", got)
+	}
+	if got := snapshot.EmbeddingCategories["blocked"].BlobCount; got != 5 {
+		t.Fatalf("blocked blobs=%d want 5 for pending/leased/received/committing/future gate=1", got)
+	}
+
+	claimed, err := store.ClaimPendingEmbeddings(ctx, 32, time.Now().Add(time.Minute))
+	if err != nil {
+		t.Fatalf("claim pending embeddings: %v", err)
+	}
+	claimedHashes := make(map[string]bool, len(claimed))
+	for _, item := range claimed {
+		claimedHashes[item.Hash] = true
+	}
+	if int64(len(claimedHashes)) != snapshot.EmbeddingCategories["queued"].BlobCount {
+		t.Fatalf("overview queued=%d but claim returned %d", snapshot.EmbeddingCategories["queued"].BlobCount, len(claimedHashes))
+	}
+	for _, status := range encodingStates {
+		for _, gate := range []bool{false, true} {
+			hash := fmt.Sprintf("%s-gate-%t", status, gate)
+			shouldClaim := !gate || status == "done" || status == "skipped" || status == "failed"
+			if claimedHashes[hash] != shouldClaim {
+				t.Errorf("claim eligibility %s=%v: got %v want %v", status, gate, claimedHashes[hash], shouldClaim)
+			}
+		}
 	}
 }
 
-func assertCounts(t *testing.T, name string, got PipelineCounts, blobs, photos, albums int64) {
+func assertBlobTotals(t *testing.T, name string, groups map[string]BlobCounts, blobs int64) {
 	t.Helper()
-	want := PipelineCounts{BlobCount: blobs, PhotoCount: photos, AlbumCount: albums}
+	var gotBlobs int64
+	for _, counts := range groups {
+		gotBlobs += counts.BlobCount
+	}
+	if gotBlobs != blobs {
+		t.Fatalf("%s totals blobs=%d want blobs=%d (%v)", name, gotBlobs, blobs, groups)
+	}
+}
+
+func assertBlobCount(t *testing.T, name string, got BlobCounts, blobs int64) {
+	t.Helper()
+	want := BlobCounts{BlobCount: blobs}
 	if got != want {
 		t.Errorf("%s=%+v want=%+v", name, got, want)
 	}

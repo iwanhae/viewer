@@ -6,11 +6,14 @@ import (
 	"fmt"
 )
 
-// PipelineCounts describes blobs in a catalog state and their references.
-// BlobCount is unique content, PhotoCount counts photo rows with a matching
-// blob, and AlbumCount counts distinct albums referencing those blobs (so
-// album counts overlap between categories). Dangling photo hashes are counted
-// separately as missing-blob photos, not as pipeline references.
+// BlobCounts describes a set of unique catalog blobs. It is used by the
+// library-wide overview, where relation counts are intentionally not computed.
+type BlobCounts struct {
+	BlobCount int64 `json:"blobCount"`
+}
+
+// PipelineCounts describes the exact blob and relation counts for a scoped
+// album drilldown. AlbumCount is distinct within each category.
 type PipelineCounts struct {
 	BlobCount  int64 `json:"blobCount"`
 	PhotoCount int64 `json:"photoCount"`
@@ -20,18 +23,16 @@ type PipelineCounts struct {
 // AdminOverviewSnapshot is a consistent catalog-only snapshot for the admin
 // overview. Raw-state maps retain states this version does not recognize.
 type AdminOverviewSnapshot struct {
-	Albums            int64
-	Photos            int64
-	Blobs             int64
-	UnreferencedBlobs int64
-	MissingBlobPhotos int64
+	Albums int64
+	Photos int64
+	Blobs  int64
 
-	EncodingCategories     map[string]PipelineCounts
-	EncodingSkippedReasons map[string]PipelineCounts
-	EncodingRawStates      map[string]PipelineCounts
+	EncodingCategories     map[string]BlobCounts
+	EncodingSkippedReasons map[string]BlobCounts
+	EncodingRawStates      map[string]BlobCounts
 
-	EmbeddingCategories map[string]PipelineCounts
-	EmbeddingRawStates  map[string]PipelineCounts
+	EmbeddingCategories map[string]BlobCounts
+	EmbeddingRawStates  map[string]BlobCounts
 }
 
 // These expressions are the canonical admin pipeline classifications. They
@@ -67,45 +68,14 @@ func (s *Store) AdminOverview(ctx context.Context) (AdminOverviewSnapshot, error
 	defer func() { _ = tx.Rollback() }()
 
 	var snapshot AdminOverviewSnapshot
-	if err := tx.QueryRowContext(ctx, `
-		SELECT
-			(SELECT COUNT(*) FROM albums),
-			(SELECT COUNT(*) FROM photos),
-			(SELECT COUNT(*) FROM blobs),
-			(SELECT COUNT(*) FROM blobs b WHERE NOT EXISTS (
-				SELECT 1 FROM photos p WHERE p.hash = b.hash
-			)),
-			(SELECT COUNT(*) FROM photos p WHERE NOT EXISTS (
-				SELECT 1 FROM blobs b WHERE b.hash = p.hash
-			))`).Scan(
-		&snapshot.Albums, &snapshot.Photos, &snapshot.Blobs, &snapshot.UnreferencedBlobs, &snapshot.MissingBlobPhotos,
+	if err := tx.QueryRowContext(ctx, `SELECT (SELECT COUNT(*) FROM albums), (SELECT COUNT(*) FROM photos)`).Scan(
+		&snapshot.Albums, &snapshot.Photos,
 	); err != nil {
 		return AdminOverviewSnapshot{}, fmt.Errorf("read admin overview library counts: %w", err)
 	}
 
-	var queryErr error
-	snapshot.EncodingCategories, queryErr = queryAdminPipelineCounts(ctx, tx, adminEncodingCategoryExpr, "")
-	if queryErr != nil {
-		return AdminOverviewSnapshot{}, fmt.Errorf("read admin overview encoding categories: %w", queryErr)
-	}
-	snapshot.EncodingSkippedReasons, queryErr = queryAdminPipelineCounts(ctx, tx,
-		adminEncodingSkippedReasonExpr,
-		`WHERE b.encoding_status = 'skipped'`)
-	if queryErr != nil {
-		return AdminOverviewSnapshot{}, fmt.Errorf("read admin overview skipped encoding reasons: %w", queryErr)
-	}
-	snapshot.EncodingRawStates, queryErr = queryAdminPipelineCounts(ctx, tx, `b.encoding_status`, "")
-	if queryErr != nil {
-		return AdminOverviewSnapshot{}, fmt.Errorf("read admin overview encoding raw states: %w", queryErr)
-	}
-
-	snapshot.EmbeddingCategories, queryErr = queryAdminPipelineCounts(ctx, tx, adminEmbeddingCategoryExpr, "")
-	if queryErr != nil {
-		return AdminOverviewSnapshot{}, fmt.Errorf("read admin overview embedding categories: %w", queryErr)
-	}
-	snapshot.EmbeddingRawStates, queryErr = queryAdminPipelineCounts(ctx, tx, `b.embedding_status`, "")
-	if queryErr != nil {
-		return AdminOverviewSnapshot{}, fmt.Errorf("read admin overview embedding raw states: %w", queryErr)
+	if err := readAdminBlobBreakdown(ctx, tx, &snapshot); err != nil {
+		return AdminOverviewSnapshot{}, fmt.Errorf("read admin overview blob breakdown: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -114,31 +84,50 @@ func (s *Store) AdminOverview(ctx context.Context) (AdminOverviewSnapshot, error
 	return snapshot, nil
 }
 
-// queryAdminPipelineCounts groups a fixed, internal SQL category expression.
-// Every category query starts with blobs and uses the same left join, so
-// unreferenced blobs remain in blob counts while contributing zero photos and
-// albums; photo rows whose blob is missing cannot join and are counted apart.
-func queryAdminPipelineCounts(ctx context.Context, tx *sql.Tx, categoryExpr, where string) (map[string]PipelineCounts, error) {
-	query := `SELECT ` + categoryExpr + `, COUNT(DISTINCT b.hash), COUNT(p.hash), COUNT(DISTINCT p.album_id)
-		FROM blobs b LEFT JOIN photos p ON p.hash = b.hash ` + where + `
-		GROUP BY ` + categoryExpr + ` ORDER BY 1`
+// readAdminBlobBreakdown scans the blobs table once, grouping by all overview
+// classifications. It intentionally never joins photos: each blob contributes
+// exactly one to each stage/raw-state breakdown regardless of its references.
+func readAdminBlobBreakdown(ctx context.Context, tx *sql.Tx, snapshot *AdminOverviewSnapshot) error {
+	snapshot.EncodingCategories = make(map[string]BlobCounts)
+	snapshot.EncodingSkippedReasons = make(map[string]BlobCounts)
+	snapshot.EncodingRawStates = make(map[string]BlobCounts)
+	snapshot.EmbeddingCategories = make(map[string]BlobCounts)
+	snapshot.EmbeddingRawStates = make(map[string]BlobCounts)
+
+	query := `SELECT ` + adminEncodingCategoryExpr + `,
+		CASE WHEN b.encoding_status='skipped' THEN ` + adminEncodingSkippedReasonExpr + ` ELSE '' END,
+		b.encoding_status, ` + adminEmbeddingCategoryExpr + `, b.embedding_status, COUNT(*)
+		FROM blobs b
+		GROUP BY 1, 2, 3, 4, 5
+		ORDER BY 1, 2, 3, 4, 5`
 	rows, err := tx.QueryContext(ctx, query)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	defer rows.Close()
 
-	counts := make(map[string]PipelineCounts)
 	for rows.Next() {
-		var category string
-		var pipelineCounts PipelineCounts
-		if err := rows.Scan(&category, &pipelineCounts.BlobCount, &pipelineCounts.PhotoCount, &pipelineCounts.AlbumCount); err != nil {
-			return nil, fmt.Errorf("scan pipeline category: %w", err)
+		var encodingCategory, skippedReason, encodingRaw, embeddingCategory, embeddingRaw string
+		var count int64
+		if err := rows.Scan(&encodingCategory, &skippedReason, &encodingRaw, &embeddingCategory, &embeddingRaw, &count); err != nil {
+			return fmt.Errorf("scan overview blob group: %w", err)
 		}
-		counts[category] = pipelineCounts
+		snapshot.Blobs += count
+		snapshot.EncodingCategories[encodingCategory] = addBlobCounts(snapshot.EncodingCategories[encodingCategory], count)
+		if skippedReason != "" {
+			snapshot.EncodingSkippedReasons[skippedReason] = addBlobCounts(snapshot.EncodingSkippedReasons[skippedReason], count)
+		}
+		snapshot.EncodingRawStates[encodingRaw] = addBlobCounts(snapshot.EncodingRawStates[encodingRaw], count)
+		snapshot.EmbeddingCategories[embeddingCategory] = addBlobCounts(snapshot.EmbeddingCategories[embeddingCategory], count)
+		snapshot.EmbeddingRawStates[embeddingRaw] = addBlobCounts(snapshot.EmbeddingRawStates[embeddingRaw], count)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate pipeline categories: %w", err)
+		return fmt.Errorf("iterate overview blob groups: %w", err)
 	}
-	return counts, nil
+	return nil
+}
+
+func addBlobCounts(counts BlobCounts, count int64) BlobCounts {
+	counts.BlobCount += count
+	return counts
 }

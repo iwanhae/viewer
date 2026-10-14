@@ -6,18 +6,20 @@ import AdminApp from './ui'
 import type { AlbumDetail, Blob, ExtractionEntry, ExtractionRun, Overview, Photo } from './api'
 
 const pipeline = { blobCount: 1, photoCount: 2, albumCount: 1 }
+const blobCount = { blobCount: 1 }
+const noBlobs = { blobCount: 0 }
 const overview: Overview = {
   measuredAt: '2026-10-14T12:00:00Z',
   units: { counts: 'counts', measuredAt: 'RFC3339 UTC' },
-  library: { albums: 1, photos: 3, blobs: 1, unreferencedBlobs: 1, missingBlobPhotos: 1 },
+  library: { albums: 1, photos: 3, blobs: 1 },
   encoding: {
-    categories: { queued: pipeline, processing: { blobCount: 0, photoCount: 0, albumCount: 0 }, validating: { blobCount: 0, photoCount: 0, albumCount: 0 }, committing: { blobCount: 0, photoCount: 0, albumCount: 0 }, completed: { blobCount: 0, photoCount: 0, albumCount: 0 }, skipped: { blobCount: 0, photoCount: 0, albumCount: 0 }, failed: { blobCount: 0, photoCount: 0, albumCount: 0 }, unknown: { blobCount: 0, photoCount: 0, albumCount: 0 } },
-    skippedReasons: { webp: { blobCount: 0, photoCount: 0, albumCount: 0 }, nonWebp: { blobCount: 0, photoCount: 0, albumCount: 0 } },
-    rawStates: { future_encode_state: pipeline }
+    categories: { queued: blobCount, processing: noBlobs, validating: noBlobs, committing: noBlobs, completed: noBlobs, skipped: noBlobs, failed: noBlobs, unknown: noBlobs },
+    skippedReasons: { webp: noBlobs, nonWebp: noBlobs },
+    rawStates: { future_encode_state: blobCount }
   },
   embedding: {
-    categories: { queued: pipeline, blocked: { blobCount: 0, photoCount: 0, albumCount: 0 }, processing: { blobCount: 0, photoCount: 0, albumCount: 0 }, completed: { blobCount: 0, photoCount: 0, albumCount: 0 }, failed: { blobCount: 0, photoCount: 0, albumCount: 0 }, unknown: { blobCount: 0, photoCount: 0, albumCount: 0 } },
-    rawStates: { future_embed_state: pipeline }
+    categories: { queued: blobCount, blocked: noBlobs, processing: noBlobs, completed: noBlobs, failed: noBlobs, unknown: noBlobs },
+    rawStates: { future_embed_state: blobCount }
   }
 }
 
@@ -101,7 +103,7 @@ const recoveryOperation = (overrides: Record<string, unknown> = {}) => ({
 describe('admin React UI', () => {
   afterEach(() => { cleanup(); vi.unstubAllGlobals(); vi.restoreAllMocks() })
 
-  it('drills overview category counts into matching URL filters and preserves unknown raw states', async () => {
+  it('drills overview unique-blob counts into blob filters and preserves unknown raw states', async () => {
     const fetchMock = mockFetch((url) => url === '/admin/api/overview'
       ? jsonResponse(overview)
       : jsonResponse({ photos: [], nextCursor: null }))
@@ -109,14 +111,15 @@ describe('admin React UI', () => {
 
     const section = (await screen.findByRole('heading', { name: 'WebP 인코딩' })).parentElement!
     const row = await within(section).findByRole('row', { name: /대기 \(queued\)/ })
-    const photoCount = within(row).getByRole('link', { name: '2' })
-    expect(photoCount.getAttribute('href')).toBe('/photos?encoding=queued')
-    const rawLink = screen.getAllByRole('link', { name: '2' }).find((link) => link.getAttribute('href')?.includes('encodingRaw=future_encode_state'))
+    const countLink = within(row).getByRole('link', { name: '1' })
+    expect(countLink.getAttribute('href')).toBe('/blobs?encoding=queued')
+    const rawLink = screen.getAllByRole('link', { name: '1' }).find((link) => link.getAttribute('href')?.includes('encodingRaw=future_encode_state'))
     expect(rawLink?.getAttribute('href')).toContain('encodingRaw=future_encode_state')
-    expect(screen.getByText(/블롭이 없는 사진 1개가 있습니다/)).toBeTruthy()
-    expect(screen.getByText(/이 항목만 거르는 필터를 제공하지 않습니다/)).toBeTruthy()
-    fireEvent.click(photoCount)
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/admin/api/photos?encoding=queued', expect.anything()))
+    expect(screen.getByText(/사진·앨범 참조 수를 상태별로 나누지 않습니다/)).toBeTruthy()
+    expect(screen.queryByText(/블롭이 없는 사진/)).toBeNull()
+    fireEvent.click(countLink)
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/admin/api/blobs?encoding=queued', expect.anything()))
+    expect(fetchMock.mock.calls.some(([url]) => String(url) === '/admin/api/diagnostics')).toBe(false)
   })
 
   it('keeps supported list filters in the URL and renders missing-blob nullable fields', async () => {
@@ -263,7 +266,8 @@ describe('admin React UI', () => {
     expect(await screen.findByText('cover.png')).toBeTruthy()
     expect(screen.getByText(/최신 실행/)).toBeTruthy()
     expect(screen.getByText(/후보 수는 현재 추출기가 검사하는 이미지 확장자 항목 기준/)).toBeTruthy()
-    fireEvent.click(screen.getByRole('button', { name: '다음 항목 더 보기' }))
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/admin/api/albums/album-1/entries?limit=50&runId=2', expect.anything()))
+    fireEvent.click(await screen.findByRole('button', { name: '다음 항목 더 보기' }))
     expect(await screen.findByText('notes.txt')).toBeTruthy()
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/admin/api/albums/album-1/entries?limit=50&runId=2&cursor=entry-page', expect.anything()))
 
@@ -355,8 +359,8 @@ describe('admin React UI', () => {
       measuredAt: '2026-10-14T12:00:00Z', totalGroups: 2, remainingGroups: 0, truncated: false,
       countScope: 'Groups are independent.',
       groups: [
-        { stage: 'encoding', errorCode: 'invalid_source', failureCount: 1, blobCount: 1, photoCount: 2, albumCount: 1 },
-        { stage: 'extraction_entry', errorCode: 'invalid_image', failureCount: 2, entryCount: 2, blobCount: 0, photoCount: 0, albumCount: 2 }
+        { stage: 'encoding', errorCode: 'invalid_source', failureCount: 1, countUnit: 'blobs' },
+        { stage: 'extraction_entry', errorCode: 'invalid_image', failureCount: 2, countUnit: 'entries' }
       ]
     }
     const fetchMock = mockFetch((url) => {
@@ -372,6 +376,10 @@ describe('admin React UI', () => {
     expect(await screen.findByText('invalid_source')).toBeTruthy()
     expect(screen.getByText(/측정/)).toBeTruthy()
     expect(screen.getByText('Groups are independent.')).toBeTruthy()
+    const encodingRow = screen.getByRole('row', { name: /인코딩 invalid_source/ })
+    expect(within(encodingRow).getByText('고유 블롭')).toBeTruthy()
+    expect(screen.queryByRole('columnheader', { name: '사진 행' })).toBeNull()
+    expect(screen.getByText('실패 항목')).toBeTruthy()
     expect(screen.getByRole('link', { name: '이슈' })).toBeTruthy()
     const issueCount = screen.getByRole('link', { name: '1' })
     expect(issueCount.getAttribute('href')).toBe('/blobs?encoding=failed&encodingErrorCode=invalid_source')
@@ -696,6 +704,7 @@ describe('admin React UI', () => {
       embeddingQueue: { queuedCount: 4, oldestStatusChangedAt: '2026-10-14T10:00:00Z', oldestAgeSeconds: 7200, unknownAgeCount: 1 },
       embeddingBlockedQueue: { blockedCount: 2, oldestStatusChangedAt: '2026-10-14T09:00:00Z', oldestAgeSeconds: 10800, unknownAgeCount: 1 },
       encodingCommit: { committingCount: 1, reconcilingCount: 1, oldestKnownStartedAt: '2026-10-14T11:00:00Z', unknownStartCount: 0 },
+      integrity: { unreferencedBlobs: 2, missingBlobPhotos: 3 },
       workerActivity: { lastClaimUnixMs: 0, lastRenewUnixMs: 0, lastResultsUnixMs: 0 },
       workerActivityScope: 'Since server restart; attempt stamps are not heartbeats.',
       vectorCount: { status: 'available', measuredAt: '2026-10-14T12:00:02Z', expectedPoints: 4, actualPoints: 4, countAgreement: true }
@@ -710,6 +719,8 @@ describe('admin React UI', () => {
     expect(screen.getByRole('link', { name: '시스템 진단' })).toBeTruthy()
     expect(screen.getByRole('link', { name: '임베딩 차단 항목 보기' }).getAttribute('href')).toBe('/blobs?embedding=blocked')
     expect(screen.getByRole('link', { name: /인코딩 만료 리스/ }).getAttribute('href')).toBe('/blobs?encodingLeaseExpired=true')
+    expect(screen.getByRole('link', { name: /미참조 블롭/ }).getAttribute('href')).toBe('/blobs?unreferenced=true')
+    expect(screen.getByText('블롭 없는 사진')).toBeTruthy()
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/admin/api/diagnostics', expect.anything()))
   })
 })

@@ -255,8 +255,8 @@ func TestOverviewDoesNotConsultVectorCounter(t *testing.T) {
 	if counter.calls != 0 {
 		t.Fatalf("overview called CountVectors %d times, want zero", counter.calls)
 	}
-	if overview.Library.Albums != 2 || overview.Library.Photos != 4 || overview.Library.Blobs != 2 || overview.Library.MissingBlobPhotos != 1 {
-		t.Fatalf("overview library=%+v want albums=2 photos=4 blobs=2 missingBlobPhotos=1", overview.Library)
+	if overview.Library.Albums != 2 || overview.Library.Photos != 4 || overview.Library.Blobs != 2 {
+		t.Fatalf("overview library=%+v want albums=2 photos=4 blobs=2", overview.Library)
 	}
 	if overview.MeasuredAt == "" || overview.Units.MeasuredAt != "RFC3339 UTC" {
 		t.Fatalf("overview timestamp contract=%+v", overview)

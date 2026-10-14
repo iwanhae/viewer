@@ -9,61 +9,58 @@ import (
 )
 
 // OverviewUnits makes the units and timestamp format of the overview explicit.
-// Album counts are distinct within each category and may overlap across
-// categories. Blob and pipeline photo counts are additive across their
-// category sets; missing-blob photo rows are reported separately.
+// Pipeline breakdowns are unique-blob counts. Library photo and album totals
+// are inventory counts, not pipeline breakdowns.
 type OverviewUnits struct {
 	Counts     string `json:"counts"`
 	MeasuredAt string `json:"measuredAt"`
 }
 
 type OverviewLibraryCounts struct {
-	Albums            int64 `json:"albums"`
-	Photos            int64 `json:"photos"`
-	Blobs             int64 `json:"blobs"`
-	UnreferencedBlobs int64 `json:"unreferencedBlobs"`
-	MissingBlobPhotos int64 `json:"missingBlobPhotos"`
+	Albums int64 `json:"albums"`
+	Photos int64 `json:"photos"`
+	Blobs  int64 `json:"blobs"`
 }
 
 // EncodingCategories classify each blob by its raw encoder status.
 type EncodingCategories struct {
-	Queued     catalog.PipelineCounts `json:"queued"`
-	Processing catalog.PipelineCounts `json:"processing"`
-	Validating catalog.PipelineCounts `json:"validating"`
-	Committing catalog.PipelineCounts `json:"committing"`
-	Completed  catalog.PipelineCounts `json:"completed"`
-	Skipped    catalog.PipelineCounts `json:"skipped"`
-	Failed     catalog.PipelineCounts `json:"failed"`
-	Unknown    catalog.PipelineCounts `json:"unknown"`
+	Queued     catalog.BlobCounts `json:"queued"`
+	Processing catalog.BlobCounts `json:"processing"`
+	Validating catalog.BlobCounts `json:"validating"`
+	Committing catalog.BlobCounts `json:"committing"`
+	Completed  catalog.BlobCounts `json:"completed"`
+	Skipped    catalog.BlobCounts `json:"skipped"`
+	Failed     catalog.BlobCounts `json:"failed"`
+	Unknown    catalog.BlobCounts `json:"unknown"`
 }
 
 // EncodingSkippedReasons distinguishes only what stored content_type can
 // reliably establish. It does not infer why a non-WebP blob was skipped.
 type EncodingSkippedReasons struct {
-	WebP    catalog.PipelineCounts `json:"webp"`
-	NonWebP catalog.PipelineCounts `json:"nonWebp"`
+	WebP    catalog.BlobCounts `json:"webp"`
+	NonWebP catalog.BlobCounts `json:"nonWebp"`
 }
 
 type EncodingOverview struct {
-	Categories     EncodingCategories                `json:"categories"`
-	SkippedReasons EncodingSkippedReasons            `json:"skippedReasons"`
-	RawStates      map[string]catalog.PipelineCounts `json:"rawStates"`
+	Categories     EncodingCategories            `json:"categories"`
+	SkippedReasons EncodingSkippedReasons        `json:"skippedReasons"`
+	RawStates      map[string]catalog.BlobCounts `json:"rawStates"`
 }
 
 // EmbeddingCategories separates pending blobs by the exact gate condition the
 // claim query uses. Other statuses preserve the catalog's source state.
 type EmbeddingCategories struct {
-	Queued     catalog.PipelineCounts `json:"queued"`
-	Blocked    catalog.PipelineCounts `json:"blocked"`
-	Processing catalog.PipelineCounts `json:"processing"`
-	Completed  catalog.PipelineCounts `json:"completed"`
-	Failed     catalog.PipelineCounts `json:"failed"`
-	Unknown    catalog.PipelineCounts `json:"unknown"`
+	Queued     catalog.BlobCounts `json:"queued"`
+	Blocked    catalog.BlobCounts `json:"blocked"`
+	Processing catalog.BlobCounts `json:"processing"`
+	Completed  catalog.BlobCounts `json:"completed"`
+	Failed     catalog.BlobCounts `json:"failed"`
+	Unknown    catalog.BlobCounts `json:"unknown"`
 }
 
 type EmbeddingOverview struct {
-	Categories EmbeddingCategories               `json:"categories"`
-	RawStates  map[string]catalog.PipelineCounts `json:"rawStates"`
+	Categories EmbeddingCategories           `json:"categories"`
+	RawStates  map[string]catalog.BlobCounts `json:"rawStates"`
 }
 
 // Overview is a catalog-only view of the ingest pipeline. measuredAt is the
@@ -93,13 +90,10 @@ func (s *Service) Overview(ctx context.Context) (Overview, error) {
 	return Overview{
 		MeasuredAt: measuredAt,
 		Units: OverviewUnits{
-			Counts:     "blobCount is distinct blobs; photoCount is photo rows; albumCount is distinct albums referencing those blobs; pipeline photo counts exclude missing-blob photos reported in library.missingBlobPhotos",
+			Counts:     "pipeline categories, skipped reasons, and raw states count each unique blob once; library albums and photos are inventory totals and are not split by pipeline status",
 			MeasuredAt: "RFC3339 UTC",
 		},
-		Library: OverviewLibraryCounts{
-			Albums: snapshot.Albums, Photos: snapshot.Photos, Blobs: snapshot.Blobs,
-			UnreferencedBlobs: snapshot.UnreferencedBlobs, MissingBlobPhotos: snapshot.MissingBlobPhotos,
-		},
+		Library: OverviewLibraryCounts{Albums: snapshot.Albums, Photos: snapshot.Photos, Blobs: snapshot.Blobs},
 		Encoding: EncodingOverview{
 			Categories: EncodingCategories{
 				Queued:     snapshot.EncodingCategories["queued"],

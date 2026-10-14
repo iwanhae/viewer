@@ -497,11 +497,24 @@ func TestAdminOverviewRouteJSONContractAndVectorIndependence(t *testing.T) {
 	if _, err := time.Parse(time.RFC3339Nano, payload.MeasuredAt); err != nil {
 		t.Fatalf("measuredAt=%q is not RFC3339: %v", payload.MeasuredAt, err)
 	}
-	if payload.Units["measuredAt"] != "RFC3339 UTC" || !strings.Contains(payload.Units["counts"], "distinct albums") {
+	if payload.Units["measuredAt"] != "RFC3339 UTC" || !strings.Contains(payload.Units["counts"], "unique blob") {
 		t.Fatalf("units=%v want explicit timestamp and count units", payload.Units)
 	}
-	if payload.Library["albums"] != 1 || payload.Library["photos"] != 3 || payload.Library["blobs"] != 3 || payload.Library["unreferencedBlobs"] != 0 || payload.Library["missingBlobPhotos"] != 0 {
-		t.Fatalf("library=%v want albums=1 photos=3 blobs=3 unreferencedBlobs=0 missingBlobPhotos=0", payload.Library)
+	if payload.Library["albums"] != 1 || payload.Library["photos"] != 3 || payload.Library["blobs"] != 3 || len(payload.Library) != 3 {
+		t.Fatalf("library=%v want only albums=1 photos=3 blobs=3", payload.Library)
+	}
+	if strings.Contains(rec.Body.String(), "unreferencedBlobs") || strings.Contains(rec.Body.String(), "missingBlobPhotos") {
+		t.Fatalf("overview JSON must omit expensive integrity counts: %s", rec.Body.String())
+	}
+	for _, groups := range []map[string]map[string]int64{
+		payload.Encoding.Categories, payload.Encoding.SkippedReasons, payload.Encoding.RawStates,
+		payload.Embedding.Categories, payload.Embedding.RawStates,
+	} {
+		for label, counts := range groups {
+			if len(counts) != 1 || counts["blobCount"] < 0 {
+				t.Errorf("%s overview group has non-blob keys: %v", label, counts)
+			}
+		}
 	}
 	for _, category := range []string{"queued", "processing", "validating", "committing", "completed", "skipped", "failed", "unknown"} {
 		assertOverviewJSONCounts(t, "encoding.categories."+category, payload.Encoding.Categories[category])
@@ -590,8 +603,12 @@ func TestAdminResourceBrowseRoutesContractAndValidation(t *testing.T) {
 		t.Fatalf("dangling photo detail status=%d body=%s", danglingDetail.Code, danglingDetail.Body.String())
 	}
 	overview := doAdminRequest(t, router, http.MethodGet, "/admin/api/overview", auth)
-	if overview.Code != http.StatusOK || !strings.Contains(overview.Body.String(), `"missingBlobPhotos":1`) || !strings.Contains(overview.Body.String(), `"photos":5`) {
-		t.Fatalf("overview dangling-photo accounting status=%d body=%s", overview.Code, overview.Body.String())
+	if overview.Code != http.StatusOK || !strings.Contains(overview.Body.String(), `"photos":5`) || strings.Contains(overview.Body.String(), `"missingBlobPhotos"`) {
+		t.Fatalf("overview inventory contract status=%d body=%s", overview.Code, overview.Body.String())
+	}
+	diagnostics := doAdminRequest(t, router, http.MethodGet, "/admin/api/diagnostics", auth)
+	if diagnostics.Code != http.StatusOK || !strings.Contains(diagnostics.Body.String(), `"unreferencedBlobs":1`) || !strings.Contains(diagnostics.Body.String(), `"missingBlobPhotos":1`) {
+		t.Fatalf("diagnostics integrity counts status=%d body=%s", diagnostics.Code, diagnostics.Body.String())
 	}
 	if rec := doAdminRequest(t, router, http.MethodGet, "/admin/api/photos/album-a/99", auth); rec.Code != http.StatusNotFound {
 		t.Fatalf("missing photo status=%d want=404 body=%s", rec.Code, rec.Body.String())
@@ -851,10 +868,11 @@ func TestAdminBlobHistoryEndpointIsPagedAndValidatesStage(t *testing.T) {
 
 func assertOverviewJSONCounts(t *testing.T, name string, counts map[string]int64) {
 	t.Helper()
-	for _, key := range []string{"blobCount", "photoCount", "albumCount"} {
-		if _, ok := counts[key]; !ok {
-			t.Errorf("%s missing %q counts: %v", name, key, counts)
-		}
+	if len(counts) != 1 {
+		t.Errorf("%s want only blobCount, got %v", name, counts)
+	}
+	if _, ok := counts["blobCount"]; !ok {
+		t.Errorf("%s missing blobCount: %v", name, counts)
 	}
 }
 
