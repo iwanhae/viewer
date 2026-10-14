@@ -12,14 +12,19 @@ import {
   adminGet,
   apiPath,
   imagePath,
+  type Diagnostics,
   type Album,
   type AlbumDetail,
   type Blob,
+  type BlockedQueueDiagnostics,
   type ExtractionEntriesPage,
   type ExtractionEntry,
   type ExtractionRun,
   type ExtractionRunsPage,
   type Overview,
+  type Issues,
+  type IssueGroup,
+  type ExtractionFailurePage,
   type Page,
   type HistoryPage,
   type Photo,
@@ -29,7 +34,7 @@ import {
 
 type LoadState<T> = { path: string; data: T | null; error: string; loading: boolean }
 
-function useAdminData<T>(path: string): LoadState<T> {
+function useAdminData<T>(path: string, refreshKey = 0): LoadState<T> {
   const [state, setState] = useState<LoadState<T>>(() => ({ path, data: null, error: '', loading: true }))
   useEffect(() => {
     if (!path) {
@@ -48,7 +53,7 @@ function useAdminData<T>(path: string): LoadState<T> {
         }
       })
     return () => controller.abort()
-  }, [path])
+  }, [path, refreshKey])
   // Effects run after render. Keying the returned state prevents one paint of
   // the prior filter's rows while the next request is starting.
   return state.path === path ? state : { path, data: null, error: '', loading: true }
@@ -73,6 +78,8 @@ function AdminApp() {
           <Link to="/photos">사진</Link>
           <Link to="/blobs">블롭</Link>
           <Link to="/albums">앨범</Link>
+          <Link to="/issues">이슈</Link>
+          <Link to="/diagnostics">시스템 진단</Link>
           <a href="/admin/legacy">기존 통계·복구</a>
         </nav>
       </header>
@@ -85,6 +92,8 @@ function AdminApp() {
           <Route path="/blobs/:hash" element={<BlobDetailPage />} />
           <Route path="/albums" element={<AlbumsPage />} />
           <Route path="/albums/:id" element={<AlbumDetailPage />} />
+          <Route path="/issues" element={<IssuesPage />} />
+          <Route path="/diagnostics" element={<DiagnosticsPage />} />
           <Route path="*" element={<NotFoundPage />} />
         </Routes>
       </main>
@@ -175,6 +184,158 @@ function OverviewPage() {
       </>}
     </>
   )
+}
+
+function IssuesPage() {
+  const state = useAdminData<Issues>(apiPath('issues'))
+  const [params] = useSearchParams()
+  const entryReasonCode = params.get('entryReasonCode') || ''
+  return <>
+    <PageTitle title="현재 이슈" description="현재 실패 상태와 앨범별 최신 추출 실행의 실패 항목만 집계합니다." />
+    {state.error && <ErrorPanel message={state.error} />}
+    {state.loading && !state.data && <p role="status">불러오는 중…</p>}
+    {state.data && <>
+      <p className="muted">측정 {formatTime(state.data.measuredAt)} · 그룹 {state.data.totalGroups.toLocaleString()}개</p>
+      <p className="muted">{state.data.countScope}</p>
+      {state.data.truncated && <div className="notice warning">상위 100개 그룹만 표시합니다. 나머지 {state.data.remainingGroups.toLocaleString()}개 그룹은 응답에서 생략되었습니다.</div>}
+      {state.data.groups.length === 0
+        ? <section className="panel"><p>현재 기록된 실패 이슈가 없습니다.</p></section>
+        : <div className="table-wrap"><table className="data-table"><thead><tr><th>단계</th><th>안전한 오류 코드</th><th>실패 수</th><th>블롭</th><th>사진 행</th><th>앨범</th><th>확인</th></tr></thead><tbody>
+          {state.data.groups.map((group) => <IssueRow key={`${group.stage}:${group.errorCode}`} group={group} />)}
+        </tbody></table></div>}
+      {state.data.groups.some((group) => group.errorCode === 'legacy_unknown') && <div className="notice warning">
+        legacy_unknown은 기존 실패의 세부 메시지를 안전하게 분류할 수 없다는 뜻입니다. 원문 오류나 비밀 값은 이 이슈 목록에 표시하지 않습니다.
+      </div>}
+    </>}
+    {entryReasonCode && <ExtractionFailureBrowser reasonCode={entryReasonCode} />}
+  </>
+}
+
+function IssueRow({ group }: { group: IssueGroup }) {
+  let target = ''
+  let failureLinkText = group.failureCount
+  if (group.stage === 'encoding') {
+    target = filterURL('blobs', { encoding: 'failed', encodingErrorCode: group.errorCode })
+  } else if (group.stage === 'embedding') {
+    target = filterURL('blobs', { embedding: 'failed', embeddingErrorCode: group.errorCode })
+  } else if (group.stage === 'album_extraction') {
+    target = '/albums?status=FAILED'
+  } else if (group.stage === 'extraction_entry') {
+    target = `/issues?entryReasonCode=${encodeURIComponent(group.errorCode)}`
+    failureLinkText = group.entryCount ?? group.failureCount
+  }
+  const stageLabel: Record<string, string> = {
+    encoding: '인코딩', embedding: '임베딩', album_extraction: '아카이브 추출', extraction_entry: '추출 항목'
+  }
+  return <tr>
+    <th scope="row">{stageLabel[group.stage] || group.stage}</th>
+    <td><code>{group.errorCode}</code></td>
+    <td>{target ? <CountLink value={failureLinkText} to={target} /> : failureLinkText.toLocaleString()}</td>
+    <td>{group.blobCount.toLocaleString()}</td>
+    <td>{group.photoCount.toLocaleString()}</td>
+    <td>{group.albumCount.toLocaleString()}</td>
+    <td>{target ? <Link to={target}>페이지 보기</Link> : '—'}</td>
+  </tr>
+}
+
+function ExtractionFailureBrowser({ reasonCode }: { reasonCode: string }) {
+  const [cursor, setCursor] = useState('')
+  useEffect(() => { setCursor('') }, [reasonCode])
+  const query = new URLSearchParams({ reasonCode, limit: '50' })
+  if (cursor) query.set('cursor', cursor)
+  const state = useAdminData<ExtractionFailurePage>(apiPath('extraction-failures', `?${query.toString()}`))
+  return <section className="panel">
+    <h2>최신 추출 실행 실패 항목 · {reasonCode}</h2>
+    <p className="muted">앨범마다 가장 최근에 기록된 실행의 실패 항목만 페이지로 표시합니다. 과거 실행에서 해결된 실패는 포함하지 않습니다.</p>
+    {state.error && <ErrorPanel message={state.error} />}
+    {state.loading && !state.data && <p role="status">불러오는 중…</p>}
+    {state.data && <>
+      <div className="table-wrap"><table className="data-table"><thead><tr><th>앨범</th><th>실행</th><th>항목</th><th>코드</th></tr></thead><tbody>
+        {state.data.failures.map((failure) => <tr key={`${failure.albumId}:${failure.ordinal}`}>
+          <td><Link to={`/albums/${encodeURIComponent(failure.albumId)}`}>{failure.originalFilename}</Link><small className="subline">{failure.albumId}</small></td>
+          <td>#{failure.runId} · 최신 실행</td><td>{failure.name}<small className="subline">항목 #{failure.ordinal}</small></td><td><code>{failure.reasonCode}</code></td>
+        </tr>)}
+        {state.data.failures.length === 0 && <EmptyRow columns={4} />}
+      </tbody></table></div>
+      <div className="pagination">
+        {cursor && <button type="button" onClick={() => setCursor('')}>첫 페이지</button>}
+        {state.data.nextCursor && <button type="button" onClick={() => setCursor(state.data!.nextCursor!)}>다음 실패 항목 더 보기</button>}
+      </div>
+    </>}
+  </section>
+}
+
+function DiagnosticsPage() {
+  const [refreshKey, setRefreshKey] = useState(0)
+  const state = useAdminData<Diagnostics>(apiPath('diagnostics'), refreshKey)
+  const data = state.data
+  return <>
+    <PageTitle title="시스템 진단" description="현재 카탈로그 관측값과 서비스 기능 설정을 구분해 표시합니다." />
+    <div className="toolbar"><button type="button" onClick={() => setRefreshKey((value) => value + 1)} disabled={state.loading}>새로고침</button>
+      <span className="muted">측정 {data ? formatTime(data.measuredAt) : '—'}</span></div>
+    {state.error && <ErrorPanel message={state.error} />}
+    {state.loading && !data && <p role="status">불러오는 중…</p>}
+    {data && <>
+      <section className="panel"><h2>기능 설정</h2><div className="summary-grid">
+        <Stat label="인코딩 API 활성화" value={data.encodingEnabled ? '활성' : '비활성'} />
+        <Stat label="임베딩 모델 활성화" value={data.modelEnabled ? '활성' : '비활성'} />
+        <Stat label="벡터 저장소 연결" value={data.vectorStoreEnabled ? '설정됨' : '비활성'} />
+      </div><p className="muted">활성화 여부는 워커 프로세스의 실행 상태를 뜻하지 않습니다.</p></section>
+      <section className="panel"><h2>만료된 리스</h2><div className="summary-grid">
+        <Stat label="인코딩 만료 리스" value={data.encodingExpiredLeases} to="/blobs?encodingLeaseExpired=true" />
+        <Stat label="임베딩 만료 리스" value={data.embeddingExpiredLeases} to="/blobs?embeddingLeaseExpired=true" />
+      </div></section>
+      <section className="panel"><h2>대기열 연령</h2>
+        <QueueDiagnostic label="인코딩" queue={data.encodingQueue} to="/blobs?encoding=queued" />
+        <QueueDiagnostic label="임베딩 대기" queue={data.embeddingQueue} to="/blobs?embedding=queued" />
+        <QueueDiagnostic label="임베딩 차단" queue={data.embeddingBlockedQueue} to="/blobs?embedding=blocked" />
+        <p className="muted">연령은 기록된 status_changed_at만 사용합니다. 모르는 연령은 별도로 세며 created_at으로 추정하지 않습니다. 각 링크는 해당 카테고리의 현재 항목 전체이며, 오래된 항목만 거르는 필터는 아닙니다.</p>
+      </section>
+      <section className="panel"><h2>인코딩 커밋</h2><div className="summary-grid">
+        <Stat label="커밋 중" value={data.encodingCommit.committingCount} to="/blobs?encoding=committing" />
+        <Stat label="재조정 중" value={data.encodingCommit.reconcilingCount} to="/blobs?encodingPhase=reconciling" />
+        <Stat label="시작 시각을 모르는 행" value={data.encodingCommit.unknownStartCount} />
+      </div><p>가장 오래 알려진 시작: {data.encodingCommit.oldestKnownStartedAt ? formatTime(data.encodingCommit.oldestKnownStartedAt) : '기록 없음'}</p>
+        <p className="muted">시작 시각은 관측된 claim의 started_at만 표시합니다.</p></section>
+      <section className="panel"><h2>워커 API 활동</h2>
+        <p className="muted">{data.workerActivityScope}</p>
+        <dl className="metadata">
+          <dt>마지막 claim 시도</dt><dd>{formatActivity(data.workerActivity.lastClaimUnixMs)}</dd>
+          <dt>마지막 renew 시도</dt><dd>{formatActivity(data.workerActivity.lastRenewUnixMs)}</dd>
+          <dt>마지막 results 시도</dt><dd>{formatActivity(data.workerActivity.lastResultsUnixMs)}</dd>
+        </dl>
+      </section>
+      <section className="panel"><h2>벡터 개수 비교</h2>
+        {data.vectorCount.status === 'disabled' && <p>벡터 저장소가 비활성화되어 개수는 측정되지 않았습니다.</p>}
+        {data.vectorCount.status === 'unavailable' && <div className="notice warning">{data.vectorCount.message || '벡터 개수를 읽을 수 없습니다.'}</div>}
+        {data.vectorCount.status === 'available' && <>
+          <p>카탈로그 예상 사진 포인트 {data.vectorCount.expectedPoints.toLocaleString()} · 외부 저장소 포인트 {data.vectorCount.actualPoints?.toLocaleString()} · 측정 {data.vectorCount.measuredAt ? formatTime(data.vectorCount.measuredAt) : '—'}</p>
+          <p>{data.vectorCount.countAgreement ? '개수 일치' : '개수 불일치'} <span className="muted">(개수 비교일 뿐 전체 동기화나 포인트 무결성을 검증하지 않습니다.)</span></p>
+        </>}
+      </section>
+    </>}
+  </>
+}
+
+function QueueDiagnostic({ label, queue, to }: { label: string; queue: Diagnostics['encodingQueue'] | BlockedQueueDiagnostics; to: string }) {
+  const count = 'blockedCount' in queue ? queue.blockedCount : queue.queuedCount
+  const countLabel = 'blockedCount' in queue ? '차단' : '대기'
+  return <div className="queue-diagnostic">
+    <h3>{label}</h3><p>{countLabel} {count.toLocaleString()} · <Link to={to}>{label} 항목 보기</Link></p>
+    <p>가장 오래된 기록 연령 {queue.oldestAgeSeconds === null ? '알 수 없음' : formatDuration(queue.oldestAgeSeconds)} · 상태 변경 {queue.oldestStatusChangedAt ? formatTime(queue.oldestStatusChangedAt) : '기록 없음'}</p>
+    <p>연령 미상 {queue.unknownAgeCount.toLocaleString()}</p>
+  </div>
+}
+
+function formatDuration(seconds: number): string {
+  if (seconds < 60) return `${seconds}초`
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}분`
+  if (seconds < 86400) return `${Math.floor(seconds / 3600)}시간 ${Math.floor((seconds % 3600) / 60)}분`
+  return `${Math.floor(seconds / 86400)}일 ${Math.floor((seconds % 86400) / 3600)}시간`
+}
+
+function formatActivity(unixMs: number): string {
+  return unixMs > 0 ? formatTime(new Date(unixMs).toISOString()) : '프로세스 시작 이후 기록 없음'
 }
 
 function CategorySection({ title, categories, rawStates, filterKey, albumId }: {
@@ -280,7 +441,7 @@ function PhotoFilters() {
   const [values, setValues] = useState<Record<string, string>>({})
   useEffect(() => {
     const initial: Record<string, string> = {}
-    for (const key of ['q', 'albumId', 'hash', 'encoding', 'embedding', 'encodingRaw', 'embeddingRaw', 'skippedReason']) initial[key] = params.get(key) || ''
+    for (const key of ['q', 'albumId', 'hash', 'encoding', 'embedding', 'encodingRaw', 'embeddingRaw', 'encodingErrorCode', 'embeddingErrorCode', 'encodingLeaseExpired', 'embeddingLeaseExpired', 'encodingPhase', 'skippedReason']) initial[key] = params.get(key) || ''
     setValues(initial)
   }, [params])
   const submit = (event: FormEvent) => {
@@ -297,6 +458,11 @@ function PhotoFilters() {
     <SelectField label="임베딩" value={values.embedding || ''} onChange={(value) => setValues({ ...values, embedding: value })} options={embeddingOptions} />
     <Field label="원본 인코딩 상태" value={values.encodingRaw || ''} onChange={(value) => setValues({ ...values, encodingRaw: value })} />
     <Field label="원본 임베딩 상태" value={values.embeddingRaw || ''} onChange={(value) => setValues({ ...values, embeddingRaw: value })} />
+    <Field label="인코딩 오류 코드" value={values.encodingErrorCode || ''} onChange={(value) => setValues({ ...values, encodingErrorCode: value })} />
+    <Field label="임베딩 오류 코드" value={values.embeddingErrorCode || ''} onChange={(value) => setValues({ ...values, embeddingErrorCode: value })} />
+    <SelectField label="인코딩 리스 만료" value={values.encodingLeaseExpired || ''} onChange={(value) => setValues({ ...values, encodingLeaseExpired: value })} options={leaseOptions} />
+    <SelectField label="임베딩 리스 만료" value={values.embeddingLeaseExpired || ''} onChange={(value) => setValues({ ...values, embeddingLeaseExpired: value })} options={leaseOptions} />
+    <SelectField label="인코딩 단계" value={values.encodingPhase || ''} onChange={(value) => setValues({ ...values, encodingPhase: value })} options={encodingPhaseOptions} />
     <SelectField label="건너뜀 형식" value={values.skippedReason || ''} onChange={(value) => setValues({ ...values, skippedReason: value })} options={skippedOptions} />
   </FilterPanel>
 }
@@ -333,7 +499,7 @@ function BlobFilters() {
   const [values, setValues] = useState<Record<string, string>>({})
   useEffect(() => {
     const initial: Record<string, string> = {}
-    for (const key of ['albumId', 'hash', 'encoding', 'embedding', 'encodingRaw', 'embeddingRaw', 'skippedReason', 'unreferenced']) initial[key] = params.get(key) || ''
+    for (const key of ['albumId', 'hash', 'encoding', 'embedding', 'encodingRaw', 'embeddingRaw', 'encodingErrorCode', 'embeddingErrorCode', 'encodingLeaseExpired', 'embeddingLeaseExpired', 'encodingPhase', 'skippedReason', 'unreferenced']) initial[key] = params.get(key) || ''
     setValues(initial)
   }, [params])
   const submit = (event: FormEvent) => {
@@ -349,6 +515,11 @@ function BlobFilters() {
     <SelectField label="임베딩" value={values.embedding || ''} onChange={(value) => setValues({ ...values, embedding: value })} options={embeddingOptions} />
     <Field label="원본 인코딩 상태" value={values.encodingRaw || ''} onChange={(value) => setValues({ ...values, encodingRaw: value })} />
     <Field label="원본 임베딩 상태" value={values.embeddingRaw || ''} onChange={(value) => setValues({ ...values, embeddingRaw: value })} />
+    <Field label="인코딩 오류 코드" value={values.encodingErrorCode || ''} onChange={(value) => setValues({ ...values, encodingErrorCode: value })} />
+    <Field label="임베딩 오류 코드" value={values.embeddingErrorCode || ''} onChange={(value) => setValues({ ...values, embeddingErrorCode: value })} />
+    <SelectField label="인코딩 리스 만료" value={values.encodingLeaseExpired || ''} onChange={(value) => setValues({ ...values, encodingLeaseExpired: value })} options={leaseOptions} />
+    <SelectField label="임베딩 리스 만료" value={values.embeddingLeaseExpired || ''} onChange={(value) => setValues({ ...values, embeddingLeaseExpired: value })} options={leaseOptions} />
+    <SelectField label="인코딩 단계" value={values.encodingPhase || ''} onChange={(value) => setValues({ ...values, encodingPhase: value })} options={encodingPhaseOptions} />
     <SelectField label="건너뜀 형식" value={values.skippedReason || ''} onChange={(value) => setValues({ ...values, skippedReason: value })} options={skippedOptions} />
     <SelectField label="참조 여부" value={values.unreferenced || ''} onChange={(value) => setValues({ ...values, unreferenced: value })} options={[
       ['', '전체'], ['true', '미참조'], ['false', '참조됨']
@@ -855,6 +1026,8 @@ const embeddingOptions: [string, string][] = [
   ['', '전체'], ['queued', '대기'], ['blocked', '차단됨'], ['processing', '처리 중'], ['completed', '완료'], ['failed', '실패'], ['unknown', '알 수 없음']
 ]
 const skippedOptions: [string, string][] = [['', '전체'], ['webp', 'WebP'], ['nonWebp', 'WebP 아님']]
+const leaseOptions: [string, string][] = [['', '전체'], ['true', '만료'], ['false', '유효']]
+const encodingPhaseOptions: [string, string][] = [['', '전체'], ['reconciling', '재조정 중']]
 
 function ErrorPanel({ message }: { message: string }) {
   return <div className="notice error" role="alert">요청 실패: {message}</div>

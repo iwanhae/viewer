@@ -6,32 +6,43 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 )
 
 // AdminPhotoFilters are the fixed filters supported by the admin photo list.
 // Values are always bound as SQL parameters; category expressions are owned by
 // this package and shared with AdminOverview.
 type AdminPhotoFilters struct {
-	Query         string
-	AlbumID       string
-	Hash          string
-	Encoding      string
-	Embedding     string
-	EncodingRaw   string
-	EmbeddingRaw  string
-	SkippedReason string
+	Query                 string
+	AlbumID               string
+	Hash                  string
+	Encoding              string
+	Embedding             string
+	EncodingRaw           string
+	EmbeddingRaw          string
+	EncodingErrorCode     string
+	EmbeddingErrorCode    string
+	EncodingLeaseExpired  *bool
+	EmbeddingLeaseExpired *bool
+	EncodingPhase         string
+	SkippedReason         string
 }
 
 // AdminBlobFilters are the fixed filters supported by the admin blob list.
 type AdminBlobFilters struct {
-	AlbumID       string
-	Hash          string
-	Encoding      string
-	Embedding     string
-	EncodingRaw   string
-	EmbeddingRaw  string
-	SkippedReason string
-	Unreferenced  *bool
+	AlbumID               string
+	Hash                  string
+	Encoding              string
+	Embedding             string
+	EncodingRaw           string
+	EmbeddingRaw          string
+	EncodingErrorCode     string
+	EmbeddingErrorCode    string
+	EncodingLeaseExpired  *bool
+	EmbeddingLeaseExpired *bool
+	EncodingPhase         string
+	SkippedReason         string
+	Unreferenced          *bool
 }
 
 // AdminAlbumFilters are the fixed filters supported by the admin album list.
@@ -58,9 +69,11 @@ type AdminPhoto struct {
 	EncodingRaw          string            `json:"encodingRaw"`
 	Encoding             string            `json:"encoding"`
 	EncodingError        string            `json:"encodingError"`
+	EncodingErrorCode    string            `json:"encodingErrorCode"`
 	EmbeddingRaw         string            `json:"embeddingRaw"`
 	Embedding            string            `json:"embedding"`
 	EmbeddingError       string            `json:"embeddingError"`
+	EmbeddingErrorCode   string            `json:"embeddingErrorCode"`
 	SkippedReason        string            `json:"skippedReason"`
 	BlockReason          string            `json:"blockReason"`
 	EncodingObservation  *StageObservation `json:"encodingObservation,omitempty"`
@@ -77,9 +90,11 @@ type AdminBlob struct {
 	EncodingRaw          string            `json:"encodingRaw"`
 	Encoding             string            `json:"encoding"`
 	EncodingError        string            `json:"encodingError"`
+	EncodingErrorCode    string            `json:"encodingErrorCode"`
 	EmbeddingRaw         string            `json:"embeddingRaw"`
 	Embedding            string            `json:"embedding"`
 	EmbeddingError       string            `json:"embeddingError"`
+	EmbeddingErrorCode   string            `json:"embeddingErrorCode"`
 	SkippedReason        string            `json:"skippedReason"`
 	BlockReason          string            `json:"blockReason"`
 	PhotoCount           int64             `json:"photoCount"`
@@ -146,7 +161,8 @@ func (s *Store) AdminPhotos(ctx context.Context, filters AdminPhotoFilters, afte
 		where = append(where, `p.hash = ?`)
 		args = append(args, filters.Hash)
 	}
-	appendAdminStateFilters(&where, &args, filters.Encoding, filters.Embedding, filters.EncodingRaw, filters.EmbeddingRaw, filters.SkippedReason)
+	appendAdminStateFilters(&where, &args, filters.Encoding, filters.Embedding, filters.EncodingRaw, filters.EmbeddingRaw,
+		filters.EncodingErrorCode, filters.EmbeddingErrorCode, filters.EncodingLeaseExpired, filters.EmbeddingLeaseExpired, filters.EncodingPhase, filters.SkippedReason)
 	if afterAlbumID != "" {
 		where = append(where, `(p.album_id > ? OR (p.album_id = ? AND p.idx > ?))`)
 		args = append(args, afterAlbumID, afterAlbumID, afterIndex)
@@ -175,17 +191,22 @@ func (s *Store) AdminPhotos(ctx context.Context, filters AdminPhotoFilters, afte
 const adminPhotoSelect = `SELECT p.album_id, a.original_filename, p.idx, p.name, p.hash, p.width, p.height,
 	b.size_bytes, b.content_type, b.hash IS NULL, COALESCE(b.encoding_status, ''),
 	CASE WHEN b.hash IS NULL THEN '' ELSE ` + adminEncodingCategoryExpr + ` END, COALESCE(b.encoding_error, ''),
+	CASE WHEN b.encoding_status='failed' THEN COALESCE(NULLIF(eo.error_code,''),'legacy_unknown') ELSE '' END,
 	COALESCE(b.embedding_status, ''), CASE WHEN b.hash IS NULL THEN '' ELSE ` + adminEmbeddingCategoryExpr + ` END, COALESCE(b.embedding_error, ''),
+	CASE WHEN b.embedding_status='failed' THEN COALESCE(NULLIF(bo.error_code,''),'legacy_unknown') ELSE '' END,
 	CASE WHEN b.encoding_status = 'skipped' THEN ` + adminEncodingSkippedReasonExpr + ` ELSE '' END,
 	CASE WHEN b.embedding_status = 'pending' AND NOT ` + embeddingClaimGatePredicate + ` THEN 'encoding_gate' ELSE '' END
-	FROM photos p JOIN albums a ON a.id = p.album_id LEFT JOIN blobs b ON b.hash = p.hash`
+	FROM photos p JOIN albums a ON a.id = p.album_id LEFT JOIN blobs b ON b.hash = p.hash
+	LEFT JOIN blob_stage_observations eo ON eo.blob_hash=b.hash AND eo.stage='encoding'
+	LEFT JOIN blob_stage_observations bo ON bo.blob_hash=b.hash AND bo.stage='embedding'`
 
 func scanAdminPhoto(row interface{ Scan(...any) error }) (AdminPhoto, error) {
 	var photo AdminPhoto
 	err := row.Scan(
 		&photo.AlbumID, &photo.AlbumName, &photo.Index, &photo.Name, &photo.Hash, &photo.Width, &photo.Height,
 		&photo.SizeBytes, &photo.ContentType, &photo.MissingBlob, &photo.EncodingRaw, &photo.Encoding, &photo.EncodingError,
-		&photo.EmbeddingRaw, &photo.Embedding, &photo.EmbeddingError, &photo.SkippedReason, &photo.BlockReason,
+		&photo.EncodingErrorCode, &photo.EmbeddingRaw, &photo.Embedding, &photo.EmbeddingError,
+		&photo.EmbeddingErrorCode, &photo.SkippedReason, &photo.BlockReason,
 	)
 	return photo, err
 }
@@ -242,18 +263,23 @@ func (s *Store) AdminBlobs(ctx context.Context, filters AdminBlobFilters, afterH
 			where = append(where, `EXISTS (SELECT 1 FROM photos f WHERE f.hash = b.hash)`)
 		}
 	}
-	appendAdminStateFilters(&where, &args, filters.Encoding, filters.Embedding, filters.EncodingRaw, filters.EmbeddingRaw, filters.SkippedReason)
+	appendAdminStateFilters(&where, &args, filters.Encoding, filters.Embedding, filters.EncodingRaw, filters.EmbeddingRaw,
+		filters.EncodingErrorCode, filters.EmbeddingErrorCode, filters.EncodingLeaseExpired, filters.EmbeddingLeaseExpired, filters.EncodingPhase, filters.SkippedReason)
 	if afterHash != "" {
 		where = append(where, `b.hash > ?`)
 		args = append(args, afterHash)
 	}
 	query := `SELECT b.hash, b.size_bytes, b.content_type, b.encoding_status, ` + adminEncodingCategoryExpr + `, b.encoding_error,
 		b.embedding_status, ` + adminEmbeddingCategoryExpr + `, b.embedding_error,
+		CASE WHEN b.encoding_status='failed' THEN COALESCE(NULLIF(eo.error_code,''),'legacy_unknown') ELSE '' END,
+		CASE WHEN b.embedding_status='failed' THEN COALESCE(NULLIF(bo.error_code,''),'legacy_unknown') ELSE '' END,
 		CASE WHEN b.encoding_status = 'skipped' THEN ` + adminEncodingSkippedReasonExpr + ` ELSE '' END,
 		CASE WHEN b.embedding_status = 'pending' AND NOT ` + embeddingClaimGatePredicate + ` THEN 'encoding_gate' ELSE '' END,
 		(SELECT COUNT(*) FROM photos p WHERE p.hash = b.hash),
 		(SELECT COUNT(DISTINCT p.album_id) FROM photos p WHERE p.hash = b.hash)
-		FROM blobs b` + adminWhere(where) + ` ORDER BY b.hash ASC LIMIT ?`
+		FROM blobs b
+		LEFT JOIN blob_stage_observations eo ON eo.blob_hash=b.hash AND eo.stage='encoding'
+		LEFT JOIN blob_stage_observations bo ON bo.blob_hash=b.hash AND bo.stage='embedding'` + adminWhere(where) + ` ORDER BY b.hash ASC LIMIT ?`
 	args = append(args, limit)
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -278,7 +304,8 @@ func scanAdminBlob(row interface{ Scan(...any) error }) (AdminBlob, error) {
 	var blob AdminBlob
 	err := row.Scan(
 		&blob.Hash, &blob.SizeBytes, &blob.ContentType, &blob.EncodingRaw, &blob.Encoding, &blob.EncodingError,
-		&blob.EmbeddingRaw, &blob.Embedding, &blob.EmbeddingError, &blob.SkippedReason, &blob.BlockReason,
+		&blob.EmbeddingRaw, &blob.Embedding, &blob.EmbeddingError, &blob.EncodingErrorCode, &blob.EmbeddingErrorCode,
+		&blob.SkippedReason, &blob.BlockReason,
 		&blob.PhotoCount, &blob.AlbumCount,
 	)
 	return blob, err
@@ -294,11 +321,14 @@ func (s *Store) AdminBlobByHash(ctx context.Context, hash string) (AdminBlob, er
 	defer func() { _ = tx.Rollback() }()
 	query := `SELECT b.hash, b.size_bytes, b.content_type, b.encoding_status, ` + adminEncodingCategoryExpr + `, b.encoding_error,
 		b.embedding_status, ` + adminEmbeddingCategoryExpr + `, b.embedding_error,
+		CASE WHEN b.encoding_status='failed' THEN COALESCE(NULLIF(eo.error_code,''),'legacy_unknown') ELSE '' END,
+		CASE WHEN b.embedding_status='failed' THEN COALESCE(NULLIF(bo.error_code,''),'legacy_unknown') ELSE '' END,
 		CASE WHEN b.encoding_status = 'skipped' THEN ` + adminEncodingSkippedReasonExpr + ` ELSE '' END,
 		CASE WHEN b.embedding_status = 'pending' AND NOT ` + embeddingClaimGatePredicate + ` THEN 'encoding_gate' ELSE '' END,
 		(SELECT COUNT(*) FROM photos p WHERE p.hash = b.hash),
 		(SELECT COUNT(DISTINCT p.album_id) FROM photos p WHERE p.hash = b.hash)
-		FROM blobs b WHERE b.hash = ?`
+		FROM blobs b LEFT JOIN blob_stage_observations eo ON eo.blob_hash=b.hash AND eo.stage='encoding'
+		LEFT JOIN blob_stage_observations bo ON bo.blob_hash=b.hash AND bo.stage='embedding' WHERE b.hash = ?`
 	blob, err := scanAdminBlob(tx.QueryRowContext(ctx, query, hash))
 	if errors.Is(err, sql.ErrNoRows) {
 		return AdminBlob{}, fmt.Errorf("%w: %s", ErrBlobNotFound, hash)
@@ -471,7 +501,9 @@ func addAlbumPipelineCounts(destination map[string]PipelineCounts, key string, c
 	destination[key] = value
 }
 
-func appendAdminStateFilters(where *[]string, args *[]any, encoding, embedding, encodingRaw, embeddingRaw, skippedReason string) {
+func appendAdminStateFilters(where *[]string, args *[]any, encoding, embedding, encodingRaw, embeddingRaw,
+	encodingErrorCode, embeddingErrorCode string, encodingLeaseExpired, embeddingLeaseExpired *bool,
+	encodingPhase, skippedReason string) {
 	if encoding != "" {
 		*where = append(*where, `b.hash IS NOT NULL AND `+adminEncodingCategoryExpr+` = ?`)
 		*args = append(*args, encoding)
@@ -487,6 +519,34 @@ func appendAdminStateFilters(where *[]string, args *[]any, encoding, embedding, 
 	if embeddingRaw != "" {
 		*where = append(*where, `b.embedding_status = ?`)
 		*args = append(*args, embeddingRaw)
+	}
+	if encodingErrorCode != "" {
+		*where = append(*where, `b.encoding_status='failed' AND COALESCE(NULLIF(eo.error_code,''),'legacy_unknown') = ?`)
+		*args = append(*args, encodingErrorCode)
+	}
+	if embeddingErrorCode != "" {
+		*where = append(*where, `b.embedding_status='failed' AND COALESCE(NULLIF(bo.error_code,''),'legacy_unknown') = ?`)
+		*args = append(*args, embeddingErrorCode)
+	}
+	if encodingLeaseExpired != nil {
+		operator := `<`
+		if !*encodingLeaseExpired {
+			operator = `>=`
+		}
+		*where = append(*where, `b.encoding_status='leased' AND b.encoding_lease_until `+operator+` ?`)
+		*args = append(*args, time.Now().UnixMilli())
+	}
+	if embeddingLeaseExpired != nil {
+		operator := `<`
+		if !*embeddingLeaseExpired {
+			operator = `>=`
+		}
+		*where = append(*where, `b.embedding_status='processing' AND b.embedding_lease_until `+operator+` ?`)
+		*args = append(*args, time.Now().UnixMilli())
+	}
+	if encodingPhase != "" {
+		*where = append(*where, `b.encoding_status='committing' AND eo.phase = ?`)
+		*args = append(*args, encodingPhase)
 	}
 	if skippedReason != "" {
 		*where = append(*where, `b.encoding_status = 'skipped' AND `+adminEncodingSkippedReasonExpr+` = ?`)

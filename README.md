@@ -117,6 +117,8 @@ Notes:
 | GET | `/admin` | Independent React admin browser; enabled only when `ADMIN_TOKEN` is set. |
 | GET | `/admin/legacy` | Existing operational stats and embedding/encoding recovery dashboard, preserved during the admin UI rollout. |
 | GET | `/admin/api/overview` | Catalog-only pipeline totals and normalized/raw state breakdowns. |
+| GET | `/admin/api/issues` | Bounded groups of current pipeline/archive failures and latest-run failed extraction entries. |
+| GET | `/admin/api/diagnostics` | Read-only lease, queue-age, commit, activity, feature-flag, and optional vector-count snapshot. |
 | GET | `/admin/api/photos` | Paged photo rows with album metadata and current encoding/embedding state. |
 | GET | `/admin/api/photos/{albumId}/{idx}` | One photo row with current pipeline state. |
 | GET | `/admin/api/blobs` | Paged blob state and reference counts, including unreferenced blobs. |
@@ -124,6 +126,9 @@ Notes:
 | GET | `/admin/api/blobs/{hash}/history` | Bounded, cursor-paged stage attempt and major-transition history. |
 | GET | `/admin/api/albums` | Paged album processing state, error, and actual photo-row count. |
 | GET | `/admin/api/albums/{id}` | Album processing state and overview-equivalent counts for its referenced blobs/photos. |
+| GET | `/admin/api/albums/{id}/extractions` | Cursor-paged append-only extraction runs, newest first. |
+| GET | `/admin/api/albums/{id}/entries` | Cursor-paged outcomes for the latest run, or a requested `runId`; supports `outcome`. |
+| GET | `/admin/api/extraction-failures` | Cursor-paged failed entries from each album's latest run when terminal, filtered by `reasonCode`. |
 
 The admin document, legacy dashboard, and resource APIs require the same HTTP
 Basic password (`ADMIN_TOKEN`), and are absent when the admin service or token
@@ -141,7 +146,9 @@ parameters, invalid categories/statuses, and malformed or mismatched cursors
 return 400. Missing detail resources return 404.
 
 `GET /admin/api/photos` accepts `q`, `albumId`, `hash`, `encoding`, `embedding`,
-`encodingRaw`, `embeddingRaw`, `skippedReason`, `limit`, and `cursor`. `q` is a
+`encodingRaw`, `embeddingRaw`, `encodingErrorCode`, `embeddingErrorCode`,
+`encodingLeaseExpired`, `embeddingLeaseExpired`, `encodingPhase`, `skippedReason`,
+`limit`, and `cursor`. `q` is a
 ASCII-case-insensitive literal substring of the album filename or photo name (`%`,
 `_`, and `\` are ordinary characters). `hash` is exact. `encoding` accepts the
 overview categories `queued`, `processing`, `validating`, `committing`,
@@ -158,7 +165,7 @@ If `missingBlob` is true, the photo row's hash has no blob row: `sizeBytes` and
 being classified as an unknown blob.
 
 `GET /admin/api/blobs` accepts `albumId`, exact `hash`, the same encoding,
-embedding, raw-state, and skipped-reason filters, plus `unreferenced=true|false`,
+embedding, raw-state, error-code, lease-expiration, phase, and skipped-reason filters, plus `unreferenced=true|false`,
 `limit`, and `cursor`. Blob details include `photoCount` and distinct
 `albumCount`, not embedded reference arrays. Use
 `GET /admin/api/photos?hash={hash}` to page through photos for a shared blob.
@@ -195,6 +202,83 @@ embedding category `photoCount` sum plus `missingBlobPhotos` equals the total
 photo count (assuming photo rows reference existing albums). The overview's
 `library.missingBlobPhotos` and album detail's `missingBlobPhotos` are counted
 in their respective catalog read transactions.
+
+The admin browser has **이슈** (`/admin/issues`) and **시스템 진단**
+(`/admin/diagnostics`) tabs. `GET /admin/api/issues` is a read-only snapshot:
+encoding and embedding groups include only blobs whose *current* stage status is
+`failed`, and group by the safe observation `errorCode` (missing/legacy codes
+are `legacy_unknown`). A blob that failed both stages appears in both groups;
+counts are independent per group and must not be added across stages. Blob,
+photo-row, and distinct album counts are reported where applicable. Current
+`FAILED` album rows form one `album_extraction / legacy_unknown` group: raw album
+errors are not classified or returned by this endpoint. Failed extraction
+entries come only from each album's latest run, and only once that run is
+**terminal**, grouped by their validated reason code; a running latest run does
+not fall back to failures from an older run.
+Groups are ordered by failure count and capped at 100. `truncated` and
+`remainingGroups` explicitly report omitted reason groups rather than silently
+dropping them. Group counts overlap where rows share blobs or albums.
+
+Pipeline issue links use `encodingErrorCode` and `embeddingErrorCode` on both
+`GET /admin/api/photos` and `/admin/api/blobs`. Each filter is exact and only
+matches rows whose current corresponding stage is `failed`; missing legacy
+observations match `legacy_unknown`. The safe code syntax is lowercase ASCII
+letters, digits, and underscores (1–64 characters). The filters combine with
+the existing status and other filters using AND. Raw error messages are not
+used as issue-group keys. The UI links encoder/embedding groups to these
+cursor-paged resource lists, and archive groups to the current `status=FAILED`
+album list.
+
+`GET /admin/api/extraction-failures?reasonCode=...&limit=...&cursor=...` is the
+matching paged target for an extraction-entry group. It returns entry names,
+album identity, run ID, ordinal, and safe reason code; it does not return raw
+error detail. Only the album's latest run is included, and only when it is
+terminal. Pages are ordered by
+`(albumId, ordinal)`, default to 50 rows, and cap at 100; cursors are bound to
+the reason and limit. Per-album history remains available via
+`GET /admin/api/albums/{id}/extractions?limit=&cursor=` and
+`GET /admin/api/albums/{id}/entries?runId=&outcome=&limit=&cursor=`. Without
+`runId`, entries select the latest run and report `runSelection: "latest"`; a
+running run returns 409 because its entries are not stable. A legacy album
+without recorded runs returns 404 rather than implying zero failures. Run
+history is append-only, but only its latest run contributes to current issue
+groups after it becomes terminal; older runs are not substituted while the
+latest run is in progress.
+
+`GET /admin/api/diagnostics` does not mutate queues or start scans. Its catalog
+measurements include stage-specific expired lease counts; encoding-queued,
+embedding-queued, and embedding-blocked counts with their oldest available
+`status_changed_at` ages; and the encoding `committing` and
+`reconciling` counts. Each queue's `unknownAgeCount` counts rows in that exact
+reported category without a matching recorded pending observation timestamp.
+`embeddingBlockedQueue.blockedCount` is separate from `embeddingQueue.queuedCount`.
+Queue age never falls back to
+`created_at`. The oldest commit start is a recorded observation `started_at`;
+`unknownStartCount` keeps rows without a known start visible. These catalog
+measurements share one short SQLite read transaction. The optional external
+vector count is fetched only after that transaction: its status is `disabled`,
+`available`, or `unavailable`, and a vector-store outage leaves catalog
+diagnostics available with a sanitized message instead of returning 500. A
+disabled store's point count and agreement are null/unmeasured. When available,
+`countAgreement` compares external point count with catalog-ready photo pairs;
+agreement is a count comparison, not a claim of full vector synchronization or
+point-by-point integrity. Model/encoding flags report server feature
+configuration separately from activity. `workerActivity` is the embedding API
+service's last claim/renew/results attempt stamp since this process started; an
+attempt is not a heartbeat and does not prove a worker is alive. Zero means no
+attempt has been recorded since restart.
+
+Embedding queue diagnostics use the same `queued`/`blocked` categories as the
+browse API and worker claim gate: a pending embedding behind the encoding gate
+is reported separately as blocked, not as queued. The diagnostics page links
+both embedding categories to their exact corresponding filters.
+
+The diagnostics page links expired embedding/encoding leases to exact
+`embeddingLeaseExpired=true` / `encodingLeaseExpired=true` filters on photo and
+blob lists. `encodingPhase=reconciling` is an exact committing-phase filter.
+Queue-age links open the matching category, but do not isolate only the oldest
+rows; the UI says so explicitly. These filters are bounded by the same
+cursor and 1–100 page limits as other browse APIs.
 
 The browse queries use existing primary-key and hash indexes and add no schema
 migration. Literal substring searches use SQLite `instr(lower(...))` and are

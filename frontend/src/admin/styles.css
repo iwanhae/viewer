@@ -99,6 +99,9 @@ button:disabled { opacity: .6; cursor: wait; }
 .extraction-table { min-width: 860px; }
 .extraction-table .entry-name { max-width: 24rem; overflow-wrap: anywhere; }
 .extraction-table .hash-cell { display: block; max-width: 18rem; }
+.queue-diagnostic { border-top: 1px solid #e5eaed; padding: .45rem 0; }
+.queue-diagnostic:first-of-type { border-top: 0; }
+.queue-diagnostic h3 { margin: .25rem 0; }
 .event-list { list-style: none; margin: .8rem 0; padding: 0; }
 .event-list li { display: grid; gap: .2rem; border-top: 1px solid #e5eaed; padding: .7rem 0; font-size: .88rem; }
 .event-list li:first-child { border-top: 0; }

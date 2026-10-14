@@ -25,6 +25,80 @@ export type Overview = {
   }
 }
 
+export type IssueGroup = {
+  stage: 'encoding' | 'embedding' | 'album_extraction' | 'extraction_entry' | string
+  errorCode: string
+  failureCount: number
+  blobCount: number
+  photoCount: number
+  albumCount: number
+  entryCount?: number
+}
+
+export type Issues = {
+  measuredAt: string
+  groups: IssueGroup[]
+  totalGroups: number
+  remainingGroups: number
+  truncated: boolean
+  countScope: string
+}
+
+export type ExtractionFailure = {
+  albumId: string
+  originalFilename: string
+  runId: number
+  ordinal: number
+  name: string
+  candidate: boolean
+  reasonCode: string
+}
+
+export type ExtractionFailurePage = {
+  reasonCode: string
+  failures: ExtractionFailure[]
+  nextCursor: string | null
+}
+
+export type QueueDiagnostics = {
+  queuedCount: number
+  oldestStatusChangedAt: string | null
+  oldestAgeSeconds: number | null
+  unknownAgeCount: number
+}
+
+export type BlockedQueueDiagnostics = Omit<QueueDiagnostics, 'queuedCount'> & {
+  blockedCount: number
+}
+
+export type Diagnostics = {
+  measuredAt: string
+  encodingEnabled: boolean
+  modelEnabled: boolean
+  vectorStoreEnabled: boolean
+  encodingExpiredLeases: number
+  embeddingExpiredLeases: number
+  encodingQueue: QueueDiagnostics
+  embeddingQueue: QueueDiagnostics
+  embeddingBlockedQueue: BlockedQueueDiagnostics
+  encodingCommit: {
+    committingCount: number
+    reconcilingCount: number
+    oldestKnownStartedAt: string | null
+    unknownStartCount: number
+  }
+  workerActivity: { lastClaimUnixMs: number; lastRenewUnixMs: number; lastResultsUnixMs: number }
+  workerActivityScope: string
+  vectorCount: {
+    status: 'disabled' | 'available' | 'unavailable'
+    measuredAt: string | null
+    expectedPoints: number
+    actualPoints: number | null
+    countAgreement: boolean | null
+    message?: string
+  }
+}
+
 export type Photo = {
   albumId: string
   albumName: string
@@ -39,9 +113,11 @@ export type Photo = {
   encodingRaw: string
   encoding: string
   encodingError: string
+  encodingErrorCode: string
   embeddingRaw: string
   embedding: string
   embeddingError: string
+  embeddingErrorCode: string
   skippedReason: string
   blockReason: string
   encodingObservation?: StageObservation
@@ -66,9 +142,11 @@ export type Blob = {
   encodingRaw: string
   encoding: string
   encodingError: string
+  encodingErrorCode: string
   embeddingRaw: string
   embedding: string
   embeddingError: string
+  embeddingErrorCode: string
   skippedReason: string
   blockReason: string
   photoCount: number

@@ -14,7 +14,8 @@ import (
 )
 
 func (s *Server) adminPhotos(w http.ResponseWriter, r *http.Request) {
-	query, err := adminQuery(r, "q", "albumId", "hash", "encoding", "embedding", "encodingRaw", "embeddingRaw", "skippedReason", "limit", "cursor")
+	query, err := adminQuery(r, "q", "albumId", "hash", "encoding", "embedding", "encodingRaw", "embeddingRaw",
+		"encodingErrorCode", "embeddingErrorCode", "encodingLeaseExpired", "embeddingLeaseExpired", "encodingPhase", "skippedReason", "limit", "cursor")
 	if err != nil {
 		writeBrowseBadRequest(w, r, err)
 		return
@@ -24,10 +25,23 @@ func (s *Server) adminPhotos(w http.ResponseWriter, r *http.Request) {
 		writeBrowseBadRequest(w, r, err)
 		return
 	}
+	encodingLeaseExpired, err := browseBoolFilter(query, "encodingLeaseExpired")
+	if err != nil {
+		writeBrowseBadRequest(w, r, err)
+		return
+	}
+	embeddingLeaseExpired, err := browseBoolFilter(query, "embeddingLeaseExpired")
+	if err != nil {
+		writeBrowseBadRequest(w, r, err)
+		return
+	}
 	page, err := s.admin.ListPhotos(r.Context(), admin.PhotoFilters{
 		Query: query.Get("q"), AlbumID: query.Get("albumId"), Hash: query.Get("hash"),
 		Encoding: query.Get("encoding"), Embedding: query.Get("embedding"),
 		EncodingRaw: query.Get("encodingRaw"), EmbeddingRaw: query.Get("embeddingRaw"),
+		EncodingErrorCode: query.Get("encodingErrorCode"), EmbeddingErrorCode: query.Get("embeddingErrorCode"),
+		EncodingLeaseExpired: encodingLeaseExpired, EmbeddingLeaseExpired: embeddingLeaseExpired,
+		EncodingPhase: query.Get("encodingPhase"),
 		SkippedReason: query.Get("skippedReason"),
 	}, admin.BrowsePageOptions{Limit: limit, Cursor: query.Get("cursor")})
 	if err != nil {
@@ -56,7 +70,8 @@ func (s *Server) adminPhoto(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) adminBlobs(w http.ResponseWriter, r *http.Request) {
-	query, err := adminQuery(r, "albumId", "hash", "encoding", "embedding", "encodingRaw", "embeddingRaw", "skippedReason", "unreferenced", "limit", "cursor")
+	query, err := adminQuery(r, "albumId", "hash", "encoding", "embedding", "encodingRaw", "embeddingRaw",
+		"encodingErrorCode", "embeddingErrorCode", "encodingLeaseExpired", "embeddingLeaseExpired", "encodingPhase", "skippedReason", "unreferenced", "limit", "cursor")
 	if err != nil {
 		writeBrowseBadRequest(w, r, err)
 		return
@@ -75,12 +90,76 @@ func (s *Server) adminBlobs(w http.ResponseWriter, r *http.Request) {
 		}
 		unreferenced = &value
 	}
+	encodingLeaseExpired, err := browseBoolFilter(query, "encodingLeaseExpired")
+	if err != nil {
+		writeBrowseBadRequest(w, r, err)
+		return
+	}
+	embeddingLeaseExpired, err := browseBoolFilter(query, "embeddingLeaseExpired")
+	if err != nil {
+		writeBrowseBadRequest(w, r, err)
+		return
+	}
 	page, err := s.admin.ListBlobs(r.Context(), admin.BlobFilters{
 		AlbumID: query.Get("albumId"), Hash: query.Get("hash"),
 		Encoding: query.Get("encoding"), Embedding: query.Get("embedding"),
 		EncodingRaw: query.Get("encodingRaw"), EmbeddingRaw: query.Get("embeddingRaw"),
+		EncodingErrorCode: query.Get("encodingErrorCode"), EmbeddingErrorCode: query.Get("embeddingErrorCode"),
+		EncodingLeaseExpired: encodingLeaseExpired, EmbeddingLeaseExpired: embeddingLeaseExpired,
+		EncodingPhase: query.Get("encodingPhase"),
 		SkippedReason: query.Get("skippedReason"), Unreferenced: unreferenced,
 	}, admin.BrowsePageOptions{Limit: limit, Cursor: query.Get("cursor")})
+	if err != nil {
+		writeBrowseError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, page)
+}
+
+func (s *Server) adminIssues(w http.ResponseWriter, r *http.Request) {
+	if err := rejectQueryParams(r); err != nil {
+		writeBrowseBadRequest(w, r, err)
+		return
+	}
+	issues, err := s.admin.Issues(r.Context())
+	if err != nil {
+		writeError(w, r, http.StatusInternalServerError, "INTERNAL", "issue snapshot is temporarily unavailable")
+		return
+	}
+	writeJSON(w, http.StatusOK, issues)
+}
+
+func (s *Server) adminDiagnostics(w http.ResponseWriter, r *http.Request) {
+	if err := rejectQueryParams(r); err != nil {
+		writeBrowseBadRequest(w, r, err)
+		return
+	}
+	diagnostics, err := s.admin.Diagnostics(r.Context())
+	if err != nil {
+		writeError(w, r, http.StatusInternalServerError, "INTERNAL", "catalog diagnostics are temporarily unavailable")
+		return
+	}
+	writeJSON(w, http.StatusOK, diagnostics)
+}
+
+func (s *Server) adminExtractionFailures(w http.ResponseWriter, r *http.Request) {
+	query, err := adminQuery(r, "reasonCode", "limit", "cursor")
+	if err != nil {
+		writeBrowseBadRequest(w, r, err)
+		return
+	}
+	if !query.Has("reasonCode") {
+		writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", "reasonCode is required")
+		return
+	}
+	limit, err := browseLimit(query)
+	if err != nil {
+		writeBrowseBadRequest(w, r, err)
+		return
+	}
+	page, err := s.admin.LatestExtractionFailures(r.Context(), admin.ExtractionFailureOptions{
+		ReasonCode: query.Get("reasonCode"), Limit: limit, Cursor: query.Get("cursor"),
+	})
 	if err != nil {
 		writeBrowseError(w, r, err)
 		return
@@ -245,6 +324,18 @@ func browseLimit(query url.Values) (int, error) {
 		return 0, fmt.Errorf("limit must be between 1 and %d", admin.MaxBrowseLimit)
 	}
 	return limit, nil
+}
+
+func browseBoolFilter(query url.Values, key string) (*bool, error) {
+	if !query.Has(key) {
+		return nil, nil
+	}
+	raw := query.Get(key)
+	if raw != "true" && raw != "false" {
+		return nil, fmt.Errorf("%s must be true or false", key)
+	}
+	value := raw == "true"
+	return &value, nil
 }
 
 func writeBrowseBadRequest(w http.ResponseWriter, r *http.Request, err error) {

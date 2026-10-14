@@ -30,26 +30,36 @@ const (
 // Query is a literal, case-insensitive SQLite substring over album and photo
 // names; %, _ and backslash are not wildcard syntax.
 type PhotoFilters struct {
-	Query         string
-	AlbumID       string
-	Hash          string
-	Encoding      string
-	Embedding     string
-	EncodingRaw   string
-	EmbeddingRaw  string
-	SkippedReason string
+	Query                 string
+	AlbumID               string
+	Hash                  string
+	Encoding              string
+	Embedding             string
+	EncodingRaw           string
+	EmbeddingRaw          string
+	EncodingErrorCode     string
+	EmbeddingErrorCode    string
+	EncodingLeaseExpired  *bool
+	EmbeddingLeaseExpired *bool
+	EncodingPhase         string
+	SkippedReason         string
 }
 
 // BlobFilters are the explicitly supported GET /admin/api/blobs filters.
 type BlobFilters struct {
-	AlbumID       string
-	Hash          string
-	Encoding      string
-	Embedding     string
-	EncodingRaw   string
-	EmbeddingRaw  string
-	SkippedReason string
-	Unreferenced  *bool
+	AlbumID               string
+	Hash                  string
+	Encoding              string
+	Embedding             string
+	EncodingRaw           string
+	EmbeddingRaw          string
+	EncodingErrorCode     string
+	EmbeddingErrorCode    string
+	EncodingLeaseExpired  *bool
+	EmbeddingLeaseExpired *bool
+	EncodingPhase         string
+	SkippedReason         string
+	Unreferenced          *bool
 }
 
 // AlbumFilters are the explicitly supported GET /admin/api/albums filters.
@@ -161,6 +171,9 @@ func (s *Service) ListPhotos(ctx context.Context, filters PhotoFilters, options 
 		Query: filters.Query, AlbumID: filters.AlbumID, Hash: filters.Hash,
 		Encoding: filters.Encoding, Embedding: filters.Embedding,
 		EncodingRaw: filters.EncodingRaw, EmbeddingRaw: filters.EmbeddingRaw,
+		EncodingErrorCode: filters.EncodingErrorCode, EmbeddingErrorCode: filters.EmbeddingErrorCode,
+		EncodingLeaseExpired: filters.EncodingLeaseExpired, EmbeddingLeaseExpired: filters.EmbeddingLeaseExpired,
+		EncodingPhase: filters.EncodingPhase,
 		SkippedReason: filters.SkippedReason,
 	}, afterAlbum, afterIndex, options.Limit+1)
 	if err != nil {
@@ -205,6 +218,9 @@ func (s *Service) ListBlobs(ctx context.Context, filters BlobFilters, options Br
 		AlbumID: filters.AlbumID, Hash: filters.Hash,
 		Encoding: filters.Encoding, Embedding: filters.Embedding,
 		EncodingRaw: filters.EncodingRaw, EmbeddingRaw: filters.EmbeddingRaw,
+		EncodingErrorCode: filters.EncodingErrorCode, EmbeddingErrorCode: filters.EmbeddingErrorCode,
+		EncodingLeaseExpired: filters.EncodingLeaseExpired, EmbeddingLeaseExpired: filters.EmbeddingLeaseExpired,
+		EncodingPhase: filters.EncodingPhase,
 		SkippedReason: filters.SkippedReason, Unreferenced: filters.Unreferenced,
 	}, afterHash, options.Limit+1)
 	if err != nil {
@@ -392,14 +408,16 @@ func validatePhotoFilters(filters PhotoFilters) error {
 	if err := validateQuery(filters.Query); err != nil {
 		return err
 	}
-	if err := validateStateFilters(filters.Encoding, filters.Embedding, filters.EncodingRaw, filters.EmbeddingRaw, filters.SkippedReason); err != nil {
+	if err := validateStateFilters(filters.Encoding, filters.Embedding, filters.EncodingRaw, filters.EmbeddingRaw,
+		filters.EncodingErrorCode, filters.EmbeddingErrorCode, filters.EncodingPhase, filters.SkippedReason); err != nil {
 		return err
 	}
 	return nil
 }
 
 func validateBlobFilters(filters BlobFilters) error {
-	return validateStateFilters(filters.Encoding, filters.Embedding, filters.EncodingRaw, filters.EmbeddingRaw, filters.SkippedReason)
+	return validateStateFilters(filters.Encoding, filters.Embedding, filters.EncodingRaw, filters.EmbeddingRaw,
+		filters.EncodingErrorCode, filters.EmbeddingErrorCode, filters.EncodingPhase, filters.SkippedReason)
 }
 
 func validateAlbumFilters(filters AlbumFilters) error {
@@ -419,7 +437,7 @@ func validateQuery(query string) error {
 	return nil
 }
 
-func validateStateFilters(encoding, embedding, encodingRaw, embeddingRaw, skippedReason string) error {
+func validateStateFilters(encoding, embedding, encodingRaw, embeddingRaw, encodingErrorCode, embeddingErrorCode, encodingPhase, skippedReason string) error {
 	if encoding != "" && !oneOf(encoding, "queued", "processing", "validating", "committing", "completed", "skipped", "failed", "unknown") {
 		return fmt.Errorf("%w: unsupported encoding category %q", ErrInvalidBrowseRequest, encoding)
 	}
@@ -430,6 +448,17 @@ func validateStateFilters(encoding, embedding, encodingRaw, embeddingRaw, skippe
 		return fmt.Errorf("%w: unsupported skipped reason %q", ErrInvalidBrowseRequest, skippedReason)
 	}
 	for _, item := range []struct{ name, value string }{
+		{name: "encodingErrorCode", value: encodingErrorCode},
+		{name: "embeddingErrorCode", value: embeddingErrorCode},
+	} {
+		if item.value != "" && !validSafeCode(item.value) {
+			return fmt.Errorf("%w: %s must be a lowercase error code", ErrInvalidBrowseRequest, item.name)
+		}
+	}
+	if encodingPhase != "" && encodingPhase != "reconciling" {
+		return fmt.Errorf("%w: encodingPhase must be reconciling", ErrInvalidBrowseRequest)
+	}
+	for _, item := range []struct{ name, value string }{
 		{name: "encodingRaw", value: encodingRaw},
 		{name: "embeddingRaw", value: embeddingRaw},
 	} {
@@ -438,6 +467,18 @@ func validateStateFilters(encoding, embedding, encodingRaw, embeddingRaw, skippe
 		}
 	}
 	return nil
+}
+
+func validSafeCode(value string) bool {
+	if len(value) < 1 || len(value) > 64 || value[0] < 'a' || value[0] > 'z' {
+		return false
+	}
+	for _, char := range value[1:] {
+		if (char < 'a' || char > 'z') && (char < '0' || char > '9') && char != '_' {
+			return false
+		}
+	}
+	return true
 }
 
 func oneOf(value string, options ...string) bool {

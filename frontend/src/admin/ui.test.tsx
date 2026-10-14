@@ -23,13 +23,13 @@ const overview: Overview = {
 
 const missingPhoto: Photo = {
   albumId: 'album-1', albumName: 'archive.zip', idx: 0, name: 'lost.jpg', hash: 'gone', missingBlob: true,
-  width: 20, height: 30, sizeBytes: null, contentType: null, encodingRaw: '', encoding: '', encodingError: '',
-  embeddingRaw: '', embedding: '', embeddingError: '', skippedReason: '', blockReason: ''
+  width: 20, height: 30, sizeBytes: null, contentType: null, encodingRaw: '', encoding: '', encodingError: '', encodingErrorCode: '',
+  embeddingRaw: '', embedding: '', embeddingError: '', embeddingErrorCode: '', skippedReason: '', blockReason: ''
 }
 
 const detailBlob: Blob = {
   hash: 'history-hash', sizeBytes: 10, contentType: 'image/jpeg', encodingRaw: 'pending', encoding: 'queued',
-  encodingError: '', embeddingRaw: 'pending', embedding: 'queued', embeddingError: '', skippedReason: '',
+  encodingError: '', encodingErrorCode: '', embeddingRaw: 'pending', embedding: 'queued', embeddingError: '', embeddingErrorCode: '', skippedReason: '',
   blockReason: '', photoCount: 0, albumCount: 0,
   encodingObservation: { startedAt: null, finishedAt: null, statusChangedAt: null, status: 'pending', phase: null, attempts: 0, errorCode: '', retryability: 'unknown' },
   embeddingObservation: { startedAt: '2026-10-14T12:00:00Z', finishedAt: null, statusChangedAt: '2026-10-14T12:00:00Z', status: 'processing', phase: null, attempts: 2, errorCode: 'legacy_unknown', retryability: 'unknown' }
@@ -328,5 +328,67 @@ describe('admin React UI', () => {
     renderAt('/albums/album-1')
     expect(await screen.findByText(/기록 기능 도입 전의 기존 앨범이며 실패 항목이 0개라는 뜻은 아닙니다/)).toBeTruthy()
     expect(fetchMock.mock.calls.some(([url]) => String(url).includes('/entries'))).toBe(false)
+  })
+
+  it('shows current issue groups and drills into the matching paged resource and latest extraction entries', async () => {
+    const issues = {
+      measuredAt: '2026-10-14T12:00:00Z', totalGroups: 2, remainingGroups: 0, truncated: false,
+      countScope: 'Groups are independent.',
+      groups: [
+        { stage: 'encoding', errorCode: 'invalid_source', failureCount: 1, blobCount: 1, photoCount: 2, albumCount: 1 },
+        { stage: 'extraction_entry', errorCode: 'invalid_image', failureCount: 2, entryCount: 2, blobCount: 0, photoCount: 0, albumCount: 2 }
+      ]
+    }
+    const fetchMock = mockFetch((url) => {
+      if (url === '/admin/api/issues') return jsonResponse(issues)
+      if (url === '/admin/api/blobs?encoding=failed&encodingErrorCode=invalid_source') return jsonResponse({ blobs: [], nextCursor: null })
+      if (url === '/admin/api/extraction-failures?reasonCode=invalid_image&limit=50') return jsonResponse({
+        reasonCode: 'invalid_image', failures: [{ albumId: 'album-2', originalFilename: 'broken.zip', runId: 9, ordinal: 2, name: 'bad.jpg', candidate: true, reasonCode: 'invalid_image' }], nextCursor: null
+      })
+      return jsonResponse({ blobs: [], nextCursor: null })
+    })
+    renderAt('/issues')
+
+    expect(await screen.findByText('invalid_source')).toBeTruthy()
+    expect(screen.getByText(/측정/)).toBeTruthy()
+    expect(screen.getByText('Groups are independent.')).toBeTruthy()
+    expect(screen.getByRole('link', { name: '이슈' })).toBeTruthy()
+    const issueCount = screen.getByRole('link', { name: '1' })
+    expect(issueCount.getAttribute('href')).toBe('/blobs?encoding=failed&encodingErrorCode=invalid_source')
+    fireEvent.click(issueCount)
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/admin/api/blobs?encoding=failed&encodingErrorCode=invalid_source', expect.anything()))
+
+    // Navigate through the extraction group, which loads entries only from
+    // their albums' latest runs and uses a separately bounded page API.
+    cleanup()
+    renderAt('/issues?entryReasonCode=invalid_image')
+    expect(await screen.findByText('bad.jpg')).toBeTruthy()
+    expect(screen.getByText(/최신 추출 실행 실패 항목/)).toBeTruthy()
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/admin/api/extraction-failures?reasonCode=invalid_image&limit=50', expect.anything()))
+  })
+
+  it('labels diagnostics as measurements rather than worker heartbeats or full vector sync', async () => {
+    const diagnostics = {
+      measuredAt: '2026-10-14T12:00:00Z', encodingEnabled: false, modelEnabled: false, vectorStoreEnabled: true,
+      encodingExpiredLeases: 1, embeddingExpiredLeases: 2,
+      encodingQueue: { queuedCount: 3, oldestStatusChangedAt: null, oldestAgeSeconds: null, unknownAgeCount: 3 },
+      embeddingQueue: { queuedCount: 4, oldestStatusChangedAt: '2026-10-14T10:00:00Z', oldestAgeSeconds: 7200, unknownAgeCount: 1 },
+      embeddingBlockedQueue: { blockedCount: 2, oldestStatusChangedAt: '2026-10-14T09:00:00Z', oldestAgeSeconds: 10800, unknownAgeCount: 1 },
+      encodingCommit: { committingCount: 1, reconcilingCount: 1, oldestKnownStartedAt: '2026-10-14T11:00:00Z', unknownStartCount: 0 },
+      workerActivity: { lastClaimUnixMs: 0, lastRenewUnixMs: 0, lastResultsUnixMs: 0 },
+      workerActivityScope: 'Since server restart; attempt stamps are not heartbeats.',
+      vectorCount: { status: 'available', measuredAt: '2026-10-14T12:00:02Z', expectedPoints: 4, actualPoints: 4, countAgreement: true }
+    }
+    const fetchMock = mockFetch((url) => url === '/admin/api/diagnostics' ? jsonResponse(diagnostics) : jsonResponse({ photos: [], nextCursor: null }))
+    renderAt('/diagnostics')
+
+    expect(await screen.findByText('개수 일치')).toBeTruthy()
+    expect(screen.getByText(/연령 미상 3/)).toBeTruthy()
+    expect(screen.getByText(/attempt stamps are not heartbeats/)).toBeTruthy()
+    expect(screen.getByText(/전체 동기화나 포인트 무결성을 검증하지 않습니다/)).toBeTruthy()
+    expect(screen.getByRole('link', { name: '시스템 진단' })).toBeTruthy()
+    expect(screen.getByRole('link', { name: '임베딩 차단 항목 보기' }).getAttribute('href')).toBe('/blobs?embedding=blocked')
+    expect(screen.getByRole('link', { name: /인코딩 만료 리스/ }).getAttribute('href')).toBe('/blobs?encodingLeaseExpired=true')
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/admin/api/diagnostics', expect.anything()))
   })
 })
