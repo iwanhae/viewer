@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -19,9 +20,15 @@ import (
 
 // stubAdminVectorCounter stands in for the Qdrant client, letting a test fix
 // the "actual points" half of the drift figure.
-type stubAdminVectorCounter struct{ points int }
+type stubAdminVectorCounter struct {
+	points int
+	err    error
+}
 
 func (c stubAdminVectorCounter) CountVectors(ctx context.Context) (int, error) {
+	if c.err != nil {
+		return 0, c.err
+	}
 	return c.points, nil
 }
 
@@ -80,6 +87,7 @@ func TestAdminRoutesRequireBothServiceAndToken(t *testing.T) {
 		{http.MethodGet, "/admin"},
 		{http.MethodGet, "/admin/"},
 		{http.MethodGet, "/admin/api/stats"},
+		{http.MethodGet, "/admin/api/overview"},
 		{http.MethodPost, "/admin/api/reindex"},
 	}
 	for name, router := range routers {
@@ -135,6 +143,7 @@ func TestAdminAuthChallenges(t *testing.T) {
 	for _, item := range unauthorized {
 		for _, route := range []struct{ method, target string }{
 			{http.MethodGet, "/admin/api/stats"},
+			{http.MethodGet, "/admin/api/overview"},
 			{http.MethodPost, "/admin/api/reindex"},
 		} {
 			rec := doAdminRequest(t, router, route.method, route.target, item.authorization)
@@ -231,6 +240,67 @@ func TestAdminStatsShape(t *testing.T) {
 	}
 	if payload["vectorStoreEnabled"] != true {
 		t.Fatalf("vectorStoreEnabled=%v want=true (a vector counter is wired)", payload["vectorStoreEnabled"])
+	}
+}
+
+func TestAdminOverviewRouteJSONContractAndVectorIndependence(t *testing.T) {
+	store := openAdminTestCatalog(t)
+	seedEmbeddingFixture(t, store)
+	service := admin.NewService(store, stubAdminVectorCounter{err: errors.New("qdrant unavailable")}, nil)
+	router := New(nil, nil, nil, nil, "worker-token", service, "sekrit").Router()
+
+	rec := doAdminRequest(t, router, http.MethodGet, "/admin/api/overview", basicAuthHeader("operator", "sekrit"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d want=200 body=%s", rec.Code, rec.Body.String())
+	}
+	var payload struct {
+		MeasuredAt string            `json:"measuredAt"`
+		Units      map[string]string `json:"units"`
+		Library    map[string]int64  `json:"library"`
+		Encoding   struct {
+			Categories     map[string]map[string]int64 `json:"categories"`
+			SkippedReasons map[string]map[string]int64 `json:"skippedReasons"`
+			RawStates      map[string]map[string]int64 `json:"rawStates"`
+		} `json:"encoding"`
+		Embedding struct {
+			Categories map[string]map[string]int64 `json:"categories"`
+			RawStates  map[string]map[string]int64 `json:"rawStates"`
+		} `json:"embedding"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode overview: %v body=%s", err, rec.Body.String())
+	}
+	if _, err := time.Parse(time.RFC3339Nano, payload.MeasuredAt); err != nil {
+		t.Fatalf("measuredAt=%q is not RFC3339: %v", payload.MeasuredAt, err)
+	}
+	if payload.Units["measuredAt"] != "RFC3339 UTC" || !strings.Contains(payload.Units["counts"], "distinct albums") {
+		t.Fatalf("units=%v want explicit timestamp and count units", payload.Units)
+	}
+	if payload.Library["albums"] != 1 || payload.Library["photos"] != 3 || payload.Library["blobs"] != 3 || payload.Library["unreferencedBlobs"] != 0 {
+		t.Fatalf("library=%v want albums=1 photos=3 blobs=3 unreferencedBlobs=0", payload.Library)
+	}
+	for _, category := range []string{"queued", "processing", "validating", "committing", "completed", "skipped", "failed", "unknown"} {
+		assertOverviewJSONCounts(t, "encoding.categories."+category, payload.Encoding.Categories[category])
+	}
+	for _, category := range []string{"queued", "blocked", "processing", "completed", "failed", "unknown"} {
+		assertOverviewJSONCounts(t, "embedding.categories."+category, payload.Embedding.Categories[category])
+	}
+	assertOverviewJSONCounts(t, "encoding.skippedReasons.webp", payload.Encoding.SkippedReasons["webp"])
+	assertOverviewJSONCounts(t, "encoding.skippedReasons.nonWebp", payload.Encoding.SkippedReasons["nonWebp"])
+	if _, ok := payload.Encoding.RawStates["pending"]; !ok {
+		t.Fatalf("encoding rawStates missing pending: %v", payload.Encoding.RawStates)
+	}
+	if _, ok := payload.Embedding.RawStates["ready"]; !ok {
+		t.Fatalf("embedding rawStates missing ready: %v", payload.Embedding.RawStates)
+	}
+}
+
+func assertOverviewJSONCounts(t *testing.T, name string, counts map[string]int64) {
+	t.Helper()
+	for _, key := range []string{"blobCount", "photoCount", "albumCount"} {
+		if _, ok := counts[key]; !ok {
+			t.Errorf("%s missing %q counts: %v", name, key, counts)
+		}
 	}
 }
 

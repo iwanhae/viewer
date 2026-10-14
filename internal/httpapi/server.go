@@ -113,6 +113,7 @@ func (s *Server) Router() http.Handler {
 			r.Use(s.requireAdminToken)
 			r.Get("/", admin.Page().ServeHTTP)
 			r.Get("/api/stats", s.adminStats)
+			r.Get("/api/overview", s.adminOverview)
 			r.Post("/api/reindex", s.adminReindex)
 			r.Post("/api/recover", s.adminRecover)
 		})

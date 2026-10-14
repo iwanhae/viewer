@@ -751,10 +751,10 @@ func (s *Store) ClaimPendingEmbeddings(ctx context.Context, limit int, leaseUnti
 		UPDATE blobs
 		SET embedding_status = ?1, embedding_lease_until = ?2
 		WHERE hash IN (
-			SELECT hash FROM blobs
+			SELECT b.hash FROM blobs AS b
 			WHERE (embedding_status = ?3
 			   OR (embedding_status = ?1 AND embedding_lease_until < ?4))
-			  AND (encoding_gate = 0 OR encoding_status IN ('done', 'skipped', 'failed'))
+			  AND `+embeddingClaimGatePredicate+`
 			ORDER BY created_at ASC
 			LIMIT ?5
 		)

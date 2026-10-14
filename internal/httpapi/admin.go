@@ -76,6 +76,17 @@ func (s *Server) adminStats(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, stats)
 }
 
+// adminOverview serves the catalog-only snapshot. Unlike /stats it has no
+// dependency on Qdrant or recommendation/model services.
+func (s *Server) adminOverview(w http.ResponseWriter, r *http.Request) {
+	overview, err := s.admin.Overview(r.Context())
+	if err != nil {
+		writeError(w, r, http.StatusInternalServerError, "INTERNAL", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, overview)
+}
+
 // adminReindex triggers the full re-embed and answers with the embedding
 // counts it produced, so the operator's next look at the page — or this very
 // response — already shows the pending surge.

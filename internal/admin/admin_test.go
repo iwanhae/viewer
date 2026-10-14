@@ -237,6 +237,27 @@ func TestStatsVectorCounterErrorPropagates(t *testing.T) {
 	}
 }
 
+func TestOverviewDoesNotConsultVectorCounter(t *testing.T) {
+	store := openTestCatalog(t)
+	seedLibrary(t, store)
+	counter := &fakeVectorCounter{err: errors.New("qdrant down")}
+	service := NewService(store, counter, nil)
+
+	overview, err := service.Overview(context.Background())
+	if err != nil {
+		t.Fatalf("overview with unavailable vector store: %v", err)
+	}
+	if counter.calls != 0 {
+		t.Fatalf("overview called CountVectors %d times, want zero", counter.calls)
+	}
+	if overview.Library.Albums != 2 || overview.Library.Photos != 3 || overview.Library.Blobs != 2 {
+		t.Fatalf("overview library=%+v want albums=2 photos=3 blobs=2", overview.Library)
+	}
+	if overview.MeasuredAt == "" || overview.Units.MeasuredAt != "RFC3339 UTC" {
+		t.Fatalf("overview timestamp contract=%+v", overview)
+	}
+}
+
 func TestReindexReturnsPostResetCounts(t *testing.T) {
 	store := openTestCatalog(t)
 	ctx := context.Background()
