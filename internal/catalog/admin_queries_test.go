@@ -60,6 +60,7 @@ func TestAdminOverviewPipelineBreakdownsAndClaimEligibility(t *testing.T) {
 		{AlbumID: "album-b", Index: 2, Hash: "skipped-nonwebp"},
 		{AlbumID: "album-b", Index: 3, Hash: "encoding-failed"},
 		{AlbumID: "album-b", Index: 4, Hash: "gate-pending"},
+		{AlbumID: "album-a", Index: 7, Name: "dangling.jpg", Hash: "missing-blob"},
 	}
 	for _, photo := range photos {
 		if err := store.InsertPhoto(ctx, photo); err != nil {
@@ -71,8 +72,8 @@ func TestAdminOverviewPipelineBreakdownsAndClaimEligibility(t *testing.T) {
 	if err != nil {
 		t.Fatalf("admin overview: %v", err)
 	}
-	if snapshot.Albums != 2 || snapshot.Photos != 12 || snapshot.Blobs != 11 || snapshot.UnreferencedBlobs != 1 {
-		t.Fatalf("library counts=%+v want albums=2 photos=12 blobs=11 unreferenced=1", snapshot)
+	if snapshot.Albums != 2 || snapshot.Photos != 13 || snapshot.Blobs != 11 || snapshot.UnreferencedBlobs != 1 || snapshot.MissingBlobPhotos != 1 {
+		t.Fatalf("library counts=%+v want albums=2 photos=13 blobs=11 unreferenced=1 missingBlobPhotos=1", snapshot)
 	}
 
 	// Category blob/photo totals partition the catalog. AlbumCount is distinct
@@ -81,6 +82,13 @@ func TestAdminOverviewPipelineBreakdownsAndClaimEligibility(t *testing.T) {
 	assertPipelineTotals(t, "embedding", snapshot.EmbeddingCategories, 11, 12)
 	assertPipelineTotals(t, "encoding raw states", snapshot.EncodingRawStates, 11, 12)
 	assertPipelineTotals(t, "embedding raw states", snapshot.EmbeddingRawStates, 11, 12)
+	var pipelinePhotoRows int64
+	for _, counts := range snapshot.EncodingCategories {
+		pipelinePhotoRows += counts.PhotoCount
+	}
+	if pipelinePhotoRows+snapshot.MissingBlobPhotos != snapshot.Photos {
+		t.Fatalf("photo accounting pipeline=%d missingBlobPhotos=%d total=%d", pipelinePhotoRows, snapshot.MissingBlobPhotos, snapshot.Photos)
+	}
 
 	assertCounts(t, "encoding queued", snapshot.EncodingCategories["queued"], 2, 4, 2)
 	assertCounts(t, "encoding processing", snapshot.EncodingCategories["processing"], 1, 1, 1)

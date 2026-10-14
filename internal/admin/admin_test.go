@@ -2,7 +2,9 @@ package admin
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -240,6 +242,9 @@ func TestStatsVectorCounterErrorPropagates(t *testing.T) {
 func TestOverviewDoesNotConsultVectorCounter(t *testing.T) {
 	store := openTestCatalog(t)
 	seedLibrary(t, store)
+	if err := store.InsertPhoto(context.Background(), catalog.Photo{AlbumID: "album-a", Index: 2, Name: "dangling.jpg", Hash: "missing-blob"}); err != nil {
+		t.Fatalf("insert dangling photo: %v", err)
+	}
 	counter := &fakeVectorCounter{err: errors.New("qdrant down")}
 	service := NewService(store, counter, nil)
 
@@ -250,11 +255,89 @@ func TestOverviewDoesNotConsultVectorCounter(t *testing.T) {
 	if counter.calls != 0 {
 		t.Fatalf("overview called CountVectors %d times, want zero", counter.calls)
 	}
-	if overview.Library.Albums != 2 || overview.Library.Photos != 3 || overview.Library.Blobs != 2 {
-		t.Fatalf("overview library=%+v want albums=2 photos=3 blobs=2", overview.Library)
+	if overview.Library.Albums != 2 || overview.Library.Photos != 4 || overview.Library.Blobs != 2 || overview.Library.MissingBlobPhotos != 1 {
+		t.Fatalf("overview library=%+v want albums=2 photos=4 blobs=2 missingBlobPhotos=1", overview.Library)
 	}
 	if overview.MeasuredAt == "" || overview.Units.MeasuredAt != "RFC3339 UTC" {
 		t.Fatalf("overview timestamp contract=%+v", overview)
+	}
+}
+
+func TestAdminBrowseKeysetCursorsAreStableAndFilterBound(t *testing.T) {
+	store := openTestCatalog(t)
+	ctx := context.Background()
+	for _, album := range []catalog.Album{
+		{ID: "album-a", OriginalFilename: "a.zip", Status: catalog.AlbumStatusReady},
+		{ID: "album-b", OriginalFilename: "b.zip", Status: catalog.AlbumStatusFailed},
+		{ID: "album-c", OriginalFilename: "c.zip", Status: catalog.AlbumStatusReady},
+	} {
+		if err := store.CreateAlbum(ctx, album); err != nil {
+			t.Fatalf("create album: %v", err)
+		}
+	}
+	for i := 0; i < 4; i++ {
+		hash := fmt.Sprintf("hash-%d", i)
+		if err := store.UpsertBlob(ctx, catalog.Blob{Hash: hash, SizeBytes: int64(i + 1)}); err != nil {
+			t.Fatalf("upsert blob: %v", err)
+		}
+	}
+	for i := 0; i < 3; i++ {
+		if err := store.InsertPhoto(ctx, catalog.Photo{AlbumID: "album-a", Index: i, Name: fmt.Sprintf("a-%d.jpg", i), Hash: fmt.Sprintf("hash-%d", i)}); err != nil {
+			t.Fatalf("insert photo: %v", err)
+		}
+	}
+	if err := store.InsertPhoto(ctx, catalog.Photo{AlbumID: "album-c", Index: 0, Name: "c.jpg", Hash: "hash-3"}); err != nil {
+		t.Fatalf("insert photo: %v", err)
+	}
+	service := NewService(store, nil, nil)
+
+	photoPage, err := service.ListPhotos(ctx, PhotoFilters{AlbumID: "album-a"}, BrowsePageOptions{Limit: 2})
+	if err != nil || len(photoPage.Photos) != 2 || photoPage.NextCursor == nil {
+		t.Fatalf("first photo page=%+v err=%v", photoPage, err)
+	}
+	if photoPage.Photos[0].Index != 0 || photoPage.Photos[1].Index != 1 {
+		t.Fatalf("first photo page order=%v want indexes 0,1", []int{photoPage.Photos[0].Index, photoPage.Photos[1].Index})
+	}
+	if _, err := base64.RawURLEncoding.DecodeString(*photoPage.NextCursor); err != nil {
+		t.Fatalf("photo cursor is not URL-safe base64: %q (%v)", *photoPage.NextCursor, err)
+	}
+	secondPhotoPage, err := service.ListPhotos(ctx, PhotoFilters{AlbumID: "album-a"}, BrowsePageOptions{Limit: 2, Cursor: *photoPage.NextCursor})
+	if err != nil || len(secondPhotoPage.Photos) != 1 || secondPhotoPage.NextCursor != nil || secondPhotoPage.Photos[0].Index != 2 {
+		t.Fatalf("second photo page=%+v err=%v", secondPhotoPage, err)
+	}
+	if _, err := service.ListPhotos(ctx, PhotoFilters{AlbumID: "album-c"}, BrowsePageOptions{Limit: 2, Cursor: *photoPage.NextCursor}); !errors.Is(err, ErrInvalidBrowseRequest) {
+		t.Fatalf("photo cursor accepted different filters: %v", err)
+	}
+	if _, err := service.ListPhotos(ctx, PhotoFilters{AlbumID: "album-a"}, BrowsePageOptions{Limit: 1, Cursor: *photoPage.NextCursor}); !errors.Is(err, ErrInvalidBrowseRequest) {
+		t.Fatalf("photo cursor accepted different limit: %v", err)
+	}
+
+	albumPage, err := service.ListAlbums(ctx, AlbumFilters{Status: string(catalog.AlbumStatusReady)}, BrowsePageOptions{Limit: 1})
+	if err != nil || len(albumPage.Albums) != 1 || albumPage.Albums[0].ID != "album-a" || albumPage.NextCursor == nil {
+		t.Fatalf("first album page=%+v err=%v", albumPage, err)
+	}
+	secondAlbumPage, err := service.ListAlbums(ctx, AlbumFilters{Status: string(catalog.AlbumStatusReady)}, BrowsePageOptions{Limit: 1, Cursor: *albumPage.NextCursor})
+	if err != nil || len(secondAlbumPage.Albums) != 1 || secondAlbumPage.Albums[0].ID != "album-c" || secondAlbumPage.NextCursor != nil {
+		t.Fatalf("second album page=%+v err=%v", secondAlbumPage, err)
+	}
+
+	blobPage, err := service.ListBlobs(ctx, BlobFilters{}, BrowsePageOptions{Limit: 2})
+	if err != nil || len(blobPage.Blobs) != 2 || blobPage.NextCursor == nil {
+		t.Fatalf("first blob page=%+v err=%v", blobPage, err)
+	}
+	secondBlobPage, err := service.ListBlobs(ctx, BlobFilters{}, BrowsePageOptions{Limit: 2, Cursor: *blobPage.NextCursor})
+	if err != nil || len(secondBlobPage.Blobs) != 2 || secondBlobPage.NextCursor != nil {
+		t.Fatalf("second blob page=%+v err=%v", secondBlobPage, err)
+	}
+	seenHashes := map[string]bool{}
+	for _, blob := range append(blobPage.Blobs, secondBlobPage.Blobs...) {
+		if seenHashes[blob.Hash] {
+			t.Fatalf("blob repeated across pages: %s", blob.Hash)
+		}
+		seenHashes[blob.Hash] = true
+	}
+	if len(seenHashes) != 4 {
+		t.Fatalf("blob pages yielded %d unique hashes, want 4: %v", len(seenHashes), seenHashes)
 	}
 }
 

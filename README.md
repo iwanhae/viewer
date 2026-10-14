@@ -115,6 +115,66 @@ Notes:
 | POST | `/api/embedding/claim`, `/renew`, `/results` | External embedding-worker lease API (bearer-token when `WORKER_TOKEN` is set). |
 | POST | `/api/encoding/claim`, `/renew`, `/complete`, `/output` | External WebP encoder lease/result API, enabled when `WORKER_TOKEN` is set. New workers request `outputMode: "api"`; result streams go to `/output`, are spooled under `$STATE_DIR/encoding-spool`, and are asynchronously validated before a conditional S3 write. Claims without that mode retain the legacy presigned-PUT contract during rollout. |
 | GET | `/admin` | Dashboard (library, embedding and WebP encoding stats + re-embed trigger); enabled only when `ADMIN_TOKEN` is set. |
+| GET | `/admin/api/overview` | Catalog-only pipeline totals and normalized/raw state breakdowns. |
+| GET | `/admin/api/photos` | Paged photo rows with album metadata and current encoding/embedding state. |
+| GET | `/admin/api/photos/{albumId}/{idx}` | One photo row with current pipeline state. |
+| GET | `/admin/api/blobs` | Paged blob state and reference counts, including unreferenced blobs. |
+| GET | `/admin/api/blobs/{hash}` | One blob with relation counts; fetch references through the paged photo list. |
+| GET | `/admin/api/albums` | Paged album processing state, error, and actual photo-row count. |
+| GET | `/admin/api/albums/{id}` | Album processing state and overview-equivalent counts for its referenced blobs/photos. |
+
+The admin resource APIs require the same HTTP Basic password (`ADMIN_TOKEN`) as
+the dashboard, and are absent when the admin service or token is disabled. List
+responses use `{photos|blobs|albums, nextCursor}`; `nextCursor` is `null` at the
+end. `limit` defaults to 50 and accepts 1–100. Cursors are URL-safe opaque
+keyset positions bound to the resource, filters, and limit; send the same
+filters and limit on continuation requests. Pages are ordered by
+`(albumId, idx)`, `hash`, or `id`, respectively. They are separate reads, not a
+snapshot across concurrent catalog updates. Unknown query parameters, repeated
+parameters, invalid categories/statuses, and malformed or mismatched cursors
+return 400. Missing detail resources return 404.
+
+`GET /admin/api/photos` accepts `q`, `albumId`, `hash`, `encoding`, `embedding`,
+`encodingRaw`, `embeddingRaw`, `skippedReason`, `limit`, and `cursor`. `q` is a
+ASCII-case-insensitive literal substring of the album filename or photo name (`%`,
+`_`, and `\` are ordinary characters). `hash` is exact. `encoding` accepts the
+overview categories `queued`, `processing`, `validating`, `committing`,
+`completed`, `skipped`, `failed`, and `unknown`; `embedding` accepts `queued`,
+`blocked`, `processing`, `completed`, `failed`, and `unknown`. The `*Raw`
+filters match exact stored states, including states this version does not
+recognize. `skippedReason` is `webp` or `nonWebp`, based only on stored content
+type. `q` is limited to 256 bytes and either raw-state filter to 128 bytes.
+Multiple filters combine with AND. Photo rows include the current raw and
+normalized states, error text, and `blockReason: "encoding_gate"` only for
+pending embeddings that fail the same gate used by embedding claims.
+If `missingBlob` is true, the photo row's hash has no blob row: `sizeBytes` and
+`contentType` are `null`, and pipeline state/error fields are empty rather than
+being classified as an unknown blob.
+
+`GET /admin/api/blobs` accepts `albumId`, exact `hash`, the same encoding,
+embedding, raw-state, and skipped-reason filters, plus `unreferenced=true|false`,
+`limit`, and `cursor`. Blob details include `photoCount` and distinct
+`albumCount`, not embedded reference arrays. Use
+`GET /admin/api/photos?hash={hash}` to page through photos for a shared blob.
+`GET /admin/api/albums` accepts a literal-substring `q`, `status` (`QUEUED`,
+`PROCESSING`, `SUCCEEDED`, or `FAILED`), `limit`, and `cursor`. Album detail
+pipeline breakdowns use the same category/raw-state meanings and count units as
+the overview, scoped to that album; its referenced photos are available through
+`GET /admin/api/photos?albumId={id}`.
+`library.photos` and album `photoCount` include every photo row, while pipeline
+category photo counts include only rows with a blob. Therefore the encoding or
+embedding category `photoCount` sum plus `missingBlobPhotos` equals the total
+photo count (assuming photo rows reference existing albums). The overview's
+`library.missingBlobPhotos` and album detail's `missingBlobPhotos` are counted
+in their respective catalog read transactions.
+
+The browse queries use existing primary-key and hash indexes and add no schema
+migration. Literal substring searches use SQLite `instr(lower(...))` and are
+not indexed; state-filtered photo/blob pages can also examine many rows on a
+large catalog. The current indexes support ordered album/photo/hash traversal,
+but production `EXPLAIN QUERY PLAN` and workload measurements should guide any
+future approved index migration. No list API reports retry counts or invented
+retry/timing estimates.
 
 For an encoder rollout, deploy the API server before upgrading workers; old
 workers remain supported by the legacy claim mode. Do not roll back to a server

@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -88,6 +89,12 @@ func TestAdminRoutesRequireBothServiceAndToken(t *testing.T) {
 		{http.MethodGet, "/admin/"},
 		{http.MethodGet, "/admin/api/stats"},
 		{http.MethodGet, "/admin/api/overview"},
+		{http.MethodGet, "/admin/api/photos"},
+		{http.MethodGet, "/admin/api/photos/a/0"},
+		{http.MethodGet, "/admin/api/blobs"},
+		{http.MethodGet, "/admin/api/blobs/hash"},
+		{http.MethodGet, "/admin/api/albums"},
+		{http.MethodGet, "/admin/api/albums/a"},
 		{http.MethodPost, "/admin/api/reindex"},
 	}
 	for name, router := range routers {
@@ -144,6 +151,12 @@ func TestAdminAuthChallenges(t *testing.T) {
 		for _, route := range []struct{ method, target string }{
 			{http.MethodGet, "/admin/api/stats"},
 			{http.MethodGet, "/admin/api/overview"},
+			{http.MethodGet, "/admin/api/photos"},
+			{http.MethodGet, "/admin/api/photos/album-a/0"},
+			{http.MethodGet, "/admin/api/blobs"},
+			{http.MethodGet, "/admin/api/blobs/hash-a"},
+			{http.MethodGet, "/admin/api/albums"},
+			{http.MethodGet, "/admin/api/albums/album-a"},
 			{http.MethodPost, "/admin/api/reindex"},
 		} {
 			rec := doAdminRequest(t, router, route.method, route.target, item.authorization)
@@ -276,8 +289,8 @@ func TestAdminOverviewRouteJSONContractAndVectorIndependence(t *testing.T) {
 	if payload.Units["measuredAt"] != "RFC3339 UTC" || !strings.Contains(payload.Units["counts"], "distinct albums") {
 		t.Fatalf("units=%v want explicit timestamp and count units", payload.Units)
 	}
-	if payload.Library["albums"] != 1 || payload.Library["photos"] != 3 || payload.Library["blobs"] != 3 || payload.Library["unreferencedBlobs"] != 0 {
-		t.Fatalf("library=%v want albums=1 photos=3 blobs=3 unreferencedBlobs=0", payload.Library)
+	if payload.Library["albums"] != 1 || payload.Library["photos"] != 3 || payload.Library["blobs"] != 3 || payload.Library["unreferencedBlobs"] != 0 || payload.Library["missingBlobPhotos"] != 0 {
+		t.Fatalf("library=%v want albums=1 photos=3 blobs=3 unreferencedBlobs=0 missingBlobPhotos=0", payload.Library)
 	}
 	for _, category := range []string{"queued", "processing", "validating", "committing", "completed", "skipped", "failed", "unknown"} {
 		assertOverviewJSONCounts(t, "encoding.categories."+category, payload.Encoding.Categories[category])
@@ -292,6 +305,138 @@ func TestAdminOverviewRouteJSONContractAndVectorIndependence(t *testing.T) {
 	}
 	if _, ok := payload.Embedding.RawStates["ready"]; !ok {
 		t.Fatalf("embedding rawStates missing ready: %v", payload.Embedding.RawStates)
+	}
+}
+
+func TestAdminResourceBrowseRoutesContractAndValidation(t *testing.T) {
+	store := openAdminTestCatalog(t)
+	ctx := context.Background()
+	for _, album := range []catalog.Album{
+		{ID: "album-a", OriginalFilename: "alpha.zip", Status: catalog.AlbumStatusFailed, Error: "extract failed"},
+		{ID: "album-b", OriginalFilename: "beta.zip", Status: catalog.AlbumStatusReady},
+	} {
+		if err := store.CreateAlbum(ctx, album); err != nil {
+			t.Fatalf("create album: %v", err)
+		}
+	}
+	blobs := []catalog.Blob{
+		{Hash: "shared", SizeBytes: 31, ContentType: "image/jpeg"},
+		{Hash: "blocked", SizeBytes: 32, ContentType: "image/png", EncodingGate: true},
+		{Hash: "orphan", SizeBytes: 33, ContentType: "image/jpeg", EncodingGate: true},
+	}
+	for _, blob := range blobs {
+		if err := store.UpsertBlob(ctx, blob); err != nil {
+			t.Fatalf("upsert blob: %v", err)
+		}
+	}
+	for _, photo := range []catalog.Photo{
+		{AlbumID: "album-a", Index: 0, Name: "shared.jpg", Hash: "shared", Width: 4, Height: 8},
+		{AlbumID: "album-a", Index: 1, Name: "blocked.jpg", Hash: "blocked", Width: 5, Height: 9},
+		{AlbumID: "album-a", Index: 2, Name: `literal%_\match.jpg`, Hash: "shared", Width: 4, Height: 8},
+		{AlbumID: "album-a", Index: 3, Name: "dangling.jpg", Hash: "missing-blob", Width: 6, Height: 10},
+		{AlbumID: "album-b", Index: 0, Name: "same bytes.jpg", Hash: "shared", Width: 4, Height: 8},
+	} {
+		if err := store.InsertPhoto(ctx, photo); err != nil {
+			t.Fatalf("insert photo: %v", err)
+		}
+	}
+	service := admin.NewService(store, nil, nil)
+	router := New(nil, nil, nil, nil, "", service, "sekrit").Router()
+	auth := basicAuthHeader("operator", "sekrit")
+
+	unauthorized := doAdminRequest(t, router, http.MethodGet, "/admin/api/photos", "")
+	if unauthorized.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthorized photos status=%d want=401", unauthorized.Code)
+	}
+
+	target := "/admin/api/photos?q=" + url.QueryEscape(`%_\`)
+	search := doAdminRequest(t, router, http.MethodGet, target, auth)
+	if search.Code != http.StatusOK {
+		t.Fatalf("literal search status=%d body=%s", search.Code, search.Body.String())
+	}
+	var searchBody struct {
+		Photos []map[string]any `json:"photos"`
+	}
+	if err := json.Unmarshal(search.Body.Bytes(), &searchBody); err != nil || len(searchBody.Photos) != 1 {
+		t.Fatalf("literal search payload=%s err=%v want exactly one photo", search.Body.String(), err)
+	}
+	photo := searchBody.Photos[0]
+	for _, key := range []string{"albumId", "albumName", "idx", "name", "hash", "missingBlob", "width", "height", "sizeBytes", "contentType", "encodingRaw", "encoding", "encodingError", "embeddingRaw", "embedding", "embeddingError", "skippedReason", "blockReason"} {
+		if _, ok := photo[key]; !ok {
+			t.Errorf("photo JSON missing %q: %v", key, photo)
+		}
+	}
+	if photo["name"] != `literal%_\match.jpg` || photo["encoding"] != "queued" {
+		t.Fatalf("photo payload=%v", photo)
+	}
+
+	detail := doAdminRequest(t, router, http.MethodGet, "/admin/api/photos/album-a/1", auth)
+	if detail.Code != http.StatusOK || !strings.Contains(detail.Body.String(), `"blockReason":"encoding_gate"`) || !strings.Contains(detail.Body.String(), `"embeddingError":""`) {
+		t.Fatalf("photo detail status=%d body=%s", detail.Code, detail.Body.String())
+	}
+	danglingDetail := doAdminRequest(t, router, http.MethodGet, "/admin/api/photos/album-a/3", auth)
+	if danglingDetail.Code != http.StatusOK || !strings.Contains(danglingDetail.Body.String(), `"missingBlob":true`) || !strings.Contains(danglingDetail.Body.String(), `"sizeBytes":null`) || !strings.Contains(danglingDetail.Body.String(), `"contentType":null`) || !strings.Contains(danglingDetail.Body.String(), `"encoding":""`) || !strings.Contains(danglingDetail.Body.String(), `"embedding":""`) {
+		t.Fatalf("dangling photo detail status=%d body=%s", danglingDetail.Code, danglingDetail.Body.String())
+	}
+	overview := doAdminRequest(t, router, http.MethodGet, "/admin/api/overview", auth)
+	if overview.Code != http.StatusOK || !strings.Contains(overview.Body.String(), `"missingBlobPhotos":1`) || !strings.Contains(overview.Body.String(), `"photos":5`) {
+		t.Fatalf("overview dangling-photo accounting status=%d body=%s", overview.Code, overview.Body.String())
+	}
+	if rec := doAdminRequest(t, router, http.MethodGet, "/admin/api/photos/album-a/99", auth); rec.Code != http.StatusNotFound {
+		t.Fatalf("missing photo status=%d want=404 body=%s", rec.Code, rec.Body.String())
+	}
+	if rec := doAdminRequest(t, router, http.MethodGet, "/admin/api/photos/album-a/nope", auth); rec.Code != http.StatusBadRequest {
+		t.Fatalf("bad photo index status=%d want=400", rec.Code)
+	}
+
+	blobDetail := doAdminRequest(t, router, http.MethodGet, "/admin/api/blobs/shared", auth)
+	if blobDetail.Code != http.StatusOK || !strings.Contains(blobDetail.Body.String(), `"photoCount":3`) || !strings.Contains(blobDetail.Body.String(), `"albumCount":2`) {
+		t.Fatalf("shared blob detail status=%d body=%s", blobDetail.Code, blobDetail.Body.String())
+	}
+	if strings.Contains(blobDetail.Body.String(), `"photos"`) || strings.Contains(blobDetail.Body.String(), `"albums"`) {
+		t.Fatalf("blob detail must not embed unbounded references: %s", blobDetail.Body.String())
+	}
+	blobList := doAdminRequest(t, router, http.MethodGet, "/admin/api/blobs?unreferenced=true&embedding=blocked", auth)
+	if blobList.Code != http.StatusOK || !strings.Contains(blobList.Body.String(), `"hash":"orphan"`) || !strings.Contains(blobList.Body.String(), `"photoCount":0`) {
+		t.Fatalf("unreferenced blob drilldown status=%d body=%s", blobList.Code, blobList.Body.String())
+	}
+	if rec := doAdminRequest(t, router, http.MethodGet, "/admin/api/blobs/missing", auth); rec.Code != http.StatusNotFound {
+		t.Fatalf("missing blob status=%d want=404", rec.Code)
+	}
+
+	albumList := doAdminRequest(t, router, http.MethodGet, "/admin/api/albums?status=FAILED", auth)
+	if albumList.Code != http.StatusOK || !strings.Contains(albumList.Body.String(), `"originalFilename":"alpha.zip"`) || !strings.Contains(albumList.Body.String(), `"error":"extract failed"`) || !strings.Contains(albumList.Body.String(), `"photoCount":4`) {
+		t.Fatalf("album list status=%d body=%s", albumList.Code, albumList.Body.String())
+	}
+	albumDetail := doAdminRequest(t, router, http.MethodGet, "/admin/api/albums/album-a", auth)
+	if albumDetail.Code != http.StatusOK || !strings.Contains(albumDetail.Body.String(), `"status":"FAILED"`) || !strings.Contains(albumDetail.Body.String(), `"error":"extract failed"`) || !strings.Contains(albumDetail.Body.String(), `"photoCount":4`) || !strings.Contains(albumDetail.Body.String(), `"missingBlobPhotos":1`) || !strings.Contains(albumDetail.Body.String(), `"encoding":{"categories"`) || !strings.Contains(albumDetail.Body.String(), `"embedding":{"categories"`) {
+		t.Fatalf("album detail status=%d body=%s", albumDetail.Code, albumDetail.Body.String())
+	}
+	if rec := doAdminRequest(t, router, http.MethodGet, "/admin/api/albums/missing", auth); rec.Code != http.StatusNotFound {
+		t.Fatalf("missing album status=%d want=404", rec.Code)
+	}
+
+	for _, target := range []string{
+		"/admin/api/photos?encoding=not-a-category",
+		"/admin/api/photos?unknown=value",
+		"/admin/api/photos?encoding=queued&encoding=blocked",
+		"/admin/api/photos?encoding=",
+		"/admin/api/photos?limit=101",
+		"/admin/api/photos?cursor=not-a-cursor",
+		"/admin/api/blobs?unreferenced=yes",
+		"/admin/api/albums?status=READY",
+	} {
+		if rec := doAdminRequest(t, router, http.MethodGet, target, auth); rec.Code != http.StatusBadRequest {
+			t.Errorf("bad browse request %s status=%d want=400 body=%s", target, rec.Code, rec.Body.String())
+		}
+	}
+	malformedQuery := httptest.NewRequest(http.MethodGet, "/admin/api/photos", nil)
+	malformedQuery.URL.RawQuery = "cursor=%"
+	malformedQuery.Header.Set("Authorization", auth)
+	malformedResponse := httptest.NewRecorder()
+	router.ServeHTTP(malformedResponse, malformedQuery)
+	if malformedResponse.Code != http.StatusBadRequest {
+		t.Fatalf("malformed query status=%d want=400 body=%s", malformedResponse.Code, malformedResponse.Body.String())
 	}
 }
 

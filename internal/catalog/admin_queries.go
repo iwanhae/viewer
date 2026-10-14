@@ -7,9 +7,10 @@ import (
 )
 
 // PipelineCounts describes blobs in a catalog state and their references.
-// BlobCount is unique content, PhotoCount counts photo rows, and AlbumCount
-// counts distinct albums referencing those blobs (so album counts overlap
-// between categories).
+// BlobCount is unique content, PhotoCount counts photo rows with a matching
+// blob, and AlbumCount counts distinct albums referencing those blobs (so
+// album counts overlap between categories). Dangling photo hashes are counted
+// separately as missing-blob photos, not as pipeline references.
 type PipelineCounts struct {
 	BlobCount  int64 `json:"blobCount"`
 	PhotoCount int64 `json:"photoCount"`
@@ -23,6 +24,7 @@ type AdminOverviewSnapshot struct {
 	Photos            int64
 	Blobs             int64
 	UnreferencedBlobs int64
+	MissingBlobPhotos int64
 
 	EncodingCategories     map[string]PipelineCounts
 	EncodingSkippedReasons map[string]PipelineCounts
@@ -31,6 +33,29 @@ type AdminOverviewSnapshot struct {
 	EmbeddingCategories map[string]PipelineCounts
 	EmbeddingRawStates  map[string]PipelineCounts
 }
+
+// These expressions are the canonical admin pipeline classifications. They
+// intentionally stay fixed SQL fragments: overview totals and browse filters
+// must use the same definitions, and no caller-controlled SQL is interpolated.
+const adminEncodingCategoryExpr = `CASE b.encoding_status
+	WHEN 'pending' THEN 'queued'
+	WHEN 'leased' THEN 'processing'
+	WHEN 'received' THEN 'validating'
+	WHEN 'committing' THEN 'committing'
+	WHEN 'done' THEN 'completed'
+	WHEN 'skipped' THEN 'skipped'
+	WHEN 'failed' THEN 'failed'
+	ELSE 'unknown' END`
+
+const adminEncodingSkippedReasonExpr = `CASE WHEN b.content_type = 'image/webp' THEN 'webp' ELSE 'nonWebp' END`
+
+const adminEmbeddingCategoryExpr = `CASE
+	WHEN b.embedding_status = 'pending' AND ` + embeddingClaimGatePredicate + ` THEN 'queued'
+	WHEN b.embedding_status = 'pending' THEN 'blocked'
+	WHEN b.embedding_status = 'processing' THEN 'processing'
+	WHEN b.embedding_status = 'ready' THEN 'completed'
+	WHEN b.embedding_status = 'failed' THEN 'failed'
+	ELSE 'unknown' END`
 
 // AdminOverview reads every field in one short SQLite read transaction. It
 // deliberately performs no vector-store or recommendation-service calls.
@@ -49,27 +74,22 @@ func (s *Store) AdminOverview(ctx context.Context) (AdminOverviewSnapshot, error
 			(SELECT COUNT(*) FROM blobs),
 			(SELECT COUNT(*) FROM blobs b WHERE NOT EXISTS (
 				SELECT 1 FROM photos p WHERE p.hash = b.hash
+			)),
+			(SELECT COUNT(*) FROM photos p WHERE NOT EXISTS (
+				SELECT 1 FROM blobs b WHERE b.hash = p.hash
 			))`).Scan(
-		&snapshot.Albums, &snapshot.Photos, &snapshot.Blobs, &snapshot.UnreferencedBlobs,
+		&snapshot.Albums, &snapshot.Photos, &snapshot.Blobs, &snapshot.UnreferencedBlobs, &snapshot.MissingBlobPhotos,
 	); err != nil {
 		return AdminOverviewSnapshot{}, fmt.Errorf("read admin overview library counts: %w", err)
 	}
 
 	var queryErr error
-	snapshot.EncodingCategories, queryErr = queryAdminPipelineCounts(ctx, tx, `CASE b.encoding_status
-		WHEN 'pending' THEN 'queued'
-		WHEN 'leased' THEN 'processing'
-		WHEN 'received' THEN 'validating'
-		WHEN 'committing' THEN 'committing'
-		WHEN 'done' THEN 'completed'
-		WHEN 'skipped' THEN 'skipped'
-		WHEN 'failed' THEN 'failed'
-		ELSE 'unknown' END`, "")
+	snapshot.EncodingCategories, queryErr = queryAdminPipelineCounts(ctx, tx, adminEncodingCategoryExpr, "")
 	if queryErr != nil {
 		return AdminOverviewSnapshot{}, fmt.Errorf("read admin overview encoding categories: %w", queryErr)
 	}
 	snapshot.EncodingSkippedReasons, queryErr = queryAdminPipelineCounts(ctx, tx,
-		`CASE WHEN b.content_type = 'image/webp' THEN 'webp' ELSE 'nonWebp' END`,
+		adminEncodingSkippedReasonExpr,
 		`WHERE b.encoding_status = 'skipped'`)
 	if queryErr != nil {
 		return AdminOverviewSnapshot{}, fmt.Errorf("read admin overview skipped encoding reasons: %w", queryErr)
@@ -79,14 +99,7 @@ func (s *Store) AdminOverview(ctx context.Context) (AdminOverviewSnapshot, error
 		return AdminOverviewSnapshot{}, fmt.Errorf("read admin overview encoding raw states: %w", queryErr)
 	}
 
-	embeddingCategory := `CASE
-		WHEN b.embedding_status = 'pending' AND ` + embeddingClaimGatePredicate + ` THEN 'queued'
-		WHEN b.embedding_status = 'pending' THEN 'blocked'
-		WHEN b.embedding_status = 'processing' THEN 'processing'
-		WHEN b.embedding_status = 'ready' THEN 'completed'
-		WHEN b.embedding_status = 'failed' THEN 'failed'
-		ELSE 'unknown' END`
-	snapshot.EmbeddingCategories, queryErr = queryAdminPipelineCounts(ctx, tx, embeddingCategory, "")
+	snapshot.EmbeddingCategories, queryErr = queryAdminPipelineCounts(ctx, tx, adminEmbeddingCategoryExpr, "")
 	if queryErr != nil {
 		return AdminOverviewSnapshot{}, fmt.Errorf("read admin overview embedding categories: %w", queryErr)
 	}
@@ -102,8 +115,9 @@ func (s *Store) AdminOverview(ctx context.Context) (AdminOverviewSnapshot, error
 }
 
 // queryAdminPipelineCounts groups a fixed, internal SQL category expression.
-// Every category query uses the same left join so unreferenced blobs remain in
-// blob counts while contributing zero photos and albums.
+// Every category query starts with blobs and uses the same left join, so
+// unreferenced blobs remain in blob counts while contributing zero photos and
+// albums; photo rows whose blob is missing cannot join and are counted apart.
 func queryAdminPipelineCounts(ctx context.Context, tx *sql.Tx, categoryExpr, where string) (map[string]PipelineCounts, error) {
 	query := `SELECT ` + categoryExpr + `, COUNT(DISTINCT b.hash), COUNT(p.hash), COUNT(DISTINCT p.album_id)
 		FROM blobs b LEFT JOIN photos p ON p.hash = b.hash ` + where + `

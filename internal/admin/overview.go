@@ -10,7 +10,8 @@ import (
 
 // OverviewUnits makes the units and timestamp format of the overview explicit.
 // Album counts are distinct within each category and may overlap across
-// categories; blob and photo counts are additive across the category set.
+// categories. Blob and pipeline photo counts are additive across their
+// category sets; missing-blob photo rows are reported separately.
 type OverviewUnits struct {
 	Counts     string `json:"counts"`
 	MeasuredAt string `json:"measuredAt"`
@@ -21,6 +22,7 @@ type OverviewLibraryCounts struct {
 	Photos            int64 `json:"photos"`
 	Blobs             int64 `json:"blobs"`
 	UnreferencedBlobs int64 `json:"unreferencedBlobs"`
+	MissingBlobPhotos int64 `json:"missingBlobPhotos"`
 }
 
 // EncodingCategories classify each blob by its raw encoder status.
@@ -91,12 +93,12 @@ func (s *Service) Overview(ctx context.Context) (Overview, error) {
 	return Overview{
 		MeasuredAt: measuredAt,
 		Units: OverviewUnits{
-			Counts:     "blobCount is distinct blobs; photoCount is photo rows; albumCount is distinct albums referencing those blobs",
+			Counts:     "blobCount is distinct blobs; photoCount is photo rows; albumCount is distinct albums referencing those blobs; pipeline photo counts exclude missing-blob photos reported in library.missingBlobPhotos",
 			MeasuredAt: "RFC3339 UTC",
 		},
 		Library: OverviewLibraryCounts{
 			Albums: snapshot.Albums, Photos: snapshot.Photos, Blobs: snapshot.Blobs,
-			UnreferencedBlobs: snapshot.UnreferencedBlobs,
+			UnreferencedBlobs: snapshot.UnreferencedBlobs, MissingBlobPhotos: snapshot.MissingBlobPhotos,
 		},
 		Encoding: EncodingOverview{
 			Categories: EncodingCategories{
