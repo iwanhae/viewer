@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"image"
 	"image/color"
 	"image/png"
@@ -26,6 +27,21 @@ type fakeStore struct {
 	mu      sync.Mutex
 	objects map[string][]byte
 	putKeys []string
+	putErr  error
+}
+
+type failingOutcomeRecorder struct{ cat *catalog.Store }
+
+func (f failingOutcomeRecorder) BeginExtractionRun(ctx context.Context, albumID string) (int64, error) {
+	return f.cat.BeginExtractionRun(ctx, albumID)
+}
+
+func (f failingOutcomeRecorder) RecordExtractionEntries(context.Context, int64, []catalog.ExtractionEntryOutcome) error {
+	return errors.New("simulated observability write failure")
+}
+
+func (f failingOutcomeRecorder) FinishExtractionRun(ctx context.Context, runID int64, status, reasonCode, detail string, entriesComplete bool) error {
+	return f.cat.FinishExtractionRun(ctx, runID, status, reasonCode, detail, entriesComplete)
 }
 
 func newFakeStore() *fakeStore {
@@ -43,6 +59,12 @@ func (f *fakeStore) GetObject(_ context.Context, key string) (io.ReadCloser, str
 }
 
 func (f *fakeStore) PutObject(_ context.Context, key string, body io.Reader, _ string) error {
+	f.mu.Lock()
+	putErr := f.putErr
+	f.mu.Unlock()
+	if putErr != nil {
+		return putErr
+	}
 	data, err := io.ReadAll(body)
 	if err != nil {
 		return err
@@ -102,6 +124,42 @@ func buildZip(t *testing.T, entries ...zipEntry) []byte {
 			t.Fatalf("create zip entry %s: %v", entry.name, err)
 		}
 		if _, err := w.Write(entry.data); err != nil {
+			t.Fatalf("write zip entry %s: %v", entry.name, err)
+		}
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close zip: %v", err)
+	}
+	return buf.Bytes()
+}
+
+func buildZipWithReadError(t *testing.T, good []zipEntry) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	writer := zip.NewWriter(&buf)
+	data := []byte("this entry has a bad checksum")
+	header := &zip.FileHeader{
+		Name:               "corrupt.jpg",
+		Method:             zip.Store,
+		CRC32:              crc32.ChecksumIEEE(data) + 1,
+		CompressedSize:     uint32(len(data)),
+		UncompressedSize:   uint32(len(data)),
+		CompressedSize64:   uint64(len(data)),
+		UncompressedSize64: uint64(len(data)),
+	}
+	raw, err := writer.CreateRaw(header)
+	if err != nil {
+		t.Fatalf("create corrupt zip entry: %v", err)
+	}
+	if _, err := raw.Write(data); err != nil {
+		t.Fatalf("write corrupt zip entry: %v", err)
+	}
+	for _, entry := range good {
+		part, err := writer.Create(entry.name)
+		if err != nil {
+			t.Fatalf("create zip entry %s: %v", entry.name, err)
+		}
+		if _, err := part.Write(entry.data); err != nil {
 			t.Fatalf("write zip entry %s: %v", entry.name, err)
 		}
 	}
@@ -287,6 +345,131 @@ func TestProcessAlbumNoValidImagesMarksFailedAndKeepsSource(t *testing.T) {
 	if !store.has(SourceKey("album-a")) {
 		t.Fatalf("failed extraction must keep the staged zip for retry")
 	}
+	run, found, err := cat.LatestExtractionRun(context.Background(), "album-a")
+	if err != nil || !found {
+		t.Fatalf("latest extraction run=%+v found=%v err=%v", run, found, err)
+	}
+	if run.Status != "failed" || run.FailureReasonCode != "no_valid_images" || !run.EntriesComplete || run.TotalEntries == nil || *run.TotalEntries != 2 || run.CandidateEntries == nil || *run.CandidateEntries != 0 || run.SkippedCount != 2 || run.RegisteredCount != 0 {
+		t.Fatalf("no-image extraction outcome=%+v", run)
+	}
+}
+
+func TestProcessAlbumRecordsAllEntryOutcomesAndKeepsPartialSuccess(t *testing.T) {
+	cat := openTestCatalog(t)
+	store := newFakeStore()
+	firstDuplicate := pngBytes(t, 2, 3, 11)
+	secondDuplicate := pngBytes(t, 5, 2, 22)
+	first := []zipEntry{
+		{name: "folder/", data: nil},
+		{name: "notes.txt", data: []byte("metadata")},
+		{name: "invalid.jpg", data: []byte("not an image")},
+		{name: "same.png", data: firstDuplicate},
+		{name: "same.png", data: secondDuplicate},
+		{name: "a.png", data: pngBytes(t, 3, 4, 33)},
+		{name: "__MACOSX/._photo", data: []byte("metadata")},
+	}
+	zipData := buildZipWithReadError(t, first)
+	seedAlbum(t, cat, store, "album-outcomes", "outcomes.zip", zipData)
+	svc := NewService(cat, store, Options{TempDir: t.TempDir()})
+	if err := svc.ProcessAlbum(context.Background(), "album-outcomes"); err != nil {
+		t.Fatalf("partial-success extraction failed: %v", err)
+	}
+
+	album, err := cat.GetAlbum(context.Background(), "album-outcomes")
+	if err != nil || album.Status != catalog.AlbumStatusReady || album.PhotoCount != 3 {
+		t.Fatalf("album after partial extraction=%+v err=%v", album, err)
+	}
+	run, found, err := cat.LatestExtractionRun(context.Background(), "album-outcomes")
+	if err != nil || !found {
+		t.Fatalf("latest extraction run=%+v found=%v err=%v", run, found, err)
+	}
+	if run.Status != "succeeded" || !run.EntriesComplete || run.TotalEntries == nil || *run.TotalEntries != 8 || run.CandidateEntries == nil || *run.CandidateEntries != 5 || run.RegisteredCount != 3 || run.SkippedCount != 5 || run.FailedCount != 0 {
+		t.Fatalf("partial-success run summary=%+v", run)
+	}
+	entries, err := cat.ListExtractionEntries(context.Background(), "album-outcomes", run.RunID, "", -1, 20)
+	if err != nil || len(entries) != 8 {
+		t.Fatalf("entry outcomes=%+v err=%v", entries, err)
+	}
+	want := map[int]struct {
+		name, outcome, reason string
+	}{
+		0: {"corrupt.jpg", "skipped", "entry_read_failed"},
+		1: {"folder/", "skipped", "directory_entry"},
+		2: {"notes.txt", "skipped", "unsupported_extension"},
+		3: {"invalid.jpg", "skipped", "invalid_image"},
+		4: {"same.png", "registered", ""},
+		5: {"same.png", "registered", ""},
+		6: {"a.png", "registered", ""},
+		7: {"__MACOSX/._photo", "skipped", "metadata_entry"},
+	}
+	for _, entry := range entries {
+		expected, ok := want[entry.Ordinal]
+		if !ok || entry.Name != expected.name || entry.Outcome != expected.outcome || entry.ReasonCode != expected.reason {
+			t.Errorf("entry outcome=%+v want=%+v", entry, expected)
+		}
+		if entry.Outcome == "registered" {
+			if entry.PhotoIndex == nil {
+				t.Errorf("registered entry %d missing photo index", entry.Ordinal)
+				continue
+			}
+			photo, err := cat.PhotoAt(context.Background(), "album-outcomes", *entry.PhotoIndex)
+			if err != nil || photo.Hash != entry.Hash || photo.Name != entry.Name {
+				t.Errorf("entry %d photo link=%+v photo=%+v err=%v", entry.Ordinal, entry, photo, err)
+			}
+		}
+	}
+	if !store.has(SourceKey("album-outcomes")) {
+		t.Fatal("successful extraction should retain the staged archive")
+	}
+}
+
+func TestOutcomeRecordingFailureDoesNotChangeAlbumResult(t *testing.T) {
+	cat := openTestCatalog(t)
+	store := newFakeStore()
+	zipData := buildZip(t,
+		zipEntry{name: "notes.txt", data: []byte("ignore")},
+		zipEntry{name: "ok.png", data: pngBytes(t, 2, 2, 91)},
+	)
+	seedAlbum(t, cat, store, "album-recording-error", "recording-error.zip", zipData)
+	svc := NewService(cat, store, Options{TempDir: t.TempDir(), ExtractionRecorder: failingOutcomeRecorder{cat: cat}})
+	if err := svc.ProcessAlbum(context.Background(), "album-recording-error"); err != nil {
+		t.Fatalf("outcome recording failure changed extraction result: %v", err)
+	}
+	album, err := cat.GetAlbum(context.Background(), "album-recording-error")
+	if err != nil || album.Status != catalog.AlbumStatusReady || album.PhotoCount != 1 {
+		t.Fatalf("album=%+v err=%v, want ready with one photo", album, err)
+	}
+	run, found, err := cat.LatestExtractionRun(context.Background(), "album-recording-error")
+	if err != nil || !found || run.Status != "incomplete" || run.FailureReasonCode != "outcome_recording_failed" || run.EntriesComplete || run.EntriesRecorded != 0 {
+		t.Fatalf("failed recording run=%+v found=%v err=%v", run, found, err)
+	}
+}
+
+func TestFatalEntryFailureIsRecordedAndKeepsAlbumFailureSemantics(t *testing.T) {
+	cat := openTestCatalog(t)
+	store := newFakeStore()
+	store.putErr = errors.New("storage unavailable")
+	zipData := buildZip(t, zipEntry{name: "a.png", data: pngBytes(t, 2, 2, 77)}, zipEntry{name: "later.png", data: pngBytes(t, 2, 2, 78)})
+	seedAlbum(t, cat, store, "album-entry-failed", "entry-failed.zip", zipData)
+	svc := NewService(cat, store, Options{TempDir: t.TempDir()})
+	if err := svc.ProcessAlbum(context.Background(), "album-entry-failed"); err == nil {
+		t.Fatal("fatal storage error should still fail the album")
+	}
+	album, err := cat.GetAlbum(context.Background(), "album-entry-failed")
+	if err != nil || album.Status != catalog.AlbumStatusFailed {
+		t.Fatalf("album=%+v err=%v, want FAILED", album, err)
+	}
+	run, found, err := cat.LatestExtractionRun(context.Background(), "album-entry-failed")
+	if err != nil || !found || run.Status != "failed" || run.FailedCount != 1 || run.EntriesComplete || run.FailureReasonCode != "extraction_failed" {
+		t.Fatalf("failed run=%+v found=%v err=%v", run, found, err)
+	}
+	entries, err := cat.ListExtractionEntries(context.Background(), "album-entry-failed", run.RunID, "failed", -1, 10)
+	if err != nil || len(entries) != 1 || entries[0].ReasonCode != "blob_storage_failed" || entries[0].Name != "a.png" {
+		t.Fatalf("fatal entry outcome=%+v err=%v", entries, err)
+	}
+	if !store.has(SourceKey("album-entry-failed")) {
+		t.Fatal("failed extraction should retain the source archive")
+	}
 }
 
 func TestProcessAlbumMissingSourceMarksFailed(t *testing.T) {
@@ -409,6 +592,14 @@ func TestProcessAlbumReplacesPhotosOnReprocess(t *testing.T) {
 	}
 	if len(photos) != 1 || photos[0].Name != "c.png" || photos[0].Index != 0 {
 		t.Fatalf("expected photos to be replaced, got %+v", photos)
+	}
+	runs, err := cat.ListExtractionRuns(context.Background(), "album-a", 0, 10)
+	if err != nil || len(runs) != 2 || runs[0].RunID <= runs[1].RunID {
+		t.Fatalf("reprocessing should append a second run, got runs=%+v err=%v", runs, err)
+	}
+	oldEntries, err := cat.ListExtractionEntries(context.Background(), "album-a", runs[1].RunID, "", -1, 10)
+	if err != nil || len(oldEntries) != 2 {
+		t.Fatalf("old run entry history was overwritten: entries=%+v err=%v", oldEntries, err)
 	}
 }
 

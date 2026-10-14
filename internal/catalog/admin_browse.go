@@ -114,14 +114,16 @@ type AdminEmbeddingBreakdown struct {
 // AdminAlbumDetail adds the overview-shaped pipeline breakdowns for the
 // distinct blobs and photo rows referenced by one album.
 type AdminAlbumDetail struct {
-	ID                string                  `json:"id"`
-	OriginalFilename  string                  `json:"originalFilename"`
-	Status            string                  `json:"status"`
-	Error             string                  `json:"error"`
-	PhotoCount        int64                   `json:"photoCount"`
-	Encoding          AdminEncodingBreakdown  `json:"encoding"`
-	Embedding         AdminEmbeddingBreakdown `json:"embedding"`
-	MissingBlobPhotos int64                   `json:"missingBlobPhotos"`
+	ID                 string                  `json:"id"`
+	OriginalFilename   string                  `json:"originalFilename"`
+	Status             string                  `json:"status"`
+	Error              string                  `json:"error"`
+	PhotoCount         int64                   `json:"photoCount"`
+	Encoding           AdminEncodingBreakdown  `json:"encoding"`
+	Embedding          AdminEmbeddingBreakdown `json:"embedding"`
+	MissingBlobPhotos  int64                   `json:"missingBlobPhotos"`
+	ExtractionRecorded bool                    `json:"extractionRecorded"`
+	LatestExtraction   *ExtractionRunSummary   `json:"latestExtraction"`
 }
 
 // AdminPhotos reads a keyset page in (album_id, idx) order. Callers request one
@@ -387,6 +389,14 @@ func (s *Store) AdminAlbumByID(ctx context.Context, albumID string) (AdminAlbumD
 	result.Encoding, result.Embedding, err = queryAlbumPipelineBreakdowns(ctx, tx, albumID)
 	if err != nil {
 		return AdminAlbumDetail{}, fmt.Errorf("read album pipeline breakdowns: %w", err)
+	}
+	latestExtraction, err := scanExtractionRun(tx.QueryRowContext(ctx, extractionRunSelect+
+		` WHERE r.id=(SELECT id FROM extraction_runs WHERE album_id=? ORDER BY id DESC LIMIT 1)`, albumID))
+	if err == nil {
+		result.ExtractionRecorded = true
+		result.LatestExtraction = &latestExtraction
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return AdminAlbumDetail{}, fmt.Errorf("read latest album extraction: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
 		return AdminAlbumDetail{}, fmt.Errorf("finish admin album detail: %w", err)

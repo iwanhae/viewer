@@ -15,6 +15,10 @@ import {
   type Album,
   type AlbumDetail,
   type Blob,
+  type ExtractionEntriesPage,
+  type ExtractionEntry,
+  type ExtractionRun,
+  type ExtractionRunsPage,
   type Overview,
   type Page,
   type HistoryPage,
@@ -28,6 +32,10 @@ type LoadState<T> = { path: string; data: T | null; error: string; loading: bool
 function useAdminData<T>(path: string): LoadState<T> {
   const [state, setState] = useState<LoadState<T>>(() => ({ path, data: null, error: '', loading: true }))
   useEffect(() => {
+    if (!path) {
+      setState({ path, data: null, error: '', loading: false })
+      return
+    }
     const controller = new AbortController()
     setState({ path, data: null, error: '', loading: true })
     adminGet<T>(path, controller.signal)
@@ -482,8 +490,192 @@ function AlbumDetailPage() {
       <CategorySection title="앨범 인코딩 상태" categories={album.encoding.categories} rawStates={album.encoding.rawStates} filterKey="encoding" albumId={album.id} />
       <section className="panel"><h2>건너뜀 형식</h2><CountTable counts={album.encoding.skippedReasons} filterKey="skippedReason" albumId={album.id} /></section>
       <CategorySection title="앨범 임베딩 상태" categories={album.embedding.categories} rawStates={album.embedding.rawStates} filterKey="embedding" albumId={album.id} />
+      <ExtractionHistory albumID={album.id} latest={album.latestExtraction} recorded={album.extractionRecorded} />
     </>}
   </>
+}
+
+type AppendPageState<T> = {
+  key: string
+  items: T[]
+  cursor: string | null
+  loaded: boolean
+  loading: boolean
+  error: string
+}
+
+function ExtractionHistory({ albumID, latest, recorded }: { albumID: string; latest: ExtractionRun | null; recorded: boolean }) {
+  const [selectedRunID, setSelectedRunID] = useState('')
+  const [pinnedLatestRun, setPinnedLatestRun] = useState<ExtractionRun | null>(null)
+  const [outcome, setOutcome] = useState('')
+  const runsPath = apiPath(`albums/${encodeURIComponent(albumID)}/extractions`, '?limit=20')
+  const runsState = useAdminData<ExtractionRunsPage>(runsPath)
+  const [olderRuns, setOlderRuns] = useState<AppendPageState<ExtractionRun>>({ key: runsPath, items: [], cursor: null, loaded: false, loading: false, error: '' })
+  const runsAppendController = useRef<AbortController | null>(null)
+  const entriesParams = new URLSearchParams({ limit: '50' })
+  if (selectedRunID) entriesParams.set('runId', selectedRunID)
+  if (outcome) entriesParams.set('outcome', outcome)
+  const entriesPath = recorded ? apiPath(`albums/${encodeURIComponent(albumID)}/entries`, `?${entriesParams.toString()}`) : ''
+  const entriesState = useAdminData<ExtractionEntriesPage>(entriesPath)
+  const [moreEntries, setMoreEntries] = useState<AppendPageState<ExtractionEntry>>({ key: entriesPath, items: [], cursor: null, loaded: false, loading: false, error: '' })
+  const entriesAppendController = useRef<AbortController | null>(null)
+
+  useEffect(() => {
+    setSelectedRunID('')
+    setPinnedLatestRun(null)
+    setOutcome('')
+  }, [albumID])
+  useEffect(() => {
+    const resolved = entriesState.data
+    if (!selectedRunID && resolved?.runSelection === 'latest') {
+      // Resolve "latest" once, then bind every later request to that run id.
+      setPinnedLatestRun(resolved.run)
+      setSelectedRunID(String(resolved.run.runId))
+    }
+  }, [entriesState.data, selectedRunID])
+  useEffect(() => {
+    if (!entriesState.error.includes('still running')) return
+    const controller = new AbortController()
+    // A run can start after the album detail and run-list requests complete.
+    // Refresh the list after a 409 so the pending summary and latest badge use
+    // the same run snapshot rather than stale album-detail data.
+    adminGet<ExtractionRunsPage>(runsPath, controller.signal).then((page) => {
+      if (!controller.signal.aborted && page.runs[0]) setPinnedLatestRun(page.runs[0])
+    }).catch(() => {})
+    return () => controller.abort()
+  }, [entriesState.error, runsPath])
+  useEffect(() => {
+    runsAppendController.current?.abort()
+    setOlderRuns({ key: runsPath, items: [], cursor: null, loaded: false, loading: false, error: '' })
+    return () => runsAppendController.current?.abort()
+  }, [runsPath])
+  useEffect(() => {
+    entriesAppendController.current?.abort()
+    setMoreEntries({ key: entriesPath, items: [], cursor: null, loaded: false, loading: false, error: '' })
+    return () => entriesAppendController.current?.abort()
+  }, [entriesPath])
+
+  const runAppend = olderRuns.key === runsPath ? olderRuns : { key: runsPath, items: [], cursor: null, loaded: false, loading: false, error: '' }
+  const entryAppend = moreEntries.key === entriesPath ? moreEntries : { key: entriesPath, items: [], cursor: null, loaded: false, loading: false, error: '' }
+  const listedRuns = [...(runsState.data?.runs || []), ...runAppend.items]
+  const runs = pinnedLatestRun && !listedRuns.some((run) => run.runId === pinnedLatestRun.runId)
+    ? [pinnedLatestRun, ...listedRuns].sort((left, right) => right.runId - left.runId)
+    : listedRuns
+  const entries = [...(entriesState.data?.entries || []), ...entryAppend.items]
+  const latestSummary = pinnedLatestRun || runsState.data?.runs[0] || latest
+  const latestRunID = latestSummary?.runId
+  const selectedSummary = selectedRunID
+    ? (entriesState.data?.run.runId === Number(selectedRunID)
+      ? entriesState.data.run
+      : runs.find((run) => run.runId === Number(selectedRunID)) || (pinnedLatestRun?.runId === Number(selectedRunID) ? pinnedLatestRun : null))
+    : (entriesState.data?.runSelection === 'latest' ? entriesState.data.run : latestSummary)
+
+  const loadOlderRuns = async () => {
+    const cursor = runAppend.loaded ? runAppend.cursor : runsState.data?.nextCursor
+    if (!cursor || runAppend.loading) return
+    const controller = new AbortController()
+    runsAppendController.current = controller
+    setOlderRuns({ ...runAppend, loading: true, error: '' })
+    try {
+      const page = await adminGet<ExtractionRunsPage>(`${runsPath}&cursor=${encodeURIComponent(cursor)}`, controller.signal)
+      if (!controller.signal.aborted) {
+        setOlderRuns({ key: runsPath, items: [...runAppend.items, ...page.runs], cursor: page.nextCursor, loaded: true, loading: false, error: '' })
+      }
+    } catch (error) {
+      if (!controller.signal.aborted) setOlderRuns({ ...runAppend, loading: false, error: errorMessage(error) })
+    }
+  }
+
+  const loadMoreEntries = async () => {
+    const cursor = entryAppend.loaded ? entryAppend.cursor : entriesState.data?.nextCursor
+    if (!cursor || entryAppend.loading) return
+    const controller = new AbortController()
+    entriesAppendController.current = controller
+    setMoreEntries({ ...entryAppend, loading: true, error: '' })
+    try {
+      const page = await adminGet<ExtractionEntriesPage>(`${entriesPath}&cursor=${encodeURIComponent(cursor)}`, controller.signal)
+      if (!controller.signal.aborted) {
+        setMoreEntries({ key: entriesPath, items: [...entryAppend.items, ...page.entries], cursor: page.nextCursor, loaded: true, loading: false, error: '' })
+      }
+    } catch (error) {
+      if (!controller.signal.aborted) setMoreEntries({ ...entryAppend, loading: false, error: errorMessage(error) })
+    }
+  }
+
+  return <section className="panel extraction-history">
+    <h2>ZIP 추출 기록</h2>
+    {!recorded && <p className="notice warning">이 앨범에는 추출 기록이 없습니다. 기록 기능 도입 전의 기존 앨범이며 실패 항목이 0개라는 뜻은 아닙니다.</p>}
+    {recorded && selectedSummary && <>
+      <div className="summary-grid compact">
+        <Stat label={selectedSummary.runId === latestRunID ? '최신 실행' : '선택 실행'} value={`#${selectedSummary.runId} · ${selectedSummary.status}`} />
+        <Stat label="등록됨" value={selectedSummary.registeredCount} />
+        <Stat label="건너뜀" value={selectedSummary.skippedCount} />
+        <Stat label="실패" value={selectedSummary.failedCount} />
+      </div>
+      <p className="muted">
+        시작 {formatTime(selectedSummary.startedAt)} · 완료 {selectedSummary.completedAt ? formatTime(selectedSummary.completedAt) : '진행 중/미기록'}
+        {' · '}기록된 항목 {selectedSummary.entriesRecorded.toLocaleString()}
+        {selectedSummary.totalEntries === null ? ' (전체 수 미확정)' : ` / 전체 ${selectedSummary.totalEntries.toLocaleString()}`}
+        {selectedSummary.candidateEntries === null ? '' : ` · 이미지 확장자 후보 ${selectedSummary.candidateEntries.toLocaleString()}`}
+        {selectedSummary.entriesComplete ? ' · 항목 기록 완료' : ' · 항목 기록 불완전'}
+      </p>
+      {selectedSummary.countsProvisional && <p className="notice warning" role="status">실행이 진행 중입니다. 등록·건너뜀·실패 수는 현재까지 기록된 값이며 계속 바뀔 수 있습니다. 항목 페이지는 실행 완료 후 확인할 수 있습니다.</p>}
+      {selectedSummary.failureReasonCode && <p className="notice error">{selectedSummary.failureReasonCode}{selectedSummary.errorDetail ? ` · ${selectedSummary.errorDetail}` : ''}</p>}
+    </>}
+    {runsState.error && <ErrorPanel message={runsState.error} />}
+    {runsState.loading && !runsState.data && <p role="status">추출 실행 기록을 불러오는 중…</p>}
+    {runsState.data && runs.length > 0 && <>
+      <h3>실행 이력</h3>
+      <p className="muted">각 재처리는 별도 실행으로 남습니다. 항목 수는 ZIP 전체(폴더·메타데이터·지원하지 않는 확장자 포함) 기준이며, 후보 수는 현재 추출기가 검사하는 이미지 확장자 항목 기준입니다.</p>
+      <div className="table-wrap"><table className="data-table extraction-table"><thead><tr><th>실행</th><th>시작</th><th>상태</th><th>등록</th><th>건너뜀</th><th>실패</th><th>항목</th><th></th></tr></thead>
+        <tbody>{runs.map((run) => <tr key={run.runId}>
+          <th scope="row">#{run.runId}{run.runId === latestRunID && <span className="subline">최신</span>}</th>
+          <td>{formatTime(run.startedAt)}</td><td>{run.status}{run.failureReasonCode && <span className="subline">{run.failureReasonCode}</span>}{run.countsProvisional && <span className="subline">현재 기록 기준</span>}</td>
+          <td>{run.registeredCount}</td><td>{run.skippedCount}</td><td>{run.failedCount}</td>
+          <td>{run.totalEntries === null ? `${run.entriesRecorded} 기록됨` : run.totalEntries}</td>
+          <td><button type="button" onClick={() => {
+            if (run.runId === latestRunID) {
+              // Keep the current resolved snapshot visible until the default
+              // latest request returns its replacement run summary.
+              setSelectedRunID('')
+            } else {
+              setSelectedRunID(String(run.runId))
+            }
+          }}>{(!selectedRunID && run.runId === latestRunID) || selectedRunID === String(run.runId) ? '선택됨' : '항목 보기'}</button></td>
+        </tr>)}</tbody>
+      </table></div>
+      {(runAppend.loaded ? runAppend.cursor : runsState.data.nextCursor) && <div className="pagination"><button type="button" disabled={runAppend.loading} onClick={loadOlderRuns}>이전 실행 더 보기</button>{runAppend.error && <span role="alert">{runAppend.error}</span>}</div>}
+    </>}
+    {runsState.data && runs.length === 0 && recorded && <p className="muted">표시할 추출 실행이 없습니다.</p>}
+    {recorded && <>
+      <div className="extraction-controls">
+        <p>선택 실행: {entriesState.data ? `#${entriesState.data.run.runId}${entriesState.data.runSelection === 'latest' ? ' (최신 기록)' : ''}` : selectedRunID ? `#${selectedRunID}` : '최신 기록'}</p>
+        <label className="field">결과 필터<select aria-label="추출 결과" value={outcome} onChange={(event) => setOutcome(event.target.value)}>
+          <option value="">모든 결과</option><option value="registered">등록됨</option><option value="skipped">건너뜀</option><option value="failed">실패</option>
+        </select></label>
+      </div>
+      {entriesState.error && (entriesState.error.includes('still running')
+        ? <p className="notice warning" role="status">추출 실행이 진행 중이므로 항목 페이지는 아직 제공되지 않습니다. 완료되거나 중단된 뒤 다시 시도해 주세요.</p>
+        : <ErrorPanel message={entriesState.error} />)}
+      {entriesState.loading && !entriesState.data && <p role="status">항목 결과를 불러오는 중…</p>}
+      {entriesState.data && <>
+        <div className="table-wrap"><ExtractionEntryTable entries={entries} /></div>
+        {(entryAppend.loaded ? entryAppend.cursor : entriesState.data.nextCursor) && <div className="pagination"><button type="button" disabled={entryAppend.loading} onClick={loadMoreEntries}>다음 항목 더 보기</button>{entryAppend.error && <span role="alert">{entryAppend.error}</span>}</div>}
+      </>}
+    </>}
+  </section>
+}
+
+function ExtractionEntryTable({ entries }: { entries: ExtractionEntry[] }) {
+  return <table className="data-table extraction-table"><thead><tr><th>순번</th><th>ZIP 항목 이름</th><th>분류</th><th>결과 / 이유</th><th>사진 연결</th></tr></thead>
+    <tbody>{entries.map((entry) => <tr key={`${entry.runId}:${entry.ordinal}`}>
+      <th scope="row">{entry.ordinal}</th><td className="entry-name">{entry.name || '(이름 없음)'}</td>
+      <td>{entry.candidate ? '이미지 후보' : '후보 제외'}</td>
+      <td><strong>{entry.outcome}</strong>{entry.reasonCode && <span className="subline">{entry.reasonCode}</span>}{entry.errorDetail && <span className="subline">{entry.errorDetail}</span>}</td>
+      <td>{entry.photoIndex === null ? '—' : <><span>idx {entry.photoIndex}</span><span className="subline hash-cell">{entry.hash}</span></>}</td>
+    </tr>)}
+    {entries.length === 0 && <tr><td className="empty-row" colSpan={5}>이 페이지에 표시할 항목이 없습니다.</td></tr>}</tbody>
+  </table>
 }
 
 function PipelineDetails({ encoding, embedding, missing }: {

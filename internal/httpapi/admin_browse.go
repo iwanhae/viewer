@@ -154,6 +154,54 @@ func (s *Server) adminAlbum(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, album)
 }
 
+func (s *Server) adminAlbumExtractions(w http.ResponseWriter, r *http.Request) {
+	query, err := adminQuery(r, "limit", "cursor")
+	if err != nil {
+		writeBrowseBadRequest(w, r, err)
+		return
+	}
+	limit, err := browseLimit(query)
+	if err != nil {
+		writeBrowseBadRequest(w, r, err)
+		return
+	}
+	page, err := s.admin.ExtractionRuns(r.Context(), chi.URLParam(r, "id"), admin.BrowsePageOptions{Limit: limit, Cursor: query.Get("cursor")})
+	if err != nil {
+		writeBrowseError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, page)
+}
+
+func (s *Server) adminAlbumEntries(w http.ResponseWriter, r *http.Request) {
+	query, err := adminQuery(r, "runId", "outcome", "limit", "cursor")
+	if err != nil {
+		writeBrowseBadRequest(w, r, err)
+		return
+	}
+	limit, err := browseLimit(query)
+	if err != nil {
+		writeBrowseBadRequest(w, r, err)
+		return
+	}
+	var runID int64
+	if query.Has("runId") {
+		runID, err = strconv.ParseInt(query.Get("runId"), 10, 64)
+		if err != nil || runID <= 0 {
+			writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", "runId must be a positive integer")
+			return
+		}
+	}
+	page, err := s.admin.ExtractionEntries(r.Context(), chi.URLParam(r, "id"), admin.ExtractionEntriesOptions{
+		RunID: runID, Outcome: query.Get("outcome"), Limit: limit, Cursor: query.Get("cursor"),
+	})
+	if err != nil {
+		writeBrowseError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, page)
+}
+
 func adminQuery(r *http.Request, allowed ...string) (url.Values, error) {
 	query, err := url.ParseQuery(r.URL.RawQuery)
 	if err != nil {
@@ -208,7 +256,11 @@ func writeBrowseError(w http.ResponseWriter, r *http.Request, err error) {
 		writeBrowseBadRequest(w, r, err)
 		return
 	}
-	if errors.Is(err, catalog.ErrAlbumNotFound) || errors.Is(err, catalog.ErrPhotoNotFound) || errors.Is(err, catalog.ErrBlobNotFound) {
+	if errors.Is(err, catalog.ErrExtractionRunInProgress) {
+		writeError(w, r, http.StatusConflict, "EXTRACTION_IN_PROGRESS", "Extraction is still running; entry outcomes can be browsed after it reaches a terminal status.")
+		return
+	}
+	if errors.Is(err, catalog.ErrAlbumNotFound) || errors.Is(err, catalog.ErrPhotoNotFound) || errors.Is(err, catalog.ErrBlobNotFound) || errors.Is(err, catalog.ErrExtractionRunNotFound) {
 		writeError(w, r, http.StatusNotFound, "NOT_FOUND", "resource not found")
 		return
 	}

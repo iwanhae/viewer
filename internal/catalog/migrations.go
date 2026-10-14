@@ -175,6 +175,43 @@ var migrations = []migration{
 				SELECT hash, 'embedding', embedding_status, CASE WHEN embedding_error != '' THEN 'legacy_unknown' ELSE '' END FROM blobs`,
 		},
 	},
+	{
+		version: 7,
+		name:    "extraction_outcomes",
+		stmts: []string{
+			`CREATE TABLE extraction_runs (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				album_id TEXT NOT NULL REFERENCES albums(id) ON DELETE CASCADE,
+				started_at TEXT NOT NULL,
+				completed_at TEXT,
+				status TEXT NOT NULL CHECK (status IN ('running', 'succeeded', 'failed', 'incomplete')),
+				failure_reason_code TEXT NOT NULL DEFAULT '',
+				error_detail TEXT NOT NULL DEFAULT '',
+				entries_complete INTEGER NOT NULL DEFAULT 0 CHECK (entries_complete IN (0, 1)),
+				entries_recorded INTEGER NOT NULL DEFAULT 0,
+				candidate_entries_recorded INTEGER NOT NULL DEFAULT 0,
+				registered_count INTEGER NOT NULL DEFAULT 0,
+				skipped_count INTEGER NOT NULL DEFAULT 0,
+				failed_count INTEGER NOT NULL DEFAULT 0
+			)`,
+			`CREATE INDEX idx_extraction_runs_album_id ON extraction_runs(album_id, id DESC)`,
+			`CREATE TABLE extraction_entry_outcomes (
+				run_id INTEGER NOT NULL REFERENCES extraction_runs(id) ON DELETE CASCADE,
+				ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+				name TEXT NOT NULL,
+				candidate INTEGER NOT NULL CHECK (candidate IN (0, 1)),
+				outcome TEXT NOT NULL CHECK (outcome IN ('registered', 'skipped', 'failed')),
+				reason_code TEXT NOT NULL DEFAULT '',
+				error_detail TEXT NOT NULL DEFAULT '',
+				photo_index INTEGER,
+				hash TEXT NOT NULL DEFAULT '',
+				PRIMARY KEY (run_id, ordinal),
+				CHECK ((outcome = 'registered' AND candidate = 1 AND photo_index IS NOT NULL AND hash != '') OR
+				       (outcome != 'registered' AND photo_index IS NULL AND hash = ''))
+			)`,
+			`CREATE INDEX idx_extraction_entry_outcomes_run_outcome_ordinal ON extraction_entry_outcomes(run_id, outcome, ordinal)`,
+		},
+	},
 }
 
 // addBlobLeaseColumnIfMissing adds the external-worker lease column to blobs.

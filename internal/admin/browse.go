@@ -106,6 +106,39 @@ type albumCursor struct {
 	ID      string `json:"id"`
 }
 
+type extractionRunsCursor struct {
+	Version int    `json:"v"`
+	Kind    string `json:"kind"`
+	Binding string `json:"binding"`
+	RunID   int64  `json:"runId"`
+}
+
+type extractionEntriesCursor struct {
+	Version int    `json:"v"`
+	Kind    string `json:"kind"`
+	Binding string `json:"binding"`
+	Ordinal int    `json:"ordinal"`
+}
+
+type ExtractionRunPage struct {
+	Runs       []catalog.ExtractionRunSummary `json:"runs"`
+	NextCursor *string                        `json:"nextCursor"`
+}
+
+type ExtractionEntriesOptions struct {
+	RunID   int64
+	Outcome string
+	Limit   int
+	Cursor  string
+}
+
+type ExtractionEntriesPage struct {
+	Run          catalog.ExtractionRunSummary     `json:"run"`
+	RunSelection string                           `json:"runSelection"`
+	Entries      []catalog.ExtractionEntryOutcome `json:"entries"`
+	NextCursor   *string                          `json:"nextCursor"`
+}
+
 // ListPhotos returns a page ordered by the stable (album_id, idx) key. Each
 // request is an independent read; cursors do not promise a snapshot while
 // rows are concurrently inserted, deleted, or reclassified.
@@ -258,6 +291,96 @@ func (s *Service) AlbumByID(ctx context.Context, albumID string) (catalog.AdminA
 	return s.cat.AdminAlbumByID(ctx, albumID)
 }
 
+// ExtractionRuns returns the album's append-only extraction history in
+// descending run-id order. Cursors are bound to the album and page size.
+func (s *Service) ExtractionRuns(ctx context.Context, albumID string, options BrowsePageOptions) (ExtractionRunPage, error) {
+	if s == nil || s.cat == nil {
+		return ExtractionRunPage{}, fmt.Errorf("catalog is not available")
+	}
+	if err := validateLimit(options.Limit); err != nil {
+		return ExtractionRunPage{}, err
+	}
+	binding := browseBinding("extractionRuns", struct {
+		AlbumID string `json:"albumId"`
+	}{albumID}, options.Limit)
+	afterID, err := decodeExtractionRunsCursor(options.Cursor, binding)
+	if err != nil {
+		return ExtractionRunPage{}, err
+	}
+	rows, err := s.cat.ListExtractionRuns(ctx, albumID, afterID, options.Limit+1)
+	if err != nil {
+		return ExtractionRunPage{}, err
+	}
+	page := ExtractionRunPage{Runs: rows}
+	if len(rows) > options.Limit {
+		page.Runs = rows[:options.Limit]
+		last := page.Runs[len(page.Runs)-1]
+		cursor := encodeBrowseCursor(extractionRunsCursor{Version: 1, Kind: "extractionRuns", Binding: binding, RunID: last.RunID})
+		page.NextCursor = &cursor
+	}
+	return page, nil
+}
+
+// ExtractionEntries defaults to the latest recorded run. The resolved run id
+// is included in the cursor binding so a cursor cannot drift to a newer run.
+func (s *Service) ExtractionEntries(ctx context.Context, albumID string, options ExtractionEntriesOptions) (ExtractionEntriesPage, error) {
+	if s == nil || s.cat == nil {
+		return ExtractionEntriesPage{}, fmt.Errorf("catalog is not available")
+	}
+	if err := validateLimit(options.Limit); err != nil {
+		return ExtractionEntriesPage{}, err
+	}
+	if options.RunID < 0 {
+		return ExtractionEntriesPage{}, fmt.Errorf("%w: runId must be positive", ErrInvalidBrowseRequest)
+	}
+	if options.Outcome != "" && !oneOf(options.Outcome, "registered", "skipped", "failed") {
+		return ExtractionEntriesPage{}, fmt.Errorf("%w: outcome must be registered, skipped, or failed", ErrInvalidBrowseRequest)
+	}
+	selection := "explicit"
+	var run catalog.ExtractionRunSummary
+	var err error
+	if options.RunID == 0 {
+		selection = "latest"
+		var found bool
+		run, found, err = s.cat.LatestExtractionRun(ctx, albumID)
+		if err != nil {
+			return ExtractionEntriesPage{}, err
+		}
+		if !found {
+			return ExtractionEntriesPage{}, fmt.Errorf("%w: no recorded extraction run for album %s", catalog.ErrExtractionRunNotFound, albumID)
+		}
+	} else {
+		run, err = s.cat.ExtractionRunByID(ctx, albumID, options.RunID)
+		if err != nil {
+			return ExtractionEntriesPage{}, err
+		}
+	}
+	if run.Status == "running" {
+		return ExtractionEntriesPage{}, fmt.Errorf("%w: %d", catalog.ErrExtractionRunInProgress, run.RunID)
+	}
+	binding := browseBinding("extractionEntries", struct {
+		AlbumID string `json:"albumId"`
+		RunID   int64  `json:"runId"`
+		Outcome string `json:"outcome"`
+	}{albumID, run.RunID, options.Outcome}, options.Limit)
+	afterOrdinal, err := decodeExtractionEntriesCursor(options.Cursor, binding)
+	if err != nil {
+		return ExtractionEntriesPage{}, err
+	}
+	rows, err := s.cat.ListExtractionEntries(ctx, albumID, run.RunID, options.Outcome, afterOrdinal, options.Limit+1)
+	if err != nil {
+		return ExtractionEntriesPage{}, err
+	}
+	page := ExtractionEntriesPage{Run: run, RunSelection: selection, Entries: rows}
+	if len(rows) > options.Limit {
+		page.Entries = rows[:options.Limit]
+		last := page.Entries[len(page.Entries)-1]
+		cursor := encodeBrowseCursor(extractionEntriesCursor{Version: 1, Kind: "extractionEntries", Binding: binding, Ordinal: last.Ordinal})
+		page.NextCursor = &cursor
+	}
+	return page, nil
+}
+
 func validateLimit(limit int) error {
 	if limit < 1 || limit > MaxBrowseLimit {
 		return fmt.Errorf("%w: limit must be between 1 and %d", ErrInvalidBrowseRequest, MaxBrowseLimit)
@@ -372,6 +495,28 @@ func decodeAlbumCursor(token, binding string) (string, error) {
 		return "", invalidCursor()
 	}
 	return cursor.ID, nil
+}
+
+func decodeExtractionRunsCursor(token, binding string) (int64, error) {
+	if token == "" {
+		return 0, nil
+	}
+	var cursor extractionRunsCursor
+	if err := decodeBrowseCursor(token, &cursor); err != nil || cursor.Version != 1 || cursor.Kind != "extractionRuns" || cursor.Binding != binding || cursor.RunID <= 0 {
+		return 0, invalidCursor()
+	}
+	return cursor.RunID, nil
+}
+
+func decodeExtractionEntriesCursor(token, binding string) (int, error) {
+	if token == "" {
+		return -1, nil
+	}
+	var cursor extractionEntriesCursor
+	if err := decodeBrowseCursor(token, &cursor); err != nil || cursor.Version != 1 || cursor.Kind != "extractionEntries" || cursor.Binding != binding || cursor.Ordinal < 0 {
+		return 0, invalidCursor()
+	}
+	return cursor.Ordinal, nil
 }
 
 func decodeBrowseCursor(token string, out any) error {

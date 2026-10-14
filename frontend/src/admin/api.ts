@@ -110,6 +110,47 @@ export type AlbumDetail = Album & {
     rawStates: Record<string, PipelineCounts>
   }
   missingBlobPhotos: number
+  extractionRecorded: boolean
+  latestExtraction: ExtractionRun | null
+}
+
+export type ExtractionRun = {
+  runId: number
+  status: string
+  startedAt: string
+  completedAt: string | null
+  failureReasonCode: string
+  errorDetail: string
+  entriesComplete: boolean
+  countsProvisional: boolean
+  entriesRecorded: number
+  candidateEntriesRecorded: number
+  totalEntries: number | null
+  candidateEntries: number | null
+  registeredCount: number
+  skippedCount: number
+  failedCount: number
+}
+
+export type ExtractionRunsPage = { runs: ExtractionRun[]; nextCursor: string | null }
+
+export type ExtractionEntry = {
+  runId: number
+  ordinal: number
+  name: string
+  candidate: boolean
+  outcome: 'registered' | 'skipped' | 'failed'
+  reasonCode: string
+  errorDetail: string
+  photoIndex: number | null
+  hash: string
+}
+
+export type ExtractionEntriesPage = {
+  run: ExtractionRun
+  runSelection: 'latest' | 'explicit'
+  entries: ExtractionEntry[]
+  nextCursor: string | null
 }
 
 export type Page<T> = { nextCursor: string | null } & (

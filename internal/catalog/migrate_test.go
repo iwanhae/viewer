@@ -759,6 +759,15 @@ func TestStageObservabilityMigrationDoesNotInventLegacyAttempts(t *testing.T) {
 	if _, err := store.db.ExecContext(ctx, `DROP TABLE blob_stage_observations`); err != nil {
 		t.Fatal(err)
 	}
+	// Open created the current schema before this test rewinds the pragma; drop
+	// migration 0007's tables too so the second Open exercises the real v5->v7
+	// path rather than an impossible partially-versioned file.
+	if _, err := store.db.ExecContext(ctx, `DROP TABLE extraction_entry_outcomes`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(ctx, `DROP TABLE extraction_runs`); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := store.db.ExecContext(ctx, `PRAGMA user_version=5`); err != nil {
 		t.Fatal(err)
 	}

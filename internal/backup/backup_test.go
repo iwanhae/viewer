@@ -532,7 +532,9 @@ func TestFinalizerRefusesDrasticallySmallerSnapshot(t *testing.T) {
 	ctx := context.Background()
 
 	cat := seedGuardFixture(t, dir)
-	const backupSize = 1 << 20
+	// Migration 0007 adds extraction-history tables to every snapshot, so keep
+	// the seeded backup comfortably above the 10x shrinkage threshold.
+	const backupSize = 2 << 20
 	store := newFakeStore(map[string]fakeObject{
 		BackupObjectKey:        {body: bytes.Repeat([]byte("x"), backupSize), lastModified: backupModified},
 		"uploads/album-ok.zip": {body: []byte("ok")},

@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -99,6 +100,8 @@ func TestAdminRoutesRequireBothServiceAndToken(t *testing.T) {
 		{http.MethodGet, "/admin/api/blobs/hash/history"},
 		{http.MethodGet, "/admin/api/albums"},
 		{http.MethodGet, "/admin/api/albums/a"},
+		{http.MethodGet, "/admin/api/albums/a/extractions"},
+		{http.MethodGet, "/admin/api/albums/a/entries"},
 		{http.MethodPost, "/admin/api/reindex"},
 	}
 	for name, router := range routers {
@@ -471,6 +474,144 @@ func TestAdminResourceBrowseRoutesContractAndValidation(t *testing.T) {
 	router.ServeHTTP(malformedResponse, malformedQuery)
 	if malformedResponse.Code != http.StatusBadRequest {
 		t.Fatalf("malformed query status=%d want=400 body=%s", malformedResponse.Code, malformedResponse.Body.String())
+	}
+}
+
+func TestAdminExtractionHistoryEndpointsArePagedFilteredAndReadOnly(t *testing.T) {
+	store := openAdminTestCatalog(t)
+	ctx := context.Background()
+	for _, id := range []string{"history-album", "legacy-album"} {
+		if err := store.CreateAlbum(ctx, catalog.Album{ID: id, OriginalFilename: id + ".zip", Status: catalog.AlbumStatusReady}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	firstRun, err := store.BeginExtractionRun(ctx, "history-album")
+	if err != nil {
+		t.Fatal(err)
+	}
+	photoIndex := 0
+	firstEntries := []catalog.ExtractionEntryOutcome{
+		{Ordinal: 0, Name: "duplicate.jpg", Candidate: true, Outcome: "registered", PhotoIndex: &photoIndex, Hash: "hash-one"},
+		{Ordinal: 2, Name: "duplicate.jpg", Candidate: true, Outcome: "skipped", ReasonCode: "invalid_image", ErrorDetail: "decode failed"},
+		{Ordinal: 4, Name: "duplicate.jpg", Candidate: true, Outcome: "skipped", ReasonCode: "entry_read_failed", ErrorDetail: "read failed"},
+		{Ordinal: 6, Name: "last.jpg", Candidate: true, Outcome: "failed", ReasonCode: "blob_storage_failed", ErrorDetail: "storage failed"},
+	}
+	if err := store.RecordExtractionEntries(ctx, firstRun, firstEntries); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.FinishExtractionRun(ctx, firstRun, "failed", "entry_failed", "safe failure", true); err != nil {
+		t.Fatal(err)
+	}
+	secondRun, err := store.BeginExtractionRun(ctx, "history-album")
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondEntries := []catalog.ExtractionEntryOutcome{
+		{Ordinal: 0, Name: "new.jpg", Candidate: true, Outcome: "registered", PhotoIndex: &photoIndex, Hash: "hash-two"},
+		{Ordinal: 1, Name: "readme.txt", Outcome: "skipped", ReasonCode: "unsupported_extension"},
+	}
+	if err := store.RecordExtractionEntries(ctx, secondRun, secondEntries); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.FinishExtractionRun(ctx, secondRun, "succeeded", "", "", true); err != nil {
+		t.Fatal(err)
+	}
+	service := admin.NewService(store, nil, nil)
+	router := New(nil, nil, nil, nil, "", service, "secret").Router()
+	auth := basicAuthHeader("operator", "secret")
+	if rec := doAdminRequest(t, router, http.MethodGet, "/admin/api/albums/history-album/entries", ""); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthorized entries status=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	// No runId explicitly selects the latest recorded run, rather than
+	// pretending that an old album has zero failures.
+	latest := doAdminRequest(t, router, http.MethodGet, "/admin/api/albums/history-album/entries?limit=1", auth)
+	if latest.Code != http.StatusOK || !strings.Contains(latest.Body.String(), `"runId":`+strconv.FormatInt(secondRun, 10)) || !strings.Contains(latest.Body.String(), `"runSelection":"latest"`) {
+		t.Fatalf("latest entries status=%d body=%s", latest.Code, latest.Body.String())
+	}
+	latestDetail := doAdminRequest(t, router, http.MethodGet, "/admin/api/albums/history-album", auth)
+	if latestDetail.Code != http.StatusOK || !strings.Contains(latestDetail.Body.String(), `"extractionRecorded":true`) || !strings.Contains(latestDetail.Body.String(), `"latestExtraction"`) || !strings.Contains(latestDetail.Body.String(), `"failedCount":0`) {
+		t.Fatalf("album extraction summary status=%d body=%s", latestDetail.Code, latestDetail.Body.String())
+	}
+	legacyDetail := doAdminRequest(t, router, http.MethodGet, "/admin/api/albums/legacy-album", auth)
+	if legacyDetail.Code != http.StatusOK || !strings.Contains(legacyDetail.Body.String(), `"extractionRecorded":false`) || !strings.Contains(legacyDetail.Body.String(), `"latestExtraction":null`) {
+		t.Fatalf("legacy album detail status=%d body=%s", legacyDetail.Code, legacyDetail.Body.String())
+	}
+	if rec := doAdminRequest(t, router, http.MethodGet, "/admin/api/albums/legacy-album/entries", auth); rec.Code != http.StatusNotFound {
+		t.Fatalf("legacy default entries status=%d want=404 body=%s", rec.Code, rec.Body.String())
+	}
+
+	// Run history pages newest first; a cursor is bound to album and limit.
+	runs := doAdminRequest(t, router, http.MethodGet, "/admin/api/albums/history-album/extractions?limit=1", auth)
+	if runs.Code != http.StatusOK || !strings.Contains(runs.Body.String(), `"runId":`+strconv.FormatInt(secondRun, 10)) || !strings.Contains(runs.Body.String(), `"nextCursor":"`) {
+		t.Fatalf("first runs page status=%d body=%s", runs.Code, runs.Body.String())
+	}
+	var runsPage struct {
+		NextCursor *string `json:"nextCursor"`
+	}
+	if err := json.Unmarshal(runs.Body.Bytes(), &runsPage); err != nil || runsPage.NextCursor == nil {
+		t.Fatalf("decode run cursor: page=%s err=%v", runs.Body.String(), err)
+	}
+	olderRuns := doAdminRequest(t, router, http.MethodGet, "/admin/api/albums/history-album/extractions?limit=1&cursor="+url.QueryEscape(*runsPage.NextCursor), auth)
+	if olderRuns.Code != http.StatusOK || !strings.Contains(olderRuns.Body.String(), `"runId":`+strconv.FormatInt(firstRun, 10)) {
+		t.Fatalf("older runs page status=%d body=%s", olderRuns.Code, olderRuns.Body.String())
+	}
+	if rec := doAdminRequest(t, router, http.MethodGet, "/admin/api/albums/history-album/extractions?limit=2&cursor="+url.QueryEscape(*runsPage.NextCursor), auth); rec.Code != http.StatusBadRequest {
+		t.Fatalf("mismatched run cursor status=%d want=400 body=%s", rec.Code, rec.Body.String())
+	}
+
+	filtered := doAdminRequest(t, router, http.MethodGet, "/admin/api/albums/history-album/entries?runId="+strconv.FormatInt(firstRun, 10)+"&outcome=skipped&limit=1", auth)
+	if filtered.Code != http.StatusOK || !strings.Contains(filtered.Body.String(), `"ordinal":2`) || !strings.Contains(filtered.Body.String(), `"reasonCode":"invalid_image"`) || !strings.Contains(filtered.Body.String(), `"nextCursor":"`) {
+		t.Fatalf("filtered entries first page status=%d body=%s", filtered.Code, filtered.Body.String())
+	}
+	var entriesPage struct {
+		NextCursor *string `json:"nextCursor"`
+	}
+	if err := json.Unmarshal(filtered.Body.Bytes(), &entriesPage); err != nil || entriesPage.NextCursor == nil {
+		t.Fatalf("decode entry cursor: page=%s err=%v", filtered.Body.String(), err)
+	}
+	nextEntry := doAdminRequest(t, router, http.MethodGet, "/admin/api/albums/history-album/entries?runId="+strconv.FormatInt(firstRun, 10)+"&outcome=skipped&limit=1&cursor="+url.QueryEscape(*entriesPage.NextCursor), auth)
+	if nextEntry.Code != http.StatusOK || !strings.Contains(nextEntry.Body.String(), `"ordinal":4`) {
+		t.Fatalf("filtered entries second page status=%d body=%s", nextEntry.Code, nextEntry.Body.String())
+	}
+	if rec := doAdminRequest(t, router, http.MethodGet, "/admin/api/albums/history-album/entries?runId="+strconv.FormatInt(firstRun, 10)+"&outcome=failed&limit=1&cursor="+url.QueryEscape(*entriesPage.NextCursor), auth); rec.Code != http.StatusBadRequest {
+		t.Fatalf("outcome-mismatched cursor status=%d want=400 body=%s", rec.Code, rec.Body.String())
+	}
+	if rec := doAdminRequest(t, router, http.MethodGet, "/admin/api/albums/history-album/entries?outcome=bad", auth); rec.Code != http.StatusBadRequest {
+		t.Fatalf("invalid outcome status=%d want=400 body=%s", rec.Code, rec.Body.String())
+	}
+	if rec := doAdminRequest(t, router, http.MethodGet, "/admin/api/albums/history-album/entries?runId=99999", auth); rec.Code != http.StatusNotFound {
+		t.Fatalf("foreign/missing run status=%d want=404 body=%s", rec.Code, rec.Body.String())
+	}
+	oldRun := doAdminRequest(t, router, http.MethodGet, "/admin/api/albums/history-album/entries?runId="+strconv.FormatInt(firstRun, 10), auth)
+	if oldRun.Code != http.StatusOK || !strings.Contains(oldRun.Body.String(), `"ordinal":6`) || strings.Contains(oldRun.Body.String(), `"name":"new.jpg"`) {
+		t.Fatalf("old run history changed after reprocessing: status=%d body=%s", oldRun.Code, oldRun.Body.String())
+	}
+
+	// Even already-recorded ordinals cannot be paged while a run may append
+	// lower ordinals. Once terminal (including incomplete), the history is stable.
+	runningRun, err := store.BeginExtractionRun(ctx, "history-album")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordExtractionEntries(ctx, runningRun, []catalog.ExtractionEntryOutcome{{Ordinal: 8, Name: "partial.jpg", Candidate: true, Outcome: "failed", ReasonCode: "invalid_image"}}); err != nil {
+		t.Fatal(err)
+	}
+	for _, target := range []string{
+		"/admin/api/albums/history-album/entries",
+		"/admin/api/albums/history-album/entries?runId=" + strconv.FormatInt(runningRun, 10),
+	} {
+		rec := doAdminRequest(t, router, http.MethodGet, target, auth)
+		if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), `"code":"EXTRACTION_IN_PROGRESS"`) {
+			t.Fatalf("running run entries %s status=%d want=409 body=%s", target, rec.Code, rec.Body.String())
+		}
+	}
+	if err := store.FinishExtractionRun(ctx, runningRun, "incomplete", "outcome_recording_failed", "", false); err != nil {
+		t.Fatal(err)
+	}
+	terminalEntries := doAdminRequest(t, router, http.MethodGet, "/admin/api/albums/history-album/entries?runId="+strconv.FormatInt(runningRun, 10), auth)
+	if terminalEntries.Code != http.StatusOK || !strings.Contains(terminalEntries.Body.String(), `"ordinal":8`) {
+		t.Fatalf("terminal incomplete run entries status=%d body=%s", terminalEntries.Code, terminalEntries.Body.String())
 	}
 }
 

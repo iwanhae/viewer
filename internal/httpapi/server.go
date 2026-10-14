@@ -129,6 +129,8 @@ func (s *Server) Router() http.Handler {
 			r.Get("/api/blobs/{hash}/history", s.adminBlobHistory)
 			r.Get("/api/blobs/{hash}", s.adminBlob)
 			r.Get("/api/albums", s.adminAlbums)
+			r.Get("/api/albums/{id}/extractions", s.adminAlbumExtractions)
+			r.Get("/api/albums/{id}/entries", s.adminAlbumEntries)
 			r.Get("/api/albums/{id}", s.adminAlbum)
 			r.Post("/api/reindex", s.adminReindex)
 			r.Post("/api/recover", s.adminRecover)
