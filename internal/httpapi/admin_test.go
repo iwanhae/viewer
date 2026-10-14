@@ -66,6 +66,12 @@ func doAdminBodyRequest(t *testing.T, router http.Handler, method, target, autho
 	if authorization != "" {
 		req.Header.Set("Authorization", authorization)
 	}
+	if method != http.MethodGet && method != http.MethodHead && method != http.MethodOptions {
+		req.Header.Set("X-Admin-Action", "1")
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
 	return rec
@@ -105,6 +111,10 @@ func TestAdminRoutesRequireBothServiceAndToken(t *testing.T) {
 		{http.MethodGet, "/admin/api/albums/a"},
 		{http.MethodGet, "/admin/api/albums/a/extractions"},
 		{http.MethodGet, "/admin/api/albums/a/entries"},
+		{http.MethodPost, "/admin/api/actions/preview"},
+		{http.MethodPost, "/admin/api/operations"},
+		{http.MethodGet, "/admin/api/operations"},
+		{http.MethodGet, "/admin/api/operations/op-id"},
 		{http.MethodPost, "/admin/api/reindex"},
 	}
 	for name, router := range routers {
@@ -167,6 +177,10 @@ func TestAdminAuthChallenges(t *testing.T) {
 			{http.MethodGet, "/admin/api/blobs/hash-a"},
 			{http.MethodGet, "/admin/api/albums"},
 			{http.MethodGet, "/admin/api/albums/album-a"},
+			{http.MethodPost, "/admin/api/actions/preview"},
+			{http.MethodPost, "/admin/api/operations"},
+			{http.MethodGet, "/admin/api/operations"},
+			{http.MethodGet, "/admin/api/operations/op-id"},
 			{http.MethodPost, "/admin/api/reindex"},
 		} {
 			rec := doAdminRequest(t, router, route.method, route.target, item.authorization)
@@ -186,6 +200,160 @@ func TestAdminAuthChallenges(t *testing.T) {
 	rec := doAdminRequest(t, router, http.MethodGet, "/admin/api/stats", basicAuthHeader("operator", "sekrit"))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("correct password status=%d want=200 body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestAdminMutationCSRFProtection(t *testing.T) {
+	router, _ := newAdminTestRouter(t, 1)
+	auth := basicAuthHeader("operator", "sekrit")
+	request := func(header, origin, fetchSite string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/admin/api/recover", strings.NewReader(`{"target":"unknown"}`))
+		req.Header.Set("Authorization", auth)
+		req.Header.Set("Content-Type", "application/json")
+		if header != "" {
+			req.Header.Set("X-Admin-Action", header)
+		}
+		if origin != "" {
+			req.Header.Set("Origin", origin)
+		}
+		if fetchSite != "" {
+			req.Header.Set("Sec-Fetch-Site", fetchSite)
+		}
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		return rec
+	}
+	for name, rec := range map[string]*httptest.ResponseRecorder{
+		"missing custom header":     request("", "", ""),
+		"cross origin":              request("1", "https://evil.example", "cross-site"),
+		"same-site not same-origin": request("1", "", "same-site"),
+	} {
+		if rec.Code != http.StatusForbidden || !jsonBodyHasErrorCode(rec.Body.String(), "CSRF") {
+			t.Fatalf("%s status=%d body=%s want CSRF 403", name, rec.Code, rec.Body.String())
+		}
+	}
+	allowed := request("1", "http://example.com", "same-origin")
+	if allowed.Code != http.StatusBadRequest || !jsonBodyHasErrorCode(allowed.Body.String(), "INVALID_REQUEST") {
+		t.Fatalf("same-origin action status=%d body=%s want handler validation after CSRF", allowed.Code, allowed.Body.String())
+	}
+	proxied := httptest.NewRequest(http.MethodPost, "/admin/api/recover", strings.NewReader(`{"target":"unknown"}`))
+	proxied.Host = "photos.example.com"
+	proxied.Header.Set("Authorization", auth)
+	proxied.Header.Set("Content-Type", "application/json")
+	proxied.Header.Set("X-Admin-Action", "1")
+	proxied.Header.Set("Origin", "https://photos.example.com")
+	proxied.Header.Set("Sec-Fetch-Site", "same-origin")
+	proxied.Header.Set("X-Forwarded-Proto", "https")
+	proxiedRec := httptest.NewRecorder()
+	router.ServeHTTP(proxiedRec, proxied)
+	if proxiedRec.Code != http.StatusBadRequest || !jsonBodyHasErrorCode(proxiedRec.Body.String(), "INVALID_REQUEST") {
+		t.Fatalf("same-origin HTTPS proxy action status=%d body=%s want handler validation after CSRF", proxiedRec.Code, proxiedRec.Body.String())
+	}
+	missingJSONType := httptest.NewRequest(http.MethodPost, "/admin/api/recover", strings.NewReader(`{"target":"unknown"}`))
+	missingJSONType.Header.Set("Authorization", auth)
+	missingJSONType.Header.Set("X-Admin-Action", "1")
+	missingJSONTypeRec := httptest.NewRecorder()
+	router.ServeHTTP(missingJSONTypeRec, missingJSONType)
+	if missingJSONTypeRec.Code != http.StatusBadRequest || !strings.Contains(missingJSONTypeRec.Body.String(), "Content-Type must be application/json") {
+		t.Fatalf("legacy recover without JSON Content-Type status=%d body=%s", missingJSONTypeRec.Code, missingJSONTypeRec.Body.String())
+	}
+	get := doAdminRequest(t, router, http.MethodGet, "/admin/api/overview", auth)
+	if get.Code != http.StatusOK {
+		t.Fatalf("GET status=%d body=%s; reads must not require the action header", get.Code, get.Body.String())
+	}
+}
+
+func TestAdminScopedRecoveryPreviewOperationAndPaginationAPI(t *testing.T) {
+	store := openAdminTestCatalog(t)
+	seedEmbeddingFixture(t, store)
+	service := admin.NewService(store, nil, nil)
+	workerCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	service.StartRecoveryWorker(workerCtx, true)
+	defer func() {
+		ctx, stop := context.WithTimeout(context.Background(), time.Second)
+		defer stop()
+		if err := service.Close(ctx); err != nil {
+			t.Errorf("close recovery worker: %v", err)
+		}
+	}()
+	router := New(nil, nil, nil, nil, "", service, "sekrit").Router()
+	auth := basicAuthHeader("operator", "sekrit")
+	previewBody := []byte(`{"action":"retry_failed_embedding","selection":{"hashes":["hash-b"]}}`)
+	previewReq := httptest.NewRequest(http.MethodPost, "/admin/api/actions/preview", bytes.NewReader(previewBody))
+	previewReq.Header.Set("Authorization", auth)
+	previewReq.Header.Set("X-Admin-Action", "1")
+	previewReq.Header.Set("Content-Type", "application/json")
+	previewRec := httptest.NewRecorder()
+	router.ServeHTTP(previewRec, previewReq)
+	if previewRec.Code != http.StatusCreated {
+		t.Fatalf("preview status=%d body=%s", previewRec.Code, previewRec.Body.String())
+	}
+	var preview catalog.RecoveryPreview
+	if err := json.Unmarshal(previewRec.Body.Bytes(), &preview); err != nil {
+		t.Fatal(err)
+	}
+	if preview.EligibleCount != 1 || preview.TargetCount != 1 || preview.Actor != "operator" || !strings.Contains(preview.ActorNote, "not individually verified") {
+		t.Fatalf("preview payload=%+v", preview)
+	}
+	blob, err := store.GetBlob(context.Background(), "hash-b")
+	if err != nil || blob.EmbeddingStatus != catalog.EmbeddingStatusFailed {
+		t.Fatalf("preview mutated failed state: blob=%+v err=%v", blob, err)
+	}
+
+	opBody, _ := json.Marshal(recoveryOperationRequest{PreviewID: preview.ID, Action: preview.Action})
+	create := func(key, body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/admin/api/operations", strings.NewReader(body))
+		req.Header.Set("Authorization", auth)
+		req.Header.Set("X-Admin-Action", "1")
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Idempotency-Key", key)
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		return rec
+	}
+	opRec := create("same-operation", string(opBody))
+	if opRec.Code != http.StatusAccepted {
+		t.Fatalf("operation create status=%d body=%s", opRec.Code, opRec.Body.String())
+	}
+	var operation catalog.RecoveryOperation
+	if err := json.Unmarshal(opRec.Body.Bytes(), &operation); err != nil {
+		t.Fatal(err)
+	}
+	repeated := create("same-operation", string(opBody))
+	if repeated.Code != http.StatusOK {
+		t.Fatalf("idempotent replay status=%d body=%s", repeated.Code, repeated.Body.String())
+	}
+	var replay catalog.RecoveryOperation
+	if err := json.Unmarshal(repeated.Body.Bytes(), &replay); err != nil || replay.ID != operation.ID {
+		t.Fatalf("replay=%+v err=%v original=%+v", replay, err, operation)
+	}
+	conflict := create("same-operation", `{"previewId":"different","action":"retry_failed_embedding"}`)
+	if conflict.Code != http.StatusConflict {
+		t.Fatalf("mismatched idempotency status=%d body=%s", conflict.Code, conflict.Body.String())
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		rec := doAdminRequest(t, router, http.MethodGet, "/admin/api/operations/"+operation.ID+"?limit=1", auth)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("operation read status=%d body=%s", rec.Code, rec.Body.String())
+		}
+		var page catalog.RecoveryResultPage
+		if err := json.Unmarshal(rec.Body.Bytes(), &page); err != nil {
+			t.Fatal(err)
+		}
+		if page.Operation.Status == "completed" {
+			if len(page.Results) != 1 || page.Results[0].Status != "succeeded" || page.Operation.Succeeded != 1 {
+				t.Fatalf("completed page=%+v", page)
+			}
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	list := doAdminRequest(t, router, http.MethodGet, "/admin/api/operations?limit=1", auth)
+	if list.Code != http.StatusOK || !strings.Contains(list.Body.String(), operation.ID) {
+		t.Fatalf("operation list status=%d body=%s", list.Code, list.Body.String())
 	}
 }
 
@@ -230,6 +398,9 @@ func TestAdminPageServesEmbeddedHTML(t *testing.T) {
 	legacy := doAdminRequest(t, router, http.MethodGet, "/admin/legacy", basicAuthHeader("operator", "sekrit"))
 	if legacy.Code != http.StatusOK || !strings.Contains(legacy.Body.String(), "Re-embed everything") || !strings.Contains(legacy.Body.String(), "/admin/api/recover") {
 		t.Fatalf("legacy dashboard status=%d body missing existing recovery UI", legacy.Code)
+	}
+	if !strings.Contains(legacy.Body.String(), "X-Admin-Action") {
+		t.Fatalf("legacy dashboard does not attach the required mutation header")
 	}
 
 	for _, target := range []string{"/admin/photos/album-a/0", "/admin/blobs/hash", "/admin/albums/album-a"} {

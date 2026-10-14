@@ -129,6 +129,10 @@ Notes:
 | GET | `/admin/api/albums/{id}/extractions` | Cursor-paged append-only extraction runs, newest first. |
 | GET | `/admin/api/albums/{id}/entries` | Cursor-paged outcomes for the latest run, or a requested `runId`; supports `outcome`. |
 | GET | `/admin/api/extraction-failures` | Cursor-paged failed entries from each album's latest run when terminal, filtered by `reasonCode`. |
+| POST | `/admin/api/actions/preview` | Read-only scoped recovery preview; snapshots its exact blob targets for ten minutes. |
+| POST | `/admin/api/operations` | Consumes a preview once and queues its durable, idempotent recovery operation. |
+| GET | `/admin/api/operations` | Newest-first paged operation audit list. |
+| GET | `/admin/api/operations/{id}` | Operation summary and bounded, cursor-paged per-target results. |
 
 The admin document, legacy dashboard, and resource APIs require the same HTTP
 Basic password (`ADMIN_TOKEN`), and are absent when the admin service or token
@@ -287,6 +291,121 @@ large catalog. The current indexes support ordered album/photo/hash traversal,
 but production `EXPLAIN QUERY PLAN` and workload measurements should guide any
 future approved index migration. No list API reports retry counts or invented
 retry/timing estimates.
+
+### Scoped admin recovery (stage 7A backend)
+
+The scoped recovery API currently supports exactly four blob actions:
+
+- `retry_failed_encoding`: only raw `encoding_status=failed` non-WebP blobs.
+- `retry_failed_embedding`: only raw `embedding_status=failed` blobs.
+- `release_expired_encoding`: only expired `encoding_status=leased` blobs.
+- `release_expired_embedding`: only expired `embedding_status=processing` blobs.
+
+Encoding `received` and `committing` work is never reset by these actions;
+`reconciling` observations are ineligible. Live leases, ready rows, `skipped`
+(including not-smaller encodings), pending rows, and all other states are
+reported as skipped. The legacy global `/admin/api/recover` and `/admin/api/reindex`
+policies remain available and retain their existing broader/explicitly
+dangerous behavior; the scoped endpoints do not add whole-library reindexing.
+Album extraction retry is deliberately not offered: the existing extraction
+queue is in-memory and does not provide the durable idempotent enqueue needed
+to safely persist a retry across a crash. No S3 source check is therefore
+performed by this backend.
+
+Create a preview with strict JSON (unknown fields and non-JSON content types are
+rejected). A selection contains exactly one of `hashes`, `photos`, `albumIds`,
+or `filter`. Explicit photo identities use `(albumId, idx)`; albums/photos
+resolve to distinct content hashes. `filter` uses the same exact filters as
+`GET /admin/api/blobs` (for example `encoding`, `embedding`, `albumId`, `hash`,
+error-code, lease-expired, phase, skipped-reason, and `unreferenced` filters).
+There is no `q` substring filter on the blob browse endpoint. Example:
+
+```http
+POST /admin/api/actions/preview
+Content-Type: application/json
+X-Admin-Action: 1
+
+{"action":"retry_failed_embedding","selection":{"albumIds":["album-a"]}}
+```
+
+The response includes `previewId`, `actor`, `actorNote`, `action`, creation and
+expiry timestamps, `targetCount`, `eligibleCount`, `skippedCount`,
+`skippedReasons`, `selectedPhotos`, `affectedPhotos`, `affectedAlbums`, and
+`sharedBlobWarning`. Previews expire after ten minutes. The target cap is 10,000
+distinct blobs and explicit inputs are capped at 10,000 items; an oversized
+filter is rejected, never truncated. The stored target set is immutable: rows
+that begin matching after preview are not added. Preview and GET calls do not
+mutate pipeline state.
+
+For album/photo scopes, `selectedPhotos` counts photo rows in that explicit
+scope while `affectedPhotos`/`affectedAlbums` count every current reference to
+the selected shared blobs. `sharedBlobWarning` is true when global photo impact
+exceeds the selected scope. For hash and blob-filter scopes, selected and global
+photo counts describe the same blob-wide scope. Preview eligibility is only a
+snapshot; execution rechecks each target's generation and uses a transactional
+compare-and-set, recording a `conflict` rather than overwriting changed state.
+The private fingerprint covers raw stage state, observation timestamps/phase,
+attempt and safe error metadata, plus an encoding lease/token digest when
+releasing an encoding lease. Lease tokens themselves are never returned or
+stored in recovery tables.
+
+Queue the preview with a caller-generated idempotency key:
+
+```http
+POST /admin/api/operations
+Content-Type: application/json
+X-Admin-Action: 1
+Idempotency-Key: incident-2026-10-14-1
+
+{"previewId":"<previewId>","action":"retry_failed_embedding"}
+```
+
+The same key and exact preview/action/payload returns the same operation; a
+different binding returns `409`. A preview can be consumed once. Operations
+are durable in SQLite and execute in bounded small batches; startup resumes
+queued or interrupted work, while shutdown returns unfinished work to the
+queue. Operation statuses are `queued`, `running`, `completed`,
+`partially_failed`, or `failed`. Per-target results include `succeeded`,
+`conflict`, `skipped`, and `failed`, with short safe reason codes only. Use
+`GET /admin/api/operations?limit=50&cursor=...` for summaries and
+`GET /admin/api/operations/{id}?limit=50&cursor=...` for results; page sizes
+are 1–100. Result rows are never returned unbounded.
+
+The operation executor starts only when `ADMIN_TOKEN` is nonempty. While the
+admin service is disabled, durable operations stay paused and no targets are
+executed; enabling the admin service at startup requeues interrupted operations
+and resumes queued work.
+
+The operation actor is the username label from HTTP Basic credentials, not a
+verified individual: deployments share an admin token, and the API explicitly
+does not claim to identify which token holder acted. Audit rows store this
+label, action, preview, idempotency binding, state, and safe result reason codes;
+they do not store credentials or raw pipeline errors.
+
+Migration 0008 adds `admin_recovery_previews` (actor/action/scope, timestamps,
+counts and one-time consumption), `admin_recovery_targets` (ordered frozen blob
+IDs, eligibility, safe reason, private generation fingerprint and impact
+counts), `admin_recovery_operations` (idempotency binding and durable status),
+and `admin_recovery_results` (one bounded-pageable result per frozen target).
+Catalog state transition, stage observation/event, and result are committed in
+the same SQLite transaction for each target.
+
+Every mutation under `/admin`, including legacy `/admin/api/recover` and
+`/admin/api/reindex` and scoped recovery POSTs, requires the custom
+`X-Admin-Action: 1` header; the legacy dashboard adds it to its existing POSTs.
+Legacy `/admin/api/recover` requests and all new POST routes require
+`Content-Type: application/json`; the existing bodyless `/admin/api/reindex`
+request is the exception and does not need a content type. Requests with an
+explicit cross-origin `Origin` or non-same-origin `Sec-Fetch-Site` are rejected.
+No CORS permission is configured, so cross-origin preflight is not enabled.
+Existing GET routes, including authenticated curl reads, do not require the
+custom header.
+
+When TLS terminates at a reverse proxy, the same-origin scheme check uses
+`X-Forwarded-Proto` and compares `Origin` against the public `Host`. Only use
+this behind a known proxy that overwrites/sanitizes the forwarded header; the
+application does not validate trusted proxies, so direct clients must not be
+able to spoof it.
 
 For an encoder rollout, deploy the API server before upgrading workers; old
 workers remain supported by the legacy claim mode. Do not roll back to a server

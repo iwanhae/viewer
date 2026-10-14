@@ -158,6 +158,14 @@ func Run(ctx context.Context) error {
 	// HTTP bind, like everything else — means /admin answers from the first
 	// served request on.
 	adminService := admin.NewService(cat, vectorStore, recommendService).WithEncodingEnabled(cfg.WorkerToken != "")
+	adminService.StartRecoveryWorker(ctx, cfg.AdminToken != "")
+	defer func() {
+		closeCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := adminService.Close(closeCtx); err != nil {
+			log.Printf("viewer: scoped admin recovery worker shutdown failed: %v", err)
+		}
+	}()
 	pipelineService := pipeline.NewService(cat, store, pipeline.Options{
 		WebPEncodingEnabled: cfg.WebPEncodingEnabled,
 		OnAlbumReady: func(albumID string) {
@@ -204,6 +212,20 @@ func Run(ctx context.Context) error {
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	log.Printf("viewer: starting HTTP server on %s", srv.Addr)
+	serverStopped := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			if err := srv.Shutdown(shutdownCtx); err != nil {
+				log.Printf("viewer: HTTP shutdown failed: %v", err)
+				_ = srv.Close()
+			}
+		case <-serverStopped:
+			return
+		}
+	}()
 
 	// The model resolves in the background so a cold start serves requests
 	// while the checkpoint is still downloading: fetch it, load the vision
@@ -249,5 +271,7 @@ func Run(ctx context.Context) error {
 		log.Printf("viewer: startup tasks completed")
 	}()
 
-	return srv.ListenAndServe()
+	err = srv.ListenAndServe()
+	close(serverStopped)
+	return err
 }

@@ -212,6 +212,65 @@ var migrations = []migration{
 			`CREATE INDEX idx_extraction_entry_outcomes_run_outcome_ordinal ON extraction_entry_outcomes(run_id, outcome, ordinal)`,
 		},
 	},
+	{
+		version: 8,
+		name:    "scoped_admin_recovery",
+		stmts: []string{
+			`CREATE TABLE IF NOT EXISTS admin_recovery_previews (
+				id TEXT PRIMARY KEY,
+				actor TEXT NOT NULL,
+				action TEXT NOT NULL,
+				selection_json TEXT NOT NULL,
+				created_at TEXT NOT NULL,
+				expires_at TEXT NOT NULL,
+				target_count INTEGER NOT NULL,
+				eligible_count INTEGER NOT NULL,
+				skipped_count INTEGER NOT NULL,
+				selected_photos INTEGER NOT NULL,
+				affected_photos INTEGER NOT NULL,
+				affected_albums INTEGER NOT NULL,
+				consumed_by TEXT
+			)`,
+			`CREATE TABLE IF NOT EXISTS admin_recovery_targets (
+				preview_id TEXT NOT NULL REFERENCES admin_recovery_previews(id) ON DELETE CASCADE,
+				ordinal INTEGER NOT NULL,
+				blob_hash TEXT NOT NULL,
+				eligible INTEGER NOT NULL CHECK (eligible IN (0, 1)),
+				skip_reason TEXT NOT NULL DEFAULT '',
+				generation TEXT NOT NULL,
+				selected_photos INTEGER NOT NULL,
+				affected_photos INTEGER NOT NULL,
+				affected_albums INTEGER NOT NULL,
+				PRIMARY KEY (preview_id, ordinal),
+				UNIQUE (preview_id, blob_hash)
+			)`,
+			`CREATE INDEX IF NOT EXISTS idx_admin_recovery_targets_preview_eligible ON admin_recovery_targets(preview_id, eligible, ordinal)`,
+			`CREATE TABLE IF NOT EXISTS admin_recovery_operations (
+				id TEXT PRIMARY KEY,
+				preview_id TEXT NOT NULL UNIQUE REFERENCES admin_recovery_previews(id),
+				actor TEXT NOT NULL,
+				action TEXT NOT NULL,
+				idempotency_key TEXT NOT NULL,
+				payload_hash TEXT NOT NULL,
+				status TEXT NOT NULL CHECK (status IN ('queued', 'running', 'completed', 'partially_failed', 'failed')),
+				created_at TEXT NOT NULL,
+				updated_at TEXT NOT NULL,
+				UNIQUE (actor, idempotency_key)
+			)`,
+			`CREATE INDEX IF NOT EXISTS idx_admin_recovery_operations_status_created ON admin_recovery_operations(status, created_at, id)`,
+			`CREATE TABLE IF NOT EXISTS admin_recovery_results (
+				operation_id TEXT NOT NULL REFERENCES admin_recovery_operations(id) ON DELETE CASCADE,
+				ordinal INTEGER NOT NULL,
+				blob_hash TEXT NOT NULL,
+				status TEXT NOT NULL CHECK (status IN ('queued', 'succeeded', 'conflict', 'skipped', 'failed')),
+				reason_code TEXT NOT NULL DEFAULT '',
+				execution_attempts INTEGER NOT NULL DEFAULT 0,
+				updated_at TEXT NOT NULL,
+				PRIMARY KEY (operation_id, ordinal)
+			)`,
+			`CREATE INDEX IF NOT EXISTS idx_admin_recovery_results_operation_status ON admin_recovery_results(operation_id, status, ordinal)`,
+		},
+	},
 }
 
 // addBlobLeaseColumnIfMissing adds the external-worker lease column to blobs.

@@ -246,29 +246,7 @@ func (s *Store) AdminBlobs(ctx context.Context, filters AdminBlobFilters, afterH
 	if limit < 1 || limit > 101 {
 		return nil, fmt.Errorf("admin blob page size must be between 1 and 101")
 	}
-	var where []string
-	args := make([]any, 0, 12)
-	if filters.Hash != "" {
-		where = append(where, `b.hash = ?`)
-		args = append(args, filters.Hash)
-	}
-	if filters.AlbumID != "" {
-		where = append(where, `EXISTS (SELECT 1 FROM photos f WHERE f.hash = b.hash AND f.album_id = ?)`)
-		args = append(args, filters.AlbumID)
-	}
-	if filters.Unreferenced != nil {
-		if *filters.Unreferenced {
-			where = append(where, `NOT EXISTS (SELECT 1 FROM photos f WHERE f.hash = b.hash)`)
-		} else {
-			where = append(where, `EXISTS (SELECT 1 FROM photos f WHERE f.hash = b.hash)`)
-		}
-	}
-	appendAdminStateFilters(&where, &args, filters.Encoding, filters.Embedding, filters.EncodingRaw, filters.EmbeddingRaw,
-		filters.EncodingErrorCode, filters.EmbeddingErrorCode, filters.EncodingLeaseExpired, filters.EmbeddingLeaseExpired, filters.EncodingPhase, filters.SkippedReason)
-	if afterHash != "" {
-		where = append(where, `b.hash > ?`)
-		args = append(args, afterHash)
-	}
+	where, args := adminBlobWhere(filters, afterHash)
 	query := `SELECT b.hash, b.size_bytes, b.content_type, b.encoding_status, ` + adminEncodingCategoryExpr + `, b.encoding_error,
 		b.embedding_status, ` + adminEmbeddingCategoryExpr + `, b.embedding_error,
 		CASE WHEN b.encoding_status='failed' THEN COALESCE(NULLIF(eo.error_code,''),'legacy_unknown') ELSE '' END,
@@ -298,6 +276,33 @@ func (s *Store) AdminBlobs(ctx context.Context, filters AdminBlobFilters, afterH
 		return nil, fmt.Errorf("iterate admin blobs: %w", err)
 	}
 	return blobs, nil
+}
+
+func adminBlobWhere(filters AdminBlobFilters, afterHash string) ([]string, []any) {
+	var where []string
+	args := make([]any, 0, 12)
+	if filters.Hash != "" {
+		where = append(where, `b.hash = ?`)
+		args = append(args, filters.Hash)
+	}
+	if filters.AlbumID != "" {
+		where = append(where, `EXISTS (SELECT 1 FROM photos f WHERE f.hash = b.hash AND f.album_id = ?)`)
+		args = append(args, filters.AlbumID)
+	}
+	if filters.Unreferenced != nil {
+		if *filters.Unreferenced {
+			where = append(where, `NOT EXISTS (SELECT 1 FROM photos f WHERE f.hash = b.hash)`)
+		} else {
+			where = append(where, `EXISTS (SELECT 1 FROM photos f WHERE f.hash = b.hash)`)
+		}
+	}
+	appendAdminStateFilters(&where, &args, filters.Encoding, filters.Embedding, filters.EncodingRaw, filters.EmbeddingRaw,
+		filters.EncodingErrorCode, filters.EmbeddingErrorCode, filters.EncodingLeaseExpired, filters.EmbeddingLeaseExpired, filters.EncodingPhase, filters.SkippedReason)
+	if afterHash != "" {
+		where = append(where, `b.hash > ?`)
+		args = append(args, afterHash)
+	}
+	return where, args
 }
 
 func scanAdminBlob(row interface{ Scan(...any) error }) (AdminBlob, error) {

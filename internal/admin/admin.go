@@ -10,7 +10,10 @@ import (
 	"context"
 	_ "embed"
 	"fmt"
+	"log"
 	"net/http"
+	"sync"
+	"time"
 
 	"viewer/internal/catalog"
 	"viewer/internal/recommend"
@@ -101,6 +104,9 @@ type Service struct {
 	vectors         VectorCounter
 	recommend       *recommend.Service
 	encodingEnabled bool
+	recoveryMu      sync.Mutex
+	recoveryCancel  context.CancelFunc
+	recoveryDone    chan struct{}
 }
 
 // NewService builds the admin service. A nil vectors counter reports the
@@ -329,4 +335,185 @@ func (s *Service) ResetStuckEncodings(ctx context.Context) (EncodingResetResult,
 		Counts:   reset,
 		Encoding: EncodingStats{Enabled: s.encodingEnabled, EncodingCounts: encoding},
 	}, nil
+}
+
+func (s *Service) CreateRecoveryPreview(ctx context.Context, actor, action string, selection catalog.RecoverySelection) (catalog.RecoveryPreview, error) {
+	if s == nil || s.cat == nil {
+		return catalog.RecoveryPreview{}, fmt.Errorf("catalog is not available")
+	}
+	if selection.Filter != nil {
+		if err := ValidateRecoveryBlobFilters(*selection.Filter); err != nil {
+			return catalog.RecoveryPreview{}, fmt.Errorf("%w: invalid browse filter: %v", catalog.ErrInvalidRecoverySelection, err)
+		}
+	}
+	return s.cat.CreateRecoveryPreview(ctx, actor, action, selection, time.Now())
+}
+
+func (s *Service) CreateRecoveryOperation(ctx context.Context, actor, previewID, action, idempotencyKey, payloadHash string) (catalog.RecoveryOperation, bool, error) {
+	if s == nil || s.cat == nil {
+		return catalog.RecoveryOperation{}, false, fmt.Errorf("catalog is not available")
+	}
+	return s.cat.CreateRecoveryOperation(ctx, actor, previewID, action, idempotencyKey, payloadHash, time.Now())
+}
+
+func (s *Service) RecoveryResults(ctx context.Context, id string, limit int, cursor string) (catalog.RecoveryResultPage, error) {
+	if s == nil || s.cat == nil {
+		return catalog.RecoveryResultPage{}, fmt.Errorf("catalog is not available")
+	}
+	return s.cat.RecoveryResults(ctx, id, limit, cursor)
+}
+
+func (s *Service) RecoveryOperations(ctx context.Context, options catalog.RecoveryOperationListOptions) (catalog.RecoveryOperationPage, error) {
+	if s == nil || s.cat == nil {
+		return catalog.RecoveryOperationPage{}, fmt.Errorf("catalog is not available")
+	}
+	return s.cat.RecoveryOperations(ctx, options)
+}
+
+// StartRecoveryWorker starts the one bounded, durable executor for scoped
+// recovery actions only while the admin service is enabled. Catalog transitions
+// and their result rows commit atomically.
+func (s *Service) StartRecoveryWorker(ctx context.Context, adminEnabled bool) {
+	if s == nil || s.cat == nil || !adminEnabled {
+		return
+	}
+	s.recoveryMu.Lock()
+	defer s.recoveryMu.Unlock()
+	if s.recoveryDone != nil {
+		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	workerCtx, cancel := context.WithCancel(ctx)
+	s.recoveryCancel = cancel
+	s.recoveryDone = make(chan struct{})
+	go s.runRecoveryWorker(workerCtx, s.recoveryDone)
+}
+
+func (s *Service) runRecoveryWorker(ctx context.Context, done chan struct{}) {
+	defer close(done)
+	defer func() {
+		if err := s.cat.ResumeRecoveryOperations(context.Background()); err != nil {
+			log.Printf("admin recovery: requeue on shutdown failed: %v", err)
+		}
+	}()
+	for ctx.Err() == nil {
+		if err := s.cat.ResumeRecoveryOperations(ctx); err == nil {
+			break
+		} else {
+			log.Printf("admin recovery: requeue interrupted operations on startup failed: %v", err)
+			if !recoveryWait(ctx, 250*time.Millisecond) {
+				return
+			}
+		}
+	}
+	for ctx.Err() == nil {
+		operationID, err := s.cat.ClaimRecoveryOperation(ctx)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			log.Printf("admin recovery: claim queued operation failed: %v", err)
+			if !recoveryWait(ctx, 250*time.Millisecond) {
+				return
+			}
+			continue
+		}
+		if operationID == "" {
+			if !recoveryWait(ctx, 250*time.Millisecond) {
+				return
+			}
+			continue
+		}
+		for ctx.Err() == nil {
+			processed := 0
+			for processed < 25 && ctx.Err() == nil {
+				didWork, err := s.cat.ProcessRecoveryTarget(ctx, operationID)
+				if err != nil {
+					if ctx.Err() != nil {
+						return
+					}
+					failed, noteErr := s.cat.NoteRecoveryExecutionFailure(ctx, operationID)
+					if noteErr != nil {
+						log.Printf("admin recovery: operation processing retry scheduled operation=%s: %v", operationID, err)
+						if !recoveryWait(ctx, 500*time.Millisecond) {
+							return
+						}
+						continue
+					}
+					if failed {
+						processed++
+						continue
+					}
+					log.Printf("admin recovery: operation processing retry scheduled operation=%s: %v", operationID, err)
+					if !recoveryWait(ctx, 500*time.Millisecond) {
+						return
+					}
+					continue
+				}
+				if !didWork {
+					finished, err := s.cat.FinishRecoveryOperation(ctx, operationID)
+					if err != nil {
+						if ctx.Err() != nil {
+							return
+						}
+						log.Printf("admin recovery: operation completion retry scheduled operation=%s: %v", operationID, err)
+						if !recoveryWait(ctx, 500*time.Millisecond) {
+							return
+						}
+						continue
+					}
+					if finished {
+						break
+					}
+					continue
+				}
+				processed++
+			}
+			if processed < 25 {
+				break
+			}
+			if !recoveryWait(ctx, 10*time.Millisecond) {
+				return
+			}
+		}
+	}
+}
+
+func recoveryWait(ctx context.Context, duration time.Duration) bool {
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+// Close waits for the bounded executor to stop between target transactions.
+// An interrupted operation is durably returned to queued for the next start.
+func (s *Service) Close(ctx context.Context) error {
+	if s == nil {
+		return nil
+	}
+	s.recoveryMu.Lock()
+	cancel, done := s.recoveryCancel, s.recoveryDone
+	s.recoveryMu.Unlock()
+	if done == nil {
+		return nil
+	}
+	if cancel != nil {
+		cancel()
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }

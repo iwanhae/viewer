@@ -160,6 +160,20 @@ func Open(path string, sink VectorSink) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("migrate catalog: %w", err)
 	}
+	// A running scoped operation owns no external lease; its last committed
+	// target results are durable, and uncommitted target work rolls back. Make
+	// such operations claimable by the single in-process executor after restart.
+	var recoverySchema int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='admin_recovery_operations'`).Scan(&recoverySchema); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("inspect scoped admin recovery schema: %w", err)
+	}
+	if recoverySchema == 1 {
+		if _, err := db.Exec(`UPDATE admin_recovery_operations SET status='queued', updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE status='running'`); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("resume scoped admin recovery operations: %w", err)
+		}
+	}
 	// A lease belongs to the lifetime of one process: anything still marked
 	// processing at startup was in flight when the previous run died, so hand
 	// those blobs straight back to the pending queue. This is runtime hygiene

@@ -182,7 +182,14 @@ function clearError() {
 }
 
 async function fetchJSON(url, options) {
-  const res = await fetch(url, Object.assign({ cache: 'no-store' }, options));
+  const request = Object.assign({ cache: 'no-store' }, options);
+  if (request.method && request.method.toUpperCase() !== 'GET') {
+    request.headers = Object.assign({}, request.headers || {}, { 'X-Admin-Action': '1' });
+    if (request.body !== undefined && request.body !== null && !request.headers['Content-Type']) {
+      request.headers['Content-Type'] = 'application/json';
+    }
+  }
+  const res = await fetch(url, request);
   if (res.status === 401) {
     throw new Error('authentication required — reload the page and enter the admin token');
   }

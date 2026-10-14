@@ -420,6 +420,18 @@ func validateBlobFilters(filters BlobFilters) error {
 		filters.EncodingErrorCode, filters.EmbeddingErrorCode, filters.EncodingPhase, filters.SkippedReason)
 }
 
+// ValidateRecoveryBlobFilters keeps operation previews on the same validated
+// state-filter vocabulary as the blob browse API.
+func ValidateRecoveryBlobFilters(filters catalog.AdminBlobFilters) error {
+	return validateBlobFilters(BlobFilters{
+		AlbumID: filters.AlbumID, Hash: filters.Hash, Encoding: filters.Encoding, Embedding: filters.Embedding,
+		EncodingRaw: filters.EncodingRaw, EmbeddingRaw: filters.EmbeddingRaw,
+		EncodingErrorCode: filters.EncodingErrorCode, EmbeddingErrorCode: filters.EmbeddingErrorCode,
+		EncodingLeaseExpired: filters.EncodingLeaseExpired, EmbeddingLeaseExpired: filters.EmbeddingLeaseExpired,
+		EncodingPhase: filters.EncodingPhase, SkippedReason: filters.SkippedReason, Unreferenced: filters.Unreferenced,
+	})
+}
+
 func validateAlbumFilters(filters AlbumFilters) error {
 	if err := validateQuery(filters.Query); err != nil {
 		return err

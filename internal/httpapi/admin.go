@@ -7,7 +7,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"viewer/internal/admin"
@@ -21,8 +23,9 @@ import (
 // without any session or login plumbing of its own.
 
 // requireAdminToken guards the admin routes with HTTP Basic auth. The username
-// is ignored and the password must equal the admin token; the comparison is
-// constant time so a wrong guess costs no measurably less than a right one.
+// does not affect authorization (scoped recovery records it only as an
+// explicitly unverified audit label) and the password must equal the admin
+// token; the comparison is constant time so a wrong guess costs no measurably less than a right one.
 // Every failure — absent header, wrong scheme, malformed base64, wrong
 // password — is the same 401 with a WWW-Authenticate challenge, so an outsider
 // cannot tell which part failed and a browser knows to prompt.
@@ -50,6 +53,84 @@ func (s *Server) requireAdminToken(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// requireAdminMutationProtection makes every admin write a non-simple browser
+// request and rejects explicit cross-origin/fetch-metadata indications. Basic
+// auth remains the authorization check; this is a CSRF boundary, not identity.
+func (s *Server) requireAdminMutationProtection(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet || r.Method == http.MethodHead || r.Method == http.MethodOptions {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if r.Header.Get("X-Admin-Action") != "1" {
+			writeError(w, r, http.StatusForbidden, "CSRF", "admin action header required")
+			return
+		}
+		if origin := r.Header.Get("Origin"); origin != "" {
+			parsed, err := url.Parse(origin)
+			if err != nil || parsed.Scheme == "" || parsed.Host == "" || parsed.User != nil ||
+				parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" ||
+				!sameAdminOriginHost(parsed.Host, r.Host, parsed.Scheme) || !strings.EqualFold(parsed.Scheme, adminRequestScheme(r)) {
+				writeError(w, r, http.StatusForbidden, "CSRF", "cross-origin admin action rejected")
+				return
+			}
+		}
+		if fetchSite := strings.ToLower(strings.TrimSpace(r.Header.Get("Sec-Fetch-Site"))); fetchSite != "" && fetchSite != "same-origin" && fetchSite != "none" {
+			writeError(w, r, http.StatusForbidden, "CSRF", "cross-origin admin action rejected")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func sameAdminOriginHost(originHost, requestHost, scheme string) bool {
+	originURL, err := url.Parse("//" + originHost)
+	if err != nil {
+		return false
+	}
+	requestURL, err := url.Parse("//" + requestHost)
+	if err != nil {
+		return false
+	}
+	defaultPort := "80"
+	if strings.EqualFold(scheme, "https") {
+		defaultPort = "443"
+	}
+	port := func(value string) string {
+		if value == "" {
+			return defaultPort
+		}
+		return value
+	}
+	return strings.EqualFold(originURL.Hostname(), requestURL.Hostname()) && port(originURL.Port()) == port(requestURL.Port())
+}
+
+func adminRequestScheme(r *http.Request) string {
+	if r.TLS != nil {
+		return "https"
+	}
+	if forwarded := strings.TrimSpace(strings.Split(r.Header.Get("X-Forwarded-Proto"), ",")[0]); forwarded != "" {
+		return strings.ToLower(forwarded)
+	}
+	return "http"
+}
+
+func adminActorFromRequest(r *http.Request) string {
+	const prefix = "Basic "
+	header := r.Header.Get("Authorization")
+	if len(header) <= len(prefix) || !strings.EqualFold(header[:len(prefix)], prefix) {
+		return "unknown"
+	}
+	decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(header[len(prefix):]))
+	if err != nil {
+		return "unknown"
+	}
+	if cut := bytes.IndexByte(decoded, ':'); cut >= 0 {
+		return string(decoded[:cut])
+	}
+	return "unknown"
 }
 
 // isAdminPath reports whether a path belongs to the protected admin surface.
@@ -96,13 +177,15 @@ func (s *Server) adminReindex(w http.ResponseWriter, r *http.Request) {
 // limit keeps a fat request from reaching the catalog at all.
 const maxAdminBodyBytes = 4 << 10
 
-// decodeAdminJSONBody decodes a strict JSON body into out, like jsonBody, with
-// one relaxation: an empty or absent body stands for the zero-value request.
-// The recovery endpoint requires an explicit target, so an empty body decodes
-// to the zero target there and is rejected as unknown — but that rejection is
-// the dispatch's message, not a decode failure, and future admin endpoints
-// with optional bodies keep the leniency useful.
+// decodeAdminJSONBody decodes a strict JSON body into out, like jsonBody. A
+// JSON content type is required even when the legacy recovery body is empty;
+// an empty JSON body stands for the zero-value request and is rejected by the
+// recovery dispatch as an unknown target.
 func decodeAdminJSONBody(w http.ResponseWriter, r *http.Request, out any) error {
+	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if err != nil || !strings.EqualFold(mediaType, "application/json") {
+		return fmt.Errorf("Content-Type must be application/json")
+	}
 	if r.Body == nil {
 		return nil
 	}

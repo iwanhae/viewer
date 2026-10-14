@@ -111,6 +111,7 @@ func (s *Server) Router() http.Handler {
 	if s.admin != nil && s.adminToken != "" {
 		r.Route("/admin", func(r chi.Router) {
 			r.Use(s.requireAdminToken)
+			r.Use(s.requireAdminMutationProtection)
 			adminPage := web.AdminHandler()
 			r.Get("/", adminPage.ServeHTTP)
 			r.Get("/assets/*", adminPage.ServeHTTP)
@@ -137,6 +138,10 @@ func (s *Server) Router() http.Handler {
 			r.Get("/api/albums/{id}/extractions", s.adminAlbumExtractions)
 			r.Get("/api/albums/{id}/entries", s.adminAlbumEntries)
 			r.Get("/api/albums/{id}", s.adminAlbum)
+			r.Post("/api/actions/preview", s.adminActionPreview)
+			r.Post("/api/operations", s.adminCreateOperation)
+			r.Get("/api/operations", s.adminOperations)
+			r.Get("/api/operations/{id}", s.adminOperation)
 			r.Post("/api/reindex", s.adminReindex)
 			r.Post("/api/recover", s.adminRecover)
 		})
