@@ -841,14 +841,14 @@ func TestStageObservabilityMigrationDoesNotInventLegacyAttempts(t *testing.T) {
 		t.Fatalf("legacy encoding observation invented history: %+v", encoding)
 	}
 	embedding := observations["embedding"]
-	if embedding.Status != "pending" || embedding.Attempts != 0 || embedding.StartedAt != nil || embedding.FinishedAt != nil || embedding.StatusChangedAt == nil || embedding.ErrorCode != "legacy_unknown" {
-		t.Fatalf("startup reset observation=%+v", embedding)
+	if embedding.Status != "processing" || embedding.Attempts != 0 || embedding.StartedAt != nil || embedding.FinishedAt != nil || embedding.StatusChangedAt != nil || embedding.ErrorCode != "legacy_unknown" {
+		t.Fatalf("external lease observation changed on startup=%+v", embedding)
 	}
 	history, err := migrated.PipelineHistory(ctx, "legacy-observation", "", 0, 100)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(history.Events) != 1 || history.Events[0].Event != "startup_reset" || strings.Contains(history.Events[0].ErrorCode, "private") {
+	if len(history.Events) != 0 {
 		t.Fatalf("legacy history=%+v", history.Events)
 	}
 }

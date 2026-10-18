@@ -287,8 +287,42 @@ var migrations = []migration{
 			`ALTER TABLE blobs ADD COLUMN embedding_finalizing TEXT NOT NULL DEFAULT ''`,
 			`CREATE INDEX idx_blobs_embedding_finalizing ON blobs(embedding_finalizing) WHERE embedding_finalizing!=''`,
 		},
-		// Old processing rows have no local identity. Open's existing startup
-		// reset returns them to pending before serving traffic, on upgrade too.
+		// Old processing rows have no local identity; treat them as external.
+	},
+	{
+		version: 11,
+		name:    "local_job_runs",
+		stmts: []string{`
+CREATE TABLE IF NOT EXISTS job_runs (
+ id TEXT PRIMARY KEY,
+ stage TEXT NOT NULL CHECK (stage IN ('embedding','encoding')),
+ actor TEXT NOT NULL,
+ idempotency_key TEXT NOT NULL,
+ executor TEXT NOT NULL,
+ status TEXT NOT NULL CHECK (status IN ('queued','running','completed','failed','cancelled','interrupted')),
+ cancel_requested INTEGER NOT NULL DEFAULT 0,
+ created_at TEXT NOT NULL,
+ updated_at TEXT NOT NULL,
+ started_at TEXT,
+ finished_at TEXT,
+ last_error TEXT NOT NULL DEFAULT '',
+ UNIQUE(actor, idempotency_key)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_job_runs_active_stage ON job_runs(stage) WHERE status IN ('queued','running');
+CREATE INDEX IF NOT EXISTS idx_job_runs_created ON job_runs(created_at DESC, id DESC);
+CREATE TABLE IF NOT EXISTS job_run_items (
+ run_id TEXT NOT NULL REFERENCES job_runs(id) ON DELETE CASCADE,
+ hash TEXT NOT NULL,
+ status TEXT NOT NULL CHECK (status IN ('pending','running','succeeded','failed','busy','skipped','cancelled','interrupted')),
+ claim_token TEXT NOT NULL DEFAULT '',
+ started_at TEXT,
+ finished_at TEXT,
+ updated_at TEXT NOT NULL,
+ last_error TEXT NOT NULL DEFAULT '',
+ PRIMARY KEY(run_id, hash)
+);
+CREATE INDEX IF NOT EXISTS idx_job_run_items_status ON job_run_items(run_id, status, hash);
+`},
 	},
 }
 

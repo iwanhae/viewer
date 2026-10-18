@@ -22,6 +22,7 @@ import (
 	"viewer/internal/pipeline"
 	"viewer/internal/qdrant"
 	"viewer/internal/recommend"
+	"viewer/internal/runs"
 	"viewer/internal/storage"
 	"viewer/internal/vision"
 )
@@ -157,7 +158,20 @@ func Run(ctx context.Context) error {
 	// encoding from an empty queue. Creating it here — before the
 	// HTTP bind, like everything else — means /admin answers from the first
 	// served request on.
-	adminService := admin.NewService(cat, vectorStore, recommendService).WithEncodingEnabled(cfg.WorkerToken != "")
+	// Transitional orchestration shell: no local stage processors are registered
+	// yet, so manual creation returns EXECUTOR_UNAVAILABLE rather than fake work.
+	// The automatic recommendService.Start below is intentionally unchanged here;
+	// it MUST be removed/replaced when the embedding executor is integrated, so
+	// automatic local workers cannot compete with manually managed local runs.
+	runManager := runs.New(ctx, cat, nil)
+	defer func() {
+		closeCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := runManager.Close(closeCtx); err != nil {
+			log.Printf("viewer: local run manager shutdown failed: %v", err)
+		}
+	}()
+	adminService := admin.NewService(cat, vectorStore, recommendService).WithEncodingEnabled(cfg.WorkerToken != "").WithRunManager(runManager)
 	adminService.StartRecoveryWorker(ctx, cfg.AdminToken != "")
 	defer func() {
 		closeCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

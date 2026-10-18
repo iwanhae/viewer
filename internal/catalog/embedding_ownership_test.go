@@ -337,6 +337,14 @@ func TestEmbeddingOwnershipUpgradeAndRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Upgraded processing rows are external and must survive server restart.
+	if counts, err := s.EmbeddingCounts(ctx); err != nil || counts.Processing != 1 {
+		t.Fatalf("external lease lost on upgrade: %+v %v", counts, err)
+	}
+	// Explicit legacy operator recovery, not startup, releases that lease.
+	if _, err := s.ReleaseStuckEmbeddingClaims(ctx, false); err != nil {
+		t.Fatal(err)
+	}
 	claim := localClaim(t, s, time.Now().Add(time.Hour))
 	// Simulate a crash after reservation and before vector/bookkeeping completion.
 	if _, _, err := s.reserveEmbeddingResults(ctx, []EmbeddingResult{localReady(claim).EmbeddingResult}, []string{claim.Token}, "abandoned"); err != nil {

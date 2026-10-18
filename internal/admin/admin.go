@@ -17,6 +17,7 @@ import (
 
 	"viewer/internal/catalog"
 	"viewer/internal/recommend"
+	"viewer/internal/runs"
 )
 
 //go:embed static/admin.html
@@ -99,6 +100,7 @@ type Service struct {
 	vectors         VectorCounter
 	recommend       *recommend.Service
 	encodingEnabled bool
+	runs            *runs.Manager
 	recoveryMu      sync.Mutex
 	recoveryCancel  context.CancelFunc
 	recoveryDone    chan struct{}

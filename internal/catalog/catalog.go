@@ -174,9 +174,8 @@ func Open(path string, sink VectorSink) (*Store, error) {
 			return nil, fmt.Errorf("resume scoped admin recovery operations: %w", err)
 		}
 	}
-	// A lease belongs to the lifetime of one process: anything still marked
-	// processing at startup was in flight when the previous run died, so hand
-	// those blobs straight back to the pending queue. This is runtime hygiene
+	// Only local leases belong to this process lifetime. External workers may
+	// still be working across a server restart; preserve their ownership. This is runtime hygiene
 	// that runs on every open, not a migration — a crash mid-flight must not
 	// need a schema change to recover from.
 	startupTx, err := db.Begin()
@@ -190,9 +189,23 @@ func Open(path string, sink VectorSink) (*Store, error) {
 		return nil, fmt.Errorf("lock stale embedding reset: %w", err)
 	}
 	now := time.Now()
+	if err := recoverJobRuns(context.Background(), startupTx); err != nil {
+		_ = startupTx.Rollback()
+		db.Close()
+		return nil, fmt.Errorf("interrupt local job runs: %w", err)
+	}
+	// A finalization reservation belongs to the HTTP server's result-write
+	// call, not to the external worker's lease. That call died with the old
+	// process. Clear only its reservation so the worker can submit again;
+	// preserve its status, owner, token and lease deadline exactly as stored.
+	if _, err := startupTx.Exec(`UPDATE blobs SET embedding_finalizing='' WHERE embedding_owner='external' AND embedding_finalizing!=''`); err != nil {
+		_ = startupTx.Rollback()
+		db.Close()
+		return nil, fmt.Errorf("clear abandoned embedding result reservations: %w", err)
+	}
 	for {
 		staleHashes, err := queryBlobHashes(context.Background(), startupTx,
-			`SELECT hash FROM blobs WHERE embedding_status='processing' ORDER BY hash LIMIT 500`)
+			`SELECT hash FROM blobs WHERE embedding_status='processing' AND embedding_owner='local' ORDER BY hash LIMIT 500`)
 		if err != nil {
 			_ = startupTx.Rollback()
 			db.Close()
@@ -204,7 +217,7 @@ func Open(path string, sink VectorSink) (*Store, error) {
 		for _, hash := range staleHashes {
 			if _, err := startupTx.ExecContext(context.Background(), `UPDATE blobs SET embedding_status='pending', embedding_lease_until=0,
 				embedding_owner='external', embedding_token='', embedding_finalizing=''
-				WHERE hash=? AND embedding_status='processing'`, hash); err != nil {
+				WHERE hash=? AND embedding_status='processing' AND embedding_owner='local'`, hash); err != nil {
 				_ = startupTx.Rollback()
 				db.Close()
 				return nil, fmt.Errorf("reset stale embedding lease: %w", err)
