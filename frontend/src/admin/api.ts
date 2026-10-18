@@ -211,6 +211,44 @@ export type RecoveryResult = {
 export type RecoveryOperationsPage = { operations: RecoveryOperation[]; nextCursor: string | null }
 export type RecoveryResultsPage = { operation: RecoveryOperation; results: RecoveryResult[]; nextCursor: string | null }
 
+export type JobRunStage = 'embedding' | 'encoding'
+export type JobRunCounts = {
+  total: number
+  pending: number
+  running: number
+  succeeded: number
+  failed: number
+  busy: number
+  skipped: number
+  cancelled: number
+  interrupted: number
+}
+export type JobRun = {
+  id: string
+  stage: JobRunStage
+  actor: string
+  executor: string
+  status: string
+  cancelRequested: boolean
+  createdAt: string
+  updatedAt: string
+  startedAt: string | null
+  finishedAt: string | null
+  lastError: string
+  counts: JobRunCounts
+}
+export type JobRunItem = {
+  hash: string
+  status: string
+  startedAt: string | null
+  finishedAt: string | null
+  updatedAt: string
+  lastError: string
+}
+export type JobRunsPage = { runs: JobRun[]; nextCursor: string | null }
+export type JobRunItemsPage = { run: JobRun; items: JobRunItem[]; nextCursor: string | null }
+export type AutomaticEmbedding = { enabled: boolean; running: boolean; pausedByManual: boolean }
+
 export type Album = {
   id: string
   originalFilename: string
@@ -307,7 +345,7 @@ export class AdminAPIError extends Error {
   }
 }
 
-export async function adminPost<T>(path: string, body: unknown, idempotencyKey?: string): Promise<T> {
+export async function adminPost<T>(path: string, body: unknown, idempotencyKey?: string, signal?: AbortSignal): Promise<T> {
   const headers: Record<string, string> = {
     Accept: 'application/json',
     'Content-Type': 'application/json',
@@ -319,7 +357,8 @@ export async function adminPost<T>(path: string, body: unknown, idempotencyKey?:
     credentials: 'same-origin',
     cache: 'no-store',
     headers,
-    body: JSON.stringify(body)
+    body: JSON.stringify(body),
+    signal
   })
   let result: unknown
   try {

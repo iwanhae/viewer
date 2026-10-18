@@ -130,6 +130,15 @@ button.danger-button { border-color: #a33b3b; background: #fff4f4; color: #8a242
 button.danger-button:hover { background: #ffe8e8; }
 .recovery-audit-table, .recovery-results-table { min-width: 950px; }
 .recovery-filter-panel > button { margin-bottom: .25rem; }
+.run-controls { display: flex; flex-wrap: wrap; gap: .7rem; }
+.run-auto-status { margin-bottom: 1rem; }
+.runs-table, .run-items-table { min-width: 1050px; }
+.run-select { max-width: 15rem; text-align: left; overflow-wrap: anywhere; color: #155e75; }
+.runs-table tr[aria-selected="true"] { background: #edf4f6; }
+.run-counts { display: flex; flex-wrap: wrap; gap: .25rem .7rem; min-width: 180px; font-variant-numeric: tabular-nums; font-size: .84rem; }
+.run-times { display: grid; gap: .25rem; margin: .5rem 0; font-size: .84rem; }
+.run-detail h2 { overflow-wrap: anywhere; }
+.run-cancel { border-top: 1px solid #e5eaed; margin-top: 1rem; padding-top: .25rem; }
 
 @media (max-width: 720px) {
   .admin-header { align-items: flex-start; flex-direction: column; }
@@ -141,4 +150,5 @@ button.danger-button:hover { background: #ffe8e8; }
   .data-table th, .data-table td { padding: .5rem; }
   .toolbar { align-items: flex-start; flex-direction: column; }
   .recovery-action-controls { align-items: stretch; flex-direction: column; }
+  .run-controls { flex-direction: column; align-items: stretch; }
 }
