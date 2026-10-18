@@ -364,8 +364,20 @@ func (s *Service) ReceiveOutput(ctx context.Context, hash, token string, body io
 
 	accepted, err := s.cat.MarkEncodingReceived(ctx, hash, token)
 	if err != nil {
-		_ = os.Remove(finalPath)
-		return fmt.Errorf("record received encoding output: %w", err)
+		// Cancellation can race the transaction's commit acknowledgement. Never
+		// delete a spool whose handoff actually committed (or is uncertain).
+		inspect, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		current, getErr := s.cat.GetEncodingJob(inspect, hash)
+		cancel()
+		if getErr != nil {
+			return fmt.Errorf("record received encoding output: %w", err)
+		}
+		if current.Token == token && (current.Status == "received" || current.Status == "committing" || current.Status == "done") {
+			accepted = true
+		} else {
+			_ = os.Remove(finalPath)
+			return fmt.Errorf("record received encoding output: %w", err)
+		}
 	}
 	if !accepted {
 		current, getErr := s.cat.GetEncodingJob(ctx, hash)
@@ -378,13 +390,11 @@ func (s *Service) ReceiveOutput(ctx context.Context, hash, token string, body io
 
 	job.Status = "received"
 	job.LeaseUntil = time.UnixMilli(0)
-	queued, err := s.enqueueReserved(ctx, job)
+	// The reserved slot guarantees queue capacity. Once accepted, request/run
+	// cancellation must not undo the handoff; service shutdown keeps the spool.
+	queued, err := s.enqueueReserved(context.WithoutCancel(ctx), job)
 	if err != nil {
-		// The catalog row and spool are recoverable; leave the slot to this
-		// process only if it actually took ownership of a queue item.
-		_ = s.cat.ResetReceivedEncoding(context.Background(), hash, token)
-		_ = os.Remove(finalPath)
-		return err
+		return nil // accepted row and spool remain recoverable
 	}
 	if queued {
 		reserved = false // processor releases it after the terminal transition.
@@ -596,6 +606,16 @@ func (s *Service) processQueuedOutput(ctx context.Context, job catalog.EncodingJ
 		}
 
 		if current.Status == "received" && (errors.Is(err, ErrInvalidOutput) || errors.Is(err, ErrSpoolMissing) || errors.Is(err, ErrLostLease)) {
+			if current.Owner == "local" && errors.Is(err, ErrInvalidOutput) {
+				if _, failErr := s.cat.SkipEncoding(ctx, job.Hash, job.Token, "failed", current.Type, "invalid encoded output", current.SizeBytes); failErr != nil {
+					if !waitOutputRetry(ctx) {
+						return
+					}
+					continue
+				}
+				_ = os.Remove(s.spoolPath(job.Hash, job.Token))
+				return
+			}
 			if resetErr := s.cat.ResetReceivedEncoding(ctx, job.Hash, job.Token); resetErr != nil {
 				log.Printf("encoding: reset received output for %s failed: %v", job.Hash[:12], resetErr)
 				if !waitOutputRetry(ctx) {
@@ -609,6 +629,9 @@ func (s *Service) processQueuedOutput(ctx context.Context, job catalog.EncodingJ
 		}
 		if current.Status == "received" && errors.Is(err, ErrInvalidSource) {
 			detail := err.Error()
+			if current.Owner == "local" {
+				detail = "invalid source blob for encoding"
+			}
 			if len(detail) > 512 {
 				detail = detail[:512]
 			}

@@ -324,6 +324,12 @@ CREATE TABLE IF NOT EXISTS job_run_items (
 CREATE INDEX IF NOT EXISTS idx_job_run_items_status ON job_run_items(run_id, status, hash);
 `},
 	},
+	{
+		version: 12,
+		name:    "encoding_ownership",
+		// Every pre-existing encoder claim belongs to an external worker.
+		stmts: []string{`ALTER TABLE blobs ADD COLUMN encoding_owner TEXT NOT NULL DEFAULT 'external' CHECK (encoding_owner IN ('external','local'))`},
+	},
 }
 
 // addBlobLeaseColumnIfMissing adds the external-worker lease column to blobs.

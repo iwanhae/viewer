@@ -91,6 +91,39 @@ Crash-stale server-side embedding result reservations are cleared at catalog
 startup without changing the external worker's lease or ownership; those
 reservations belonged to the dead server request, not to the worker.
 
+### Encoding adapter (Step 4B, not registered yet)
+
+`encoding.NewEncodingExecutor(encodingService)` implements `runs.Executor` for
+`stage=encoding`. It requires the existing encoding service's spool processors
+to be started with the service lifetime, not the run context. It never polls or
+claims queue-wide work and does not require `WORKER_TOKEN`.
+
+`catalog.ClaimLocalEncoding` atomically claims exactly one pending non-WebP hash
+with the item's private 128-bit hex token and explicit `encoding_owner='local'`.
+External claims retain their existing token/API format. Even expired external
+leases are busy to this exact-target API. Local release/run restart cleanup
+requires both local ownership and a matching token, and touches only leased rows.
+External polling/bulk reset cannot reclaim local leases or local received output.
+
+The executor streams a size-bounded source into a private temporary file, verifies
+its SHA-256 and dimensions, then invokes `cwebp -q 85 -alpha_q 100 -metadata all
+<source> -o -` with a five-minute timeout. Stdout streams into a strictly bounded
+private output file; stderr is discarded. Source/output files are capped at 1 GiB,
+source dimensions at 100 million pixels. Temporary files are removed on every
+return; crash leftovers match the existing startup partial-spool cleanup pattern.
+Already-WebP/not-smaller results use the catalog's token-fenced skip transition.
+`cwebp_unavailable` means install libwebp's `cwebp` executable on the server PATH;
+deployment/transient failures release the local lease for a later manual retry.
+
+Successful output passes the existing WebP validation, `ReceiveOutput`, durable
+spool, asynchronous validation, object replacement, and ambiguous-commit recovery.
+Before acceptance, run cancellation kills the command and releases only that
+local lease. After acceptance, cancellation does not reset received/committing
+output: the executor waits for a terminal catalog outcome using an independent
+completion context (bounded at 21 minutes). If that bound expires, the accepted
+output remains owned by the service and recoverable on restart. No startup
+registration, worker protocol changes, or UI integration are included here.
+
 **Required later integration:** replace/remove the automatic
 `recommendService.Start(ctx)` in `internal/app/app.go` when registering the manual
 embedding executor. This transitional commit deliberately leaves that existing

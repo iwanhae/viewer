@@ -327,6 +327,7 @@ func TestEmbeddingOwnershipUpgradeAndRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	dropEmbeddingOwnershipColumns(t, s)
+	dropEncodingOwnershipColumn(t, s)
 	if _, err := s.db.Exec(`PRAGMA user_version=9`); err != nil {
 		t.Fatal(err)
 	}

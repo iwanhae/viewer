@@ -390,6 +390,95 @@ func TestRecoveryExpiredEncodingNeverResetsLiveReceivedOrCommitting(t *testing.T
 	}
 }
 
+func TestRecoveryEncodingReleaseSkipsLocalAndReleasesExternal(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+	now := time.Now()
+	lease := now.Add(-time.Minute).UnixMilli()
+	for _, owner := range []string{"local", "external"} {
+		seedRecoveryBlob(t, store, owner, "leased", "pending", lease, 0)
+		if _, err := store.db.ExecContext(ctx, `UPDATE blobs SET encoding_owner=?,encoding_token=?,encoding_stage_key=? WHERE hash=?`, owner, "secret-"+owner, "staging/"+owner, owner); err != nil {
+			t.Fatal(err)
+		}
+	}
+	before, err := store.GetEncodingJob(ctx, "local")
+	if err != nil {
+		t.Fatal(err)
+	}
+	preview, err := store.CreateRecoveryPreview(ctx, "operator", RecoveryReleaseEncoding,
+		RecoverySelection{Hashes: []string{"local", "external"}}, now)
+	if err != nil || preview.EligibleCount != 1 || preview.SkippedCount != 1 || preview.SkippedReasons["local_owned"] != 1 {
+		t.Fatalf("preview=%+v err=%v", preview, err)
+	}
+	op := recoveryOperationForTest(t, store, preview, "operator", "release-external-only")
+	if completed := drainRecoveryForTest(t, store, op.ID); completed.Succeeded != 1 || completed.Skipped != 1 {
+		t.Fatalf("operation=%+v", completed)
+	}
+	results, err := store.RecoveryResults(ctx, op.ID, 10, "")
+	if err != nil || len(results.Results) != 2 {
+		t.Fatalf("results=%+v err=%v", results, err)
+	}
+	for _, result := range results.Results {
+		if result.Hash == "local" && (result.Status != "skipped" || result.Reason != "local_owned") {
+			t.Fatalf("local result=%+v", result)
+		}
+	}
+	after, err := store.GetEncodingJob(ctx, "local")
+	if err != nil || after != before {
+		t.Fatalf("local lease changed: before=%+v after=%+v err=%v", before, after, err)
+	}
+	external, err := store.GetEncodingJob(ctx, "external")
+	if err != nil || external.Status != "pending" || external.Owner != "external" || external.Token != "" || external.StageKey != "" || external.LeaseUntil.UnixMilli() != 0 {
+		t.Fatalf("external lease was not released: %+v err=%v", external, err)
+	}
+}
+
+func TestRecoveryEncodingReleaseFencesOwnerChangedAfterPreview(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+	now := time.Now()
+	seedRecoveryBlob(t, store, "target", "leased", "pending", now.Add(-time.Minute).UnixMilli(), 0)
+	before, err := readRecoveryTargetState(ctx, store.db, "target", "encoding")
+	if err != nil || before.EncodingOwner != "external" {
+		t.Fatalf("external state=%+v err=%v", before, err)
+	}
+	preview, err := store.CreateRecoveryPreview(ctx, "operator", RecoveryReleaseEncoding,
+		RecoverySelection{Hashes: []string{"target"}}, now)
+	if err != nil || preview.EligibleCount != 1 {
+		t.Fatalf("preview=%+v err=%v", preview, err)
+	}
+	op := recoveryOperationForTest(t, store, preview, "operator", "owner-changed")
+	// Change only ownership, retaining the token, lease and observations so
+	// ownership itself must invalidate the preview generation.
+	if _, err := store.db.ExecContext(ctx, `UPDATE blobs SET encoding_owner='local' WHERE hash='target'`); err != nil {
+		t.Fatal(err)
+	}
+	after, err := readRecoveryTargetState(ctx, store.db, "target", "encoding")
+	if err != nil || after.EncodingOwner != "local" || recoveryGeneration(RecoveryReleaseEncoding, before) == recoveryGeneration(RecoveryReleaseEncoding, after) {
+		t.Fatalf("owner change did not invalidate generation: before=%+v after=%+v err=%v", before, after, err)
+	}
+	// Also exercise the SQL guard directly with the stale external state; a
+	// caller cannot bypass ownership fencing by skipping the generation check.
+	tx, err := store.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	changed, applyErr := applyRecoveryTransition(ctx, tx, RecoveryReleaseEncoding, "target", before, now)
+	if err := tx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	if applyErr != nil || changed {
+		t.Fatalf("SQL released local lease with stale state: changed=%v err=%v", changed, applyErr)
+	}
+	if completed := drainRecoveryForTest(t, store, op.ID); completed.Conflicts != 1 || completed.Succeeded != 0 {
+		t.Fatalf("operation=%+v", completed)
+	}
+	current, err := readRecoveryTargetState(ctx, store.db, "target", "encoding")
+	if err != nil || current != after {
+		t.Fatalf("local state changed: before=%+v after=%+v err=%v", after, current, err)
+	}
+}
+
 func TestRecoveryIdempotencyConcurrencyAndRestartResume(t *testing.T) {
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "catalog.db")

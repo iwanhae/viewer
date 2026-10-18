@@ -110,6 +110,7 @@ type RecoveryResultPage struct {
 
 type recoveryTargetState struct {
 	EncodingStatus      string
+	EncodingOwner       string
 	EmbeddingStatus     string
 	ContentType         string
 	EncodingLease       int64
@@ -385,13 +386,13 @@ func readRecoveryTargetState(ctx context.Context, q interface {
 	var state recoveryTargetState
 	var token string
 	var started, finished, changed, phase sql.NullString
-	err := q.QueryRowContext(ctx, `SELECT b.encoding_status, b.embedding_status, b.content_type,
+	err := q.QueryRowContext(ctx, `SELECT b.encoding_status, b.encoding_owner, b.embedding_status, b.content_type,
 		b.encoding_lease_until, b.embedding_lease_until, CASE WHEN ?='embedding' THEN b.embedding_token ELSE b.encoding_token END,
 		b.embedding_finalizing!='',
 		COALESCE(o.status,''), o.phase, o.started_at, o.finished_at, o.status_changed_at, COALESCE(o.attempts,0),
 		COALESCE(o.error_code,''), COALESCE(o.retryability,'')
 		FROM blobs b LEFT JOIN blob_stage_observations o ON o.blob_hash=b.hash AND o.stage=? WHERE b.hash=?`, stage, stage, hash).Scan(
-		&state.EncodingStatus, &state.EmbeddingStatus, &state.ContentType, &state.EncodingLease, &state.EmbeddingLease, &token,
+		&state.EncodingStatus, &state.EncodingOwner, &state.EmbeddingStatus, &state.ContentType, &state.EncodingLease, &state.EmbeddingLease, &token,
 		&state.EmbeddingFinalizing,
 		&state.ObsStatus, &phase, &started, &finished, &changed, &state.Attempts, &state.ErrorCode, &state.Retryability)
 	if err != nil {
@@ -443,6 +444,9 @@ func recoveryEligibility(action string, state recoveryTargetState, now time.Time
 			return false, "not_failed"
 		}
 	case RecoveryReleaseEncoding:
+		if state.EncodingOwner == "local" {
+			return false, "local_owned"
+		}
 		if state.EncodingStatus == "received" || state.EncodingStatus == "committing" {
 			return false, "unsafe_phase"
 		}
@@ -470,6 +474,7 @@ func recoveryGeneration(action string, state recoveryTargetState) string {
 	stage := recoveryStage(action)
 	value := struct {
 		Action, EncodingStatus, EmbeddingStatus, ContentType                   string
+		EncodingOwner                                                          string `json:",omitempty"`
 		EncodingLease, EmbeddingLease                                          int64
 		TokenHash, ObsStatus, ObsPhase, StartedAt, FinishedAt, StatusChangedAt string
 		Attempts                                                               int64
@@ -479,6 +484,7 @@ func recoveryGeneration(action string, state recoveryTargetState) string {
 		StartedAt: state.StartedAt, FinishedAt: state.FinishedAt, StatusChangedAt: state.StatusChangedAt,
 		Attempts: state.Attempts, ErrorCode: state.ErrorCode, Retryability: state.Retryability}
 	if stage == "encoding" {
+		value.EncodingOwner = state.EncodingOwner
 		value.EncodingLease = state.EncodingLease
 		if state.EncodingStatus == "leased" {
 			value.TokenHash = state.TokenHash
@@ -962,7 +968,7 @@ func applyRecoveryTransition(ctx context.Context, tx *sql.Tx, action, hash strin
 	switch action {
 	case RecoveryRetryFailedEncoding:
 		stage, event, status = "encoding", "admin_retry", "pending"
-		query = `UPDATE blobs SET encoding_status='pending', encoding_token='', encoding_stage_key='', encoding_lease_until=0,
+		query = `UPDATE blobs SET encoding_status='pending', encoding_owner='external', encoding_token='', encoding_stage_key='', encoding_lease_until=0,
 			encoding_source_size_bytes=0, encoding_error='' WHERE hash=? AND encoding_status='failed' AND content_type!='image/webp'`
 		args = []any{hash}
 	case RecoveryRetryFailedEmbedding:
@@ -971,8 +977,8 @@ func applyRecoveryTransition(ctx context.Context, tx *sql.Tx, action, hash strin
 		args = []any{hash}
 	case RecoveryReleaseEncoding:
 		stage, event, status = "encoding", "lease_expired", "pending"
-		query = `UPDATE blobs SET encoding_status='pending', encoding_token='', encoding_stage_key='', encoding_lease_until=0
-			WHERE hash=? AND encoding_status='leased' AND encoding_lease_until=? AND encoding_token=?`
+		query = `UPDATE blobs SET encoding_status='pending', encoding_owner='external', encoding_token='', encoding_stage_key='', encoding_lease_until=0
+			WHERE hash=? AND encoding_owner='external' AND encoding_status='leased' AND encoding_lease_until=? AND encoding_token=?`
 		args = []any{hash, state.EncodingLease, state.TokenValue}
 	case RecoveryReleaseEmbedding:
 		stage, event, status = "embedding", "lease_expired", "pending"

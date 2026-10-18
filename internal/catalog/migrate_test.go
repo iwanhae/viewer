@@ -757,6 +757,7 @@ func TestIndependentEmbeddingMigrationNeutralizesLegacyGates(t *testing.T) {
 		}
 	}
 	dropEmbeddingOwnershipColumns(t, store)
+	dropEncodingOwnershipColumn(t, store)
 	if _, err := store.db.ExecContext(ctx, `PRAGMA user_version=8`); err != nil {
 		t.Fatal(err)
 	}
@@ -820,6 +821,7 @@ func TestStageObservabilityMigrationDoesNotInventLegacyAttempts(t *testing.T) {
 		t.Fatal(err)
 	}
 	dropEmbeddingOwnershipColumns(t, store)
+	dropEncodingOwnershipColumn(t, store)
 	if _, err := store.db.ExecContext(ctx, `PRAGMA user_version=5`); err != nil {
 		t.Fatal(err)
 	}

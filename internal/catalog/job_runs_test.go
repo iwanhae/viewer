@@ -252,7 +252,7 @@ func TestJobRunRestartInterruptsOnlyLocalRunClaims(t *testing.T) {
 		local := nextTestRunItem(t, s, r.ID)
 		query := `UPDATE blobs SET embedding_status='processing',embedding_owner='local',embedding_token=?,embedding_lease_until=? WHERE hash=?`
 		if stage == "encoding" {
-			query = `UPDATE blobs SET encoding_status='leased',encoding_token=?,encoding_lease_until=? WHERE hash=?`
+			query = `UPDATE blobs SET encoding_status='leased',encoding_owner='local',encoding_token=?,encoding_lease_until=? WHERE hash=?`
 		}
 		if _, err := s.db.Exec(query, local.ClaimToken, lease, local.Hash); err != nil {
 			t.Fatal(err)

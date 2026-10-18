@@ -287,7 +287,12 @@ func (s *Store) NextJobRunItem(ctx context.Context, id string) (*JobRunItem, err
 		return nil, err
 	}
 	item.Status = "running"
-	item.ClaimToken = rand.Text()
+	// Private stage tokens also identify accepted encoder spool files. Use the
+	// same safe 128-bit hex identity as encoding, without changing worker APIs.
+	item.ClaimToken, err = newEncodingToken()
+	if err != nil {
+		return nil, err
+	}
 	item.UpdatedAt = recoveryTimestamp(time.Now())
 	item.StartedAt = &item.UpdatedAt
 	_, err = tx.ExecContext(ctx, `UPDATE job_run_items SET status='running',claim_token=?,started_at=?,updated_at=? WHERE run_id=? AND hash=? AND status='pending'`, item.ClaimToken, item.UpdatedAt, item.UpdatedAt, id, item.Hash)
@@ -338,7 +343,7 @@ func (s *Store) FinishJobRunItem(ctx context.Context, id string, item JobRunItem
 // must not become a durable Admin-visible error.
 func jobRunSafeError(code string) string {
 	switch code {
-	case "", "executor_failed", "executor_panic", "invalid_executor_outcome", "target_busy", "target_missing", "claim_lost", "processing_failed", "service_stopped":
+	case "", "executor_failed", "executor_panic", "invalid_executor_outcome", "target_busy", "target_missing", "claim_lost", "processing_failed", "service_stopped", "cwebp_unavailable":
 		return code
 	default:
 		return "executor_failed"
@@ -418,8 +423,8 @@ func finishJobRunTx(ctx context.Context, tx *sql.Tx, id, status, safeError strin
 	if err != nil {
 		return err
 	}
-	encodingHashes, err := queryBlobHashes(ctx, tx, `UPDATE blobs SET encoding_status='pending',encoding_token='',encoding_lease_until=0,encoding_stage_key=''
- WHERE encoding_status='leased' AND EXISTS
+	encodingHashes, err := queryBlobHashes(ctx, tx, `UPDATE blobs SET encoding_status='pending',encoding_owner='external',encoding_token='',encoding_lease_until=0,encoding_stage_key=''
+ WHERE encoding_owner='local' AND encoding_status='leased' AND EXISTS
  (SELECT 1 FROM job_run_items i JOIN job_runs r ON r.id=i.run_id WHERE r.id=? AND r.stage='encoding' AND i.hash=blobs.hash AND i.claim_token!='' AND i.claim_token=blobs.encoding_token) RETURNING hash`, id)
 	if err != nil {
 		return err

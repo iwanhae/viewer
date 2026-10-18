@@ -17,6 +17,7 @@ type EncodingJob struct {
 	Type       string
 	Status     string
 	Token      string
+	Owner      string // local run or external worker; never inferred from token text
 	StageKey   string
 	LeaseUntil time.Time
 }
@@ -83,8 +84,9 @@ func newEncodingToken() (string, error) {
 	return hex.EncodeToString(raw[:]), nil
 }
 
-// ClaimEncoding takes the largest pending source blobs first. Expired claims
-// become pending before selection. SQLite's single writer serializes callers.
+// ClaimEncoding takes the largest pending source blobs first. Expired external
+// claims become pending before selection; local run cleanup owns local claims.
+// SQLite's single writer serializes callers.
 func (s *Store) ClaimEncoding(ctx context.Context, limit int, ttl time.Duration) ([]EncodingJob, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -96,7 +98,7 @@ func (s *Store) ClaimEncoding(ctx context.Context, limit int, ttl time.Duration)
 	}
 	now := time.Now()
 	for {
-		expired, err := queryBlobHashes(ctx, tx, `SELECT hash FROM blobs WHERE encoding_status='leased' AND encoding_lease_until < ? ORDER BY hash LIMIT 500`, now.UnixMilli())
+		expired, err := queryBlobHashes(ctx, tx, `SELECT hash FROM blobs WHERE encoding_owner='external' AND encoding_status='leased' AND encoding_lease_until < ? ORDER BY hash LIMIT 500`, now.UnixMilli())
 		if err != nil {
 			return nil, err
 		}
@@ -105,7 +107,7 @@ func (s *Store) ClaimEncoding(ctx context.Context, limit int, ttl time.Duration)
 		}
 		for _, hash := range expired {
 			result, err := tx.ExecContext(ctx, `UPDATE blobs SET encoding_status='pending', encoding_token='', encoding_stage_key='', encoding_lease_until=0
-				WHERE hash=? AND encoding_status='leased' AND encoding_lease_until < ?`, hash, now.UnixMilli())
+				WHERE hash=? AND encoding_owner='external' AND encoding_status='leased' AND encoding_lease_until < ?`, hash, now.UnixMilli())
 			if err != nil {
 				return nil, err
 			}
@@ -147,10 +149,11 @@ func (s *Store) ClaimEncoding(ctx context.Context, limit int, ttl time.Duration)
 			return nil, err
 		}
 		jobs[i].Token = token
+		jobs[i].Owner = "external"
 		jobs[i].StageKey = fmt.Sprintf("encoding/%s_%s.webp", jobs[i].Hash, token)
 		jobs[i].Status = "leased"
 		jobs[i].LeaseUntil = lease
-		if _, err := tx.ExecContext(ctx, `UPDATE blobs SET encoding_status='leased', encoding_token=?, encoding_stage_key=?, encoding_lease_until=? WHERE hash=?`,
+		if _, err := tx.ExecContext(ctx, `UPDATE blobs SET encoding_status='leased', encoding_owner='external', encoding_token=?, encoding_stage_key=?, encoding_lease_until=? WHERE hash=?`,
 			token, jobs[i].StageKey, lease.UnixMilli(), jobs[i].Hash); err != nil {
 			return nil, err
 		}
@@ -167,8 +170,8 @@ func (s *Store) ClaimEncoding(ctx context.Context, limit int, ttl time.Duration)
 func (s *Store) GetEncodingJob(ctx context.Context, hash string) (EncodingJob, error) {
 	var job EncodingJob
 	var lease int64
-	err := s.db.QueryRowContext(ctx, `SELECT hash, size_bytes, content_type, encoding_status, encoding_token, encoding_stage_key, encoding_lease_until FROM blobs WHERE hash=?`, hash).
-		Scan(&job.Hash, &job.SizeBytes, &job.Type, &job.Status, &job.Token, &job.StageKey, &lease)
+	err := s.db.QueryRowContext(ctx, `SELECT hash, size_bytes, content_type, encoding_status, encoding_token, encoding_stage_key, encoding_lease_until, encoding_owner FROM blobs WHERE hash=?`, hash).
+		Scan(&job.Hash, &job.SizeBytes, &job.Type, &job.Status, &job.Token, &job.StageKey, &lease, &job.Owner)
 	if err == sql.ErrNoRows {
 		return job, ErrBlobNotFound
 	}
@@ -224,7 +227,7 @@ func (s *Store) MarkEncodingReceived(ctx context.Context, hash, token string) (b
 // Received jobs are deliberately not reclaimed by ClaimEncoding; they remain
 // owned by their token until committed or explicitly reset.
 func (s *Store) ReceivedEncodings(ctx context.Context) ([]EncodingJob, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT hash, size_bytes, content_type, encoding_status, encoding_token, encoding_stage_key, encoding_lease_until
+	rows, err := s.db.QueryContext(ctx, `SELECT hash, size_bytes, content_type, encoding_status, encoding_token, encoding_stage_key, encoding_lease_until, encoding_owner
 		FROM blobs WHERE encoding_status='received'`)
 	if err != nil {
 		return nil, err
@@ -234,7 +237,7 @@ func (s *Store) ReceivedEncodings(ctx context.Context) ([]EncodingJob, error) {
 	for rows.Next() {
 		var job EncodingJob
 		var lease int64
-		if err := rows.Scan(&job.Hash, &job.SizeBytes, &job.Type, &job.Status, &job.Token, &job.StageKey, &lease); err != nil {
+		if err := rows.Scan(&job.Hash, &job.SizeBytes, &job.Type, &job.Status, &job.Token, &job.StageKey, &lease, &job.Owner); err != nil {
 			return nil, err
 		}
 		job.LeaseUntil = time.UnixMilli(lease)
@@ -252,7 +255,7 @@ func (s *Store) ResetReceivedEncoding(ctx context.Context, hash, token string) e
 		return err
 	}
 	defer tx.Rollback()
-	result, err := tx.ExecContext(ctx, `UPDATE blobs SET encoding_status='pending', encoding_token='', encoding_stage_key='', encoding_lease_until=0
+	result, err := tx.ExecContext(ctx, `UPDATE blobs SET encoding_status='pending', encoding_owner='external', encoding_token='', encoding_stage_key='', encoding_lease_until=0
 		WHERE hash=? AND encoding_token=? AND encoding_status='received'`, hash, token)
 	if err != nil {
 		return err
@@ -374,13 +377,17 @@ func (s *Store) SkipEncoding(ctx context.Context, hash, token, status, contentTy
 }
 
 func (s *Store) ReleaseEncoding(ctx context.Context, hash, token string) error {
+	return s.releaseEncoding(ctx, hash, token, "external")
+}
+
+func (s *Store) releaseEncoding(ctx context.Context, hash, token, owner string) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	result, err := tx.ExecContext(ctx, `UPDATE blobs SET encoding_status='pending', encoding_lease_until=0, encoding_token='', encoding_stage_key=''
-		WHERE hash=? AND encoding_token=? AND encoding_status='leased'`, hash, token)
+	result, err := tx.ExecContext(ctx, `UPDATE blobs SET encoding_status='pending', encoding_owner='external', encoding_lease_until=0, encoding_token='', encoding_stage_key=''
+		WHERE hash=? AND encoding_token=? AND encoding_owner=? AND encoding_status='leased'`, hash, token, owner)
 	if err != nil {
 		return err
 	}
@@ -395,7 +402,7 @@ func (s *Store) ReleaseEncoding(ctx context.Context, hash, token string) error {
 }
 
 func (s *Store) CommittingEncodings(ctx context.Context) ([]EncodingJob, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT hash, size_bytes, content_type, encoding_status, encoding_token, encoding_stage_key, encoding_lease_until
+	rows, err := s.db.QueryContext(ctx, `SELECT hash, size_bytes, content_type, encoding_status, encoding_token, encoding_stage_key, encoding_lease_until, encoding_owner
 		FROM blobs WHERE encoding_status='committing'`)
 	if err != nil {
 		return nil, err
@@ -405,7 +412,7 @@ func (s *Store) CommittingEncodings(ctx context.Context) ([]EncodingJob, error) 
 	for rows.Next() {
 		var job EncodingJob
 		var lease int64
-		if err := rows.Scan(&job.Hash, &job.SizeBytes, &job.Type, &job.Status, &job.Token, &job.StageKey, &lease); err != nil {
+		if err := rows.Scan(&job.Hash, &job.SizeBytes, &job.Type, &job.Status, &job.Token, &job.StageKey, &lease, &job.Owner); err != nil {
 			return nil, err
 		}
 		job.LeaseUntil = time.UnixMilli(lease)
@@ -420,7 +427,7 @@ func (s *Store) ResetCommittingEncoding(ctx context.Context, hash, token string)
 		return err
 	}
 	defer tx.Rollback()
-	result, err := tx.ExecContext(ctx, `UPDATE blobs SET encoding_status='pending', encoding_token='', encoding_stage_key='', encoding_lease_until=0, encoding_source_size_bytes=0
+	result, err := tx.ExecContext(ctx, `UPDATE blobs SET encoding_status='pending', encoding_owner='external', encoding_token='', encoding_stage_key='', encoding_lease_until=0, encoding_source_size_bytes=0
 		WHERE hash=? AND encoding_token=? AND encoding_status='committing'`, hash, token)
 	if err != nil {
 		return err
@@ -479,15 +486,16 @@ type EncodingResetCounts struct {
 // the manual counterpart of what the normal claim loop already does for
 // expired leases. It runs two passes, in this order:
 //
-// Expired leased rows go back to pending. This is exactly the pre-expire step
+// Expired external leased rows go back to pending. This is exactly the pre-expire step
 // ClaimEncoding already runs inside its transaction, surfaced as a standalone
 // action; running it here only matters when no encoder is claiming (or the
 // operator wants to see the queue drain without waiting for one).
 //
-// received rows go back to pending with no token guard. The per-token
+// External received rows go back to pending with no token guard. Local accepted
+// output remains server-owned and is recoverable independently of its run.
 // ResetReceivedEncoding carries a token check because an old receiver must not
 // be able to reset a newer job it no longer owns; an operator issuing this
-// reset is authoritative over every job, so the guard does not apply here.
+// reset is authoritative over external received jobs, so the guard does not apply here.
 //
 // committing rows are deliberately left untouched in both passes. A committing
 // row means the S3 object replacement may be in flight or may have landed with
@@ -508,7 +516,7 @@ func (s *Store) ResetStuckEncodings(ctx context.Context) (EncodingResetCounts, e
 		return counts, err
 	}
 	for {
-		leasedHashes, err := queryBlobHashes(ctx, tx, `SELECT hash FROM blobs WHERE encoding_status='leased' AND encoding_lease_until < ? ORDER BY hash LIMIT 500`, now.UnixMilli())
+		leasedHashes, err := queryBlobHashes(ctx, tx, `SELECT hash FROM blobs WHERE encoding_owner='external' AND encoding_status='leased' AND encoding_lease_until < ? ORDER BY hash LIMIT 500`, now.UnixMilli())
 		if err != nil {
 			return EncodingResetCounts{}, fmt.Errorf("read expired encoding leases: %w", err)
 		}
@@ -517,7 +525,7 @@ func (s *Store) ResetStuckEncodings(ctx context.Context) (EncodingResetCounts, e
 		}
 		for _, hash := range leasedHashes {
 			result, err := tx.ExecContext(ctx, `UPDATE blobs SET encoding_status='pending', encoding_token='', encoding_stage_key='', encoding_lease_until=0
-				WHERE hash=? AND encoding_status='leased' AND encoding_lease_until < ?`, hash, now.UnixMilli())
+				WHERE hash=? AND encoding_owner='external' AND encoding_status='leased' AND encoding_lease_until < ?`, hash, now.UnixMilli())
 			if err != nil {
 				return EncodingResetCounts{}, fmt.Errorf("release expired encoding lease: %w", err)
 			}
@@ -534,7 +542,7 @@ func (s *Store) ResetStuckEncodings(ctx context.Context) (EncodingResetCounts, e
 		}
 	}
 	for {
-		receivedHashes, err := queryBlobHashes(ctx, tx, `SELECT hash FROM blobs WHERE encoding_status='received' ORDER BY hash LIMIT 500`)
+		receivedHashes, err := queryBlobHashes(ctx, tx, `SELECT hash FROM blobs WHERE encoding_owner='external' AND encoding_status='received' ORDER BY hash LIMIT 500`)
 		if err != nil {
 			return EncodingResetCounts{}, fmt.Errorf("read received encodings: %w", err)
 		}
@@ -543,7 +551,7 @@ func (s *Store) ResetStuckEncodings(ctx context.Context) (EncodingResetCounts, e
 		}
 		for _, hash := range receivedHashes {
 			result, err := tx.ExecContext(ctx, `UPDATE blobs SET encoding_status='pending', encoding_token='', encoding_stage_key='', encoding_lease_until=0
-				WHERE hash=? AND encoding_status='received'`, hash)
+				WHERE hash=? AND encoding_owner='external' AND encoding_status='received'`, hash)
 			if err != nil {
 				return EncodingResetCounts{}, fmt.Errorf("reset received encoding: %w", err)
 			}

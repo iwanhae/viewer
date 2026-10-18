@@ -734,7 +734,7 @@ func (s *Store) UpsertBlob(ctx context.Context, blob Blob) error {
 		VALUES (?, ?, ?, ?, '', ?, ?)
 		ON CONFLICT(hash) DO UPDATE SET
 			size_bytes=excluded.size_bytes, content_type=excluded.content_type,
-			encoding_status=excluded.encoding_status, encoding_token='', encoding_stage_key='', encoding_lease_until=0,
+			encoding_status=excluded.encoding_status, encoding_owner='external', encoding_token='', encoding_stage_key='', encoding_lease_until=0,
 			encoding_error='', encoding_source_size_bytes=0
 		WHERE ?`,
 		blob.Hash, blob.SizeBytes, blob.ContentType, string(EmbeddingStatusPending), now, encodingStatus, blob.SourceRestored,
