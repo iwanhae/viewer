@@ -75,7 +75,6 @@ type AdminPhoto struct {
 	EmbeddingError       string            `json:"embeddingError"`
 	EmbeddingErrorCode   string            `json:"embeddingErrorCode"`
 	SkippedReason        string            `json:"skippedReason"`
-	BlockReason          string            `json:"blockReason"`
 	EncodingObservation  *StageObservation `json:"encodingObservation,omitempty"`
 	EmbeddingObservation *StageObservation `json:"embeddingObservation,omitempty"`
 }
@@ -96,7 +95,6 @@ type AdminBlob struct {
 	EmbeddingError       string            `json:"embeddingError"`
 	EmbeddingErrorCode   string            `json:"embeddingErrorCode"`
 	SkippedReason        string            `json:"skippedReason"`
-	BlockReason          string            `json:"blockReason"`
 	PhotoCount           int64             `json:"photoCount"`
 	AlbumCount           int64             `json:"albumCount"`
 	EncodingObservation  *StageObservation `json:"encodingObservation,omitempty"`
@@ -194,8 +192,7 @@ const adminPhotoSelect = `SELECT p.album_id, a.original_filename, p.idx, p.name,
 	CASE WHEN b.encoding_status='failed' THEN COALESCE(NULLIF(eo.error_code,''),'legacy_unknown') ELSE '' END,
 	COALESCE(b.embedding_status, ''), CASE WHEN b.hash IS NULL THEN '' ELSE ` + adminEmbeddingCategoryExpr + ` END, COALESCE(b.embedding_error, ''),
 	CASE WHEN b.embedding_status='failed' THEN COALESCE(NULLIF(bo.error_code,''),'legacy_unknown') ELSE '' END,
-	CASE WHEN b.encoding_status = 'skipped' THEN ` + adminEncodingSkippedReasonExpr + ` ELSE '' END,
-	CASE WHEN b.embedding_status = 'pending' AND NOT ` + embeddingClaimGatePredicate + ` THEN 'encoding_gate' ELSE '' END
+	CASE WHEN b.encoding_status = 'skipped' THEN ` + adminEncodingSkippedReasonExpr + ` ELSE '' END
 	FROM photos p JOIN albums a ON a.id = p.album_id LEFT JOIN blobs b ON b.hash = p.hash
 	LEFT JOIN blob_stage_observations eo ON eo.blob_hash=b.hash AND eo.stage='encoding'
 	LEFT JOIN blob_stage_observations bo ON bo.blob_hash=b.hash AND bo.stage='embedding'`
@@ -206,7 +203,7 @@ func scanAdminPhoto(row interface{ Scan(...any) error }) (AdminPhoto, error) {
 		&photo.AlbumID, &photo.AlbumName, &photo.Index, &photo.Name, &photo.Hash, &photo.Width, &photo.Height,
 		&photo.SizeBytes, &photo.ContentType, &photo.MissingBlob, &photo.EncodingRaw, &photo.Encoding, &photo.EncodingError,
 		&photo.EncodingErrorCode, &photo.EmbeddingRaw, &photo.Embedding, &photo.EmbeddingError,
-		&photo.EmbeddingErrorCode, &photo.SkippedReason, &photo.BlockReason,
+		&photo.EmbeddingErrorCode, &photo.SkippedReason,
 	)
 	return photo, err
 }
@@ -252,7 +249,6 @@ func (s *Store) AdminBlobs(ctx context.Context, filters AdminBlobFilters, afterH
 		CASE WHEN b.encoding_status='failed' THEN COALESCE(NULLIF(eo.error_code,''),'legacy_unknown') ELSE '' END,
 		CASE WHEN b.embedding_status='failed' THEN COALESCE(NULLIF(bo.error_code,''),'legacy_unknown') ELSE '' END,
 		CASE WHEN b.encoding_status = 'skipped' THEN ` + adminEncodingSkippedReasonExpr + ` ELSE '' END,
-		CASE WHEN b.embedding_status = 'pending' AND NOT ` + embeddingClaimGatePredicate + ` THEN 'encoding_gate' ELSE '' END,
 		(SELECT COUNT(*) FROM photos p WHERE p.hash = b.hash),
 		(SELECT COUNT(DISTINCT p.album_id) FROM photos p WHERE p.hash = b.hash)
 		FROM blobs b
@@ -310,7 +306,7 @@ func scanAdminBlob(row interface{ Scan(...any) error }) (AdminBlob, error) {
 	err := row.Scan(
 		&blob.Hash, &blob.SizeBytes, &blob.ContentType, &blob.EncodingRaw, &blob.Encoding, &blob.EncodingError,
 		&blob.EmbeddingRaw, &blob.Embedding, &blob.EmbeddingError, &blob.EncodingErrorCode, &blob.EmbeddingErrorCode,
-		&blob.SkippedReason, &blob.BlockReason,
+		&blob.SkippedReason,
 		&blob.PhotoCount, &blob.AlbumCount,
 	)
 	return blob, err
@@ -329,7 +325,6 @@ func (s *Store) AdminBlobByHash(ctx context.Context, hash string) (AdminBlob, er
 		CASE WHEN b.encoding_status='failed' THEN COALESCE(NULLIF(eo.error_code,''),'legacy_unknown') ELSE '' END,
 		CASE WHEN b.embedding_status='failed' THEN COALESCE(NULLIF(bo.error_code,''),'legacy_unknown') ELSE '' END,
 		CASE WHEN b.encoding_status = 'skipped' THEN ` + adminEncodingSkippedReasonExpr + ` ELSE '' END,
-		CASE WHEN b.embedding_status = 'pending' AND NOT ` + embeddingClaimGatePredicate + ` THEN 'encoding_gate' ELSE '' END,
 		(SELECT COUNT(*) FROM photos p WHERE p.hash = b.hash),
 		(SELECT COUNT(DISTINCT p.album_id) FROM photos p WHERE p.hash = b.hash)
 		FROM blobs b LEFT JOIN blob_stage_observations eo ON eo.blob_hash=b.hash AND eo.stage='encoding'
@@ -488,7 +483,7 @@ func queryAlbumPipelineBreakdowns(ctx context.Context, tx *sql.Tx, albumID strin
 			encoding.SkippedReasons[reason] = PipelineCounts{}
 		}
 	}
-	for _, category := range []string{"queued", "blocked", "processing", "completed", "failed", "unknown"} {
+	for _, category := range []string{"queued", "processing", "completed", "failed", "unknown"} {
 		if _, ok := embedding.Categories[category]; !ok {
 			embedding.Categories[category] = PipelineCounts{}
 		}

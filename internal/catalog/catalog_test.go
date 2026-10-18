@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1524,56 +1525,57 @@ func TestEmbeddingLeaseHealth(t *testing.T) {
 	}
 }
 
-// TestPendingEncodingBreakdown pins the gate diagnosis: the breakdown only
-// covers pending embeddings, and it splits them by encoding state, which is
-// what tells the operator how many are blocked behind the encoding gate.
-func TestPendingEncodingBreakdown(t *testing.T) {
+func TestNewBlobsDoNotSetEncodingGate(t *testing.T) {
 	store := openTestStore(t)
 	ctx := context.Background()
-
-	// Empty catalog answers an empty (non-nil) map.
-	empty, err := store.PendingEncodingBreakdown(ctx)
-	if err != nil {
-		t.Fatalf("empty breakdown: %v", err)
-	}
-	if empty == nil || len(empty) != 0 {
-		t.Fatalf("empty breakdown=%v want empty non-nil map", empty)
-	}
-
-	seed := []struct {
-		hash          string
-		embedding     EmbeddingStatus
-		encodingState string
-	}{
-		{hash: "gate-pending-a", embedding: EmbeddingStatusPending, encodingState: "pending"},
-		{hash: "gate-pending-b", embedding: EmbeddingStatusPending, encodingState: "pending"},
-		{hash: "gate-leased", embedding: EmbeddingStatusPending, encodingState: "leased"},
-		{hash: "gate-received", embedding: EmbeddingStatusPending, encodingState: "received"},
-		{hash: "gate-done", embedding: EmbeddingStatusPending, encodingState: "done"},
-		{hash: "not-pending", embedding: EmbeddingStatusReady, encodingState: "pending"},
-	}
-	for _, item := range seed {
-		if err := store.UpsertBlob(ctx, Blob{Hash: item.hash, SizeBytes: 1, ContentType: "image/jpeg"}); err != nil {
-			t.Fatalf("upsert %s: %v", item.hash, err)
+	for _, contentType := range []string{"image/jpeg", "image/png", "image/webp"} {
+		if err := store.UpsertBlob(ctx, Blob{Hash: contentType, SizeBytes: 1, ContentType: contentType}); err != nil {
+			t.Fatal(err)
 		}
-		if _, err := store.db.ExecContext(ctx,
-			`UPDATE blobs SET embedding_status=?, encoding_status=? WHERE hash=?`,
-			string(item.embedding), item.encodingState, item.hash); err != nil {
-			t.Fatalf("seed %s: %v", item.hash, err)
+		var gate int
+		if err := store.db.QueryRowContext(ctx, `SELECT encoding_gate FROM blobs WHERE hash=?`, contentType).Scan(&gate); err != nil {
+			t.Fatal(err)
+		}
+		if gate != 0 {
+			t.Errorf("new %s blob has encoding_gate=%d", contentType, gate)
 		}
 	}
+}
 
-	breakdown, err := store.PendingEncodingBreakdown(ctx)
-	if err != nil {
-		t.Fatalf("pending encoding breakdown: %v", err)
+func TestEmbeddingReclaimIgnoresEncodingAndLegacyGate(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+	states := []string{"pending", "leased", "received", "committing"}
+	for _, state := range states {
+		for _, live := range []bool{false, true} {
+			hash := fmt.Sprintf("%s-live-%t", state, live)
+			if err := store.UpsertBlob(ctx, Blob{Hash: hash, SizeBytes: 1, ContentType: "image/jpeg"}); err != nil {
+				t.Fatal(err)
+			}
+			lease := time.Now().Add(-time.Minute)
+			if live {
+				lease = time.Now().Add(time.Hour)
+			}
+			if _, err := store.db.ExecContext(ctx, `UPDATE blobs SET embedding_status='processing', embedding_lease_until=?, encoding_status=?, encoding_gate=1 WHERE hash=?`, lease.UnixMilli(), state, hash); err != nil {
+				t.Fatal(err)
+			}
+		}
 	}
-	want := map[string]int64{"pending": 2, "leased": 1, "received": 1, "done": 1}
-	if len(breakdown) != len(want) {
-		t.Fatalf("breakdown=%v want=%v", breakdown, want)
+	until := time.Now().Add(time.Minute)
+	claimed, err := store.ClaimPendingEmbeddings(ctx, 20, until)
+	if err != nil || len(claimed) != len(states) {
+		t.Fatalf("reclaimed=%+v err=%v want only the four expired embedding leases", claimed, err)
 	}
-	for status, count := range want {
-		if breakdown[status] != count {
-			t.Fatalf("breakdown[%s]=%d want=%d (full: %v)", status, breakdown[status], count, breakdown)
+	for _, blob := range claimed {
+		if !strings.HasSuffix(blob.Hash, "-live-false") {
+			t.Errorf("reclaimed live embedding lease: %s", blob.Hash)
+		}
+		var lease int64
+		if err := store.db.QueryRowContext(ctx, `SELECT embedding_lease_until FROM blobs WHERE hash=?`, blob.Hash).Scan(&lease); err != nil {
+			t.Fatal(err)
+		}
+		if lease != until.UnixMilli() {
+			t.Errorf("claim did not update lease for %s: got %d want %d", blob.Hash, lease, until.UnixMilli())
 		}
 	}
 }

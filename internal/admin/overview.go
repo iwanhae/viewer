@@ -47,11 +47,9 @@ type EncodingOverview struct {
 	RawStates      map[string]catalog.BlobCounts `json:"rawStates"`
 }
 
-// EmbeddingCategories separates pending blobs by the exact gate condition the
-// claim query uses. Other statuses preserve the catalog's source state.
+// EmbeddingCategories classify blobs independently of their encoding status.
 type EmbeddingCategories struct {
 	Queued     catalog.BlobCounts `json:"queued"`
-	Blocked    catalog.BlobCounts `json:"blocked"`
 	Processing catalog.BlobCounts `json:"processing"`
 	Completed  catalog.BlobCounts `json:"completed"`
 	Failed     catalog.BlobCounts `json:"failed"`
@@ -114,7 +112,6 @@ func (s *Service) Overview(ctx context.Context) (Overview, error) {
 		Embedding: EmbeddingOverview{
 			Categories: EmbeddingCategories{
 				Queued:     snapshot.EmbeddingCategories["queued"],
-				Blocked:    snapshot.EmbeddingCategories["blocked"],
 				Processing: snapshot.EmbeddingCategories["processing"],
 				Completed:  snapshot.EmbeddingCategories["completed"],
 				Failed:     snapshot.EmbeddingCategories["failed"],

@@ -51,15 +51,11 @@ type Stats struct {
 	Blobs          int64                   `json:"blobs"`
 	Embedding      catalog.EmbeddingCounts `json:"embedding"`
 	Encoding       EncodingStats           `json:"encoding"`
-	// The four fields below diagnose *why* the embedding counts above look
+	// The three fields below diagnose *why* the embedding counts above look
 	// wrong, one layer down each:
 	//   - EmbeddingLease reads the processing rows' leases: processing blobs
 	//     whose lease has expired mean no worker is claiming anything, while
 	//     live leases that never finish point at a stuck write-back.
-	//   - PendingByEncoding splits the pending blobs by their WebP encoding
-	//     state, because the claim gate requires terminal encoding — pending
-	//     blobs behind an unfinished encoding are stalled by the WebP queue,
-	//     not by a lack of embedding workers.
 	//   - Failures groups the failed blobs by error text (top reasons only),
 	//     turning "N failed" into "what to fix first".
 	//   - WorkerActivity is the recommend service's last-attempt stamps at the
@@ -67,10 +63,9 @@ type Stats struct {
 	//     start. The recommend type is used directly — its JSON tags are the
 	//     dashboard contract, and a re-declared copy in this package could
 	//     silently drift from the stamps the service actually records.
-	EmbeddingLease    catalog.EmbeddingLeaseHealth `json:"embeddingLease"`
-	PendingByEncoding map[string]int64             `json:"pendingByEncoding"`
-	Failures          []catalog.EmbeddingFailure   `json:"failures"`
-	WorkerActivity    recommend.WorkerActivity     `json:"workerActivity"`
+	EmbeddingLease catalog.EmbeddingLeaseHealth `json:"embeddingLease"`
+	Failures       []catalog.EmbeddingFailure   `json:"failures"`
+	WorkerActivity recommend.WorkerActivity     `json:"workerActivity"`
 	// ExpectedPoints is how many points the vector store should hold: one per
 	// photo whose blob embedding is ready. QdrantPoints is how many it
 	// actually holds, and Drift is the difference — non-zero means the two
@@ -164,10 +159,6 @@ func (s *Service) Stats(ctx context.Context) (Stats, error) {
 	if err != nil {
 		return Stats{}, fmt.Errorf("embedding lease health: %w", err)
 	}
-	pendingByEncoding, err := s.cat.PendingEncodingBreakdown(ctx)
-	if err != nil {
-		return Stats{}, fmt.Errorf("pending encoding breakdown: %w", err)
-	}
 	// Five reasons: the dashboard renders a fixed handful of rows, and a
 	// failure list longer than that is noise an operator works through one
 	// fix at a time rather than a page to scroll. The store clamps the limit
@@ -178,16 +169,15 @@ func (s *Service) Stats(ctx context.Context) (Stats, error) {
 	}
 
 	stats := Stats{
-		Albums:            albums,
-		AlbumsByStatus:    byStatus,
-		Photos:            photos,
-		Blobs:             blobs,
-		Embedding:         embedding,
-		Encoding:          EncodingStats{Enabled: s.encodingEnabled, EncodingCounts: encoding},
-		EmbeddingLease:    lease,
-		PendingByEncoding: pendingByEncoding,
-		Failures:          failures,
-		ExpectedPoints:    expected,
+		Albums:         albums,
+		AlbumsByStatus: byStatus,
+		Photos:         photos,
+		Blobs:          blobs,
+		Embedding:      embedding,
+		Encoding:       EncodingStats{Enabled: s.encodingEnabled, EncodingCounts: encoding},
+		EmbeddingLease: lease,
+		Failures:       failures,
+		ExpectedPoints: expected,
 	}
 	if s.vectors != nil {
 		points, err := s.vectors.CountVectors(ctx)

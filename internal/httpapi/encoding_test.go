@@ -319,7 +319,7 @@ func TestEncodingOutputRouteAcceptsThroughEncodingService(t *testing.T) {
 	if err := service.Start(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if err := cat.UpsertBlob(ctx, catalog.Blob{Hash: hash, SizeBytes: int64(len(source)), ContentType: "image/png", EncodingGate: true}); err != nil {
+	if err := cat.UpsertBlob(ctx, catalog.Blob{Hash: hash, SizeBytes: int64(len(source)), ContentType: "image/png"}); err != nil {
 		t.Fatal(err)
 	}
 	claimed, err := service.Claim(ctx, 1)

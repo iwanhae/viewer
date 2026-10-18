@@ -159,7 +159,6 @@ type AdminDiagnosticsSnapshot struct {
 	EmbeddingExpiredLeases int64
 	EncodingQueue          AdminQueueDiagnostics
 	EmbeddingQueue         AdminQueueDiagnostics
-	EmbeddingBlockedQueue  AdminQueueDiagnostics
 	EncodingCommit         AdminEncodingCommitDiagnostics
 }
 
@@ -201,10 +200,6 @@ func (s *Store) AdminDiagnostics(ctx context.Context) (AdminDiagnosticsSnapshot,
 		return AdminDiagnosticsSnapshot{}, err
 	}
 	result.EmbeddingQueue, err = queryAdminQueueDiagnostics(ctx, tx, "embedding", adminEmbeddingCategoryExpr, "queued")
-	if err != nil {
-		return AdminDiagnosticsSnapshot{}, err
-	}
-	result.EmbeddingBlockedQueue, err = queryAdminQueueDiagnostics(ctx, tx, "embedding", adminEmbeddingCategoryExpr, "blocked")
 	if err != nil {
 		return AdminDiagnosticsSnapshot{}, err
 	}

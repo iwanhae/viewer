@@ -88,7 +88,6 @@ type Blob struct {
 	Hash            string
 	SizeBytes       int64
 	ContentType     string
-	EncodingGate    bool
 	SourceRestored  bool
 	EmbeddingStatus EmbeddingStatus
 	EmbeddingError  string
@@ -716,14 +715,14 @@ func (s *Store) UpsertBlob(ctx context.Context, blob Blob) error {
 		return fmt.Errorf("check blob %s: %w", blob.Hash, err)
 	}
 	_, err = tx.ExecContext(ctx, `
-		INSERT INTO blobs (hash, size_bytes, content_type, embedding_status, embedding_error, created_at, encoding_status, encoding_gate)
-		VALUES (?, ?, ?, ?, '', ?, ?, ?)
+		INSERT INTO blobs (hash, size_bytes, content_type, embedding_status, embedding_error, created_at, encoding_status)
+		VALUES (?, ?, ?, ?, '', ?, ?)
 		ON CONFLICT(hash) DO UPDATE SET
 			size_bytes=excluded.size_bytes, content_type=excluded.content_type,
 			encoding_status=excluded.encoding_status, encoding_token='', encoding_stage_key='', encoding_lease_until=0,
 			encoding_error='', encoding_source_size_bytes=0
 		WHERE ?`,
-		blob.Hash, blob.SizeBytes, blob.ContentType, string(EmbeddingStatusPending), now, encodingStatus, blob.EncodingGate, blob.SourceRestored,
+		blob.Hash, blob.SizeBytes, blob.ContentType, string(EmbeddingStatusPending), now, encodingStatus, blob.SourceRestored,
 	)
 	if err != nil {
 		return fmt.Errorf("upsert blob %s: %w", blob.Hash, err)
@@ -822,6 +821,7 @@ type RejectedEmbedding struct {
 // is not able to strand its blobs: the next claim reclaims them. Candidate
 // selection, expiry observations, claim attempts, and updates share one
 // serialized write transaction. Returned rows are re-sorted by created_at.
+// Encoding runs independently and never affects embedding eligibility.
 func (s *Store) ClaimPendingEmbeddings(ctx context.Context, limit int, leaseUntil time.Time) ([]Blob, error) {
 	now := time.Now()
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -835,7 +835,6 @@ func (s *Store) ClaimPendingEmbeddings(ctx context.Context, limit int, leaseUnti
 	rows, err := tx.QueryContext(ctx, `SELECT b.hash, b.size_bytes, b.content_type, b.created_at, b.embedding_status
 		FROM blobs AS b
 		WHERE (b.embedding_status = ? OR (b.embedding_status = ? AND b.embedding_lease_until < ?))
-		  AND `+embeddingClaimGatePredicate+`
 		ORDER BY b.created_at ASC LIMIT ?`,
 		string(EmbeddingStatusPending), string(EmbeddingStatusProcessing), now.UnixMilli(), limit)
 	if err != nil {
@@ -869,8 +868,7 @@ func (s *Store) ClaimPendingEmbeddings(ctx context.Context, limit int, leaseUnti
 			}
 		}
 		update, err := tx.ExecContext(ctx, `UPDATE blobs SET embedding_status=?, embedding_lease_until=?
-			WHERE hash=? AND (embedding_status=? OR (embedding_status=? AND embedding_lease_until<?))
-			AND (encoding_gate=0 OR encoding_status IN ('done','skipped','failed'))`,
+			WHERE hash=? AND (embedding_status=? OR (embedding_status=? AND embedding_lease_until<?))`,
 			string(EmbeddingStatusProcessing), leaseUntil.UnixMilli(), item.blob.Hash,
 			string(EmbeddingStatusPending), string(EmbeddingStatusProcessing), now.UnixMilli())
 		if err != nil {
@@ -1483,38 +1481,6 @@ func (s *Store) EmbeddingLeaseHealth(ctx context.Context) (EmbeddingLeaseHealth,
 		return EmbeddingLeaseHealth{}, fmt.Errorf("embedding lease health: %w", err)
 	}
 	return health, nil
-}
-
-// PendingEncodingBreakdown groups the pending-embedding blobs by their encoding
-// state, showing how many are blocked by the encoding gate rather than by a
-// lack of embedding workers: the claim condition requires encoding_gate=0 OR
-// encoding_status IN ('done', 'skipped', 'failed'), so pending embeddings
-// sitting behind a pending/leased/received encoding cannot be claimed no matter
-// how idle the workers are. A breakdown dominated by non-terminal encoding
-// states means the stall is in the WebP queue, not the embedding one.
-func (s *Store) PendingEncodingBreakdown(ctx context.Context) (map[string]int64, error) {
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT encoding_status, COUNT(*) FROM blobs
-		WHERE embedding_status = ?
-		GROUP BY encoding_status`, string(EmbeddingStatusPending))
-	if err != nil {
-		return nil, fmt.Errorf("pending encoding breakdown: %w", err)
-	}
-	defer rows.Close()
-
-	byEncodingStatus := make(map[string]int64)
-	for rows.Next() {
-		var status string
-		var count int64
-		if err := rows.Scan(&status, &count); err != nil {
-			return nil, fmt.Errorf("scan pending encoding count: %w", err)
-		}
-		byEncodingStatus[status] = count
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate pending encoding counts: %w", err)
-	}
-	return byEncodingStatus, nil
 }
 
 // EmbeddingFailure is one distinct embedding failure reason with how many

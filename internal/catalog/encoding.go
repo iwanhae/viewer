@@ -21,11 +21,6 @@ type EncodingJob struct {
 	LeaseUntil time.Time
 }
 
-// embeddingClaimGatePredicate is shared by the embedding claim query and the
-// admin overview's queued/blocked split. Both queries use the b alias so the
-// reported eligibility rule cannot drift from what workers actually claim.
-const embeddingClaimGatePredicate = `(b.encoding_gate = 0 OR b.encoding_status IN ('done', 'skipped', 'failed'))`
-
 // EncodingCounts summarizes the conversion queue and measured storage savings
 // across unique blobs. Already-WebP objects are excluded from Candidates.
 type EncodingCounts struct {

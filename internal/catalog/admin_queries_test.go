@@ -39,11 +39,11 @@ func TestAdminOverviewPipelineBreakdownsAndClaimEligibility(t *testing.T) {
 		{"future", "image/jpeg", "future-encoding", "future-embedding", true},
 	}
 	for _, item := range items {
-		if err := store.UpsertBlob(ctx, Blob{Hash: item.hash, ContentType: item.contentType, EncodingGate: item.gate}); err != nil {
+		if err := store.UpsertBlob(ctx, Blob{Hash: item.hash, ContentType: item.contentType}); err != nil {
 			t.Fatalf("upsert %s: %v", item.hash, err)
 		}
-		if _, err := store.db.ExecContext(ctx, `UPDATE blobs SET encoding_status=?, embedding_status=? WHERE hash=?`,
-			item.encodingStatus, item.embeddingStatus, item.hash); err != nil {
+		if _, err := store.db.ExecContext(ctx, `UPDATE blobs SET encoding_status=?, embedding_status=?, encoding_gate=? WHERE hash=?`,
+			item.encodingStatus, item.embeddingStatus, item.gate, item.hash); err != nil {
 			t.Fatalf("set state for %s: %v", item.hash, err)
 		}
 	}
@@ -98,8 +98,7 @@ func TestAdminOverviewPipelineBreakdownsAndClaimEligibility(t *testing.T) {
 		t.Fatalf("unknown encoding raw state was lost: %v", snapshot.EncodingRawStates)
 	}
 
-	assertBlobCount(t, "embedding queued", snapshot.EmbeddingCategories["queued"], 4)
-	assertBlobCount(t, "embedding blocked", snapshot.EmbeddingCategories["blocked"], 2)
+	assertBlobCount(t, "embedding queued", snapshot.EmbeddingCategories["queued"], 6)
 	assertBlobCount(t, "embedding processing", snapshot.EmbeddingCategories["processing"], 1)
 	assertBlobCount(t, "embedding completed", snapshot.EmbeddingCategories["completed"], 2)
 	assertBlobCount(t, "embedding failed", snapshot.EmbeddingCategories["failed"], 1)
@@ -108,8 +107,8 @@ func TestAdminOverviewPipelineBreakdownsAndClaimEligibility(t *testing.T) {
 		t.Fatalf("unknown embedding raw state was lost: %v", snapshot.EmbeddingRawStates)
 	}
 
-	// Prove queued is exactly the claim query's gate predicate, including the
-	// gate=0/pending-encoding and gate=1/failed-encoding cases.
+	// Every pending embedding is queued regardless of legacy gates or encoding.
+	// The processing row has an expired lease and is also reclaimable.
 	claimed, err := store.ClaimPendingEmbeddings(ctx, 100, time.Now().Add(time.Minute))
 	if err != nil {
 		t.Fatalf("claim eligible embeddings: %v", err)
@@ -120,6 +119,7 @@ func TestAdminOverviewPipelineBreakdownsAndClaimEligibility(t *testing.T) {
 	}
 	wantClaimed := map[string]bool{
 		"shared": true, "gate-failed": true, "skipped-webp": true, "skipped-nonwebp": true,
+		"encoding-leased": true, "gate-pending": true, "encoding-received": true,
 	}
 	if len(claimedHashes) != len(wantClaimed) {
 		t.Fatalf("claimable blobs=%v want=%v", claimedHashes, wantClaimed)
@@ -129,12 +129,12 @@ func TestAdminOverviewPipelineBreakdownsAndClaimEligibility(t *testing.T) {
 			t.Errorf("claim query omitted %s: %v", hash, claimedHashes)
 		}
 	}
-	if int64(len(claimedHashes)) != snapshot.EmbeddingCategories["queued"].BlobCount {
-		t.Fatalf("overview queued=%d but claim returned %d", snapshot.EmbeddingCategories["queued"].BlobCount, len(claimedHashes))
+	if int64(len(claimedHashes)) != snapshot.EmbeddingCategories["queued"].BlobCount+1 {
+		t.Fatalf("overview queued=%d but claim returned %d (including one expired lease)", snapshot.EmbeddingCategories["queued"].BlobCount, len(claimedHashes))
 	}
 }
 
-func TestAdminOverviewEmbeddingGateClassificationMatchesClaimsForAllCombinations(t *testing.T) {
+func TestAdminOverviewEmbeddingClaimsIgnoreEncodingAndLegacyGates(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "catalog.db"), nil)
 	if err != nil {
 		t.Fatalf("open catalog: %v", err)
@@ -145,10 +145,11 @@ func TestAdminOverviewEmbeddingGateClassificationMatchesClaimsForAllCombinations
 	for _, encodingStatus := range encodingStates {
 		for _, gate := range []bool{false, true} {
 			hash := fmt.Sprintf("%s-gate-%t", encodingStatus, gate)
-			if err := store.UpsertBlob(ctx, Blob{Hash: hash, ContentType: "image/jpeg", EncodingGate: gate}); err != nil {
+			if err := store.UpsertBlob(ctx, Blob{Hash: hash, ContentType: "image/jpeg"}); err != nil {
 				t.Fatalf("upsert %s: %v", hash, err)
 			}
-			if _, err := store.db.ExecContext(ctx, `UPDATE blobs SET encoding_status=?, embedding_status='pending' WHERE hash=?`, encodingStatus, hash); err != nil {
+			// Simulate persisted gates even after the neutralizing migration.
+			if _, err := store.db.ExecContext(ctx, `UPDATE blobs SET encoding_status=?, encoding_gate=?, embedding_status='pending' WHERE hash=?`, encodingStatus, gate, hash); err != nil {
 				t.Fatalf("set state for %s: %v", hash, err)
 			}
 		}
@@ -158,11 +159,11 @@ func TestAdminOverviewEmbeddingGateClassificationMatchesClaimsForAllCombinations
 	if err != nil {
 		t.Fatalf("admin overview: %v", err)
 	}
-	if got := snapshot.EmbeddingCategories["queued"].BlobCount; got != 11 {
-		t.Fatalf("queued blobs=%d want 11 for gate=0 plus done/skipped/failed gate=1", got)
+	if got := snapshot.EmbeddingCategories["queued"].BlobCount; got != 16 {
+		t.Fatalf("queued blobs=%d want all 16 regardless of encoding or legacy gate", got)
 	}
-	if got := snapshot.EmbeddingCategories["blocked"].BlobCount; got != 5 {
-		t.Fatalf("blocked blobs=%d want 5 for pending/leased/received/committing/future gate=1", got)
+	if _, ok := snapshot.EmbeddingCategories["blocked"]; ok {
+		t.Fatal("obsolete blocked category is still present")
 	}
 
 	claimed, err := store.ClaimPendingEmbeddings(ctx, 32, time.Now().Add(time.Minute))
@@ -179,9 +180,17 @@ func TestAdminOverviewEmbeddingGateClassificationMatchesClaimsForAllCombinations
 	for _, status := range encodingStates {
 		for _, gate := range []bool{false, true} {
 			hash := fmt.Sprintf("%s-gate-%t", status, gate)
-			shouldClaim := !gate || status == "done" || status == "skipped" || status == "failed"
-			if claimedHashes[hash] != shouldClaim {
-				t.Errorf("claim eligibility %s=%v: got %v want %v", status, gate, claimedHashes[hash], shouldClaim)
+			if !claimedHashes[hash] {
+				t.Errorf("claim omitted %s", hash)
+			}
+			var embeddingStatus, encodingStatus string
+			var lease int64
+			if err := store.db.QueryRowContext(ctx, `SELECT embedding_status, embedding_lease_until, encoding_status FROM blobs WHERE hash=?`, hash).
+				Scan(&embeddingStatus, &lease, &encodingStatus); err != nil {
+				t.Fatal(err)
+			}
+			if embeddingStatus != "processing" || lease <= time.Now().UnixMilli() || encodingStatus != status {
+				t.Errorf("claim %s: embedding=%s lease=%d encoding=%s", hash, embeddingStatus, lease, encodingStatus)
 			}
 		}
 	}

@@ -85,7 +85,7 @@ The viewer is deployed as a Docker image, and every setting is an environment va
 | `QDRANT_API_KEY` | no | (empty) | Sent as the `api-key` header on every Qdrant request. Sent only when set, so an unauthenticated server needs no placeholder. |
 | `QDRANT_COLLECTION` | when `QDRANT_URL` is set | — | Qdrant collection holding the per-photo embedding points. Deliberately no default: the viewer refuses to start with a URL but no collection. |
 | `SIGLIP2_MODEL_URL` | no | built-in mirror | Base URL the SigLIP2 checkpoint (`config.json`, `model.safetensors`, `tokenizer.json`) is fetched from on first start into `/app/siglip2`. Mount a prepared directory at `/app/siglip2` to skip the download. |
-| `WORKER_TOKEN` | no | (empty) | Shared bearer token for the external recommender and encoder APIs. Setting it enables WebP encoding and gates new non-WebP image embeddings until encoding finishes. |
+| `WORKER_TOKEN` | no | (empty) | Shared bearer token for the external recommender and encoder APIs. Setting it enables WebP encoding, which runs independently of embedding jobs. |
 | `ADMIN_TOKEN` | no | (empty) | Basic-auth password for `/admin`. Empty keeps the admin UI disabled. |
 | `ALLOW_BACKUP_OVERWRITE` | no | `false` | Lets the catalog finalizer overwrite the bucket's `backups/viewer.db` with a local database it would otherwise refuse to write (untraceable stamp, or drastically smaller than the backup it would replace). |
 
@@ -157,13 +157,13 @@ ASCII-case-insensitive literal substring of the album filename or photo name (`%
 `_`, and `\` are ordinary characters). `hash` is exact. `encoding` accepts the
 overview categories `queued`, `processing`, `validating`, `committing`,
 `completed`, `skipped`, `failed`, and `unknown`; `embedding` accepts `queued`,
-`blocked`, `processing`, `completed`, `failed`, and `unknown`. The `*Raw`
+`processing`, `completed`, `failed`, and `unknown`. The `*Raw`
 filters match exact stored states, including states this version does not
 recognize. `skippedReason` is `webp` or `nonWebp`, based only on stored content
 type. `q` is limited to 256 bytes and either raw-state filter to 128 bytes.
 Multiple filters combine with AND. Photo rows include the current raw and
-normalized states, error text, and `blockReason: "encoding_gate"` only for
-pending embeddings that fail the same gate used by embedding claims.
+normalized states and error text. Pending embeddings are always `queued`,
+regardless of encoding status; encoding does not block embedding claims.
 If `missingBlob` is true, the photo row's hash has no blob row: `sizeBytes` and
 `contentType` are `null`, and pipeline state/error fields are empty rather than
 being classified as an unknown blob.
@@ -268,11 +268,10 @@ latest run is in progress.
 This endpoint is loaded only when the diagnostics page is opened. Its catalog
 measurements include the explicit integrity counts `integrity.unreferencedBlobs`
 and `integrity.missingBlobPhotos`, plus stage-specific expired lease counts;
-encoding-queued, embedding-queued, and embedding-blocked counts with their oldest available
+encoding-queued and embedding-queued counts with their oldest available
 `status_changed_at` ages; and the encoding `committing` and
 `reconciling` counts. Each queue's `unknownAgeCount` counts rows in that exact
 reported category without a matching recorded pending observation timestamp.
-`embeddingBlockedQueue.blockedCount` is separate from `embeddingQueue.queuedCount`.
 Queue age never falls back to
 `created_at`. The oldest commit start is a recorded observation `started_at`;
 `unknownStartCount` keeps rows without a known start visible. These catalog
@@ -289,10 +288,10 @@ service's last claim/renew/results attempt stamp since this process started; an
 attempt is not a heartbeat and does not prove a worker is alive. Zero means no
 attempt has been recorded since restart.
 
-Embedding queue diagnostics use the same `queued`/`blocked` categories as the
-browse API and worker claim gate: a pending embedding behind the encoding gate
-is reported separately as blocked, not as queued. The diagnostics page links
-both embedding categories to their exact corresponding filters.
+Embedding queue diagnostics and browse filters classify every pending embedding
+as `queued`, independently of encoding progress. Claims also reclaim expired
+embedding leases without checking encoding status. Legacy encoding gates are
+neutralized on upgrade and ignored by claims.
 
 The diagnostics page links expired embedding/encoding leases to exact
 `embeddingLeaseExpired=true` / `encodingLeaseExpired=true` filters on photo and

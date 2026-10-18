@@ -93,10 +93,10 @@ func TestAdminDiagnosticsEmbeddingQueuesMatchBrowseCategories(t *testing.T) {
 		{hash: "blocked-gate-one-unknown", encodingStatus: "pending", gate: true},
 	}
 	for _, item := range fixtures {
-		if err := store.UpsertBlob(ctx, Blob{Hash: item.hash, SizeBytes: 10, ContentType: "image/jpeg", EncodingGate: item.gate}); err != nil {
+		if err := store.UpsertBlob(ctx, Blob{Hash: item.hash, SizeBytes: 10, ContentType: "image/jpeg"}); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := store.db.ExecContext(ctx, `UPDATE blobs SET encoding_status=?, embedding_status='pending' WHERE hash=?`, item.encodingStatus, item.hash); err != nil {
+		if _, err := store.db.ExecContext(ctx, `UPDATE blobs SET encoding_status=?, encoding_gate=?, embedding_status='pending' WHERE hash=?`, item.encodingStatus, item.gate, item.hash); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := store.db.ExecContext(ctx, `UPDATE blob_stage_observations SET status='pending', status_changed_at=? WHERE blob_hash=? AND stage='embedding'`, item.changedAt, item.hash); err != nil {
@@ -109,10 +109,6 @@ func TestAdminDiagnosticsEmbeddingQueuesMatchBrowseCategories(t *testing.T) {
 		t.Fatal(err)
 	}
 	queued, err := store.AdminBlobs(ctx, AdminBlobFilters{Embedding: "queued"}, "", 20)
-	if err != nil {
-		t.Fatal(err)
-	}
-	blocked, err := store.AdminBlobs(ctx, AdminBlobFilters{Embedding: "blocked"}, "", 20)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -139,13 +135,9 @@ func TestAdminDiagnosticsEmbeddingQueuesMatchBrowseCategories(t *testing.T) {
 			t.Errorf("%s oldest timestamp=%v want %q", label, diagnostic.OldestStatusChangedAt, wantOldest)
 		}
 	}
-	assertQueueMatchesBrowse("queued", queued, snapshot.EmbeddingQueue, queuedAt)
-	assertQueueMatchesBrowse("blocked", blocked, snapshot.EmbeddingBlockedQueue, blockedAt)
-	if len(queued) != 2 || queued[0].Hash != "queued-failed-gate" || queued[1].Hash != "queued-gate-zero" {
-		t.Errorf("queued browse=%+v; gate=0 and failed-gate rows should be eligible", queued)
-	}
-	if len(blocked) != 2 || blocked[0].Hash != "blocked-gate-one-known" || blocked[1].Hash != "blocked-gate-one-unknown" {
-		t.Errorf("blocked browse=%+v; gate=1 pending rows should be separate", blocked)
+	assertQueueMatchesBrowse("queued", queued, snapshot.EmbeddingQueue, blockedAt)
+	if len(queued) != 4 {
+		t.Errorf("queued browse=%+v; all pending rows should be eligible regardless of legacy gates", queued)
 	}
 }
 

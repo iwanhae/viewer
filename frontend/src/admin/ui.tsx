@@ -19,7 +19,6 @@ import {
   type AlbumDetail,
   type Blob,
   type BlobCounts,
-  type BlockedQueueDiagnostics,
   type ExtractionEntriesPage,
   type ExtractionEntry,
   type ExtractionRun,
@@ -303,7 +302,6 @@ function DiagnosticsPage() {
       <section className="panel"><h2>대기열 연령</h2>
         <QueueDiagnostic label="인코딩" queue={data.encodingQueue} to="/blobs?encoding=queued" />
         <QueueDiagnostic label="임베딩 대기" queue={data.embeddingQueue} to="/blobs?embedding=queued" />
-        <QueueDiagnostic label="임베딩 차단" queue={data.embeddingBlockedQueue} to="/blobs?embedding=blocked" />
         <p className="muted">연령은 기록된 status_changed_at만 사용합니다. 모르는 연령은 별도로 세며 created_at으로 추정하지 않습니다. 각 링크는 해당 카테고리의 현재 항목 전체이며, 오래된 항목만 거르는 필터는 아닙니다.</p>
       </section>
       <section className="panel"><h2>인코딩 커밋</h2><div className="summary-grid">
@@ -332,11 +330,9 @@ function DiagnosticsPage() {
   </>
 }
 
-function QueueDiagnostic({ label, queue, to }: { label: string; queue: Diagnostics['encodingQueue'] | BlockedQueueDiagnostics; to: string }) {
-  const count = 'blockedCount' in queue ? queue.blockedCount : queue.queuedCount
-  const countLabel = 'blockedCount' in queue ? '차단' : '대기'
+function QueueDiagnostic({ label, queue, to }: { label: string; queue: Diagnostics['encodingQueue']; to: string }) {
   return <div className="queue-diagnostic">
-    <h3>{label}</h3><p>{countLabel} {count.toLocaleString()} · <Link to={to}>{label} 항목 보기</Link></p>
+    <h3>{label}</h3><p>대기 {queue.queuedCount.toLocaleString()} · <Link to={to}>{label} 항목 보기</Link></p>
     <p>가장 오래된 기록 연령 {queue.oldestAgeSeconds === null ? '알 수 없음' : formatDuration(queue.oldestAgeSeconds)} · 상태 변경 {queue.oldestStatusChangedAt ? formatTime(queue.oldestStatusChangedAt) : '기록 없음'}</p>
     <p>연령 미상 {queue.unknownAgeCount.toLocaleString()}</p>
   </div>
@@ -363,12 +359,12 @@ function CategorySection({ title, categories, rawStates, filterKey, albumId, blo
 }) {
   const order = filterKey === 'encoding'
     ? ['queued', 'processing', 'validating', 'committing', 'completed', 'skipped', 'failed', 'unknown']
-    : ['queued', 'blocked', 'processing', 'completed', 'failed', 'unknown']
+    : ['queued', 'processing', 'completed', 'failed', 'unknown']
   const states = [...new Set([...order, ...Object.keys(categories)])]
   const resource = blobOnly ? 'blobs' : 'photos'
   return <section className="panel">
     <h2>{title}</h2>
-    {filterKey === 'embedding' && <p className="muted">대기(queued)는 처리 가능 상태입니다. 차단(blocked)은 인코딩 게이트가 끝날 때까지 임베딩 작업자가 가져가지 않는 대기 항목입니다.</p>}
+    {filterKey === 'embedding' && <p className="muted">대기(queued)는 인코딩 상태와 관계없이 임베딩 작업자가 처리할 수 있는 상태입니다.</p>}
     {blobOnly && <p className="muted">각 블롭은 해당 단계의 정규화 상태 하나에 한 번만 집계됩니다.</p>}
     <table className="data-table"><thead><tr><th>상태</th>{blobOnly ? <th>고유 블롭</th> : <><th>사진 행</th><th>고유 블롭</th><th>앨범 (필터 없음)</th></>}</tr></thead>
       <tbody>{states.map((state) => <tr key={state}>
@@ -443,7 +439,7 @@ function CountLink({ value, to }: { value: number; to: string }) {
 function stateLabel(state: string): string {
   const labels: Record<string, string> = {
     queued: '대기', processing: '처리 중', validating: '검증 중', committing: '저장 중',
-    completed: '완료', skipped: '건너뜀', failed: '실패', unknown: '알 수 없음', blocked: '차단됨'
+    completed: '완료', skipped: '건너뜀', failed: '실패', unknown: '알 수 없음'
   }
   return labels[state] ? `${labels[state]} (${state})` : `${state} (새 상태)`
 }
@@ -1015,7 +1011,7 @@ function PhotoTable({ photos, selected, toggle }: { photos: Photo[]; selected: s
       <td><Link to={`/photos/${encodeURIComponent(photo.albumId)}/${photo.idx}`} state={returnState(location)}>{photo.name}</Link><small className="subline">{photo.width} × {photo.height} · {photo.hash}</small></td>
       <td><Link to={`/albums/${encodeURIComponent(photo.albumId)}`} state={returnState(location)}>{photo.albumName}</Link></td>
       <td>{photo.missingBlob ? '블롭 없음' : stateLabel(photo.encoding)}<RawState raw={photo.encodingRaw} filterKey="encodingRaw" /></td>
-      <td>{photo.missingBlob ? '블롭 없음' : stateLabel(photo.embedding)}{photo.blockReason === 'encoding_gate' && <small className="subline warning-text">인코딩 게이트 대기</small>}<RawState raw={photo.embeddingRaw} filterKey="embeddingRaw" /></td>
+      <td>{photo.missingBlob ? '블롭 없음' : stateLabel(photo.embedding)}<RawState raw={photo.embeddingRaw} filterKey="embeddingRaw" /></td>
       <td>{photo.sizeBytes === null ? '—' : formatBytes(photo.sizeBytes)}</td>
     </tr>)}
     {photos.length === 0 && <EmptyRow columns={7} />}
@@ -1044,7 +1040,7 @@ function PhotoDetailPage() {
           <dt>블롭 존재</dt><dd>{photo.missingBlob ? '아니요' : '예'}</dd>
         </dl>
       </section>
-      <PipelineDetails encoding={{ raw: photo.encodingRaw, state: photo.encoding, error: photo.encodingError, skippedReason: photo.skippedReason, observation: photo.encodingObservation }} embedding={{ raw: photo.embeddingRaw, state: photo.embedding, error: photo.embeddingError, blockReason: photo.blockReason, observation: photo.embeddingObservation }} missing={photo.missingBlob} />
+      <PipelineDetails encoding={{ raw: photo.encodingRaw, state: photo.encoding, error: photo.encodingError, skippedReason: photo.skippedReason, observation: photo.encodingObservation }} embedding={{ raw: photo.embeddingRaw, state: photo.embedding, error: photo.embeddingError, observation: photo.embeddingObservation }} missing={photo.missingBlob} />
     </div>}
     {photo && !photo.missingBlob && <RecoverySelectionPanel
       selection={{ photos: [{ albumId: photo.albumId, idx: photo.idx }] }}
@@ -1073,7 +1069,7 @@ function BlobDetailPage() {
           <dt>앨범 수</dt><dd>{blob.albumCount}</dd>
         </dl>
       </section>
-      <PipelineDetails encoding={{ raw: blob.encodingRaw, state: blob.encoding, error: blob.encodingError, skippedReason: blob.skippedReason, observation: blob.encodingObservation }} embedding={{ raw: blob.embeddingRaw, state: blob.embedding, error: blob.embeddingError, blockReason: blob.blockReason, observation: blob.embeddingObservation }} missing={false} />
+      <PipelineDetails encoding={{ raw: blob.encodingRaw, state: blob.encoding, error: blob.encodingError, skippedReason: blob.skippedReason, observation: blob.encodingObservation }} embedding={{ raw: blob.embeddingRaw, state: blob.embedding, error: blob.embeddingError, observation: blob.embeddingObservation }} missing={false} />
     </div>}
     {blob && <RecoverySelectionPanel selection={{ hashes: [blob.hash] }} selectionKey={`blob:${blob.hash}`} selectedLabel={`블롭 ${blob.hash} 하나`} />}
     {blob && <PipelineHistory hash={blob.hash} />}
@@ -1299,7 +1295,7 @@ function ExtractionEntryTable({ entries }: { entries: ExtractionEntry[] }) {
 
 function PipelineDetails({ encoding, embedding, missing }: {
   encoding: { raw: string; state: string; error: string; skippedReason?: string; observation?: import('./api').StageObservation }
-  embedding: { raw: string; state: string; error: string; blockReason?: string; observation?: import('./api').StageObservation }
+  embedding: { raw: string; state: string; error: string; observation?: import('./api').StageObservation }
   missing: boolean
 }) {
   return <section className="panel pipeline-detail">
@@ -1308,9 +1304,7 @@ function PipelineDetails({ encoding, embedding, missing }: {
       <StateDetail title="인코딩" raw={encoding.raw} state={encoding.state} error={encoding.error} filterKey="encodingRaw" observation={encoding.observation} />
       {encoding.state === 'skipped' && <p className="muted">건너뜀 분류: 저장된 콘텐츠 형식 기준 {encoding.skippedReason || '확인 불가'} (건너뛴 이유 자체는 제공되지 않습니다).</p>}
       <StateDetail title="임베딩" raw={embedding.raw} state={embedding.state} error={embedding.error} filterKey="embeddingRaw" observation={embedding.observation} />
-      {embedding.blockReason === 'encoding_gate'
-        ? <p className="notice warning">임베딩은 대기 중이지만 인코딩 게이트 때문에 작업자가 아직 가져가지 않습니다. 이는 일반 대기 상태와 구분됩니다.</p>
-        : embedding.state === 'queued' && <p className="muted">대기 중이며 현재 인코딩 게이트로 차단된 상태는 아닙니다.</p>}
+      {embedding.state === 'queued' && <p className="muted">인코딩 상태와 관계없이 임베딩 처리 대기 중입니다.</p>}
     </>}
   </section>
 }
@@ -1471,7 +1465,7 @@ const encodingOptions: [string, string][] = [
   ['', '전체'], ['queued', '대기'], ['processing', '처리 중'], ['validating', '검증 중'], ['committing', '저장 중'], ['completed', '완료'], ['skipped', '건너뜀'], ['failed', '실패'], ['unknown', '알 수 없음']
 ]
 const embeddingOptions: [string, string][] = [
-  ['', '전체'], ['queued', '대기'], ['blocked', '차단됨'], ['processing', '처리 중'], ['completed', '완료'], ['failed', '실패'], ['unknown', '알 수 없음']
+  ['', '전체'], ['queued', '대기'], ['processing', '처리 중'], ['completed', '완료'], ['failed', '실패'], ['unknown', '알 수 없음']
 ]
 const skippedOptions: [string, string][] = [['', '전체'], ['webp', 'WebP'], ['nonWebp', 'WebP 아님']]
 const leaseOptions: [string, string][] = [['', '전체'], ['true', '만료'], ['false', '유효']]

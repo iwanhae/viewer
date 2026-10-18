@@ -168,7 +168,7 @@ func TestReceivedOutputIsValidatedAndPutAsynchronously(t *testing.T) {
 	source := sourcePNG(t)
 	sum := sha256.Sum256(source)
 	hash := hex.EncodeToString(sum[:])
-	if err := cat.UpsertBlob(ctx, catalog.Blob{Hash: hash, SizeBytes: int64(len(source)), ContentType: "image/png", EncodingGate: true}); err != nil {
+	if err := cat.UpsertBlob(ctx, catalog.Blob{Hash: hash, SizeBytes: int64(len(source)), ContentType: "image/png"}); err != nil {
 		t.Fatal(err)
 	}
 	encoded, err := base64.StdEncoding.DecodeString(tinyWebP)
@@ -775,15 +775,15 @@ func TestEncodingCommitAndDuplicateUpload(t *testing.T) {
 	if len(encoded) >= len(source) {
 		t.Fatal("fixture must save bytes")
 	}
-	if err := cat.UpsertBlob(ctx, catalog.Blob{Hash: hash, SizeBytes: int64(len(source)), ContentType: "image/png", EncodingGate: true}); err != nil {
+	if err := cat.UpsertBlob(ctx, catalog.Blob{Hash: hash, SizeBytes: int64(len(source)), ContentType: "image/png"}); err != nil {
 		t.Fatal(err)
 	}
 	store := newMemoryStore()
 	key := "blobs/" + hash
 	store.objects[key] = source
 	store.types[key] = "image/png"
-	if pending, err := cat.ClaimPendingEmbeddings(ctx, 1, time.Now().Add(time.Minute)); err != nil || len(pending) != 0 {
-		t.Fatalf("new image embedded before encoding: %+v %v", pending, err)
+	if pending, err := cat.ClaimPendingEmbeddings(ctx, 1, time.Now().Add(time.Minute)); err != nil || len(pending) != 1 || pending[0].Hash != hash {
+		t.Fatalf("new image must be claimable before encoding: %+v %v", pending, err)
 	}
 	svc := New(cat, store, t.TempDir())
 	claimed, err := svc.Claim(ctx, 1)
@@ -822,8 +822,11 @@ func TestEncodingCommitAndDuplicateUpload(t *testing.T) {
 	if blob.ContentType != "image/webp" || blob.SizeBytes != int64(len(encoded)) {
 		t.Fatalf("duplicate upload clobbered metadata: %+v", blob)
 	}
-	if pending, err := cat.ClaimPendingEmbeddings(ctx, 1, time.Now().Add(time.Minute)); err != nil || len(pending) != 1 {
-		t.Fatalf("encoded image not released to embedder: %+v %v", pending, err)
+	if blob.EmbeddingStatus != catalog.EmbeddingStatusProcessing {
+		t.Fatalf("encoding or duplicate upload changed embedding claim: %+v", blob)
+	}
+	if pending, err := cat.ClaimPendingEmbeddings(ctx, 1, time.Now().Add(time.Minute)); err != nil || len(pending) != 0 {
+		t.Fatalf("encoding must not release a live embedding claim: %+v %v", pending, err)
 	}
 }
 

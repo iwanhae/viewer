@@ -51,8 +51,7 @@ const adminEncodingCategoryExpr = `CASE b.encoding_status
 const adminEncodingSkippedReasonExpr = `CASE WHEN b.content_type = 'image/webp' THEN 'webp' ELSE 'nonWebp' END`
 
 const adminEmbeddingCategoryExpr = `CASE
-	WHEN b.embedding_status = 'pending' AND ` + embeddingClaimGatePredicate + ` THEN 'queued'
-	WHEN b.embedding_status = 'pending' THEN 'blocked'
+	WHEN b.embedding_status = 'pending' THEN 'queued'
 	WHEN b.embedding_status = 'processing' THEN 'processing'
 	WHEN b.embedding_status = 'ready' THEN 'completed'
 	WHEN b.embedding_status = 'failed' THEN 'failed'

@@ -171,9 +171,8 @@ func Load() (Config, error) {
 		AllowBackupOverwrite: allowBackupOverwrite,
 		ModelURL:             normalizeModelURL(os.Getenv("SIGLIP2_MODEL_URL")),
 		WorkerToken:          workerToken,
-		// A configured worker token enables the external encoder and puts new
-		// non-WebP uploads behind the encoding gate. There is no separate
-		// opt-out: the same token configures both worker APIs.
+		// A configured worker token enables the external encoder independently
+		// of embeddings. The same token configures both worker APIs.
 		WebPEncodingEnabled: workerToken != "",
 		QdrantURL:           normalizeQdrantURL(rawQdrantURL),
 		QdrantAPIKey:        qdrantAPIKey,

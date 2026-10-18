@@ -737,6 +737,56 @@ func TestOpenToleratesNewerSchema(t *testing.T) {
 	}
 }
 
+func TestIndependentEmbeddingMigrationNeutralizesLegacyGates(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "catalog.db")
+	store, err := Open(path, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	states := []string{"pending", "leased", "received", "committing"}
+	lease := time.Now().Add(time.Hour).UnixMilli()
+	for _, state := range states {
+		if err := store.UpsertBlob(ctx, Blob{Hash: state, SizeBytes: 100, ContentType: "image/jpeg"}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.db.ExecContext(ctx, `UPDATE blobs SET encoding_gate=1, encoding_status=?,
+			encoding_token='legacy-token', encoding_stage_key='legacy-stage', encoding_lease_until=?,
+			encoding_source_size_bytes=200, encoding_error='legacy-error' WHERE hash=?`, state, lease, state); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := store.db.ExecContext(ctx, `PRAGMA user_version=8`); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	migrated, err := Open(path, nil)
+	if err != nil {
+		t.Fatalf("upgrade legacy gates: %v", err)
+	}
+	defer migrated.Close()
+	for _, state := range states {
+		var gate int
+		var status, token, stageKey, errorText string
+		var gotLease, sourceSize int64
+		if err := migrated.db.QueryRowContext(ctx, `SELECT encoding_gate, encoding_status, encoding_token,
+			encoding_stage_key, encoding_lease_until, encoding_source_size_bytes, encoding_error FROM blobs WHERE hash=?`, state).
+			Scan(&gate, &status, &token, &stageKey, &gotLease, &sourceSize, &errorText); err != nil {
+			t.Fatal(err)
+		}
+		if gate != 0 || status != state || token != "legacy-token" || stageKey != "legacy-stage" || gotLease != lease || sourceSize != 200 || errorText != "legacy-error" {
+			t.Errorf("migration changed encoding ownership/state for %s: gate=%d status=%s token=%s stage=%s lease=%d source=%d error=%s", state, gate, status, token, stageKey, gotLease, sourceSize, errorText)
+		}
+	}
+	claimed, err := migrated.ClaimPendingEmbeddings(ctx, 10, time.Now().Add(time.Minute))
+	if err != nil || len(claimed) != len(states) {
+		t.Fatalf("claims after upgrade=%+v err=%v want all four legacy blobs", claimed, err)
+	}
+}
+
 func TestStageObservabilityMigrationDoesNotInventLegacyAttempts(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "catalog.db")
 	store, err := Open(path, nil)

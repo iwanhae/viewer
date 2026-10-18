@@ -453,7 +453,7 @@ func validateStateFilters(encoding, embedding, encodingRaw, embeddingRaw, encodi
 	if encoding != "" && !oneOf(encoding, "queued", "processing", "validating", "committing", "completed", "skipped", "failed", "unknown") {
 		return fmt.Errorf("%w: unsupported encoding category %q", ErrInvalidBrowseRequest, encoding)
 	}
-	if embedding != "" && !oneOf(embedding, "queued", "blocked", "processing", "completed", "failed", "unknown") {
+	if embedding != "" && !oneOf(embedding, "queued", "processing", "completed", "failed", "unknown") {
 		return fmt.Errorf("%w: unsupported embedding category %q", ErrInvalidBrowseRequest, embedding)
 	}
 	if skippedReason != "" && !oneOf(skippedReason, "webp", "nonWebp") {

@@ -43,11 +43,11 @@ func seedAdminBrowseCatalog(t *testing.T, store *Store) {
 		{"unknown-other", "image/jpeg", "future-encoding-other", "future-embedding-other", "enc err 2", "embed err 2", true, 19},
 	}
 	for _, blob := range blobs {
-		if err := store.UpsertBlob(ctx, Blob{Hash: blob.hash, SizeBytes: blob.size, ContentType: blob.contentType, EncodingGate: blob.gate}); err != nil {
+		if err := store.UpsertBlob(ctx, Blob{Hash: blob.hash, SizeBytes: blob.size, ContentType: blob.contentType}); err != nil {
 			t.Fatalf("upsert blob %s: %v", blob.hash, err)
 		}
-		if _, err := store.db.ExecContext(ctx, `UPDATE blobs SET encoding_status=?, embedding_status=?, encoding_error=?, embedding_error=? WHERE hash=?`,
-			blob.encoding, blob.embedding, blob.encodingError, blob.embeddingError, blob.hash); err != nil {
+		if _, err := store.db.ExecContext(ctx, `UPDATE blobs SET encoding_status=?, embedding_status=?, encoding_error=?, embedding_error=?, encoding_gate=? WHERE hash=?`,
+			blob.encoding, blob.embedding, blob.encodingError, blob.embeddingError, blob.gate, blob.hash); err != nil {
 			t.Fatalf("set blob states %s: %v", blob.hash, err)
 		}
 	}
@@ -89,13 +89,9 @@ func TestAdminPhotoBrowseFiltersAndLiteralSearch(t *testing.T) {
 		t.Fatalf("photo pipeline state=%+v", photos[0])
 	}
 
-	blocked, err := store.AdminPhotos(ctx, AdminPhotoFilters{Embedding: "blocked"}, "", 0, 20)
-	if err != nil || len(blocked) != 1 || blocked[0].BlockReason != "encoding_gate" {
-		t.Fatalf("blocked list=%+v err=%v want encoding_gate", blocked, err)
-	}
 	queued, err := store.AdminPhotos(ctx, AdminPhotoFilters{Embedding: "queued"}, "", 0, 20)
-	if err != nil || len(queued) != 3 || queued[0].Name != "webp.jpg" || queued[1].Name != "png.jpg" || queued[2].Name != "eligible.jpg" {
-		t.Fatalf("queued list=%+v err=%v; want gate-eligible pending rows", queued, err)
+	if err != nil || len(queued) != 4 || queued[0].Name != "blocked.jpg" || queued[1].Name != "webp.jpg" || queued[2].Name != "png.jpg" || queued[3].Name != "eligible.jpg" {
+		t.Fatalf("queued list=%+v err=%v; want all pending rows including legacy gated rows", queued, err)
 	}
 	unknown, err := store.AdminPhotos(ctx, AdminPhotoFilters{Encoding: "unknown", Embedding: "unknown", EncodingRaw: "future-encoding", EmbeddingRaw: "future-embedding"}, "", 0, 20)
 	if err != nil || len(unknown) != 1 || unknown[0].EncodingRaw != "future-encoding" || unknown[0].EmbeddingRaw != "future-embedding" {
@@ -153,8 +149,8 @@ func TestAdminBlobBrowseOrphansRelationsAndAlbumPipelineCounts(t *testing.T) {
 	if got := detail.Encoding.SkippedReasons["webp"]; got != (PipelineCounts{BlobCount: 1, PhotoCount: 1, AlbumCount: 1}) {
 		t.Fatalf("album skipped webp=%+v", got)
 	}
-	if got := detail.Embedding.Categories["blocked"]; got != (PipelineCounts{BlobCount: 1, PhotoCount: 1, AlbumCount: 1}) {
-		t.Fatalf("album blocked embedding=%+v", got)
+	if got := detail.Embedding.Categories["queued"]; got != (PipelineCounts{BlobCount: 2, PhotoCount: 2, AlbumCount: 1}) {
+		t.Fatalf("album queued embedding=%+v", got)
 	}
 	if got := detail.Encoding.Categories["unknown"]; got != (PipelineCounts{BlobCount: 2, PhotoCount: 2, AlbumCount: 1}) {
 		t.Fatalf("album unknown encoding aggregate=%+v want distinct album and both raw unknown states", got)

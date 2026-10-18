@@ -542,6 +542,21 @@ func TestProcessAlbumReadyWithPendingEmbeddings(t *testing.T) {
 	if blob.EmbeddingStatus != catalog.EmbeddingStatusPending {
 		t.Fatalf("embedding status=%s want=%s", blob.EmbeddingStatus, catalog.EmbeddingStatusPending)
 	}
+	// Newly registered images enter both independent queues. An encoder can
+	// lease the source without preventing an embedding worker from claiming it.
+	ctx := context.Background()
+	encodings, err := cat.ClaimEncoding(ctx, 1, time.Minute)
+	if err != nil || len(encodings) != 1 || encodings[0].Hash != blob.Hash {
+		t.Fatalf("claim registered encoding: jobs=%+v err=%v", encodings, err)
+	}
+	embeddings, err := cat.ClaimPendingEmbeddings(ctx, 1, time.Now().Add(time.Minute))
+	if err != nil || len(embeddings) != 1 || embeddings[0].Hash != blob.Hash {
+		t.Fatalf("claim registered embedding while encoding is leased: blobs=%+v err=%v", embeddings, err)
+	}
+	encoding, err := cat.GetEncodingJob(ctx, blob.Hash)
+	if err != nil || encoding.Status != "leased" || encoding.Token != encodings[0].Token {
+		t.Fatalf("embedding claim changed encoding: job=%+v err=%v", encoding, err)
+	}
 }
 
 func TestProcessAlbumInvokesReadyHook(t *testing.T) {

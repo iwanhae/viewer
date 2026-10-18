@@ -95,7 +95,6 @@
   <tr><th>Expired leases</th><td id="leaseExpired">&ndash;</td></tr>
   <tr><th>Oldest processing lease age</th><td id="oldestLease">&ndash;</td></tr>
   <tr><th>Worker last activity</th><td id="workerActivity">&ndash;</td></tr>
-  <tr><th>Pending by encoding status</th><td id="pendingByEncoding">&ndash;</td></tr>
 </table>
 <p class="muted">
   Expired leases: all expired = no worker claiming; none expired = leases held
@@ -307,25 +306,6 @@ function render(stats) {
     'claim ' + formatRelative(act.lastClaimUnixMs) +
     ' · renew ' + formatRelative(act.lastRenewUnixMs) +
     ' · results ' + formatRelative(act.lastResultsUnixMs);
-
-  const pbe = stats.pendingByEncoding || {};
-  const pbeEl = $('pendingByEncoding');
-  const pbeKeys = Object.keys(pbe);
-  if (!pbeKeys.length) {
-    pbeEl.textContent = '–';
-  } else {
-    // Anything other than pending/done/skipped is a blob stuck at the
-    // WebP-encoding gate, so flag it.
-    const gateDone = new Set(['pending', 'done', 'skipped']);
-    pbeEl.textContent = '';
-    pbeKeys.forEach((status, i) => {
-      const span = document.createElement('span');
-      span.textContent = status + ': ' + pbe[status];
-      if (!gateDone.has(status)) span.className = 'bad';
-      pbeEl.appendChild(span);
-      if (i < pbeKeys.length - 1) pbeEl.appendChild(document.createTextNode(' · '));
-    });
-  }
 
   const failures = Array.isArray(stats.failures) ? stats.failures : [];
   $('failures').hidden = failures.length === 0;

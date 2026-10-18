@@ -70,7 +70,6 @@ type Store interface {
 
 // Options configure a pipeline service.
 type Options struct {
-	WebPEncodingEnabled bool
 	// ExtractionRecorder optionally overrides catalog-backed per-entry
 	// observability. Failures to record do not change extraction results; the
 	// affected run is marked incomplete when possible.
@@ -537,7 +536,6 @@ func (s *Service) extractEntry(ctx context.Context, albumID string, index int, e
 		Hash:           hash,
 		SizeBytes:      int64(len(data)),
 		ContentType:    contentType,
-		EncodingGate:   s.opts.WebPEncodingEnabled && contentType != "image/webp",
 		SourceRestored: restored,
 	}); err != nil {
 		return false, "blob_catalog_failed", err.Error(), "", err

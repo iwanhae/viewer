@@ -271,6 +271,13 @@ var migrations = []migration{
 			`CREATE INDEX IF NOT EXISTS idx_admin_recovery_results_operation_status ON admin_recovery_results(operation_id, status, ordinal)`,
 		},
 	},
+	{
+		version: 9,
+		name:    "independent_embedding_queue",
+		// Retain the legacy column, but neutralize stored gates. Neither new
+		// registrations nor embedding claims use it anymore.
+		stmts: []string{`UPDATE blobs SET encoding_gate = 0 WHERE encoding_gate != 0`},
+	},
 }
 
 // addBlobLeaseColumnIfMissing adds the external-worker lease column to blobs.

@@ -64,10 +64,6 @@ export type QueueDiagnostics = {
   unknownAgeCount: number
 }
 
-export type BlockedQueueDiagnostics = Omit<QueueDiagnostics, 'queuedCount'> & {
-  blockedCount: number
-}
-
 export type Diagnostics = {
   measuredAt: string
   encodingEnabled: boolean
@@ -77,7 +73,6 @@ export type Diagnostics = {
   embeddingExpiredLeases: number
   encodingQueue: QueueDiagnostics
   embeddingQueue: QueueDiagnostics
-  embeddingBlockedQueue: BlockedQueueDiagnostics
   encodingCommit: {
     committingCount: number
     reconcilingCount: number
@@ -117,7 +112,6 @@ export type Photo = {
   embeddingError: string
   embeddingErrorCode: string
   skippedReason: string
-  blockReason: string
   encodingObservation?: StageObservation
   embeddingObservation?: StageObservation
 }
@@ -146,7 +140,6 @@ export type Blob = {
   embeddingError: string
   embeddingErrorCode: string
   skippedReason: string
-  blockReason: string
   photoCount: number
   albumCount: number
   encodingObservation?: StageObservation

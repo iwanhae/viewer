@@ -167,7 +167,6 @@ func Run(ctx context.Context) error {
 		}
 	}()
 	pipelineService := pipeline.NewService(cat, store, pipeline.Options{
-		WebPEncodingEnabled: cfg.WebPEncodingEnabled,
 		OnAlbumReady: func(albumID string) {
 			if err := recommendService.ReloadAlbum(context.Background(), albumID); err != nil {
 				log.Printf("viewer: reload recommendation index for album=%s failed: %v", albumID, err)

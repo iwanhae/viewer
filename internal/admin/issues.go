@@ -143,13 +143,6 @@ type QueueDiagnostics struct {
 	UnknownAgeCount       int64   `json:"unknownAgeCount"`
 }
 
-type BlockedQueueDiagnostics struct {
-	BlockedCount          int64   `json:"blockedCount"`
-	OldestStatusChangedAt *string `json:"oldestStatusChangedAt"`
-	OldestAgeSeconds      *int64  `json:"oldestAgeSeconds"`
-	UnknownAgeCount       int64   `json:"unknownAgeCount"`
-}
-
 type EncodingCommitDiagnostics struct {
 	CommittingCount      int64   `json:"committingCount"`
 	ReconcilingCount     int64   `json:"reconcilingCount"`
@@ -175,7 +168,6 @@ type Diagnostics struct {
 	EmbeddingExpiredLeases int64                     `json:"embeddingExpiredLeases"`
 	EncodingQueue          QueueDiagnostics          `json:"encodingQueue"`
 	EmbeddingQueue         QueueDiagnostics          `json:"embeddingQueue"`
-	EmbeddingBlockedQueue  BlockedQueueDiagnostics   `json:"embeddingBlockedQueue"`
 	EncodingCommit         EncodingCommitDiagnostics `json:"encodingCommit"`
 	Integrity              IntegrityDiagnostics      `json:"integrity"`
 	WorkerActivity         WorkerActivityDiagnostics `json:"workerActivity"`
@@ -207,9 +199,8 @@ func (s *Service) Diagnostics(ctx context.Context) (Diagnostics, error) {
 	result := Diagnostics{
 		MeasuredAt: measuredAt, EncodingEnabled: s.encodingEnabled,
 		EncodingExpiredLeases: snapshot.EncodingExpiredLeases, EmbeddingExpiredLeases: snapshot.EmbeddingExpiredLeases,
-		EncodingQueue:         queueDiagnostics(snapshot.EncodingQueue, measuredAtTime),
-		EmbeddingQueue:        queueDiagnostics(snapshot.EmbeddingQueue, measuredAtTime),
-		EmbeddingBlockedQueue: blockedQueueDiagnostics(snapshot.EmbeddingBlockedQueue, measuredAtTime),
+		EncodingQueue:  queueDiagnostics(snapshot.EncodingQueue, measuredAtTime),
+		EmbeddingQueue: queueDiagnostics(snapshot.EmbeddingQueue, measuredAtTime),
 		Integrity: IntegrityDiagnostics{
 			UnreferencedBlobs: snapshot.UnreferencedBlobs, MissingBlobPhotos: snapshot.MissingBlobPhotos,
 		},
@@ -255,15 +246,6 @@ func queueDiagnostics(snapshot catalog.AdminQueueDiagnostics, measuredAt time.Ti
 	oldestAt, oldestAge := queueAge(snapshot, measuredAt)
 	result := QueueDiagnostics{
 		QueuedCount: snapshot.Count, OldestStatusChangedAt: oldestAt,
-		OldestAgeSeconds: oldestAge, UnknownAgeCount: snapshot.UnknownAgeCount,
-	}
-	return result
-}
-
-func blockedQueueDiagnostics(snapshot catalog.AdminQueueDiagnostics, measuredAt time.Time) BlockedQueueDiagnostics {
-	oldestAt, oldestAge := queueAge(snapshot, measuredAt)
-	result := BlockedQueueDiagnostics{
-		BlockedCount: snapshot.Count, OldestStatusChangedAt: oldestAt,
 		OldestAgeSeconds: oldestAge, UnknownAgeCount: snapshot.UnknownAgeCount,
 	}
 	return result

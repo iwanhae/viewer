@@ -18,7 +18,7 @@ const overview: Overview = {
     rawStates: { future_encode_state: blobCount }
   },
   embedding: {
-    categories: { queued: blobCount, blocked: noBlobs, processing: noBlobs, completed: noBlobs, failed: noBlobs, unknown: noBlobs },
+    categories: { queued: blobCount, processing: noBlobs, completed: noBlobs, failed: noBlobs, unknown: noBlobs },
     rawStates: { future_embed_state: blobCount }
   }
 }
@@ -26,13 +26,13 @@ const overview: Overview = {
 const missingPhoto: Photo = {
   albumId: 'album-1', albumName: 'archive.zip', idx: 0, name: 'lost.jpg', hash: 'gone', missingBlob: true,
   width: 20, height: 30, sizeBytes: null, contentType: null, encodingRaw: '', encoding: '', encodingError: '', encodingErrorCode: '',
-  embeddingRaw: '', embedding: '', embeddingError: '', embeddingErrorCode: '', skippedReason: '', blockReason: ''
+  embeddingRaw: '', embedding: '', embeddingError: '', embeddingErrorCode: '', skippedReason: ''
 }
 
 const detailBlob: Blob = {
   hash: 'history-hash', sizeBytes: 10, contentType: 'image/jpeg', encodingRaw: 'pending', encoding: 'queued',
   encodingError: '', encodingErrorCode: '', embeddingRaw: 'pending', embedding: 'queued', embeddingError: '', embeddingErrorCode: '', skippedReason: '',
-  blockReason: '', photoCount: 0, albumCount: 0,
+  photoCount: 0, albumCount: 0,
   encodingObservation: { startedAt: null, finishedAt: null, statusChangedAt: null, status: 'pending', phase: null, attempts: 0, errorCode: '', retryability: 'unknown' },
   embeddingObservation: { startedAt: '2026-10-14T12:00:00Z', finishedAt: null, statusChangedAt: '2026-10-14T12:00:00Z', status: 'processing', phase: null, attempts: 2, errorCode: 'legacy_unknown', retryability: 'unknown' }
 }
@@ -117,6 +117,8 @@ describe('admin React UI', () => {
     expect(rawLink?.getAttribute('href')).toContain('encodingRaw=future_encode_state')
     expect(screen.getByText(/사진·앨범 참조 수를 상태별로 나누지 않습니다/)).toBeTruthy()
     expect(screen.queryByText(/블롭이 없는 사진/)).toBeNull()
+    expect(screen.getByText(/인코딩 상태와 관계없이 임베딩 작업자가 처리할 수 있는 상태/)).toBeTruthy()
+    expect(screen.queryByRole('link', { name: /차단됨/ })).toBeNull()
     fireEvent.click(countLink)
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/admin/api/blobs?encoding=queued', expect.anything()))
     expect(fetchMock.mock.calls.some(([url]) => String(url) === '/admin/api/diagnostics')).toBe(false)
@@ -133,6 +135,7 @@ describe('admin React UI', () => {
     expect(screen.queryByRole('img')).toBeNull()
     expect(fetchMock).toHaveBeenCalledWith('/admin/api/photos?hash=gone', expect.anything())
     expect(screen.getByLabelText('해시')).toHaveProperty('value', 'gone')
+    expect(screen.queryByRole('option', { name: '차단됨' })).toBeNull()
   })
 
   it('shows request errors without dropping the current route', async () => {
@@ -161,6 +164,8 @@ describe('admin React UI', () => {
     expect(screen.getAllByText('—').length).toBeGreaterThan(0)
     expect(screen.getAllByText('unknown').length).toBeGreaterThan(0)
     expect(screen.getByText('legacy_unknown')).toBeTruthy()
+    expect(screen.getByText('인코딩 상태와 관계없이 임베딩 처리 대기 중입니다.')).toBeTruthy()
+    expect(screen.queryByText(/인코딩 게이트/)).toBeNull()
     fireEvent.click(screen.getByRole('button', { name: '다음 기록 더 보기' }))
     expect(await screen.findByText(/encoding · commit_started/)).toBeTruthy()
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/admin/api/blobs/history-hash/history?limit=50&cursor=1', expect.anything()))
@@ -702,7 +707,6 @@ describe('admin React UI', () => {
       encodingExpiredLeases: 1, embeddingExpiredLeases: 2,
       encodingQueue: { queuedCount: 3, oldestStatusChangedAt: null, oldestAgeSeconds: null, unknownAgeCount: 3 },
       embeddingQueue: { queuedCount: 4, oldestStatusChangedAt: '2026-10-14T10:00:00Z', oldestAgeSeconds: 7200, unknownAgeCount: 1 },
-      embeddingBlockedQueue: { blockedCount: 2, oldestStatusChangedAt: '2026-10-14T09:00:00Z', oldestAgeSeconds: 10800, unknownAgeCount: 1 },
       encodingCommit: { committingCount: 1, reconcilingCount: 1, oldestKnownStartedAt: '2026-10-14T11:00:00Z', unknownStartCount: 0 },
       integrity: { unreferencedBlobs: 2, missingBlobPhotos: 3 },
       workerActivity: { lastClaimUnixMs: 0, lastRenewUnixMs: 0, lastResultsUnixMs: 0 },
@@ -717,7 +721,8 @@ describe('admin React UI', () => {
     expect(screen.getByText(/attempt stamps are not heartbeats/)).toBeTruthy()
     expect(screen.getByText(/전체 동기화나 포인트 무결성을 검증하지 않습니다/)).toBeTruthy()
     expect(screen.getByRole('link', { name: '시스템 진단' })).toBeTruthy()
-    expect(screen.getByRole('link', { name: '임베딩 차단 항목 보기' }).getAttribute('href')).toBe('/blobs?embedding=blocked')
+    expect(screen.getByRole('link', { name: '임베딩 대기 항목 보기' }).getAttribute('href')).toBe('/blobs?embedding=queued')
+    expect(screen.queryByRole('link', { name: '임베딩 차단 항목 보기' })).toBeNull()
     expect(screen.getByRole('link', { name: /인코딩 만료 리스/ }).getAttribute('href')).toBe('/blobs?encodingLeaseExpired=true')
     expect(screen.getByRole('link', { name: /미참조 블롭/ }).getAttribute('href')).toBe('/blobs?unreferenced=true')
     expect(screen.getByText('블롭 없는 사진')).toBeTruthy()

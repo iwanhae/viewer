@@ -519,8 +519,11 @@ func TestAdminOverviewRouteJSONContractAndVectorIndependence(t *testing.T) {
 	for _, category := range []string{"queued", "processing", "validating", "committing", "completed", "skipped", "failed", "unknown"} {
 		assertOverviewJSONCounts(t, "encoding.categories."+category, payload.Encoding.Categories[category])
 	}
-	for _, category := range []string{"queued", "blocked", "processing", "completed", "failed", "unknown"} {
+	for _, category := range []string{"queued", "processing", "completed", "failed", "unknown"} {
 		assertOverviewJSONCounts(t, "embedding.categories."+category, payload.Embedding.Categories[category])
+	}
+	if _, ok := payload.Embedding.Categories["blocked"]; ok {
+		t.Fatal("overview still exposes the obsolete blocked embedding category")
 	}
 	assertOverviewJSONCounts(t, "encoding.skippedReasons.webp", payload.Encoding.SkippedReasons["webp"])
 	assertOverviewJSONCounts(t, "encoding.skippedReasons.nonWebp", payload.Encoding.SkippedReasons["nonWebp"])
@@ -545,8 +548,8 @@ func TestAdminResourceBrowseRoutesContractAndValidation(t *testing.T) {
 	}
 	blobs := []catalog.Blob{
 		{Hash: "shared", SizeBytes: 31, ContentType: "image/jpeg"},
-		{Hash: "blocked", SizeBytes: 32, ContentType: "image/png", EncodingGate: true},
-		{Hash: "orphan", SizeBytes: 33, ContentType: "image/jpeg", EncodingGate: true},
+		{Hash: "blocked", SizeBytes: 32, ContentType: "image/png"},
+		{Hash: "orphan", SizeBytes: 33, ContentType: "image/jpeg"},
 	}
 	for _, blob := range blobs {
 		if err := store.UpsertBlob(ctx, blob); err != nil {
@@ -585,7 +588,7 @@ func TestAdminResourceBrowseRoutesContractAndValidation(t *testing.T) {
 		t.Fatalf("literal search payload=%s err=%v want exactly one photo", search.Body.String(), err)
 	}
 	photo := searchBody.Photos[0]
-	for _, key := range []string{"albumId", "albumName", "idx", "name", "hash", "missingBlob", "width", "height", "sizeBytes", "contentType", "encodingRaw", "encoding", "encodingError", "embeddingRaw", "embedding", "embeddingError", "skippedReason", "blockReason"} {
+	for _, key := range []string{"albumId", "albumName", "idx", "name", "hash", "missingBlob", "width", "height", "sizeBytes", "contentType", "encodingRaw", "encoding", "encodingError", "embeddingRaw", "embedding", "embeddingError", "skippedReason"} {
 		if _, ok := photo[key]; !ok {
 			t.Errorf("photo JSON missing %q: %v", key, photo)
 		}
@@ -595,7 +598,7 @@ func TestAdminResourceBrowseRoutesContractAndValidation(t *testing.T) {
 	}
 
 	detail := doAdminRequest(t, router, http.MethodGet, "/admin/api/photos/album-a/1", auth)
-	if detail.Code != http.StatusOK || !strings.Contains(detail.Body.String(), `"blockReason":"encoding_gate"`) || !strings.Contains(detail.Body.String(), `"embeddingError":""`) {
+	if detail.Code != http.StatusOK || strings.Contains(detail.Body.String(), `"blockReason"`) || !strings.Contains(detail.Body.String(), `"embedding":"queued"`) || !strings.Contains(detail.Body.String(), `"embeddingError":""`) {
 		t.Fatalf("photo detail status=%d body=%s", detail.Code, detail.Body.String())
 	}
 	danglingDetail := doAdminRequest(t, router, http.MethodGet, "/admin/api/photos/album-a/3", auth)
@@ -609,6 +612,9 @@ func TestAdminResourceBrowseRoutesContractAndValidation(t *testing.T) {
 	diagnostics := doAdminRequest(t, router, http.MethodGet, "/admin/api/diagnostics", auth)
 	if diagnostics.Code != http.StatusOK || !strings.Contains(diagnostics.Body.String(), `"unreferencedBlobs":1`) || !strings.Contains(diagnostics.Body.String(), `"missingBlobPhotos":1`) {
 		t.Fatalf("diagnostics integrity counts status=%d body=%s", diagnostics.Code, diagnostics.Body.String())
+	}
+	if strings.Contains(diagnostics.Body.String(), `"embeddingBlockedQueue"`) {
+		t.Fatalf("diagnostics still exposes obsolete gate diagnostics: %s", diagnostics.Body.String())
 	}
 	if rec := doAdminRequest(t, router, http.MethodGet, "/admin/api/photos/album-a/99", auth); rec.Code != http.StatusNotFound {
 		t.Fatalf("missing photo status=%d want=404 body=%s", rec.Code, rec.Body.String())
@@ -624,7 +630,7 @@ func TestAdminResourceBrowseRoutesContractAndValidation(t *testing.T) {
 	if strings.Contains(blobDetail.Body.String(), `"photos"`) || strings.Contains(blobDetail.Body.String(), `"albums"`) {
 		t.Fatalf("blob detail must not embed unbounded references: %s", blobDetail.Body.String())
 	}
-	blobList := doAdminRequest(t, router, http.MethodGet, "/admin/api/blobs?unreferenced=true&embedding=blocked", auth)
+	blobList := doAdminRequest(t, router, http.MethodGet, "/admin/api/blobs?unreferenced=true&embedding=queued", auth)
 	if blobList.Code != http.StatusOK || !strings.Contains(blobList.Body.String(), `"hash":"orphan"`) || !strings.Contains(blobList.Body.String(), `"photoCount":0`) {
 		t.Fatalf("unreferenced blob drilldown status=%d body=%s", blobList.Code, blobList.Body.String())
 	}
@@ -645,6 +651,8 @@ func TestAdminResourceBrowseRoutesContractAndValidation(t *testing.T) {
 	}
 
 	for _, target := range []string{
+		"/admin/api/photos?embedding=blocked",
+		"/admin/api/blobs?embedding=blocked",
 		"/admin/api/photos?encoding=not-a-category",
 		"/admin/api/photos?unknown=value",
 		"/admin/api/photos?encoding=queued&encoding=blocked",

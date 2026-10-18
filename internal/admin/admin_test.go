@@ -411,8 +411,8 @@ func TestReindexNilCatalogErrors(t *testing.T) {
 
 // seedEmbeddingDiagnostics builds every diagnostic shape Stats reports at once:
 // two processing rows (one live lease, one expired), three failed rows carrying
-// two distinct error texts, and three gated pending rows sitting behind three
-// different encoding states. It returns nothing — the shape itself is the
+// two distinct error texts, and three pending rows with independent encoding
+// states. It returns nothing — the shape itself is the
 // fixture, and each test asserts the slice it cares about.
 func seedEmbeddingDiagnostics(t *testing.T, store *catalog.Store) {
 	t.Helper()
@@ -443,17 +443,17 @@ func seedEmbeddingDiagnostics(t *testing.T, store *catalog.Store) {
 		t.Fatalf("apply failed outcomes: applied=%v rejected=%v err=%v", applied, rejected, err)
 	}
 
-	// Three gated pending rows behind different encoding states. The big
+	// Three pending embeddings with different encoding states. The big
 	// sizes steer ClaimEncoding (largest first) at exactly the rows this
 	// fixture needs, one claim each: a negative TTL hands back an
 	// already-expired lease (the stuck shape the dashboard diagnoses), while
 	// the received row needs a live lease to hand off through.
-	gated := []catalog.Blob{
-		{Hash: "hash-gate-received", SizeBytes: 100, ContentType: "image/jpeg", EncodingGate: true},
-		{Hash: "hash-gate-leased", SizeBytes: 90, ContentType: "image/jpeg", EncodingGate: true},
-		{Hash: "hash-gate-pending", SizeBytes: 80, ContentType: "image/jpeg", EncodingGate: true},
+	pending := []catalog.Blob{
+		{Hash: "hash-gate-received", SizeBytes: 100, ContentType: "image/jpeg"},
+		{Hash: "hash-gate-leased", SizeBytes: 90, ContentType: "image/jpeg"},
+		{Hash: "hash-gate-pending", SizeBytes: 80, ContentType: "image/jpeg"},
 	}
-	for _, blob := range gated {
+	for _, blob := range pending {
 		if err := store.UpsertBlob(ctx, blob); err != nil {
 			t.Fatalf("upsert %s: %v", blob.Hash, err)
 		}
@@ -494,16 +494,6 @@ func TestStatsEmbeddingDiagnostics(t *testing.T) {
 	}
 	if stats.EmbeddingLease.OldestLeaseUnixMs <= 0 {
 		t.Fatalf("oldestLeaseUnixMs=%d want a positive timestamp (two processing rows hold leases)", stats.EmbeddingLease.OldestLeaseUnixMs)
-	}
-
-	wantBreakdown := map[string]int64{"pending": 1, "leased": 1, "received": 1}
-	if len(stats.PendingByEncoding) != len(wantBreakdown) {
-		t.Fatalf("pendingByEncoding=%v want=%v", stats.PendingByEncoding, wantBreakdown)
-	}
-	for status, want := range wantBreakdown {
-		if stats.PendingByEncoding[status] != want {
-			t.Fatalf("pendingByEncoding[%s]=%d want=%d", status, stats.PendingByEncoding[status], want)
-		}
 	}
 
 	wantFailures := []catalog.EmbeddingFailure{
