@@ -4,9 +4,10 @@ One uv project provides two commands: `uv run recommender` for image
 embeddings and `uv run encoder` for WebP Q85 compression. Both read
 `VIEWER_BASE_URL` and `WORKER_TOKEN` from the environment or `worker/.env`.
 
-Setting `WORKER_TOKEN` on the server enables WebP encoding. Use the same token
-here. There is no separate WebP opt-out. Install the official `cwebp` CLI on
-the encoder host. From `worker/`:
+Setting `WORKER_TOKEN` on the server enables the external encoder API routes;
+local Admin encoding does not require it. Use the same token here for this
+external worker. There is no separate external WebP opt-out. Install the
+official `cwebp` CLI on the encoder host. From `worker/`:
 
 ```sh
 uv sync
