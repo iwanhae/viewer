@@ -123,6 +123,8 @@ func (s *Server) Router() http.Handler {
 			r.Get("/albums/*", adminPage.ServeHTTP)
 			r.Get("/issues", adminPage.ServeHTTP)
 			r.Get("/diagnostics", adminPage.ServeHTTP)
+			r.Get("/runs", adminPage.ServeHTTP)
+			r.Get("/runs/*", adminPage.ServeHTTP)
 			r.Get("/legacy", admin.LegacyPage().ServeHTTP)
 			r.Get("/api/stats", s.adminStats)
 			r.Get("/api/overview", s.adminOverview)

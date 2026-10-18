@@ -302,7 +302,10 @@ func Run(ctx context.Context) error {
 // Local capability and spool recovery do not depend on external worker auth.
 func startLocalEncoding(ctx context.Context, cat *catalog.Store, store encoding.Store, stateDir string) (*encoding.Service, error) {
 	service := encoding.New(cat, store, filepath.Join(stateDir, "encoding-spool"))
-	if err := service.Start(ctx); err != nil {
+	// Accepted local handoffs outlive request/run cancellation. Root shutdown
+	// still stops HTTP and the run manager, but only Close (after that manager
+	// joins) may stop the output processors and recovery scanner.
+	if err := service.Start(context.WithoutCancel(ctx)); err != nil {
 		return nil, fmt.Errorf("start WebP encoding: %w", err)
 	}
 	return service, nil

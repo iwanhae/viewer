@@ -96,6 +96,8 @@ func TestAdminRoutesRequireBothServiceAndToken(t *testing.T) {
 		{http.MethodGet, "/admin/"},
 		{http.MethodGet, "/admin/assets/nonexistent.js"},
 		{http.MethodGet, "/admin/photos/album-a/0"},
+		{http.MethodGet, "/admin/runs"},
+		{http.MethodGet, "/admin/runs/run-id"},
 		{http.MethodGet, "/admin/legacy"},
 		{http.MethodGet, "/admin/api/stats"},
 		{http.MethodGet, "/admin/api/overview"},
@@ -407,6 +409,30 @@ func TestAdminPageServesEmbeddedHTML(t *testing.T) {
 		protected := doAdminRequest(t, router, http.MethodGet, target, "")
 		if protected.Code != http.StatusUnauthorized {
 			t.Errorf("nested admin route %s status=%d want=401", target, protected.Code)
+		}
+	}
+}
+
+func TestAdminRunsDirectNavigationAndReload(t *testing.T) {
+	router, _ := newAdminTestRouter(t, 1)
+	for _, target := range []string{"/admin/runs", "/admin/runs/", "/admin/runs/run-id"} {
+		t.Run(target, func(t *testing.T) {
+			unauthorized := doAdminRequest(t, router, http.MethodGet, target, "")
+			if unauthorized.Code != http.StatusUnauthorized || unauthorized.Header().Get("WWW-Authenticate") == "" {
+				t.Fatalf("unprotected runs page: status=%d body=%s", unauthorized.Code, unauthorized.Body.String())
+			}
+			for range 2 { // first navigation and browser reload
+				page := doAdminRequest(t, router, http.MethodGet, target, basicAuthHeader("operator", "sekrit"))
+				if page.Code != http.StatusOK || page.Header().Get("Content-Type") != "text/html; charset=utf-8" || !strings.Contains(page.Body.String(), `<div id="admin-root">`) {
+					t.Fatalf("runs page: status=%d type=%s body=%s", page.Code, page.Header().Get("Content-Type"), page.Body.String())
+				}
+			}
+		})
+	}
+	for _, target := range []string{"/admin/unknown", "/admin/not-runs/run-id", "/admin/api/unknown"} {
+		page := doAdminRequest(t, router, http.MethodGet, target, basicAuthHeader("operator", "sekrit"))
+		if page.Code != http.StatusNotFound || !strings.HasPrefix(page.Header().Get("Content-Type"), "application/json") || !jsonBodyHasErrorCode(page.Body.String(), "NOT_FOUND") {
+			t.Fatalf("unknown path %s did not return JSON 404: status=%d body=%s", target, page.Code, page.Body.String())
 		}
 	}
 }

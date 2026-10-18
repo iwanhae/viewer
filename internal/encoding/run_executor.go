@@ -1,6 +1,7 @@
 package encoding
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -110,6 +111,45 @@ func (e *EncodingExecutor) Execute(ctx context.Context, run catalog.JobRun, item
 		}
 		return runs.Outcome{Status: "skipped"}
 	}
+	reader, _, loadErr := s.store.GetObject(work, pipeline.BlobKey(job.Hash))
+	if loadErr != nil {
+		if ctx.Err() != nil {
+			return runs.Outcome{Status: "cancelled"}, nil
+		}
+		return failed, nil // storage outages are retryable, not invalid input
+	}
+	defer func() {
+		if reader != nil {
+			_ = reader.Close()
+		}
+	}()
+	input := &contextReader{work, reader}
+	var header [12]byte
+	headerSize, headerErr := io.ReadFull(input, header[:])
+	if ctx.Err() != nil {
+		return runs.Outcome{Status: "cancelled"}, nil
+	}
+	if headerErr != nil && !errors.Is(headerErr, io.EOF) && !errors.Is(headerErr, io.ErrUnexpectedEOF) {
+		return failed, nil
+	}
+	// Restored catalogs may describe the original PNG/JPEG even though a prior
+	// replacement already put WebP under its stable source hash. Repair that
+	// metadata before enforcing original-source size/hash, just like workers do.
+	// Count the actual bytes without trusting stale sizes or buffering the body.
+	if isWebP(header[:headerSize]) {
+		n, err := io.Copy(io.Discard, io.LimitReader(input, MaxOutputBytes-int64(headerSize)+1))
+		if ctx.Err() != nil {
+			return runs.Outcome{Status: "cancelled"}, nil
+		}
+		if err != nil {
+			return failed, nil
+		}
+		n += int64(headerSize)
+		if n > MaxOutputBytes {
+			return terminal("failed", job.Type, "invalid source blob for encoding", job.SizeBytes), nil
+		}
+		return terminal("skipped", "image/webp", "", n), nil
+	}
 	if job.SizeBytes <= 0 || job.SizeBytes > MaxOutputBytes {
 		return terminal("failed", job.Type, "invalid source blob for encoding", job.SizeBytes), nil
 	}
@@ -119,16 +159,10 @@ func (e *EncodingExecutor) Execute(ctx context.Context, run catalog.JobRun, item
 	}
 	defer os.Remove(source.Name())
 	defer source.Close()
-	reader, _, loadErr := s.store.GetObject(work, pipeline.BlobKey(job.Hash))
-	if loadErr != nil {
-		if ctx.Err() != nil {
-			return runs.Outcome{Status: "cancelled"}, nil
-		}
-		return failed, nil // storage outages are retryable, not invalid input
-	}
 	hash := sha256.New()
-	n, copyErr := io.Copy(io.MultiWriter(source, hash), io.LimitReader(&contextReader{work, reader}, job.SizeBytes+1))
+	n, copyErr := io.Copy(io.MultiWriter(source, hash), io.LimitReader(io.MultiReader(bytes.NewReader(header[:headerSize]), input), job.SizeBytes+1))
 	_ = reader.Close()
+	reader = nil
 	if ctx.Err() != nil {
 		return runs.Outcome{Status: "cancelled"}, nil
 	}
@@ -137,14 +171,6 @@ func (e *EncodingExecutor) Execute(ctx context.Context, run catalog.JobRun, item
 	}
 	if n != job.SizeBytes || hex.EncodeToString(hash.Sum(nil)) != job.Hash {
 		return terminal("failed", job.Type, "invalid source blob for encoding", job.SizeBytes), nil
-	}
-	if _, err := source.Seek(0, io.SeekStart); err != nil {
-		return failed, nil
-	}
-	var header [12]byte
-	_, _ = io.ReadFull(source, header[:])
-	if isWebP(header[:]) {
-		return terminal("skipped", "image/webp", "", n), nil
 	}
 	if _, err := source.Seek(0, io.SeekStart); err != nil {
 		return failed, nil

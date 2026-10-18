@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"image"
 	"image/png"
 	"io"
@@ -474,8 +475,13 @@ func TestEncodingExecutorPermanentCommandFailureHidesDiagnostics(t *testing.T) {
 	assertNoLocalTemps(t, e)
 }
 
-func TestEncodingExecutorRejectsOversizedSourceBeforeDownload(t *testing.T) {
-	e, run, item, _ := localExecutorFixture(t, sourcePNG(t))
+func TestEncodingExecutorRejectsOversizedSourceBeforeFullDownload(t *testing.T) {
+	source := sourcePNG(t)
+	e, run, item, store := localExecutorFixture(t, source)
+	probe := bytes.NewReader(source)
+	e.service.store = executorReadStore{Store: store, get: func(context.Context, string) (io.ReadCloser, string, error) {
+		return io.NopCloser(probe), "image/png", nil
+	}}
 	if err := e.service.cat.UpsertBlob(context.Background(), catalog.Blob{Hash: item.Hash, SizeBytes: MaxOutputBytes + 1, ContentType: "image/png", SourceRestored: true}); err != nil {
 		t.Fatal(err)
 	}
@@ -487,6 +493,93 @@ func TestEncodingExecutorRejectsOversizedSourceBeforeDownload(t *testing.T) {
 	job, _ := e.service.cat.GetEncodingJob(context.Background(), item.Hash)
 	if err != nil || outcome.Status != "failed" || outcome.ErrorCode != "processing_failed" || job.Status != "failed" {
 		t.Fatalf("oversized source=%+v %v job=%+v", outcome, err, job)
+	}
+	if read := len(source) - probe.Len(); read != 12 {
+		t.Fatalf("oversized source read %d bytes; only the magic probe is allowed", read)
+	}
+	assertNoLocalTemps(t, e)
+}
+
+func TestEncodingExecutorRepairsPreviouslyReplacedWebP(t *testing.T) {
+	encoded := fixtureWebP(t)
+	for _, contentType := range []string{"image/png", "image/jpeg"} {
+		for _, staleSize := range []int64{int64(len(sourcePNG(t))), 13, 0, MaxOutputBytes + 1} {
+			t.Run(fmt.Sprintf("%s/size-%d", contentType, staleSize), func(t *testing.T) {
+				e, run, item, store := localExecutorFixture(t, sourcePNG(t))
+				if err := e.service.cat.UpsertBlob(context.Background(), catalog.Blob{Hash: item.Hash, SizeBytes: staleSize, ContentType: contentType, SourceRestored: true}); err != nil {
+					t.Fatal(err)
+				}
+				// A pre-conversion catalog was restored, but the prior replacement
+				// still lives under the original PNG/JPEG's content-addressed key.
+				store.objects["blobs/"+item.Hash] = encoded
+				e.runCommand = func(context.Context, string, []string, io.Writer) error {
+					t.Error("encoder invoked for a previously replaced WebP")
+					return nil
+				}
+				outcome, err := e.Execute(context.Background(), run, item)
+				job, getErr := e.service.cat.GetEncodingJob(context.Background(), item.Hash)
+				if err != nil || getErr != nil || outcome.Status != "skipped" || job.Status != "skipped" || job.Type != "image/webp" || job.SizeBytes != int64(len(encoded)) || job.Token != item.ClaimToken || job.Owner != "local" || !job.LeaseUntil.Equal(time.UnixMilli(0)) {
+					t.Fatalf("restored metadata not repaired: outcome=%+v err=%v job=%+v getErr=%v", outcome, err, job, getErr)
+				}
+				if store.putCalls != 0 || !bytes.Equal(store.objects["blobs/"+item.Hash], encoded) {
+					t.Fatal("already-WebP repair changed stored bytes")
+				}
+				assertNoLocalTemps(t, e)
+			})
+		}
+	}
+}
+
+type executorReadStore struct {
+	Store
+	get func(context.Context, string) (io.ReadCloser, string, error)
+}
+
+func (s executorReadStore) GetObject(ctx context.Context, key string) (io.ReadCloser, string, error) {
+	return s.get(ctx, key)
+}
+
+// Infinite input without allocating/writing a gigabyte-sized test fixture.
+type executorCountingReader struct{ bytes int64 }
+
+func (r *executorCountingReader) Read(p []byte) (int, error) {
+	r.bytes += int64(len(p))
+	return len(p), nil
+}
+
+func TestEncodingExecutorAlreadyWebPReadIsBounded(t *testing.T) {
+	e, run, item, store := localExecutorFixture(t, sourcePNG(t))
+	tail := &executorCountingReader{}
+	header := fixtureWebP(t)[:12]
+	e.service.store = executorReadStore{Store: store, get: func(context.Context, string) (io.ReadCloser, string, error) {
+		return io.NopCloser(io.MultiReader(bytes.NewReader(header), tail)), "image/webp", nil
+	}}
+	outcome, err := e.Execute(context.Background(), run, item)
+	job, _ := e.service.cat.GetEncodingJob(context.Background(), item.Hash)
+	if err != nil || outcome.Status != "failed" || job.Status != "failed" || job.Type != "image/png" || tail.bytes+int64(len(header)) != MaxOutputBytes+1 {
+		t.Fatalf("unbounded/unsafe WebP repair: %+v %v job=%+v bytes=%d", outcome, err, job, tail.bytes+int64(len(header)))
+	}
+	assertNoLocalTemps(t, e)
+}
+
+func TestEncodingExecutorAlreadyWebPRepairIsTokenFenced(t *testing.T) {
+	e, run, item, store := localExecutorFixture(t, sourcePNG(t))
+	var external catalog.EncodingJob
+	e.service.store = executorReadStore{Store: store, get: func(ctx context.Context, key string) (io.ReadCloser, string, error) {
+		if err := e.service.cat.ReleaseLocalEncoding(ctx, item.Hash, item.ClaimToken); err != nil {
+			return nil, "", err
+		}
+		jobs, err := e.service.cat.ClaimEncoding(ctx, 1, time.Hour)
+		if err != nil || len(jobs) != 1 {
+			return nil, "", fmt.Errorf("external claim: %v jobs=%v", err, jobs)
+		}
+		external = jobs[0]
+		return io.NopCloser(bytes.NewReader(fixtureWebP(t))), "image/webp", nil
+	}}
+	outcome, err := e.Execute(context.Background(), run, item)
+	job, _ := e.service.cat.GetEncodingJob(context.Background(), item.Hash)
+	if err != nil || outcome.Status != "busy" || outcome.ErrorCode != "claim_lost" || job.Status != "leased" || job.Owner != "external" || job.Token != external.Token || job.Type != "image/png" {
+		t.Fatalf("repair/release touched a newer external claim: %+v %v job=%+v", outcome, err, job)
 	}
 	assertNoLocalTemps(t, e)
 }
