@@ -7,7 +7,7 @@ Self-hosted photo album server. Upload a zip of photos; the server stores each i
 - Zip batch upload via presigned PUT (1 GiB cap).
 - Deduplicated storage: objects live at `blobs/<original-sha256>`, so identical uploaded images are stored once even after optional WebP encoding.
 - On-the-fly resized JPEGs (320/640/1024 widths), streamed from S3 and cached with response-byte ETags.
-- Optional external WebP encoder using `cwebp` Q85, preserving supported EXIF/ICC/XMP metadata and replacing only when smaller.
+- Admin-controlled local and optional external WebP encoding using `cwebp` Q85, preserving supported EXIF/ICC/XMP metadata and replacing only when smaller.
 - Semantic "similar photos" recommendations across albums (SigLIP2-base, 768-dim vectors in Qdrant).
 - Lease-based HTTP API so external GPU workers can drain the embedding backlog.
 - Protected admin browser for catalog, photo, blob, and album pipeline inspection; existing stats and recovery actions remain at `/admin/legacy`.
@@ -85,14 +85,14 @@ The viewer is deployed as a Docker image, and every setting is an environment va
 | `QDRANT_API_KEY` | no | (empty) | Sent as the `api-key` header on every Qdrant request. Sent only when set, so an unauthenticated server needs no placeholder. |
 | `QDRANT_COLLECTION` | when `QDRANT_URL` is set | — | Qdrant collection holding the per-photo embedding points. Deliberately no default: the viewer refuses to start with a URL but no collection. |
 | `SIGLIP2_MODEL_URL` | no | built-in mirror | Base URL the SigLIP2 checkpoint (`config.json`, `model.safetensors`, `tokenizer.json`) is fetched from on first start into `/app/siglip2`. Mount a prepared directory at `/app/siglip2` to skip the download. |
-| `WORKER_TOKEN` | no | (empty) | Shared bearer token for the external recommender and encoder APIs. Setting it enables WebP encoding, which runs independently of embedding jobs. |
+| `WORKER_TOKEN` | no | (empty) | Shared bearer token for external embedding and encoder APIs. Setting it enables external encoding routes; local encoding and spool recovery are always available. |
 | `ADMIN_TOKEN` | no | (empty) | Basic-auth password for `/admin`. Empty keeps the admin UI disabled. |
 | `ALLOW_BACKUP_OVERWRITE` | no | `false` | Lets the catalog finalizer overwrite the bucket's `backups/viewer.db` with a local database it would otherwise refuse to write (untraceable stamp, or drastically smaller than the backup it would replace). |
 
 Notes:
 
 - Set-but-blank values of `QDRANT_URL`, `WORKER_TOKEN`, `QDRANT_API_KEY`, `QDRANT_COLLECTION`, and `ADMIN_TOKEN` are rejected at startup rather than silently meaning "off".
-- `WEBP_ENCODING_ENABLED` is no longer read. Setting `WORKER_TOKEN` enables WebP encoding; there is no separate opt-out.
+- `WEBP_ENCODING_ENABLED` is no longer read. `WORKER_TOKEN` enables only the external encoding API, not local capability.
 - Existing deployments must rename `EMBEDDING_WORKER_TOKEN` to `WORKER_TOKEN`; a non-empty old variable now fails startup instead of leaving the worker API open.
 - Similarly, `QDRANT_API_KEY` or `QDRANT_COLLECTION` without `QDRANT_URL` is rejected: Qdrant is optional, but half-configured is a mistake, not an opt-out.
 - Some values are fixed constants, not environment variables: the 1 GiB upload cap, the 15 minute presign TTL, the `us-east-1` signing region, and the `/app/siglip2` checkpoint directory. See `internal/config/config.go`.
@@ -133,6 +133,33 @@ Notes:
 | POST | `/admin/api/operations` | Consumes a preview once and queues its durable, idempotent recovery operation. |
 | GET | `/admin/api/operations` | Newest-first paged operation audit list. |
 | GET | `/admin/api/operations/{id}` | Operation summary and bounded, cursor-paged per-target results. |
+| POST / GET | `/admin/api/runs` | Start a finite local `embedding` or `encoding` run / list durable runs. POST requires `Idempotency-Key` and `{"stage":"embedding"}` (or `encoding`). |
+| GET | `/admin/api/runs/{id}` | Run summary and paged target outcomes. |
+| POST | `/admin/api/runs/{id}/cancel` | Cancel only this local run; body `{}`. |
+| GET / POST | `/admin/api/automatic/embedding` | Read / change automatic local embedding; POST body `{"enabled":true}` or `{"enabled":false}`. |
+
+Automatic local embedding is **enabled by default on every server start**; its
+pause preference is process-local, not persisted. Both automatic-control methods
+return `{"enabled":boolean,"running":boolean,"pausedByManual":boolean}` with
+HTTP 200. `running` means the local poller exists (including while releasing
+claims), not that inference is active. `pausedByManual` means enabled automatic
+work is suspended by a manual embedding run or its pre-snapshot handoff. Pause
+waits for the automatic worker to release its claims; it neither cancels manual
+runs nor closes the model. A manual embedding run joins the automatic worker
+before snapshotting pending targets and resumes it afterward only if still
+enabled. Before successful model load, manual embedding returns HTTP 503
+`EXECUTOR_UNAVAILABLE` without creating a run; the automatic preference can
+already be changed. Invalid control JSON (including missing/null `enabled` or
+unknown fields) returns 400 `INVALID_REQUEST`; stopped/interrupted control
+returns 503 `UNAVAILABLE`. All mutations use the existing Admin auth,
+same-origin and `X-Admin-Action: 1` guards. External workers and their leases are
+unaffected by these local controls.
+
+Host deployments need `cwebp` on the server's `PATH` for local encoding (Debian:
+`apt-get install webp`). The Docker runtime includes this package. Missing
+`cwebp` is reported as a per-item `cwebp_unavailable` outcome. No worker token is
+needed locally; external encoding routes are absent without one. Encoding spool
+recovery always starts on boot, even when external worker routes are disabled.
 
 The admin document, legacy dashboard, and resource APIs require the same HTTP
 Basic password (`ADMIN_TOKEN`), and are absent when the admin service or token

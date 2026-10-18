@@ -21,7 +21,7 @@ const localCompletionTimeout = 2*LeaseTTL + time.Minute
 const maxSourcePixels = 100_000_000
 
 // EncodingExecutor performs exact-target local work, not polling. It deliberately
-// is not registered at startup. Service.Start must run with the service lifetime
+// requires Service.Start to run with the service lifetime
 // before use, so accepted output survives run cancellation and process restart.
 // cwebp_unavailable means install libwebp's cwebp executable on the server PATH;
 // local execution never needs WORKER_TOKEN or presigned URLs.

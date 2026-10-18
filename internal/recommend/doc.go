@@ -1,8 +1,9 @@
 // Package recommend serves cross-album recommendations from an external
 // Qdrant vector store and provides a shared queue with separate ownership paths
 // for token-fenced in-process workers and hash-only external workers. The local
-// worker drains pending blobs on its own, and external workers lease batches
-// over the worker API for the initial backfill.
+// worker drains pending blobs under runs.Manager's automatic enable/pause and
+// manual handoff control. External workers lease batches over the worker API
+// independently of Admin local cancellation.
 //
 // The service holds no vector state. SQLite keeps the bookkeeping — which blob
 // is pending, processing, ready, or failed — and the vector store keeps the

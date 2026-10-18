@@ -12,9 +12,8 @@ import (
 // EmbeddingExecutor adapts the existing image/inference/finalization pipeline to
 // finite durable runs. It owns no poller and never claims queue-wide work.
 //
-// Integration is deliberately deferred: register this for stage=embedding only
-// when both stage executors are ready, and remove the automatic Service.Start
-// call at that time. Do not start both local execution paths in production.
+// Register only after model load; Manager suspends and joins RunAutomatic before
+// taking a manual snapshot. Both paths share the model, never its lifetime.
 type EmbeddingExecutor struct {
 	service *Service
 }

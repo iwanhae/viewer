@@ -1,5 +1,5 @@
-// Package runs owns finite, manual, local-only stage runs. It never polls or
-// cancels external worker queues. Actual stage processors are injected.
+// Package runs owns manual local stage runs and the automatic local embedding
+// worker. It never cancels external worker queues. Processors are injected.
 package runs
 
 import (
@@ -14,8 +14,10 @@ import (
 )
 
 var (
-	ErrUnavailable = errors.New("local stage executor unavailable; no processor is registered for this stage")
-	ErrClosed      = errors.New("local run manager is stopping")
+	ErrUnavailable  = errors.New("local stage executor unavailable; no processor is registered for this stage")
+	ErrClosed       = errors.New("local run manager is stopping")
+	ErrRegistration = errors.New("invalid or duplicate local executor registration")
+	ErrAutomatic    = errors.New("automatic local worker did not stop cleanly; retry control before starting a manual run")
 )
 
 // Executor must claim only item.Hash, atomically from pending, using the item's
@@ -37,24 +39,33 @@ type Registration struct {
 	Executor Executor
 }
 
+func validRegistration(stage string, registration Registration) bool {
+	return catalog.ValidJobRunStage(stage) && registration.Name != "" && registration.Executor != nil
+}
+
 type Manager struct {
-	cat       *catalog.Store
-	ctx       context.Context
-	stop      context.CancelFunc
-	executors map[string]Registration
-	mu        sync.Mutex
-	active    map[string]context.CancelFunc
-	closed    bool
-	wg        sync.WaitGroup
+	cat             *catalog.Store
+	ctx             context.Context
+	stop            context.CancelFunc
+	executors       map[string]Registration
+	mu              sync.Mutex
+	active          map[string]context.CancelFunc
+	closed          bool
+	wg              sync.WaitGroup
+	autoEnabled     bool
+	autoWorker      func(context.Context) error
+	auto            *automaticExecution
+	manualEmbedding bool // includes the pre-snapshot automatic-worker handoff
 }
 
 // New uses the service lifetime, never an HTTP request context. Registration is
-// immutable. Open has already interrupted old runs; New never resumes them.
+// safe to extend at runtime. Open interrupted old runs; New never resumes them.
+// Automatic embedding defaults to enabled on each server start (not persisted).
 func New(ctx context.Context, cat *catalog.Store, executors map[string]Registration) *Manager {
 	ctx, stop := context.WithCancel(ctx)
-	m := &Manager{cat: cat, ctx: ctx, stop: stop, executors: make(map[string]Registration), active: make(map[string]context.CancelFunc)}
+	m := &Manager{cat: cat, ctx: ctx, stop: stop, executors: make(map[string]Registration), active: make(map[string]context.CancelFunc), autoEnabled: true}
 	for stage, executor := range executors {
-		if catalog.ValidJobRunStage(stage) && executor.Name != "" && executor.Executor != nil {
+		if validRegistration(stage, executor) {
 			m.executors[stage] = executor
 		}
 	}
@@ -77,8 +88,35 @@ func (m *Manager) Create(ctx context.Context, actor, stage, key string) (catalog
 	if !ok {
 		return catalog.JobRun{}, false, fmt.Errorf("%w: %s", ErrUnavailable, stage)
 	}
+	if stage == "embedding" {
+		if m.manualEmbedding {
+			return catalog.JobRun{}, false, catalog.ErrJobRunConflict
+		}
+		// Reserve the stage before unlocking. No competing submission or resume
+		// may start local work while we join the automatic worker. Its released
+		// claims must be pending before CreateJobRun takes the finite snapshot.
+		m.manualEmbedding = true
+		done := m.stopAutomaticLocked()
+		m.wg.Add(1) // Close must also join submissions awaiting the handoff.
+		defer m.wg.Done()
+		m.mu.Unlock()
+		err := m.waitAutomatic(ctx, done)
+		m.mu.Lock()
+		if err == nil && (m.closed || m.ctx.Err() != nil) {
+			err = ErrClosed
+		}
+		if err != nil {
+			m.manualEmbedding = false
+			m.startAutomaticLocked()
+			return catalog.JobRun{}, false, err
+		}
+	}
 	r, repeated, err := m.cat.CreateJobRun(ctx, actor, stage, key, executor.Name)
 	if err != nil || repeated {
+		if stage == "embedding" {
+			m.manualEmbedding = false
+			m.startAutomaticLocked()
+		}
 		return r, repeated, err
 	}
 	runCtx, cancel := context.WithCancel(m.ctx)
@@ -86,7 +124,16 @@ func (m *Manager) Create(ctx context.Context, actor, stage, key string) (catalog
 	m.wg.Add(1)
 	go func() {
 		defer m.wg.Done()
-		defer func() { cancel(); m.mu.Lock(); delete(m.active, r.ID); m.mu.Unlock() }()
+		defer func() {
+			cancel()
+			m.mu.Lock()
+			defer m.mu.Unlock()
+			delete(m.active, r.ID)
+			if r.Stage == "embedding" {
+				m.manualEmbedding = false
+				m.startAutomaticLocked()
+			}
+		}()
 		m.execute(runCtx, r, executor.Executor)
 	}()
 	return r, false, nil

@@ -39,7 +39,7 @@ COPY --from=backend-build --chown=65532:65532 /out/viewer /app/viewer
 # The bounded encoder result spool also lives here so accepted outputs survive
 # a container replacement. Staged zips being unpacked still go to /tmp.
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ca-certificates && \
+    apt-get install -y --no-install-recommends ca-certificates webp && \
     rm -rf /var/lib/apt/lists/* && \
     mkdir -p /app/siglip2 /var/lib/viewer && \
     chown -R 65532:65532 /app /var/lib/viewer

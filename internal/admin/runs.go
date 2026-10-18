@@ -30,3 +30,17 @@ func (s *Service) Runs(ctx context.Context, limit int, cursor string) (catalog.J
 func (s *Service) Run(ctx context.Context, id string, limit int, cursor string) (catalog.JobRunItemPage, error) {
 	return s.cat.JobRunItems(ctx, id, limit, cursor)
 }
+
+func (s *Service) AutomaticEmbedding() (runs.AutomaticEmbeddingStatus, error) {
+	if s.runs == nil {
+		return runs.AutomaticEmbeddingStatus{}, runs.ErrUnavailable
+	}
+	return s.runs.AutomaticEmbedding()
+}
+
+func (s *Service) SetAutomaticEmbedding(ctx context.Context, enabled bool) (runs.AutomaticEmbeddingStatus, error) {
+	if s.runs == nil {
+		return runs.AutomaticEmbeddingStatus{}, runs.ErrUnavailable
+	}
+	return s.runs.SetAutomaticEmbedding(ctx, enabled)
+}

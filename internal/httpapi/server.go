@@ -37,8 +37,8 @@ type Server struct {
 	adminToken     string
 }
 
-// New wires the API together. An empty workerToken runs the external worker
-// endpoints without auth, which is only sensible on a trusted network. The
+// New wires the API together. An empty workerToken runs external embedding
+// endpoints without auth, but leaves external encoding routes absent. The
 // admin surface only registers when both an adminService and an adminToken are
 // supplied: a dashboard that answered without its credential would be an
 // unauthenticated view of the whole library, so either half missing simply
@@ -55,7 +55,7 @@ func New(albumsService *albums.Service, feedService *feed.Service, imageService 
 	}
 }
 
-// WithEncoder enables the external encoding routes when the feature is on.
+// WithEncoder supplies encoding; external routes also require workerToken.
 func (s *Server) WithEncoder(service *encoding.Service) *Server {
 	s.encoder = service
 	s.encodingOutput = service
@@ -96,7 +96,7 @@ func (s *Server) Router() http.Handler {
 		r.Post("/api/embedding/claim", s.claimEmbeddings)
 		r.Post("/api/embedding/renew", s.renewLeases)
 		r.Post("/api/embedding/results", s.postEmbeddingResults)
-		if s.encoder != nil {
+		if s.encoder != nil && s.workerToken != "" {
 			r.Post("/api/encoding/claim", s.claimEncoding)
 			r.Post("/api/encoding/renew", s.renewEncoding)
 			r.Post("/api/encoding/complete", s.completeEncoding)
@@ -146,6 +146,8 @@ func (s *Server) Router() http.Handler {
 			r.Get("/api/runs", s.adminRuns)
 			r.Get("/api/runs/{id}", s.adminRun)
 			r.Post("/api/runs/{id}/cancel", s.adminCancelRun)
+			r.Get("/api/automatic/embedding", s.adminAutomaticEmbedding)
+			r.Post("/api/automatic/embedding", s.adminSetAutomaticEmbedding)
 			r.Post("/api/reindex", s.adminReindex)
 			r.Post("/api/recover", s.adminRecover)
 		})

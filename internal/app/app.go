@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"viewer/internal/admin"
@@ -40,6 +41,8 @@ const embeddingLoadTimeout = 15 * time.Minute
 const backupInterval = time.Hour
 
 func Run(ctx context.Context) error {
+	ctx, stop := context.WithCancel(ctx)
+	defer stop()
 	cfg, err := cfgpkg.Load()
 	if err != nil {
 		return err
@@ -99,13 +102,11 @@ func Run(ctx context.Context) error {
 		return fmt.Errorf("open metadata catalog: %w", err)
 	}
 	defer cat.Close()
-	var encodingService *encoding.Service
-	if cfg.WebPEncodingEnabled {
-		encodingService = encoding.New(cat, store, filepath.Join(cfg.StateDir, "encoding-spool"))
-		if err := encodingService.Start(ctx); err != nil {
-			return fmt.Errorf("start WebP encoding: %w", err)
-		}
+	encodingService, err := startLocalEncoding(ctx, cat, store, cfg.StateDir)
+	if err != nil {
+		return err
 	}
+	defer func() { stop(); encodingService.Close() }()
 
 	// The migration only guarantees the collection exists when it had vectors
 	// to move. Ensure it on every boot so a fresh or already-migrated catalog
@@ -151,29 +152,29 @@ func Run(ctx context.Context) error {
 	recommendService := recommend.NewService(cat, vectorStore, imageService, recommend.NewVisionEmbedder(vision.Config{
 		ModelID: cfgpkg.ModelDir,
 	}), finalizer.Run)
+	defer recommendService.Close()
 
 	// The admin service reads the catalog and vector store, and its re-embed
-	// trigger only flips catalog rows the workers already drain. Include the
-	// server-side encoder feature flag so the dashboard distinguishes disabled
-	// encoding from an empty queue. Creating it here — before the
+	// trigger only flips catalog rows the workers already drain. Local encoding
+	// is always available, regardless of external worker credentials. Creating
+	// it here — before the
 	// HTTP bind, like everything else — means /admin answers from the first
 	// served request on.
-	// Transitional orchestration shell: no local stage processors are registered
-	// yet, so manual creation returns EXECUTOR_UNAVAILABLE rather than fake work.
-	// The automatic recommendService.Start below is intentionally unchanged here;
-	// it MUST be removed/replaced when the embedding executor is integrated, so
-	// automatic local workers cannot compete with manually managed local runs.
-	runManager := runs.New(ctx, cat, nil)
+	runManager := newLocalRunManager(ctx, cat, encodingService)
+	var modelLoad sync.WaitGroup
 	defer func() {
-		closeCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		if err := runManager.Close(closeCtx); err != nil {
+		stop()
+		// Join, rather than timing out and closing SQLite/model under live work.
+		// Executors bound their uncancellable completion/claim cleanup sections.
+		modelLoad.Wait()
+		if err := runManager.Close(context.Background()); err != nil {
 			log.Printf("viewer: local run manager shutdown failed: %v", err)
 		}
 	}()
-	adminService := admin.NewService(cat, vectorStore, recommendService).WithEncodingEnabled(cfg.WorkerToken != "").WithRunManager(runManager)
+	adminService := admin.NewService(cat, vectorStore, recommendService).WithEncodingEnabled(true).WithRunManager(runManager)
 	adminService.StartRecoveryWorker(ctx, cfg.AdminToken != "")
 	defer func() {
+		stop()
 		closeCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		if err := adminService.Close(closeCtx); err != nil {
@@ -226,7 +227,9 @@ func Run(ctx context.Context) error {
 	}
 	log.Printf("viewer: starting HTTP server on %s", srv.Addr)
 	serverStopped := make(chan struct{})
+	shutdownDone := make(chan struct{})
 	go func() {
+		defer close(shutdownDone)
 		select {
 		case <-ctx.Done():
 			shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -239,6 +242,7 @@ func Run(ctx context.Context) error {
 			return
 		}
 	}()
+	defer func() { stop(); <-shutdownDone }()
 
 	// The model resolves in the background so a cold start serves requests
 	// while the checkpoint is still downloading: fetch it, load the vision
@@ -247,8 +251,10 @@ func Run(ctx context.Context) error {
 	// pending - the same degradation as a missing checkpoint. The workers must
 	// not start earlier: an embed attempt against an incomplete directory
 	// caches the load failure permanently.
+	modelLoad.Add(1)
 	go func() {
-		loadCtx, cancel := context.WithTimeout(context.Background(), embeddingLoadTimeout)
+		defer modelLoad.Done()
+		loadCtx, cancel := context.WithTimeout(ctx, embeddingLoadTimeout)
 		defer cancel()
 		if err := checkpoint.Ensure(loadCtx, cfgpkg.ModelDir, cfg.ModelURL); err != nil {
 			// vision.Load then fails on the incomplete directory and marks the
@@ -257,14 +263,18 @@ func Run(ctx context.Context) error {
 		}
 		if err := recommendService.LoadModel(loadCtx); err != nil {
 			log.Printf("viewer: embedding model unavailable, continuing without embeddings: %v", err)
+			return
 		}
 		if !recommendService.Enabled() {
 			log.Printf("viewer: embedding model unavailable; serving recommendations from stored embeddings only")
 			return
 		}
 		log.Printf("viewer: recommendation service enabled (model=%s)", cfgpkg.ModelDir)
-		recommendService.Start(ctx)
-		log.Printf("viewer: embedding background workers started")
+		if err := registerEmbedding(runManager, recommendService); err != nil {
+			log.Printf("viewer: registering local embedding failed: %v", err)
+			return
+		}
+		log.Printf("viewer: managed local embedding available")
 	}()
 
 	log.Printf("viewer: startup tasks running in background")
@@ -287,4 +297,30 @@ func Run(ctx context.Context) error {
 	err = srv.ListenAndServe()
 	close(serverStopped)
 	return err
+}
+
+// Local capability and spool recovery do not depend on external worker auth.
+func startLocalEncoding(ctx context.Context, cat *catalog.Store, store encoding.Store, stateDir string) (*encoding.Service, error) {
+	service := encoding.New(cat, store, filepath.Join(stateDir, "encoding-spool"))
+	if err := service.Start(ctx); err != nil {
+		return nil, fmt.Errorf("start WebP encoding: %w", err)
+	}
+	return service, nil
+}
+
+func newLocalRunManager(ctx context.Context, cat *catalog.Store, encoder *encoding.Service) *runs.Manager {
+	return runs.New(ctx, cat, map[string]runs.Registration{
+		"encoding": {Name: "local-cwebp/v1", Executor: encoding.NewEncodingExecutor(encoder)},
+	})
+}
+
+// Called only after successful LoadModel, never while the model is unavailable.
+func registerEmbedding(manager *runs.Manager, service *recommend.Service) error {
+	if !service.Enabled() {
+		return runs.ErrUnavailable
+	}
+	if err := manager.Register("embedding", runs.Registration{Name: "local-siglip2/v1", Executor: recommend.NewEmbeddingExecutor(service)}); err != nil {
+		return err
+	}
+	return manager.RegisterAutomaticEmbedding(service.RunAutomatic)
 }

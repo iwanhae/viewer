@@ -1,6 +1,6 @@
-// Package encoding coordinates external WebP workers. Legacy workers stage
-// output in object storage; API-mode workers stream to a bounded local spool.
-// Both paths validate output before replacing the original blob key.
+// Package encoding coordinates local and external WebP execution. Legacy
+// workers stage output in object storage; API-mode and local workers use a
+// bounded local spool. Both paths validate output before replacing the blob key.
 package encoding
 
 import (
@@ -72,6 +72,8 @@ type Service struct {
 
 	startMu  sync.Mutex
 	started  bool
+	stop     context.CancelFunc
+	wg       sync.WaitGroup
 	queueMu  sync.Mutex
 	queued   map[string]struct{}
 	uploadMu sync.Mutex
@@ -222,11 +224,25 @@ func (s *Service) Start(ctx context.Context) error {
 	}
 
 	s.started = true
+	ctx, s.stop = context.WithCancel(ctx)
 	for i := 0; i < outputProcessors; i++ {
-		go s.runOutputProcessor(ctx)
+		s.wg.Add(1)
+		go func() { defer s.wg.Done(); s.runOutputProcessor(ctx) }()
 	}
-	go s.scanReceivedOutputs(ctx)
+	s.wg.Add(1)
+	go func() { defer s.wg.Done(); s.scanReceivedOutputs(ctx) }()
 	return nil
+}
+
+// Close stops and joins recovery/output processing before catalog shutdown.
+// Call after the HTTP server and local run manager have stopped accepting work.
+func (s *Service) Close() {
+	s.startMu.Lock()
+	if s.stop != nil {
+		s.stop()
+	}
+	s.startMu.Unlock()
+	s.wg.Wait()
 }
 
 // ReceiveOutput persists a worker's fully uploaded WebP to a private local

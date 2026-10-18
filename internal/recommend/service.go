@@ -74,7 +74,8 @@ type Service struct {
 	// deployment could go days between backups while embeddings still land.
 	onEmbeddingDrain func(ctx context.Context) error
 
-	startOnce sync.Once
+	startOnce   sync.Once
+	inferenceMu sync.Mutex // shared by local runs, the poller, and query inference
 
 	// modelMu guards model loading and modelErr. A failed load marks the
 	// embedder unusable so the ingest pipeline keeps blobs pending instead of
@@ -154,11 +155,16 @@ func (s *Service) Enabled() bool {
 	return s.modelErr == nil
 }
 
+// Close releases the shared model after all local workers and requests join.
+// Pausing automatic embedding must never call this method.
+func (s *Service) Close() error { return s.close() }
+
 // close releases the embedding model.
 func (s *Service) close() error {
 	if s == nil || s.embedder == nil {
 		return nil
 	}
+	s.finishEmbeddingRun()
 	return s.embedder.Close()
 }
 
@@ -167,6 +173,11 @@ func (s *Service) close() error {
 // by embeddingTimeout; a deadline counts as transient, so the blob stays
 // pending for a later retry instead of being marked failed.
 func (s *Service) computeEmbedding(ctx context.Context, imageBytes []byte) ([]float32, error) {
+	s.inferenceMu.Lock()
+	defer s.inferenceMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	embedCtx, cancel := context.WithTimeout(ctx, embeddingTimeout)
 	defer cancel()
 
@@ -181,7 +192,8 @@ func (s *Service) computeEmbedding(ctx context.Context, imageBytes []byte) ([]fl
 	return s.embedder.Embed(embedCtx, imageBytes)
 }
 
-// Start launches the background embedding workers.
+// Start launches standalone background workers. The app instead supplies the
+// restartable RunAutomatic entry point to runs.Manager.
 func (s *Service) Start(ctx context.Context) {
 	s.startOnce.Do(func() {
 		if !s.Enabled() {
@@ -195,20 +207,39 @@ func (s *Service) Start(ctx context.Context) {
 
 		concurrency := embeddingConcurrency
 		for i := 0; i < concurrency; i++ {
-			go s.workerLoop(ctx)
+			go func() { _ = s.workerLoop(ctx) }()
 		}
 	})
 }
 
-func (s *Service) workerLoop(ctx context.Context) {
+// RunAutomatic is the blocking, restartable Manager worker entry point. It
+// retains the existing queue drain/finalizer behavior, releases token-fenced
+// claims before returning, and never closes the shared model. An open drain is
+// retained across pauses so a resumed idle tick still runs its finalizer.
+func (s *Service) RunAutomatic(ctx context.Context) error {
+	if s.Enabled() {
+		return s.workerLoop(ctx)
+	}
+	return nil
+}
+
+func (s *Service) workerLoop(ctx context.Context) (workerErr error) {
 	idleTicker := time.NewTicker(500 * time.Millisecond)
 	defer idleTicker.Stop()
+	var claims []catalog.LocalEmbeddingClaim
+	defer func() {
+		cleanup, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if _, err := s.ReleaseLocalClaims(cleanup, claims); err != nil {
+			log.Printf("recommend: automatic claim cleanup failed: %v", err)
+			workerErr = err
+		}
+	}()
 
 	for {
 		select {
 		case <-ctx.Done():
-			s.finishEmbeddingRun()
-			return
+			return nil
 		case <-idleTicker.C:
 		}
 
@@ -233,14 +264,14 @@ func (s *Service) workerLoop(ctx context.Context) {
 			}
 			continue
 		}
+		claims = blobs
 		s.beginEmbeddingRun(len(blobs))
 		for i, blob := range blobs {
 			if ctx.Err() != nil {
 				// Never strand the unprocessed remainder: hand their claims
 				// back so the next worker picks them up without waiting for
 				// the lease to expire.
-				_, _ = s.ReleaseLocalClaims(context.Background(), blobs[i:])
-				return
+				return nil // deferred cleanup joins release of this whole batch
 			}
 			// A transient failure leaves the blob pending for a later retry. A
 			// panic in the embedder is treated the same way: recover here so
@@ -260,8 +291,7 @@ func (s *Service) workerLoop(ctx context.Context) {
 			if transient {
 				select {
 				case <-ctx.Done():
-					_, _ = s.ReleaseLocalClaims(context.Background(), blobs[i+1:])
-					return
+					return nil
 				case <-time.After(2 * time.Second):
 				}
 			}
@@ -276,6 +306,15 @@ func (s *Service) workerLoop(ctx context.Context) {
 				s.logEmbeddingProgress()
 			}
 		}
+		// Also release any token whose terminal bookkeeping failed.
+		cleanup, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		_, releaseErr := s.ReleaseLocalClaims(cleanup, claims)
+		cancel()
+		if releaseErr != nil {
+			log.Printf("recommend: automatic batch cleanup failed: %v", releaseErr)
+			return releaseErr
+		}
+		claims = nil
 	}
 }
 
@@ -311,7 +350,7 @@ func (s *Service) beginEmbeddingRun(batch int) {
 }
 
 // finishEmbeddingRun closes the record opened by beginEmbeddingRun. It is
-// called on every idle tick and on shutdown, and reports whether a drain was
+// called on every idle tick and on model close, and reports whether a drain was
 // actually in progress and has now closed — the signal the drain hook keys on,
 // so a quiet ticker never re-triggers it.
 func (s *Service) finishEmbeddingRun() bool {
@@ -616,6 +655,10 @@ func isZeroNorm(vector []float32) bool {
 func (s *Service) embedBlob(ctx context.Context, claim catalog.LocalEmbeddingClaim) bool {
 	hash := claim.Hash
 	data, err := s.images.GetImageBytes(ctx, hash)
+	if ctx.Err() != nil {
+		_, _ = s.ReleaseLocalClaims(context.Background(), []catalog.LocalEmbeddingClaim{claim})
+		return true
+	}
 	if err != nil {
 		log.Printf("recommend: blob=%s image load failed: %v", hash, err)
 		s.persistFailed(context.Background(), claim, fmt.Sprintf("load image bytes: %v", err))
@@ -624,6 +667,10 @@ func (s *Service) embedBlob(ctx context.Context, claim catalog.LocalEmbeddingCla
 
 	startedAt := time.Now()
 	vector, err := s.computeEmbedding(ctx, data)
+	if ctx.Err() != nil {
+		_, _ = s.ReleaseLocalClaims(context.Background(), []catalog.LocalEmbeddingClaim{claim})
+		return true
+	}
 	if err != nil {
 		if isTransientEmbedError(err) {
 			log.Printf("recommend: blob=%s embed transient failure: %v", hash, err)
@@ -786,7 +833,14 @@ func (s *Service) Search(ctx context.Context, query string, limit int) (Recommen
 		return RecommendationResponse{}, ErrEmptyQuery
 	}
 
-	vector, err := textEmbedder.EmbedText(ctx, trimmed)
+	vector, err := func() ([]float32, error) {
+		s.inferenceMu.Lock()
+		defer s.inferenceMu.Unlock()
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		return textEmbedder.EmbedText(ctx, trimmed)
+	}()
 	if err != nil {
 		return RecommendationResponse{}, fmt.Errorf("embed query: %w", err)
 	}
@@ -849,7 +903,7 @@ func (s *Service) SearchByImage(ctx context.Context, imageBytes []byte, limit in
 		return RecommendationResponse{}, ErrUnreadableImage
 	}
 
-	vector, err := s.embedder.Embed(ctx, imageBytes)
+	vector, err := s.computeEmbedding(ctx, imageBytes)
 	if err != nil {
 		if errors.Is(err, ErrUnreadableImage) {
 			// Pass the classified error through unwrapped: the 400 is the

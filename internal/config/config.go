@@ -102,7 +102,9 @@ type Config struct {
 	ModelURL string
 
 	// WorkerToken protects both external worker APIs.
-	WorkerToken         string
+	WorkerToken string
+	// WebPEncodingEnabled is the external-route switch only. Local execution
+	// and accepted-output recovery do not depend on worker credentials.
 	WebPEncodingEnabled bool
 
 	// QdrantURL is the REST base URL of the external Qdrant server vector
