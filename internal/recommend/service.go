@@ -454,6 +454,14 @@ func (s *Service) ApplyExternalEmbeddingResults(ctx context.Context, results []c
 }
 
 func (s *Service) applyEmbeddingResults(ctx context.Context, results []catalog.EmbeddingResult, tokens []string) (applied int, rejected []catalog.RejectedEmbedding, err error) {
+	applied, rejected, err = s.applyEmbeddingResultsWithCompletion(ctx, ctx, results, tokens)
+	if err != nil {
+		return 0, nil, err
+	}
+	return applied, rejected, nil
+}
+
+func (s *Service) applyEmbeddingResultsWithCompletion(ctx, completionCtx context.Context, results []catalog.EmbeddingResult, tokens []string) (applied int, rejected []catalog.RejectedEmbedding, err error) {
 	if s == nil {
 		return 0, nil, fmt.Errorf("catalog is not available")
 	}
@@ -503,12 +511,15 @@ func (s *Service) applyEmbeddingResults(ctx context.Context, results []catalog.E
 	var appliedHashes []string
 	var catalogRejected []catalog.RejectedEmbedding
 	if tokens != nil {
-		appliedHashes, catalogRejected, err = s.catalog.FinalizeLocalEmbeddingResults(ctx, local, write)
+		appliedHashes, catalogRejected, err = s.catalog.FinalizeLocalEmbeddingResultsWithCompletion(ctx, completionCtx, local, write)
 	} else {
 		appliedHashes, catalogRejected, err = s.catalog.FinalizeExternalEmbeddingResults(ctx, valid, write)
 	}
 	if err != nil {
-		return 0, nil, err
+		// A completion cleanup error cannot undo hashes already committed. The
+		// run adapter preserves those successes; the batch wrapper above keeps
+		// its existing all-errors-return-zero contract.
+		return len(appliedHashes), nil, err
 	}
 	rejected = append(rejected, catalogRejected...)
 	// The catalog reservation accepts only the first valid result per hash.

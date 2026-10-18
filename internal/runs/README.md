@@ -55,8 +55,8 @@ Catalog APIs: `CreateJobRun`, `FindJobRunSubmission`, `JobRun`, `JobRuns`,
 `JobRunItems`, `StartJobRun`, `NextJobRunItem`, `FinishJobRunItem`,
 `RequestJobRunCancel`, `FinishJobRun`. Snapshotting pending hashes takes no blob
 leases. `NextJobRunItem` reserves **run bookkeeping only**, supplying a private
-`ClaimToken`. The next executor integration must add exact-hash atomic blob claim
-APIs that bind that token to the stage claim and reject non-pending targets.
+`ClaimToken`. Exact-hash atomic blob claim APIs must bind that token to the stage
+claim and reject non-pending targets.
 Do not use the existing queue-wide claim methods: they can claim outside the
 snapshot. If an external worker wins after snapshot, return `busy`; never steal
 its lease, retry indefinitely, or append new uploads. Check cancellation before
@@ -64,6 +64,23 @@ claims, fence every write, release only owned claims, and return `succeeded` onl
 after durable stage completion. Executor errors are safely reduced to machine
 codes. The shell does not implement embedding, cwebp, stage lease renewal, or
 cross-store commit reconciliation.
+
+### Embedding adapter (Step 4A, not registered yet)
+
+`recommend.NewEmbeddingExecutor(recommendService)` implements `runs.Executor` for
+`stage=embedding`, reusing image loading, bounded model inference, result validation,
+photo vector upload, and catalog finalization. It does not start a worker or poller.
+`catalog.ClaimLocalEmbedding(ctx, hash, item.ClaimToken, leaseUntil)` claims only
+that pending hash, returning `claimed`, `busy`, or `missing`; even expired processing
+leases are not reclaimed by this API. Busy and missing become safe run outcomes.
+
+Cancellation before reservation releases only the item's matching token. The
+opt-in `FinalizeLocalEmbeddingResultsWithCompletion` separates the cancellable
+reservation context from a bounded completion context: once reserved, vector upload
+and catalog bookkeeping settle independently of run cancellation. A committed
+result remains successful. Existing local/external batch finalization still uses
+the original context for both phases. Failures use allowlisted run codes, never
+raw provider/storage errors; transient failures leave the blob pending for retry.
 
 Startup interrupts only unfinished run records, retaining terminal item outcomes.
 Run cleanup releases only token-matching local embedding or leased encoding

@@ -3,6 +3,7 @@ package catalog
 import (
 	"context"
 	"crypto/rand"
+	"database/sql"
 	"errors"
 	"fmt"
 	"strings"
@@ -19,6 +20,57 @@ type LocalEmbeddingClaim struct {
 type LocalEmbeddingResult struct {
 	EmbeddingResult
 	Token string
+}
+
+type LocalEmbeddingClaimStatus string
+
+const (
+	LocalEmbeddingClaimed LocalEmbeddingClaimStatus = "claimed"
+	LocalEmbeddingBusy    LocalEmbeddingClaimStatus = "busy"
+	LocalEmbeddingMissing LocalEmbeddingClaimStatus = "missing"
+)
+
+// ClaimLocalEmbedding claims exactly hash with the caller's private run-item
+// token. Unlike the batch queue API, it accepts ONLY pending blobs: even an
+// expired processing lease belongs to another attempt and is left untouched.
+// Busy includes terminal or finalizing blobs; missing never claims a substitute.
+func (s *Store) ClaimLocalEmbedding(ctx context.Context, hash, token string, leaseUntil time.Time) (LocalEmbeddingClaim, LocalEmbeddingClaimStatus, error) {
+	if hash == "" || token == "" {
+		return LocalEmbeddingClaim{}, "", errors.New("local embedding hash and token are required")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return LocalEmbeddingClaim{}, "", err
+	}
+	defer tx.Rollback()
+	if err := lockCatalogWriter(ctx, tx); err != nil {
+		return LocalEmbeddingClaim{}, "", err
+	}
+	claim := LocalEmbeddingClaim{Token: token}
+	err = tx.QueryRowContext(ctx, `UPDATE blobs SET embedding_status='processing', embedding_lease_until=?, embedding_owner='local', embedding_token=?
+		WHERE hash=? AND embedding_status='pending' AND embedding_finalizing=''
+		RETURNING hash, size_bytes, content_type, created_at, embedding_status`, leaseUntil.UnixMilli(), token, hash).Scan(
+		&claim.Hash, &claim.SizeBytes, &claim.ContentType, &claim.CreatedAt, &claim.EmbeddingStatus)
+	status := LocalEmbeddingClaimed
+	if errors.Is(err, sql.ErrNoRows) {
+		claim = LocalEmbeddingClaim{}
+		var exists bool
+		if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM blobs WHERE hash=?)`, hash).Scan(&exists); err != nil {
+			return LocalEmbeddingClaim{}, "", err
+		}
+		status = LocalEmbeddingBusy
+		if !exists {
+			status = LocalEmbeddingMissing
+		}
+	} else if err != nil {
+		return LocalEmbeddingClaim{}, "", err
+	} else if _, err := observeStage(ctx, tx, hash, "embedding", "claimed", string(EmbeddingStatusProcessing), "", time.Now(), true, false, false, "", "unknown"); err != nil {
+		return LocalEmbeddingClaim{}, "", err
+	}
+	if err := tx.Commit(); err != nil {
+		return LocalEmbeddingClaim{}, "", err
+	}
+	return claim, status, nil
 }
 
 func (s *Store) ClaimLocalEmbeddings(ctx context.Context, limit int, leaseUntil time.Time) ([]LocalEmbeddingClaim, error) {
@@ -93,13 +145,22 @@ func (s *Store) updateLocalEmbeddingClaims(ctx context.Context, claims []LocalEm
 // failure they are cleared; after a crash Open's startup reset clears them.
 // As with the existing startup reset, only one server process may open a catalog.
 func (s *Store) FinalizeLocalEmbeddingResults(ctx context.Context, results []LocalEmbeddingResult, write func(context.Context, []EmbeddingResult) error) ([]string, []RejectedEmbedding, error) {
+	return s.FinalizeLocalEmbeddingResultsWithCompletion(ctx, ctx, results, write)
+}
+
+// FinalizeLocalEmbeddingResultsWithCompletion uses ctx only to reserve ownership.
+// Once reserved, write and bookkeeping use completionCtx, allowing a manual run's
+// already-started side effect to settle despite run cancellation. Callers should
+// bound completionCtx independently. Existing local/external batch semantics do
+// not detach cancellation.
+func (s *Store) FinalizeLocalEmbeddingResultsWithCompletion(ctx, completionCtx context.Context, results []LocalEmbeddingResult, write func(context.Context, []EmbeddingResult) error) ([]string, []RejectedEmbedding, error) {
 	plain := make([]EmbeddingResult, 0, len(results))
 	tokens := make([]string, 0, len(results))
 	for _, result := range results {
 		plain = append(plain, result.EmbeddingResult)
 		tokens = append(tokens, result.Token)
 	}
-	return s.finalizeEmbeddingResults(ctx, plain, tokens, write)
+	return s.finalizeEmbeddingResultsWithCompletion(ctx, completionCtx, plain, tokens, write)
 }
 
 // FinalizeExternalEmbeddingResults preserves legacy hash-only acceptance,
@@ -111,6 +172,10 @@ func (s *Store) FinalizeExternalEmbeddingResults(ctx context.Context, results []
 }
 
 func (s *Store) finalizeEmbeddingResults(ctx context.Context, results []EmbeddingResult, tokens []string, write func(context.Context, []EmbeddingResult) error) (applied []string, rejected []RejectedEmbedding, err error) {
+	return s.finalizeEmbeddingResultsWithCompletion(ctx, ctx, results, tokens, write)
+}
+
+func (s *Store) finalizeEmbeddingResultsWithCompletion(ctx, completionCtx context.Context, results []EmbeddingResult, tokens []string, write func(context.Context, []EmbeddingResult) error) (applied []string, rejected []RejectedEmbedding, err error) {
 	reservation := rand.Text()
 	valid, rejected, err := s.reserveEmbeddingResults(ctx, results, tokens, reservation)
 	if err != nil {
@@ -128,11 +193,11 @@ func (s *Store) finalizeEmbeddingResults(ctx context.Context, results []Embeddin
 		}
 	}()
 	if write != nil {
-		if err := write(ctx, valid); err != nil {
+		if err := write(completionCtx, valid); err != nil {
 			return nil, rejected, err
 		}
 	}
-	applied, moreRejected, err := s.applyEmbeddingResults(ctx, valid, reservation)
+	applied, moreRejected, err := s.applyEmbeddingResults(completionCtx, valid, reservation)
 	return applied, append(rejected, moreRejected...), err
 }
 
