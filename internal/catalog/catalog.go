@@ -8,6 +8,7 @@ package catalog
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -201,7 +202,8 @@ func Open(path string, sink VectorSink) (*Store, error) {
 			break
 		}
 		for _, hash := range staleHashes {
-			if _, err := startupTx.ExecContext(context.Background(), `UPDATE blobs SET embedding_status='pending', embedding_lease_until=0
+			if _, err := startupTx.ExecContext(context.Background(), `UPDATE blobs SET embedding_status='pending', embedding_lease_until=0,
+				embedding_owner='external', embedding_token='', embedding_finalizing=''
 				WHERE hash=? AND embedding_status='processing'`, hash); err != nil {
 				_ = startupTx.Rollback()
 				db.Close()
@@ -823,6 +825,20 @@ type RejectedEmbedding struct {
 // serialized write transaction. Returned rows are re-sorted by created_at.
 // Encoding runs independently and never affects embedding eligibility.
 func (s *Store) ClaimPendingEmbeddings(ctx context.Context, limit int, leaseUntil time.Time) ([]Blob, error) {
+	return s.ClaimExternalEmbeddings(ctx, limit, leaseUntil)
+}
+
+// ClaimExternalEmbeddings retains the legacy hash-only external worker contract.
+func (s *Store) ClaimExternalEmbeddings(ctx context.Context, limit int, leaseUntil time.Time) ([]Blob, error) {
+	claims, err := s.claimEmbeddings(ctx, limit, leaseUntil, "external")
+	blobs := make([]Blob, 0, len(claims))
+	for _, claim := range claims {
+		blobs = append(blobs, claim.Blob)
+	}
+	return blobs, err
+}
+
+func (s *Store) claimEmbeddings(ctx context.Context, limit int, leaseUntil time.Time, owner string) ([]LocalEmbeddingClaim, error) {
 	now := time.Now()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -834,7 +850,7 @@ func (s *Store) ClaimPendingEmbeddings(ctx context.Context, limit int, leaseUnti
 	}
 	rows, err := tx.QueryContext(ctx, `SELECT b.hash, b.size_bytes, b.content_type, b.created_at, b.embedding_status
 		FROM blobs AS b
-		WHERE (b.embedding_status = ? OR (b.embedding_status = ? AND b.embedding_lease_until < ?))
+		WHERE b.embedding_finalizing='' AND (b.embedding_status = ? OR (b.embedding_status = ? AND b.embedding_lease_until < ?))
 		ORDER BY b.created_at ASC LIMIT ?`,
 		string(EmbeddingStatusPending), string(EmbeddingStatusProcessing), now.UnixMilli(), limit)
 	if err != nil {
@@ -860,16 +876,20 @@ func (s *Store) ClaimPendingEmbeddings(ctx context.Context, limit int, leaseUnti
 		return nil, fmt.Errorf("iterate claimed blobs: %w", err)
 	}
 	_ = rows.Close()
-	blobs := make([]Blob, 0, len(candidates))
+	blobs := make([]LocalEmbeddingClaim, 0, len(candidates))
 	for _, item := range candidates {
 		if item.priorStatus == EmbeddingStatusProcessing {
 			if _, err := observeStage(ctx, tx, item.blob.Hash, "embedding", "lease_expired", string(EmbeddingStatusPending), "", now, false, true, false, "", "unknown"); err != nil {
 				return nil, err
 			}
 		}
-		update, err := tx.ExecContext(ctx, `UPDATE blobs SET embedding_status=?, embedding_lease_until=?
-			WHERE hash=? AND (embedding_status=? OR (embedding_status=? AND embedding_lease_until<?))`,
-			string(EmbeddingStatusProcessing), leaseUntil.UnixMilli(), item.blob.Hash,
+		token := ""
+		if owner == "local" {
+			token = rand.Text()
+		}
+		update, err := tx.ExecContext(ctx, `UPDATE blobs SET embedding_status=?, embedding_lease_until=?, embedding_owner=?, embedding_token=?
+			WHERE hash=? AND embedding_finalizing='' AND (embedding_status=? OR (embedding_status=? AND embedding_lease_until<?))`,
+			string(EmbeddingStatusProcessing), leaseUntil.UnixMilli(), owner, token, item.blob.Hash,
 			string(EmbeddingStatusPending), string(EmbeddingStatusProcessing), now.UnixMilli())
 		if err != nil {
 			return nil, fmt.Errorf("claim blob %s for embedding: %w", item.blob.Hash, err)
@@ -885,7 +905,7 @@ func (s *Store) ClaimPendingEmbeddings(ctx context.Context, limit int, leaseUnti
 			return nil, err
 		}
 		item.blob.EmbeddingStatus = EmbeddingStatusProcessing
-		blobs = append(blobs, item.blob)
+		blobs = append(blobs, LocalEmbeddingClaim{Blob: item.blob, Token: token})
 	}
 	sort.Slice(blobs, func(i, j int) bool { return blobs[i].CreatedAt < blobs[j].CreatedAt })
 	if err := tx.Commit(); err != nil {
@@ -894,24 +914,21 @@ func (s *Store) ClaimPendingEmbeddings(ctx context.Context, limit int, leaseUnti
 	return blobs, nil
 }
 
-// RenewEmbeddingLeases extends the lease of the named blobs and returns the
-// hashes actually renewed. Only blobs still in the processing state are
-// touched, so the return value tells a worker which of its leases were lost to
-// expiry and re-claim — those results would be rejected anyway, and knowing
-// now beats finding out one write-back later.
+// RenewEmbeddingLeases is the legacy external-only renewal helper. It cannot
+// renew local owners. Hash-only external attempts cannot be
+// distinguished after external-to-external reclaim (including for renewal).
 func (s *Store) RenewEmbeddingLeases(ctx context.Context, hashes []string, leaseUntil time.Time) ([]string, error) {
 	return s.updateEmbeddingLeases(ctx, hashes, func(builder *strings.Builder, args []any) []any {
 		builder.WriteString(`
 			UPDATE blobs SET embedding_lease_until = ?
-			WHERE embedding_status = ? AND hash IN (`)
+			WHERE embedding_status = ? AND embedding_owner='external' AND hash IN (`)
 		args = append(args, leaseUntil.UnixMilli(), string(EmbeddingStatusProcessing))
 		return args
 	})
 }
 
-// ReleaseEmbeddingClaims hands the named blobs back to the pending queue, used
-// when a worker gives up on a batch without recording an outcome (transient
-// failure, shutdown).
+// ReleaseEmbeddingClaims is the legacy external-only release helper. Local
+// owners and finalizing rows are deliberately untouched.
 func (s *Store) ReleaseEmbeddingClaims(ctx context.Context, hashes []string) error {
 	if len(hashes) == 0 {
 		return nil
@@ -931,8 +948,8 @@ func (s *Store) ReleaseEmbeddingClaims(ctx context.Context, hashes []string) err
 		for _, hash := range chunk {
 			args = append(args, hash)
 		}
-		rows, err := tx.QueryContext(ctx, `UPDATE blobs SET embedding_status=?, embedding_lease_until=0
-			WHERE embedding_status=? AND hash IN (`+placeholders+`) RETURNING hash`, args...)
+		rows, err := tx.QueryContext(ctx, `UPDATE blobs SET embedding_status=?, embedding_lease_until=0, embedding_token=''
+			WHERE embedding_status=? AND embedding_owner='external' AND embedding_finalizing='' AND hash IN (`+placeholders+`) RETURNING hash`, args...)
 		if err != nil {
 			return fmt.Errorf("release embedding claims: %w", err)
 		}
@@ -1014,16 +1031,17 @@ func (s *Store) updateEmbeddingLeases(
 	return renewed, nil
 }
 
-// ApplyEmbeddingResults records a batch of worker outcomes in one transaction.
-// The vector itself is not stored here: the caller writes it to the vector
-// store before calling this, and what lands in SQLite is the bookkeeping only —
-// status, error text, and the cleared lease. A result only lands on a blob
-// still in the processing state: terminal rows (ready/failed) can never be
-// overwritten, and a blob whose lease expired but which nobody re-claimed yet
-// still accepts the late result — the content is hash-identical, so nothing is
-// corrupted. Items that do not land are reported as rejected with a reason;
-// they are informational, not errors.
+// ApplyEmbeddingResults is a bookkeeping-only legacy external helper, retained
+// for catalog callers/tests without vector side effects. It cannot touch local
+// owners or reservations. Callers with vector writes MUST instead use
+// FinalizeExternalEmbeddingResults, which fences ownership before those writes.
+// Expired external claims still accept late results; successive external
+// attempts cannot be distinguished by the legacy hash-only contract.
 func (s *Store) ApplyEmbeddingResults(ctx context.Context, results []EmbeddingResult) ([]string, []RejectedEmbedding, error) {
+	return s.applyEmbeddingResults(ctx, results, "")
+}
+
+func (s *Store) applyEmbeddingResults(ctx context.Context, results []EmbeddingResult, reservation string) ([]string, []RejectedEmbedding, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, nil, fmt.Errorf("begin embedding write-back: %w", err)
@@ -1054,11 +1072,17 @@ func (s *Store) ApplyEmbeddingResults(ctx context.Context, results []EmbeddingRe
 			errorText = truncateErrorText(result.Error)
 		}
 
+		ownership := ` AND embedding_owner='external' AND embedding_finalizing=''`
+		args := []any{string(result.Status), errorText, hash, string(EmbeddingStatusProcessing)}
+		if reservation != "" {
+			ownership = ` AND embedding_finalizing=?`
+			args = append(args, reservation)
+		}
 		update, err := tx.ExecContext(ctx, `
 			UPDATE blobs
-			SET embedding_status = ?, embedding_error = ?, embedding_lease_until = 0
-			WHERE hash = ? AND embedding_status = ?`,
-			string(result.Status), errorText, hash, string(EmbeddingStatusProcessing),
+			SET embedding_status = ?, embedding_error = ?, embedding_lease_until = 0,
+				embedding_owner='external', embedding_token='', embedding_finalizing=''
+			WHERE hash = ? AND embedding_status = ?`+ownership, args...,
 		)
 		if err != nil {
 			return nil, nil, fmt.Errorf("apply embedding result for %s: %w", hash, err)
@@ -1335,6 +1359,7 @@ func (s *Store) ResetReadyEmbeddings(ctx context.Context) (int64, error) {
 // is simply re-claimed and re-embedded by whoever gets there next, so the only
 // cost is wasted work. Only widen to expiredOnly=false once there is no worker
 // left to finish the in-flight batch.
+// Finalizing rows are always excluded, including with expiredOnly=false.
 func (s *Store) ReleaseStuckEmbeddingClaims(ctx context.Context, expiredOnly bool) (int64, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -1350,9 +1375,10 @@ func (s *Store) ReleaseStuckEmbeddingClaims(ctx context.Context, expiredOnly boo
 		event = "lease_expired"
 	}
 	var count int64
-	selectQuery := `SELECT hash FROM blobs WHERE embedding_status=?`
+	selectQuery := `SELECT hash FROM blobs WHERE embedding_status=? AND embedding_finalizing=''`
 	selectArgs := []any{string(EmbeddingStatusProcessing)}
-	updateQuery := `UPDATE blobs SET embedding_status=?, embedding_error='', embedding_lease_until=0 WHERE hash=? AND embedding_status=?`
+	updateQuery := `UPDATE blobs SET embedding_status=?, embedding_error='', embedding_lease_until=0, embedding_owner='external', embedding_token=''
+		WHERE hash=? AND embedding_status=? AND embedding_finalizing=''`
 	if expiredOnly {
 		selectQuery += ` AND embedding_lease_until < ?`
 		selectArgs = append(selectArgs, now.UnixMilli())

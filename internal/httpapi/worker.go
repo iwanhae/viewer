@@ -103,7 +103,7 @@ func (s *Server) claimEmbeddings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	blobs, leaseUntil, err := s.recommend.ClaimEmbeddings(r.Context(), req.Limit)
+	blobs, leaseUntil, err := s.recommend.ClaimExternalEmbeddings(r.Context(), req.Limit)
 	if err != nil {
 		writeError(w, r, http.StatusInternalServerError, "INTERNAL", err.Error())
 		return
@@ -119,7 +119,7 @@ func (s *Server) claimEmbeddings(w http.ResponseWriter, r *http.Request) {
 			// may be the reason the presign failed, so the release runs on its
 			// own clock.
 			releaseCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			if relErr := s.recommend.ReleaseClaims(releaseCtx, append(leased, blob.Hash)); relErr != nil {
+			if relErr := s.recommend.ReleaseExternalClaims(releaseCtx, append(leased, blob.Hash)); relErr != nil {
 				log.Printf("claim: release after presign failure failed blobs=%d: %v", len(blobs), relErr)
 			}
 			cancel()
@@ -169,7 +169,7 @@ func (s *Server) renewLeases(w http.ResponseWriter, r *http.Request) {
 		writeBodyError(w, r, err)
 		return
 	}
-	leaseUntil, renewed, err := s.recommend.RenewLeases(r.Context(), req.Hashes)
+	leaseUntil, renewed, err := s.recommend.RenewExternalLeases(r.Context(), req.Hashes)
 	if err != nil {
 		writeError(w, r, http.StatusInternalServerError, "INTERNAL", err.Error())
 		return
@@ -276,7 +276,7 @@ func (s *Server) postEmbeddingResults(w http.ResponseWriter, r *http.Request) {
 		results = append(results, result)
 	}
 
-	updated, applyRejected, err := s.recommend.ApplyEmbeddingResults(r.Context(), results)
+	updated, applyRejected, err := s.recommend.ApplyExternalEmbeddingResults(r.Context(), results)
 	if err != nil {
 		writeError(w, r, http.StatusInternalServerError, "INTERNAL", err.Error())
 		return

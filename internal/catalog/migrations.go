@@ -278,6 +278,18 @@ var migrations = []migration{
 		// registrations nor embedding claims use it anymore.
 		stmts: []string{`UPDATE blobs SET encoding_gate = 0 WHERE encoding_gate != 0`},
 	},
+	{
+		version: 10,
+		name:    "embedding_ownership",
+		stmts: []string{
+			`ALTER TABLE blobs ADD COLUMN embedding_owner TEXT NOT NULL DEFAULT 'external'`,
+			`ALTER TABLE blobs ADD COLUMN embedding_token TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE blobs ADD COLUMN embedding_finalizing TEXT NOT NULL DEFAULT ''`,
+			`CREATE INDEX idx_blobs_embedding_finalizing ON blobs(embedding_finalizing) WHERE embedding_finalizing!=''`,
+		},
+		// Old processing rows have no local identity. Open's existing startup
+		// reset returns them to pending before serving traffic, on upgrade too.
+	},
 }
 
 // addBlobLeaseColumnIfMissing adds the external-worker lease column to blobs.

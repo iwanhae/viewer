@@ -49,10 +49,9 @@ const (
 // external vector store. The service owns no vector state itself: SQLite keeps
 // the bookkeeping (which blob is embedded, by which status) and the vector
 // store keeps the vectors, so the two are written in that order — index first,
-// bookkeeping second — by the single ApplyEmbeddingResults path. Extraction
-// never embeds anything itself: the in-process workers and external workers
-// leasing batches through ClaimEmbeddings are the only producers of
-// embeddings, and both write through ApplyEmbeddingResults.
+// bookkeeping second — after reserving ownership. Extraction never embeds
+// anything itself: token-fenced in-process workers and hash-only external
+// workers share the atomic queue and the ownership-reserved finalization path.
 type Service struct {
 	catalog *catalog.Store
 
@@ -216,9 +215,8 @@ func (s *Service) workerLoop(ctx context.Context) {
 		if s.catalog == nil || s.images == nil || s.embedder == nil {
 			continue
 		}
-		// The external worker API shares this exact claim path, so the two
-		// fleets can never double-embed a blob.
-		blobs, _, err := s.ClaimEmbeddings(ctx, defaultWorkerBatchSize)
+		// Local tokens and external hash-only claims share one atomic queue.
+		blobs, _, err := s.ClaimLocalEmbeddings(ctx, defaultWorkerBatchSize)
 		if err != nil {
 			continue
 		}
@@ -241,7 +239,7 @@ func (s *Service) workerLoop(ctx context.Context) {
 				// Never strand the unprocessed remainder: hand their claims
 				// back so the next worker picks them up without waiting for
 				// the lease to expire.
-				_ = s.ReleaseClaims(context.Background(), claimHashes(blobs[i:]))
+				_, _ = s.ReleaseLocalClaims(context.Background(), blobs[i:])
 				return
 			}
 			// A transient failure leaves the blob pending for a later retry. A
@@ -253,24 +251,24 @@ func (s *Service) workerLoop(ctx context.Context) {
 				defer func() {
 					if rec := recover(); rec != nil {
 						transient = true
-						_ = s.ReleaseClaims(context.Background(), []string{blob.Hash})
+						_, _ = s.ReleaseLocalClaims(context.Background(), []catalog.LocalEmbeddingClaim{blob})
 						log.Printf("recommend: embed panic recovered blob=%s: %v", blob.Hash, rec)
 					}
 				}()
-				transient = s.embedBlob(ctx, blob.Hash)
+				transient = s.embedBlob(ctx, blob)
 			}()
 			if transient {
 				select {
 				case <-ctx.Done():
-					_ = s.ReleaseClaims(context.Background(), claimHashes(blobs[i+1:]))
+					_, _ = s.ReleaseLocalClaims(context.Background(), blobs[i+1:])
 					return
 				case <-time.After(2 * time.Second):
 				}
 			}
 			// Renew the lease of everything not yet embedded so a slow batch
 			// is not stolen out from under this worker.
-			if rest := claimHashes(blobs[i+1:]); len(rest) > 0 {
-				if _, err := s.catalog.RenewEmbeddingLeases(ctx, rest, time.Now().Add(DefaultLeaseTTL)); err != nil {
+			if rest := blobs[i+1:]; len(rest) > 0 {
+				if _, err := s.catalog.RenewLocalEmbeddingLeases(ctx, rest, time.Now().Add(DefaultLeaseTTL)); err != nil {
 					log.Printf("recommend: lease renew failed blobs=%d: %v", len(rest), err)
 				}
 			}
@@ -388,13 +386,14 @@ func (s *Service) progressFrom(counts catalog.EmbeddingCounts) EmbeddingProgress
 	}
 }
 
-// ClaimEmbeddings leases up to limit pending blobs to one worker and returns
-// them together with the lease deadline. It is the single entry point for the
-// in-process worker loop and the external worker API alike, so the two fleets
-// can never double-embed a blob. It deliberately works even when the local
-// model is not loaded: external backfill must not depend on this process
-// having a usable checkpoint.
+// ClaimEmbeddings is the legacy name for the external ownership path.
 func (s *Service) ClaimEmbeddings(ctx context.Context, limit int) ([]catalog.Blob, time.Time, error) {
+	return s.ClaimExternalEmbeddings(ctx, limit)
+}
+
+// ClaimExternalEmbeddings works without a local model and preserves external
+// polling limits and deadlines. External workers remain outside local cancellation.
+func (s *Service) ClaimExternalEmbeddings(ctx context.Context, limit int) ([]catalog.Blob, time.Time, error) {
 	if s == nil {
 		return nil, time.Time{}, fmt.Errorf("catalog is not available")
 	}
@@ -403,19 +402,20 @@ func (s *Service) ClaimEmbeddings(ctx context.Context, limit int) ([]catalog.Blo
 		return nil, time.Time{}, fmt.Errorf("catalog is not available")
 	}
 	leaseUntil := time.Now().Add(DefaultLeaseTTL)
-	blobs, err := s.catalog.ClaimPendingEmbeddings(ctx, clampClaimLimit(limit), leaseUntil)
+	blobs, err := s.catalog.ClaimExternalEmbeddings(ctx, clampClaimLimit(limit), leaseUntil)
 	if err != nil {
 		return nil, time.Time{}, err
 	}
 	return blobs, leaseUntil, nil
 }
 
-// RenewLeases extends the lease of claimed blobs for another TTL and returns
-// the deadline together with the hashes actually renewed. Only blobs still in
-// the processing state are touched, so a renewal racing a reclaim is a no-op —
-// and the renewed list is how a worker finds out its lease was lost before it
-// wastes GPU hours on results that would be rejected anyway.
+// RenewLeases is the legacy external renewal name. Hash-only external attempts
+// cannot distinguish an old external worker from a newer external claimant.
 func (s *Service) RenewLeases(ctx context.Context, hashes []string) (time.Time, []string, error) {
+	return s.RenewExternalLeases(ctx, hashes)
+}
+
+func (s *Service) RenewExternalLeases(ctx context.Context, hashes []string) (time.Time, []string, error) {
 	if s == nil {
 		return time.Time{}, nil, fmt.Errorf("catalog is not available")
 	}
@@ -431,31 +431,29 @@ func (s *Service) RenewLeases(ctx context.Context, hashes []string) (time.Time, 
 // ReleaseClaims hands claimed blobs back to the pending queue without an
 // outcome, for transient failures and shutdowns.
 func (s *Service) ReleaseClaims(ctx context.Context, hashes []string) error {
+	return s.ReleaseExternalClaims(ctx, hashes)
+}
+
+func (s *Service) ReleaseExternalClaims(ctx context.Context, hashes []string) error {
 	if s == nil || s.catalog == nil {
 		return fmt.Errorf("catalog is not available")
 	}
 	return s.catalog.ReleaseEmbeddingClaims(ctx, hashes)
 }
 
-// ApplyEmbeddingResults validates a batch of worker outcomes and persists the
-// acceptable ones. It is the single write path for the in-process worker and
-// external workers alike, and it writes the two stores in a fixed order:
-//
-//  1. The vector store first. Every accepted ready vector is turned into its
-//     photo points — one per (album, idx) the hash appears under, resolved
-//     from the catalog — and upserted. A store failure returns an error and
-//     leaves SQLite completely untouched, so the blobs stay "processing" and
-//     the worker hands its claims back for a clean retry.
-//  2. SQLite bookkeeping second, in one transaction.
-//
-// The ordering makes both crash windows recoverable. A crash between the two
-// leaves Qdrant written but SQLite still saying "processing": the claim is
-// re-leased, the blob is re-embedded, and the write-back upserts the very same
-// deterministic point IDs, overwriting the first copy in place. A crash inside
-// the SQLite transaction loses only the bookkeeping and recovers the same way.
-// Neither window can produce a duplicate or a vector the catalog does not know
-// about — the reverse order could.
+// ApplyEmbeddingResults is the legacy external-only entry point.
 func (s *Service) ApplyEmbeddingResults(ctx context.Context, results []catalog.EmbeddingResult) (applied int, rejected []catalog.RejectedEmbedding, err error) {
+	return s.ApplyExternalEmbeddingResults(ctx, results)
+}
+
+// ApplyExternalEmbeddingResults reserves external ownership before vector
+// writes, then commits SQLite bookkeeping. Hash-only external attempts retain
+// their legacy limitation: successive external attempts cannot be distinguished.
+func (s *Service) ApplyExternalEmbeddingResults(ctx context.Context, results []catalog.EmbeddingResult) (int, []catalog.RejectedEmbedding, error) {
+	return s.applyEmbeddingResults(ctx, results, nil)
+}
+
+func (s *Service) applyEmbeddingResults(ctx context.Context, results []catalog.EmbeddingResult, tokens []string) (applied int, rejected []catalog.RejectedEmbedding, err error) {
 	if s == nil {
 		return 0, nil, fmt.Errorf("catalog is not available")
 	}
@@ -469,8 +467,9 @@ func (s *Service) ApplyEmbeddingResults(ctx context.Context, results []catalog.E
 	// cosine distance divides by the norm, so a zero vector ranks as NaN and
 	// NaN drags the whole neighbor ranking down with it.
 	valid := make([]catalog.EmbeddingResult, 0, len(results))
+	local := make([]catalog.LocalEmbeddingResult, 0, len(results))
 	rejected = make([]catalog.RejectedEmbedding, 0)
-	for _, result := range results {
+	for i, result := range results {
 		// Key by the trimmed hash: the catalog normalizes the same way, so
 		// reporting rejections under an untrimmed string would disagree with
 		// the catalog's own rejected list for the same result.
@@ -490,25 +489,29 @@ func (s *Service) ApplyEmbeddingResults(ctx context.Context, results []catalog.E
 			}
 		}
 		valid = append(valid, result)
-	}
-
-	// Ready vectors go to the store before the catalog claims them. First wins
-	// per hash, matching the catalog's own first-wins UPDATE: a duplicate
-	// report of the same hash re-upserts the identical point IDs, so it is
-	// harmless rather than corrupting.
-	if s.vectors != nil {
-		if err := s.uploadReadyVectors(ctx, valid); err != nil {
-			return 0, nil, err
+		if tokens != nil {
+			local = append(local, catalog.LocalEmbeddingResult{EmbeddingResult: result, Token: tokens[i]})
 		}
 	}
 
-	appliedHashes, catalogRejected, err := s.catalog.ApplyEmbeddingResults(ctx, valid)
+	write := func(ctx context.Context, owned []catalog.EmbeddingResult) error {
+		if s.vectors != nil {
+			return s.uploadReadyVectors(ctx, owned)
+		}
+		return nil
+	}
+	var appliedHashes []string
+	var catalogRejected []catalog.RejectedEmbedding
+	if tokens != nil {
+		appliedHashes, catalogRejected, err = s.catalog.FinalizeLocalEmbeddingResults(ctx, local, write)
+	} else {
+		appliedHashes, catalogRejected, err = s.catalog.FinalizeExternalEmbeddingResults(ctx, valid, write)
+	}
 	if err != nil {
 		return 0, nil, err
 	}
 	rejected = append(rejected, catalogRejected...)
-	// First-wins per hash falls out of the catalog: only the first UPDATE per
-	// hash still sees the processing state.
+	// The catalog reservation accepts only the first valid result per hash.
 	return len(appliedHashes), rejected, nil
 }
 
@@ -599,11 +602,12 @@ func isZeroNorm(vector []float32) bool {
 // embedBlob computes and stores one blob embedding. It reports whether the
 // failure was transient (the claim is released and the blob returns to the
 // pending queue for an early retry).
-func (s *Service) embedBlob(ctx context.Context, hash string) bool {
+func (s *Service) embedBlob(ctx context.Context, claim catalog.LocalEmbeddingClaim) bool {
+	hash := claim.Hash
 	data, err := s.images.GetImageBytes(ctx, hash)
 	if err != nil {
 		log.Printf("recommend: blob=%s image load failed: %v", hash, err)
-		s.persistFailed(context.Background(), hash, fmt.Sprintf("load image bytes: %v", err))
+		s.persistFailed(context.Background(), claim, fmt.Sprintf("load image bytes: %v", err))
 		return false
 	}
 
@@ -613,26 +617,26 @@ func (s *Service) embedBlob(ctx context.Context, hash string) bool {
 		if isTransientEmbedError(err) {
 			log.Printf("recommend: blob=%s embed transient failure: %v", hash, err)
 			// Hand the claim back so the retry does not wait out the lease.
-			if releaseErr := s.ReleaseClaims(context.Background(), []string{hash}); releaseErr != nil {
+			if _, releaseErr := s.ReleaseLocalClaims(context.Background(), []catalog.LocalEmbeddingClaim{claim}); releaseErr != nil {
 				log.Printf("recommend: blob=%s claim release failed: %v", hash, releaseErr)
 			}
 			return true
 		}
 		log.Printf("recommend: blob=%s embed failed: %v", hash, err)
-		s.persistFailed(context.Background(), hash, fmt.Sprintf("embed image: %v", err))
+		s.persistFailed(context.Background(), claim, fmt.Sprintf("embed image: %v", err))
 		return false
 	}
 
-	// Use a fresh context: the write must land even when the worker is being
-	// shut down mid-batch.
-	applied, rejected, err := s.ApplyEmbeddingResults(context.Background(), []catalog.EmbeddingResult{{
+	// A fresh context allows bookkeeping during shutdown, but never bypasses
+	// token fencing: cancellation/reclaim before reservation rejects this write.
+	applied, rejected, err := s.ApplyLocalEmbeddingResults(context.Background(), []catalog.LocalEmbeddingResult{{Token: claim.Token, EmbeddingResult: catalog.EmbeddingResult{
 		Hash:   hash,
 		Status: catalog.EmbeddingStatusReady,
 		Vector: vector,
-	}})
+	}}})
 	if err != nil {
 		log.Printf("recommend: blob=%s persist embedding failed: %v", hash, err)
-		if releaseErr := s.ReleaseClaims(context.Background(), []string{hash}); releaseErr != nil {
+		if _, releaseErr := s.ReleaseLocalClaims(context.Background(), []catalog.LocalEmbeddingClaim{claim}); releaseErr != nil {
 			log.Printf("recommend: blob=%s claim release failed: %v", hash, releaseErr)
 		}
 		return true
@@ -657,14 +661,15 @@ func (s *Service) embedBlob(ctx context.Context, hash string) bool {
 }
 
 // persistFailed records a permanent failure for a claimed blob in the catalog:
-// ApplyEmbeddingResults flips the blob to the failed status, which takes it out
+// ApplyLocalEmbeddingResults flips the blob to the failed status, which takes it out
 // of the pending queue for good and counts it as done in the progress counts.
-func (s *Service) persistFailed(ctx context.Context, hash string, errText string) {
-	applied, rejected, err := s.ApplyEmbeddingResults(ctx, []catalog.EmbeddingResult{{
+func (s *Service) persistFailed(ctx context.Context, claim catalog.LocalEmbeddingClaim, errText string) {
+	hash := claim.Hash
+	applied, rejected, err := s.ApplyLocalEmbeddingResults(ctx, []catalog.LocalEmbeddingResult{{Token: claim.Token, EmbeddingResult: catalog.EmbeddingResult{
 		Hash:   hash,
 		Status: catalog.EmbeddingStatusFailed,
 		Error:  errText,
-	}})
+	}}})
 	if err != nil {
 		log.Printf("recommend: blob=%s mark failed failed: %v", hash, err)
 		return

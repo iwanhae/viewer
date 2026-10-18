@@ -109,21 +109,22 @@ type RecoveryResultPage struct {
 }
 
 type recoveryTargetState struct {
-	EncodingStatus  string
-	EmbeddingStatus string
-	ContentType     string
-	EncodingLease   int64
-	EmbeddingLease  int64
-	TokenHash       string
-	TokenValue      string
-	ObsStatus       string
-	ObsPhase        string
-	StartedAt       string
-	FinishedAt      string
-	StatusChangedAt string
-	Attempts        int64
-	ErrorCode       string
-	Retryability    string
+	EncodingStatus      string
+	EmbeddingStatus     string
+	ContentType         string
+	EncodingLease       int64
+	EmbeddingLease      int64
+	EmbeddingFinalizing bool
+	TokenHash           string
+	TokenValue          string
+	ObsStatus           string
+	ObsPhase            string
+	StartedAt           string
+	FinishedAt          string
+	StatusChangedAt     string
+	Attempts            int64
+	ErrorCode           string
+	Retryability        string
 }
 
 func validRecoveryAction(action string) bool {
@@ -385,11 +386,13 @@ func readRecoveryTargetState(ctx context.Context, q interface {
 	var token string
 	var started, finished, changed, phase sql.NullString
 	err := q.QueryRowContext(ctx, `SELECT b.encoding_status, b.embedding_status, b.content_type,
-		b.encoding_lease_until, b.embedding_lease_until, b.encoding_token,
+		b.encoding_lease_until, b.embedding_lease_until, CASE WHEN ?='embedding' THEN b.embedding_token ELSE b.encoding_token END,
+		b.embedding_finalizing!='',
 		COALESCE(o.status,''), o.phase, o.started_at, o.finished_at, o.status_changed_at, COALESCE(o.attempts,0),
 		COALESCE(o.error_code,''), COALESCE(o.retryability,'')
-		FROM blobs b LEFT JOIN blob_stage_observations o ON o.blob_hash=b.hash AND o.stage=? WHERE b.hash=?`, stage, hash).Scan(
+		FROM blobs b LEFT JOIN blob_stage_observations o ON o.blob_hash=b.hash AND o.stage=? WHERE b.hash=?`, stage, stage, hash).Scan(
 		&state.EncodingStatus, &state.EmbeddingStatus, &state.ContentType, &state.EncodingLease, &state.EmbeddingLease, &token,
+		&state.EmbeddingFinalizing,
 		&state.ObsStatus, &phase, &started, &finished, &changed, &state.Attempts, &state.ErrorCode, &state.Retryability)
 	if err != nil {
 		return state, fmt.Errorf("read recovery generation: %w", err)
@@ -450,6 +453,9 @@ func recoveryEligibility(action string, state recoveryTargetState, now time.Time
 			return false, "lease_live"
 		}
 	case RecoveryReleaseEmbedding:
+		if state.EmbeddingFinalizing {
+			return false, "finalizing"
+		}
 		if state.EmbeddingStatus != "processing" {
 			return false, "not_leased"
 		}
@@ -479,6 +485,9 @@ func recoveryGeneration(action string, state recoveryTargetState) string {
 		}
 	} else {
 		value.EmbeddingLease = state.EmbeddingLease
+		if state.EmbeddingStatus == "processing" {
+			value.TokenHash = state.TokenHash
+		}
 	}
 	encoded, _ := json.Marshal(value)
 	digest := sha256.Sum256(encoded)
@@ -967,9 +976,9 @@ func applyRecoveryTransition(ctx context.Context, tx *sql.Tx, action, hash strin
 		args = []any{hash, state.EncodingLease, state.TokenValue}
 	case RecoveryReleaseEmbedding:
 		stage, event, status = "embedding", "lease_expired", "pending"
-		query = `UPDATE blobs SET embedding_status='pending', embedding_error='', embedding_lease_until=0
-			WHERE hash=? AND embedding_status='processing' AND embedding_lease_until=?`
-		args = []any{hash, state.EmbeddingLease}
+		query = `UPDATE blobs SET embedding_status='pending', embedding_error='', embedding_lease_until=0, embedding_owner='external', embedding_token=''
+			WHERE hash=? AND embedding_status='processing' AND embedding_lease_until=? AND embedding_token=? AND embedding_finalizing=''`
+		args = []any{hash, state.EmbeddingLease, state.TokenValue}
 	default:
 		return false, fmt.Errorf("unsupported recovery action")
 	}

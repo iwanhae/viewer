@@ -1408,11 +1408,8 @@ func TestApplyEmbeddingResultsWritesQdrantBeforeSQLite(t *testing.T) {
 }
 
 // TestApplyEmbeddingResultsReembedOverwritesSamePoint covers the crash-window
-// recovery: a write-back whose vector already reached the store — a re-embed
-// after the SQLite half failed, or a duplicate report from a second worker —
-// upserts the very same deterministic point IDs, so the store converges to one
-// point per photo instead of duplicating them. The catalog side of a duplicate
-// report is rejected as not_claimed, which is what keeps it first-wins.
+// recovery: a re-embed after the SQLite half failed upserts the same deterministic
+// point IDs. A terminal duplicate is now rejected before either store is touched.
 func TestApplyEmbeddingResultsReembedOverwritesSamePoint(t *testing.T) {
 	cat := newTestCatalog(t)
 	store := newFakeVectorStore()
@@ -1434,7 +1431,7 @@ func TestApplyEmbeddingResultsReembedOverwritesSamePoint(t *testing.T) {
 	}
 
 	// A late duplicate report of the same hash (no fresh claim — the blob is
-	// already terminal): the store upsert is harmless, the catalog says no.
+	// already terminal): ownership validation rejects it before vector writes.
 	applied, rejected, err := svc.ApplyEmbeddingResults(ctx, []catalog.EmbeddingResult{
 		{Hash: "hash-x", Status: catalog.EmbeddingStatusReady, Vector: dimVector(3)},
 	})
@@ -1450,8 +1447,29 @@ func TestApplyEmbeddingResultsReembedOverwritesSamePoint(t *testing.T) {
 		t.Fatalf("duplicate report duplicated points: %+v", points)
 	}
 	for _, record := range points {
+		if record.Vector[0] != 1 {
+			t.Fatalf("rejected duplicate changed point %+v", record)
+		}
+	}
+	// A deliberate reindex still overwrites those same points in place.
+	if _, err := cat.ResetReadyEmbeddings(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := svc.ClaimExternalEmbeddings(ctx, 1); err != nil {
+		t.Fatal(err)
+	}
+	if n, rejected, err := svc.ApplyExternalEmbeddingResults(ctx, []catalog.EmbeddingResult{{
+		Hash: "hash-x", Status: catalog.EmbeddingStatusReady, Vector: dimVector(3),
+	}}); err != nil || n != 1 || len(rejected) != 0 {
+		t.Fatalf("reindex apply=%d rejected=%v err=%v", n, rejected, err)
+	}
+	points, _ = store.snapshot()
+	if len(points) != 2 {
+		t.Fatalf("reindex duplicated points: %v", points)
+	}
+	for _, record := range points {
 		if record.Vector[0] != 3 {
-			t.Fatalf("point %+v kept the stale first vector", record)
+			t.Fatal("reindex did not overwrite vector")
 		}
 	}
 }
