@@ -737,6 +737,83 @@ func TestOpenToleratesNewerSchema(t *testing.T) {
 	}
 }
 
+func TestDropScopedAdminRecoveryMigrationRemovesTablesAndIndexes(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "catalog.db")
+	store, err := Open(path, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The current chain creates the 0008 tables and drops them again in 0013,
+	// so a fresh file has none to remove. Recreate the v8 shape by hand —
+	// tables plus the three indexes — and rewind the pragma, so the reopen
+	// below exercises the real v12→v13 drop instead of a no-op.
+	if _, err := store.db.Exec(`
+		CREATE TABLE IF NOT EXISTS admin_recovery_previews (
+			id TEXT PRIMARY KEY, actor TEXT NOT NULL, action TEXT NOT NULL, selection_json TEXT NOT NULL,
+			created_at TEXT NOT NULL, expires_at TEXT NOT NULL, target_count INTEGER NOT NULL,
+			eligible_count INTEGER NOT NULL, skipped_count INTEGER NOT NULL, selected_photos INTEGER NOT NULL,
+			affected_photos INTEGER NOT NULL, affected_albums INTEGER NOT NULL, consumed_by TEXT
+		);
+		CREATE TABLE IF NOT EXISTS admin_recovery_targets (
+			preview_id TEXT NOT NULL REFERENCES admin_recovery_previews(id) ON DELETE CASCADE,
+			ordinal INTEGER NOT NULL, blob_hash TEXT NOT NULL, eligible INTEGER NOT NULL CHECK (eligible IN (0, 1)),
+			skip_reason TEXT NOT NULL DEFAULT '', generation TEXT NOT NULL, selected_photos INTEGER NOT NULL,
+			affected_photos INTEGER NOT NULL, affected_albums INTEGER NOT NULL, PRIMARY KEY (preview_id, ordinal),
+			UNIQUE (preview_id, blob_hash)
+		);
+		CREATE INDEX IF NOT EXISTS idx_admin_recovery_targets_preview_eligible ON admin_recovery_targets(preview_id, eligible, ordinal);
+		CREATE TABLE IF NOT EXISTS admin_recovery_operations (
+			id TEXT PRIMARY KEY, preview_id TEXT NOT NULL UNIQUE REFERENCES admin_recovery_previews(id),
+			actor TEXT NOT NULL, action TEXT NOT NULL, idempotency_key TEXT NOT NULL, payload_hash TEXT NOT NULL,
+			status TEXT NOT NULL CHECK (status IN ('queued', 'running', 'completed', 'partially_failed', 'failed')),
+			created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE (actor, idempotency_key)
+		);
+		CREATE INDEX IF NOT EXISTS idx_admin_recovery_operations_status_created ON admin_recovery_operations(status, created_at, id);
+		CREATE TABLE IF NOT EXISTS admin_recovery_results (
+			operation_id TEXT NOT NULL REFERENCES admin_recovery_operations(id) ON DELETE CASCADE,
+			ordinal INTEGER NOT NULL, blob_hash TEXT NOT NULL,
+			status TEXT NOT NULL CHECK (status IN ('queued', 'succeeded', 'conflict', 'skipped', 'failed')),
+			reason_code TEXT NOT NULL DEFAULT '', execution_attempts INTEGER NOT NULL DEFAULT 0,
+			updated_at TEXT NOT NULL, PRIMARY KEY (operation_id, ordinal)
+		);
+		CREATE INDEX IF NOT EXISTS idx_admin_recovery_results_operation_status ON admin_recovery_results(operation_id, status, ordinal);
+	`); err != nil {
+		t.Fatalf("seed v8 scoped recovery schema: %v", err)
+	}
+	if _, err := store.db.Exec(`PRAGMA user_version=12`); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	migrated, err := Open(path, nil)
+	if err != nil {
+		t.Fatalf("reopen through migration 0013: %v", err)
+	}
+	defer migrated.Close()
+	if got := fileVersion(t, path); got != len(migrations) {
+		t.Fatalf("user_version=%d want %d", got, len(migrations))
+	}
+	// Nothing of the subsystem survives — the four tables and, because SQLite
+	// drops attached indexes with their tables, the three idx_admin_recovery_*
+	// indexes too.
+	var leftovers int
+	if err := migrated.db.QueryRow(`
+		SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'admin_recovery%' OR name LIKE 'idx_admin_recovery%'`).Scan(&leftovers); err != nil {
+		t.Fatal(err)
+	}
+	if leftovers != 0 {
+		t.Fatalf("migration 0013 left %d scoped admin recovery object(s) behind", leftovers)
+	}
+	// The drop is surgical: the schema the live catalog uses is untouched.
+	for _, table := range []string{"albums", "blobs", "photos", "job_runs", "job_run_items", "extraction_runs"} {
+		if !tableExists(t, migrated.db, table) {
+			t.Fatalf("%s missing after migration 0013; the drop must not widen beyond the retired subsystem", table)
+		}
+	}
+}
+
 func TestIndependentEmbeddingMigrationNeutralizesLegacyGates(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "catalog.db")
 	store, err := Open(path, nil)

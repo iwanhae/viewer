@@ -129,10 +129,6 @@ Notes:
 | GET | `/admin/api/albums/{id}/extractions` | Cursor-paged append-only extraction runs, newest first. |
 | GET | `/admin/api/albums/{id}/entries` | Cursor-paged outcomes for the latest run, or a requested `runId`; supports `outcome`. |
 | GET | `/admin/api/extraction-failures` | Cursor-paged failed entries from each album's latest run when terminal, filtered by `reasonCode`. |
-| POST | `/admin/api/actions/preview` | Read-only scoped recovery preview; snapshots its exact blob targets for ten minutes. |
-| POST | `/admin/api/operations` | Consumes a preview once and queues its durable, idempotent recovery operation. |
-| GET | `/admin/api/operations` | Newest-first paged operation audit list. |
-| GET | `/admin/api/operations/{id}` | Operation summary and bounded, cursor-paged per-target results. |
 | POST / GET | `/admin/api/runs` | Start a finite local `embedding` or `encoding` run / list durable runs. POST requires `Idempotency-Key` and `{"stage":"embedding"}` (or `encoding`). |
 | GET | `/admin/api/runs/{id}` | Run summary and paged target outcomes. |
 | POST | `/admin/api/runs/{id}/cancel` | Cancel only this local run; body `{}`. |
@@ -243,11 +239,8 @@ those explicit integrity counts are available on demand in
 exact blob-list filter; there is not currently a list filter for dangling
 photo rows.
 
-The admin browser has **이슈** (`/admin/issues`), **시스템 진단**
-(`/admin/diagnostics`), and **복구 운영** tabs. Recovery operations use the
-existing admin root as `/?tab=recovery`; operation details add an `operation`
-query parameter. Keeping this tab on the registered root route avoids adding a
-server route. `GET /admin/api/issues` is a read-only snapshot:
+The admin browser has **이슈** (`/admin/issues`) and **시스템 진단**
+(`/admin/diagnostics`) tabs. `GET /admin/api/issues` is a read-only snapshot:
 encoding and embedding groups include only blobs whose *current* stage status is
 `failed`, and group by the safe observation `errorCode` (missing/legacy codes
 are `legacy_unknown`). Each group reports `failureCount` and an explicit
@@ -459,7 +452,7 @@ Catalog state transition, stage observation/event, and result are committed in
 the same SQLite transaction for each target.
 
 Every mutation under `/admin`, including legacy `/admin/api/recover` and
-`/admin/api/reindex` and scoped recovery POSTs, requires the custom
+`/admin/api/reindex`, requires the custom
 `X-Admin-Action: 1` header; the legacy dashboard adds it to its existing POSTs.
 Legacy `/admin/api/recover` requests and all new POST routes require
 `Content-Type: application/json`; the existing bodyless `/admin/api/reindex`

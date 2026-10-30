@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/go-chi/chi/v5"
@@ -73,6 +74,26 @@ func (s *Server) adminCancelRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, run)
+}
+
+// onlyQueryKeys reports whether the query string carries exactly the allowed
+// keys, each bound exactly once. Unknown or repeated parameters are a caller
+// bug, not data to silently drop: a typo'd filter must fail loudly instead of
+// widening a page the operator believes is narrowed.
+func onlyQueryKeys(query url.Values, allowed ...string) bool {
+	set := make(map[string]struct{}, len(allowed))
+	for _, key := range allowed {
+		set[key] = struct{}{}
+	}
+	for key := range query {
+		if _, ok := set[key]; !ok {
+			return false
+		}
+		if len(query[key]) != 1 {
+			return false
+		}
+	}
+	return true
 }
 
 func runPageQuery(w http.ResponseWriter, r *http.Request) (int, string, bool) {

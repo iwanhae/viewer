@@ -172,15 +172,6 @@ func Run(ctx context.Context) error {
 		}
 	}()
 	adminService := admin.NewService(cat, vectorStore, recommendService).WithEncodingEnabled(true).WithRunManager(runManager)
-	adminService.StartRecoveryWorker(ctx, cfg.AdminToken != "")
-	defer func() {
-		stop()
-		closeCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		if err := adminService.Close(closeCtx); err != nil {
-			log.Printf("viewer: scoped admin recovery worker shutdown failed: %v", err)
-		}
-	}()
 	pipelineService := pipeline.NewService(cat, store, pipeline.Options{
 		OnAlbumReady: func(albumID string) {
 			if err := recommendService.ReloadAlbum(context.Background(), albumID); err != nil {

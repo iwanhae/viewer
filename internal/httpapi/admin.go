@@ -24,8 +24,8 @@ import (
 // without any session or login plumbing of its own.
 
 // requireAdminToken guards the admin routes with HTTP Basic auth. The username
-// does not affect authorization (scoped recovery records it only as an
-// explicitly unverified audit label) and the password must equal the admin
+// does not affect authorization (job runs record it only as an explicitly
+// unverified audit label) and the password must equal the admin
 // token; the comparison is constant time so a wrong guess costs no measurably less than a right one.
 // Every failure — absent header, wrong scheme, malformed base64, wrong
 // password — is the same 401 with a WWW-Authenticate challenge, so an outsider
@@ -232,8 +232,7 @@ const (
 // would invite a "run everything" habit the confirm dialogs exist to prevent,
 // and blur which flip produced which number.
 //
-// Hashes optionally narrows any target to the listed blobs — the scope a later
-// admin stage uses to replace the heavier scoped-recovery subsystem. Absent or
+// Hashes optionally narrows any target to the listed blobs. Absent or
 // empty, it means the historical whole-library behavior, so existing callers
 // are unaffected. Reindex is deliberately not reachable through this endpoint
 // and has no hashes plumbing of its own: it is a separate, global-by-design

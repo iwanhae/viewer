@@ -89,7 +89,11 @@ func blobEmbeddingsDDL() string {
 // is the baseline: the CREATE statements plus the two data fixes that used to
 // run inline on every open, all idempotent because pre-migration databases
 // arrive here with their schema already partially in place. To change the
-// schema, append a migration — never edit one that shipped.
+// schema, append a migration — never edit one that shipped. Removal is the
+// same act: a retired feature's tables are dropped by a later migration
+// (0013 is the first to drop whole feature tables) rather than by editing
+// the creation out of history, because a file that already applied the
+// creation must be led forward, never rewritten.
 var migrations = []migration{
 	{
 		version: 1,
@@ -329,6 +333,21 @@ CREATE INDEX IF NOT EXISTS idx_job_run_items_status ON job_run_items(run_id, sta
 		name:    "encoding_ownership",
 		// Every pre-existing encoder claim belongs to an external worker.
 		stmts: []string{`ALTER TABLE blobs ADD COLUMN encoding_owner TEXT NOT NULL DEFAULT 'external' CHECK (encoding_owner IN ('external','local'))`},
+	},
+	{
+		version: 13,
+		name:    "drop_scoped_admin_recovery",
+		// The scoped preview → operation recovery subsystem was replaced by the
+		// synchronous POST /admin/api/recover; its tables are retired here.
+		// Children drop before parents so no foreign key sees a vanishing
+		// parent, and SQLite removes the idx_admin_recovery_* indexes with
+		// their tables, so no explicit index drops are needed.
+		stmts: []string{
+			`DROP TABLE IF EXISTS admin_recovery_results`,
+			`DROP TABLE IF EXISTS admin_recovery_operations`,
+			`DROP TABLE IF EXISTS admin_recovery_targets`,
+			`DROP TABLE IF EXISTS admin_recovery_previews`,
+		},
 	},
 }
 

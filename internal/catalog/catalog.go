@@ -160,20 +160,6 @@ func Open(path string, sink VectorSink) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("migrate catalog: %w", err)
 	}
-	// A running scoped operation owns no external lease; its last committed
-	// target results are durable, and uncommitted target work rolls back. Make
-	// such operations claimable by the single in-process executor after restart.
-	var recoverySchema int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='admin_recovery_operations'`).Scan(&recoverySchema); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("inspect scoped admin recovery schema: %w", err)
-	}
-	if recoverySchema == 1 {
-		if _, err := db.Exec(`UPDATE admin_recovery_operations SET status='queued', updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE status='running'`); err != nil {
-			db.Close()
-			return nil, fmt.Errorf("resume scoped admin recovery operations: %w", err)
-		}
-	}
 	// Only local leases belong to this process lifetime. External workers may
 	// still be working across a server restart; preserve their ownership. This is runtime hygiene
 	// that runs on every open, not a migration — a crash mid-flight must not
@@ -1368,6 +1354,26 @@ func blobHashScope(hashes []string) (string, []any) {
 		return "", nil
 	}
 	return " AND hash IN (" + placeholders(len(hashes)) + ")", stringArgs(hashes)
+}
+
+// placeholders builds a "?, ?, ..." list for an IN clause. A non-positive
+// count yields NULL, which matches no row and keeps the assembled SQL valid
+// instead of leaving an empty "IN ()".
+func placeholders(count int) string {
+	if count <= 0 {
+		return "NULL"
+	}
+	return strings.TrimRight(strings.Repeat("?,", count), ",")
+}
+
+// stringArgs widens a []string to []any so it can splat into Query/Exec
+// variadic argument lists.
+func stringArgs(items []string) []any {
+	args := make([]any, len(items))
+	for i := range items {
+		args[i] = items[i]
+	}
+	return args
 }
 
 // ReleaseStuckEmbeddingClaims flips processing rows back to pending and

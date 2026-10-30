@@ -238,13 +238,6 @@ func TestEmbeddingFinalizationReservationBlocksOwnershipChanges(t *testing.T) {
 				if rows, err := s.ClaimExternalEmbeddings(ctx, 1, until); err != nil || len(rows) != 0 {
 					t.Fatalf("external reclaimed reservation: %v %v", rows, err)
 				}
-				state, err := readRecoveryTargetState(ctx, s.db, claim.Hash, "embedding")
-				if err != nil {
-					t.Fatal(err)
-				}
-				if eligible, reason := recoveryEligibility(RecoveryReleaseEmbedding, state, time.Now()); eligible || reason != "finalizing" {
-					t.Fatalf("recovery allowed reservation: %v %s", eligible, reason)
-				}
 				if rows, _, err := s.ApplyEmbeddingResults(ctx, []EmbeddingResult{localReady(claim).EmbeddingResult}); err != nil || len(rows) != 0 {
 					t.Fatalf("direct helper bypassed reservation: %v %v", rows, err)
 				}

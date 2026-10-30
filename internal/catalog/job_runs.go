@@ -20,6 +20,15 @@ var (
 
 const JobRunPageLimit = 100
 
+// jobRunTimestamp renders the UTC instant every job_runs row stamps its
+// bookkeeping with. The format is fixed-precision — always nine fractional
+// digits — so the created_at/updated_at strings the keyset cursors compare
+// sort identically to their instants; RFC3339Nano would drop trailing zeros
+// and make "…T00:00:00.1Z" and "…T00:00:00.100Z" order as different keys.
+func jobRunTimestamp(t time.Time) string {
+	return t.UTC().Format("2006-01-02T15:04:05.000000000Z")
+}
+
 type JobRunCounts struct {
 	Total       int64 `json:"total"`
 	Pending     int64 `json:"pending"`
@@ -143,7 +152,7 @@ func (s *Store) CreateJobRun(ctx context.Context, actor, stage, key, executor st
 	if active {
 		return JobRun{}, false, ErrJobRunConflict
 	}
-	id, now := rand.Text(), recoveryTimestamp(time.Now())
+	id, now := rand.Text(), jobRunTimestamp(time.Now())
 	if _, err := tx.ExecContext(ctx, `INSERT INTO job_runs(id,stage,actor,idempotency_key,executor,status,created_at,updated_at) VALUES(?,?,?,?,?,'queued',?,?)`, id, stage, actor, key, executor, now, now); err != nil {
 		return JobRun{}, false, err
 	}
@@ -261,7 +270,7 @@ func (s *Store) JobRunItems(ctx context.Context, id string, limit int, cursor st
 }
 
 func (s *Store) StartJobRun(ctx context.Context, id string) error {
-	now := recoveryTimestamp(time.Now())
+	now := jobRunTimestamp(time.Now())
 	_, err := s.db.ExecContext(ctx, `UPDATE job_runs SET status='running',started_at=?,updated_at=? WHERE id=? AND status='queued' AND cancel_requested=0`, now, now, id)
 	return err
 }
@@ -293,7 +302,7 @@ func (s *Store) NextJobRunItem(ctx context.Context, id string) (*JobRunItem, err
 	if err != nil {
 		return nil, err
 	}
-	item.UpdatedAt = recoveryTimestamp(time.Now())
+	item.UpdatedAt = jobRunTimestamp(time.Now())
 	item.StartedAt = &item.UpdatedAt
 	_, err = tx.ExecContext(ctx, `UPDATE job_run_items SET status='running',claim_token=?,started_at=?,updated_at=? WHERE run_id=? AND hash=? AND status='pending'`, item.ClaimToken, item.UpdatedAt, item.UpdatedAt, id, item.Hash)
 	if err != nil {
@@ -322,7 +331,7 @@ func (s *Store) FinishJobRunItem(ctx context.Context, id string, item JobRunItem
 		return err
 	}
 	defer tx.Rollback()
-	now := recoveryTimestamp(time.Now())
+	now := jobRunTimestamp(time.Now())
 	result, err := tx.ExecContext(ctx, `UPDATE job_run_items SET status=?,last_error=?,updated_at=?,finished_at=? WHERE run_id=? AND hash=? AND claim_token=? AND claim_token!='' AND status='running'`, status, safeError, now, now, id, item.Hash, item.ClaimToken)
 	if err != nil {
 		return err
@@ -359,7 +368,7 @@ func (s *Store) RequestJobRunCancel(ctx context.Context, id string) (JobRun, err
 	if err := lockCatalogWriter(ctx, tx); err != nil {
 		return JobRun{}, err
 	}
-	now := recoveryTimestamp(time.Now())
+	now := jobRunTimestamp(time.Now())
 	if _, err := tx.ExecContext(ctx, `UPDATE job_runs SET cancel_requested=1,updated_at=? WHERE id=? AND status IN ('queued','running') AND cancel_requested=0`, now, id); err != nil {
 		return JobRun{}, err
 	}
@@ -414,7 +423,7 @@ func (s *Store) FinishJobRun(ctx context.Context, id, terminal, safeError string
 
 func finishJobRunTx(ctx context.Context, tx *sql.Tx, id, status, safeError string) error {
 	finishedAt := time.Now()
-	now := recoveryTimestamp(finishedAt)
+	now := jobRunTimestamp(finishedAt)
 	// Release only matching run-owned tokens. In particular, do not reset any
 	// external leases, or roll back ambiguous encoding commits/finalizations.
 	embeddingHashes, err := queryBlobHashes(ctx, tx, `UPDATE blobs SET embedding_status='pending',embedding_owner='external',embedding_token='',embedding_lease_until=0

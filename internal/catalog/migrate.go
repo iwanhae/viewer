@@ -28,8 +28,9 @@ type migration struct {
 // A file whose user_version is newer than this build's chain — a binary
 // downgrade after a restore from a newer backup — is left untouched: schema
 // changes so far have been additive, so the older binary's named queries keep
-// working. (Migration 0003 is the first exception: it drops vector storage, so
-// a downgrade below it is unsupported.)
+// working. (Migrations 0003 and 0013 are the exceptions: they drop vector
+// storage and the scoped admin recovery tables, so a downgrade below them is
+// unsupported.)
 func runMigrations(db *sql.DB, sink VectorSink) error {
 	var current int
 	if err := db.QueryRow(`PRAGMA user_version`).Scan(&current); err != nil {
