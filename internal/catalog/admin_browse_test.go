@@ -93,41 +93,43 @@ func TestAdminPhotoBrowseFiltersAndLiteralSearch(t *testing.T) {
 	if err != nil || len(queued) != 4 || queued[0].Name != "blocked.jpg" || queued[1].Name != "webp.jpg" || queued[2].Name != "png.jpg" || queued[3].Name != "eligible.jpg" {
 		t.Fatalf("queued list=%+v err=%v; want all pending rows including legacy gated rows", queued, err)
 	}
-	unknown, err := store.AdminPhotos(ctx, AdminPhotoFilters{Encoding: "unknown", Embedding: "unknown", EncodingRaw: "future-encoding", EmbeddingRaw: "future-embedding"}, "", 0, 20)
-	if err != nil || len(unknown) != 1 || unknown[0].EncodingRaw != "future-encoding" || unknown[0].EmbeddingRaw != "future-embedding" {
-		t.Fatalf("unknown raw drilldown=%+v err=%v", unknown, err)
-	}
 	unknownCategory, err := store.AdminPhotos(ctx, AdminPhotoFilters{Encoding: "unknown"}, "", 0, 20)
 	if err != nil || len(unknownCategory) != 2 {
 		t.Fatalf("unknown encoding category=%+v err=%v; missing blob must not be an unknown blob", unknownCategory, err)
 	}
-	skipped, err := store.AdminPhotos(ctx, AdminPhotoFilters{AlbumID: "album-a", SkippedReason: "webp"}, "", 0, 20)
-	if err != nil || len(skipped) != 1 || skipped[0].SkippedReason != "webp" {
-		t.Fatalf("skipped webp list=%+v err=%v", skipped, err)
+	// The missingBlob filter is the photos-side integrity drilldown: it must
+	// return exactly the rows whose hash has no blob, and its negation must
+	// exclude them without disturbing any other filter.
+	missing := true
+	dangling, err := store.AdminPhotos(ctx, AdminPhotoFilters{MissingBlob: &missing}, "", 0, 20)
+	if err != nil || len(dangling) != 1 || dangling[0].Name != "dangling.jpg" || dangling[0].Hash != "missing-blob" || !dangling[0].MissingBlob {
+		t.Fatalf("missing-blob list=%+v err=%v want only the dangling photo row", dangling, err)
 	}
-	if skipped, err = store.AdminPhotos(ctx, AdminPhotoFilters{SkippedReason: "nonWebp"}, "", 0, 20); err != nil || len(skipped) != 1 || skipped[0].SkippedReason != "nonWebp" {
-		t.Fatalf("skipped nonWebp list=%+v err=%v", skipped, err)
+	present := false
+	attached, err := store.AdminPhotos(ctx, AdminPhotoFilters{MissingBlob: &present, AlbumID: "album-a"}, "", 0, 20)
+	if err != nil || len(attached) != 6 {
+		t.Fatalf("present-blob list=%+v err=%v want album-a's six blob-backed photos", attached, err)
+	}
+	for _, photo := range attached {
+		if photo.MissingBlob {
+			t.Fatalf("present-blob filter returned a dangling photo: %+v", photo)
+		}
 	}
 	photo, err := store.AdminPhotoAt(ctx, "album-b", 2)
 	if err != nil || photo.Name != "eligible.jpg" || photo.EncodingError != "encode err" {
 		t.Fatalf("photo detail=%+v err=%v", photo, err)
 	}
-	dangling, err := store.AdminPhotoAt(ctx, "album-a", 6)
-	if err != nil || !dangling.MissingBlob || dangling.SizeBytes != nil || dangling.ContentType != nil || dangling.EncodingRaw != "" || dangling.Encoding != "" || dangling.EmbeddingRaw != "" || dangling.Embedding != "" {
-		t.Fatalf("dangling photo=%+v err=%v want explicit missing blob and unavailable metadata", dangling, err)
+	danglingDetail, err := store.AdminPhotoAt(ctx, "album-a", 6)
+	if err != nil || !danglingDetail.MissingBlob || danglingDetail.SizeBytes != nil || danglingDetail.ContentType != nil || danglingDetail.EncodingRaw != "" || danglingDetail.Encoding != "" || danglingDetail.EmbeddingRaw != "" || danglingDetail.Embedding != "" {
+		t.Fatalf("dangling photo=%+v err=%v want explicit missing blob and unavailable metadata", danglingDetail, err)
 	}
 }
 
-func TestAdminBlobBrowseOrphansRelationsAndAlbumPipelineCounts(t *testing.T) {
+func TestAdminBlobDetailRelationsAndAlbumMetadata(t *testing.T) {
 	store := openAdminBrowseCatalog(t)
 	seedAdminBrowseCatalog(t, store)
 	ctx := context.Background()
 
-	orphaned := true
-	blobs, err := store.AdminBlobs(ctx, AdminBlobFilters{Unreferenced: &orphaned, Encoding: "unknown", EmbeddingRaw: "future-embedding"}, "", 20)
-	if err != nil || len(blobs) != 1 || blobs[0].Hash != "orphan" || blobs[0].PhotoCount != 0 || blobs[0].AlbumCount != 0 {
-		t.Fatalf("orphan blob list=%+v err=%v", blobs, err)
-	}
 	shared, err := store.AdminBlobByHash(ctx, "shared")
 	if err != nil || shared.PhotoCount != 3 || shared.AlbumCount != 2 || shared.Encoding != "completed" {
 		t.Fatalf("shared blob=%+v err=%v want three photo refs in two albums", shared, err)
@@ -142,31 +144,6 @@ func TestAdminBlobBrowseOrphansRelationsAndAlbumPipelineCounts(t *testing.T) {
 	}
 	if detail.Status != string(AlbumStatusReady) || detail.PhotoCount != 7 || detail.MissingBlobPhotos != 1 {
 		t.Fatalf("album metadata=%+v want SUCCEEDED, 7 photos, missingBlobPhotos=1", detail)
-	}
-	if got := detail.Encoding.Categories["completed"]; got != (PipelineCounts{BlobCount: 1, PhotoCount: 2, AlbumCount: 1}) {
-		t.Fatalf("album encoding completed=%+v want shared blob once, two photo rows", got)
-	}
-	if got := detail.Encoding.SkippedReasons["webp"]; got != (PipelineCounts{BlobCount: 1, PhotoCount: 1, AlbumCount: 1}) {
-		t.Fatalf("album skipped webp=%+v", got)
-	}
-	if got := detail.Embedding.Categories["queued"]; got != (PipelineCounts{BlobCount: 2, PhotoCount: 2, AlbumCount: 1}) {
-		t.Fatalf("album queued embedding=%+v", got)
-	}
-	if got := detail.Encoding.Categories["unknown"]; got != (PipelineCounts{BlobCount: 2, PhotoCount: 2, AlbumCount: 1}) {
-		t.Fatalf("album unknown encoding aggregate=%+v want distinct album and both raw unknown states", got)
-	}
-	if _, ok := detail.Encoding.RawStates["future-encoding"]; !ok {
-		t.Fatalf("album raw unknown state missing: %v", detail.Encoding.RawStates)
-	}
-	if _, ok := detail.Encoding.RawStates["future-encoding-other"]; !ok {
-		t.Fatalf("album second raw unknown state missing: %v", detail.Encoding.RawStates)
-	}
-	var pipelinePhotos int64
-	for _, counts := range detail.Encoding.Categories {
-		pipelinePhotos += counts.PhotoCount
-	}
-	if pipelinePhotos+detail.MissingBlobPhotos != detail.PhotoCount {
-		t.Fatalf("album photo accounting pipeline=%d missing=%d total=%d", pipelinePhotos, detail.MissingBlobPhotos, detail.PhotoCount)
 	}
 
 	albums, err := store.AdminAlbums(ctx, AdminAlbumFilters{Status: string(AlbumStatusFailed)}, "", 10)

@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
 import AdminApp from './ui'
-import type { AlbumDetail, Blob, ExtractionEntry, ExtractionRun, Overview, Photo } from './api'
+import type { AlbumDetail, Blob, ExtractionRun, Overview, Photo } from './api'
 
 const pipeline = { blobCount: 1, photoCount: 2, albumCount: 1 }
 const blobCount = { blobCount: 1 }
@@ -51,16 +51,8 @@ const extractionRun = (runId: number, status = 'succeeded'): ExtractionRun => ({
 
 const albumDetail: AlbumDetail = {
   id: 'album-1', originalFilename: 'archive.zip', status: 'SUCCEEDED', error: '', photoCount: 1,
-  encoding: { categories: {}, skippedReasons: {}, rawStates: {} },
-  embedding: { categories: {}, rawStates: {} }, missingBlobPhotos: 0,
-  extractionRecorded: true, latestExtraction: extractionRun(2)
+  missingBlobPhotos: 0, extractionRecorded: true, latestExtraction: extractionRun(2)
 }
-
-const extractionEntry = (runId: number, ordinal: number, name: string, outcome: ExtractionEntry['outcome'], reasonCode = ''): ExtractionEntry => ({
-  runId, ordinal, name, candidate: outcome !== 'skipped' || reasonCode !== 'unsupported_extension', outcome,
-  reasonCode, errorDetail: reasonCode === 'invalid_image' ? 'image decode failed' : '',
-  photoIndex: outcome === 'registered' ? 0 : null, hash: outcome === 'registered' ? 'sha256-hash' : ''
-})
 
 function jsonResponse(body: unknown, status = 200) {
   return { ok: status >= 200 && status < 300, status, json: async () => body } as Response
@@ -108,7 +100,7 @@ const automaticStatus = { enabled: true, running: true }
 describe('admin React UI', () => {
   afterEach(() => { cleanup(); vi.unstubAllGlobals(); vi.restoreAllMocks() })
 
-  it('drills overview unique-blob counts into blob filters', async () => {
+  it('drills overview unique-blob counts into the photos list', async () => {
     const fetchMock = mockFetch((url) => url === '/admin/api/overview'
       ? jsonResponse(overview)
       : url === '/admin/api/automatic/embedding'
@@ -119,12 +111,16 @@ describe('admin React UI', () => {
     const section = (await screen.findByRole('heading', { name: 'WebP 인코딩' })).parentElement!
     const row = await within(section).findByRole('row', { name: /대기 \(queued\)/ })
     const countLink = within(row).getByRole('link', { name: '1' })
-    expect(countLink.getAttribute('href')).toBe('/blobs?encoding=queued')
+    // The counts are unique-blob counts, but the blobs list is retired: the
+    // drilldown opens photo rows filtered by the category.
+    expect(countLink.getAttribute('href')).toBe('/photos?encoding=queued')
+    expect(screen.getByRole('link', { name: /고유 블롭/ }).getAttribute('href')).toBe('/photos')
     expect(screen.getByText(/사진·앨범 참조 수를 상태별로 나누지 않습니다/)).toBeTruthy()
     expect(screen.getByText(/인코딩 상태와 관계없이 임베딩 작업자가 처리할 수 있는 상태/)).toBeTruthy()
-    expect(screen.queryByRole('link', { name: /차단됨/ })).toBeNull()
+    expect(within(section).getByRole('columnheader', { name: '고유 블롭' })).toBeTruthy()
+    expect(screen.queryByRole('columnheader', { name: '사진 행' })).toBeNull()
     fireEvent.click(countLink)
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/admin/api/blobs?encoding=queued', expect.anything()))
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/admin/api/photos?encoding=queued', expect.anything()))
   })
 
   it('keeps supported list filters in the URL and renders missing-blob nullable fields', async () => {
@@ -141,6 +137,56 @@ describe('admin React UI', () => {
     expect(screen.queryByRole('option', { name: '차단됨' })).toBeNull()
   })
 
+  it('exposes exactly the five form fields on the photos page', async () => {
+    mockFetch((url) => jsonResponse({ photos: [], nextCursor: null }))
+    renderAt('/photos')
+
+    const form = document.querySelector('.filter-panel') as HTMLElement
+    expect(form).toBeTruthy()
+    expect(within(form).getAllByRole('textbox')).toHaveLength(3)
+    expect(within(form).getAllByRole('combobox')).toHaveLength(2)
+    for (const label of ['이름 검색', '앨범 ID', '해시', '인코딩', '임베딩']) {
+      expect(within(form).getByLabelText(label)).toBeTruthy()
+    }
+    // The retired raw-state, error-code, lease, phase, and skipped-reason
+    // fields must not come back as hidden inputs.
+    for (const label of ['원본 인코딩 상태', '원본 임베딩 상태', '인코딩 오류 코드', '임베딩 오류 코드', '인코딩 리스 만료', '임베딩 리스 만료', '인코딩 단계', '건너뜀 형식', '참조 여부']) {
+      expect(within(form).queryByLabelText(label)).toBeNull()
+    }
+  })
+
+  it('honors URL-only photo filters and explains them as chips with a clear link', async () => {
+    const fetchMock = mockFetch((url) => url === '/admin/api/photos?hash=gone&missingBlob=true&encodingErrorCode=invalid_source'
+      ? jsonResponse({ photos: [missingPhoto], nextCursor: null })
+      : jsonResponse({ photos: [], nextCursor: null }))
+    renderAt('/photos?hash=gone&missingBlob=true&encodingErrorCode=invalid_source')
+
+    // The deep link's filters reach the API and the page explains itself.
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/admin/api/photos?hash=gone&missingBlob=true&encodingErrorCode=invalid_source', expect.anything()))
+    const notice = (await screen.findByText('블롭 없는 사진')).closest('.notice') as HTMLElement
+    expect(notice).toBeTruthy()
+    expect(within(notice).getByText('true')).toBeTruthy()
+    expect(within(notice).getByText('인코딩 오류 코드')).toBeTruthy()
+    expect(within(notice).getByText('invalid_source')).toBeTruthy()
+    // The form keeps only its five fields; the URL-only ones are not inputs.
+    expect(screen.getByLabelText('해시')).toHaveProperty('value', 'gone')
+    expect(screen.queryByLabelText('인코딩 오류 코드')).toBeNull()
+
+    // Clearing drops exactly the URL-only filters and keeps the form's.
+    fireEvent.click(within(notice).getByRole('link', { name: 'URL 필터 지우기' }))
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/admin/api/photos?hash=gone', expect.anything()))
+    await waitFor(() => expect(screen.queryByText('블롭 없는 사진')).toBeNull())
+
+    // Submitting the form preserves the URL-only filters it did not show.
+    cleanup()
+    const secondMock = mockFetch((url) => jsonResponse({ photos: [], nextCursor: null }))
+    renderAt('/photos?missingBlob=true')
+    await waitFor(() => expect(secondMock).toHaveBeenCalledWith('/admin/api/photos?missingBlob=true', expect.anything()))
+    fireEvent.change(screen.getByLabelText('이름 검색'), { target: { value: 'pic' } })
+    fireEvent.click(screen.getByRole('button', { name: '검색' }))
+    await waitFor(() => expect(secondMock).toHaveBeenCalledWith('/admin/api/photos?missingBlob=true&q=pic', expect.anything()))
+  })
+
   it('shows request errors without dropping the current route', async () => {
     mockFetch(() => jsonResponse({ error: { message: 'catalog unavailable' } }, 500))
     renderAt('/albums?status=FAILED')
@@ -148,16 +194,12 @@ describe('admin React UI', () => {
     expect(screen.getByRole('combobox', { name: '앨범 상태' })).toHaveProperty('value', 'FAILED')
   })
 
-  it('renders nullable observations as unavailable and pages safe blob history', async () => {
-    const fetchMock = mockFetch((url) => {
+  it('renders nullable observations as unavailable and shows the bounded blob history', async () => {
+    mockFetch((url) => {
       if (url === '/admin/api/blobs/history-hash') return jsonResponse(detailBlob)
-      if (url === '/admin/api/blobs/history-hash/history') return jsonResponse({
+      if (url === '/admin/api/blobs/history-hash/history?limit=20') return jsonResponse({
         events: [{ id: 1, stage: 'encoding', event: 'claimed', status: 'leased', phase: null, attemptId: 1, errorCode: '', retryability: 'unknown', occurredAt: '2026-10-14T12:00:00Z' }],
         nextCursor: '1'
-      })
-      if (url === '/admin/api/blobs/history-hash/history?limit=50&cursor=1') return jsonResponse({
-        events: [{ id: 2, stage: 'encoding', event: 'commit_started', status: 'committing', phase: 'committing', attemptId: 1, errorCode: '', retryability: 'unknown', occurredAt: '2026-10-14T12:01:00Z' }],
-        nextCursor: null
       })
       return jsonResponse({ events: [], nextCursor: null })
     })
@@ -168,54 +210,10 @@ describe('admin React UI', () => {
     expect(screen.getAllByText('unknown').length).toBeGreaterThan(0)
     expect(screen.getByText('legacy_unknown')).toBeTruthy()
     expect(screen.getByText('인코딩 상태와 관계없이 임베딩 처리 대기 중입니다.')).toBeTruthy()
-    expect(screen.queryByText(/인코딩 게이트/)).toBeNull()
-    fireEvent.click(screen.getByRole('button', { name: '다음 기록 더 보기' }))
-    expect(await screen.findByText(/encoding · commit_started/)).toBeTruthy()
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/admin/api/blobs/history-hash/history?limit=50&cursor=1', expect.anything()))
-  })
-
-  it('ignores load-more results and errors after the selected history stage changes', async () => {
-    const oldStageMore = deferred<Response>()
-    const encodingMore = deferred<Response>()
-    const event = (id: number, stage: string, name: string) => ({
-      id, stage, event: name, status: 'done', phase: null, attemptId: 1,
-      errorCode: '', retryability: 'unknown', occurredAt: '2026-10-14T12:00:00Z'
-    })
-    const fetchMock = mockFetch((url) => {
-      if (url === '/admin/api/blobs/history-hash') return jsonResponse(detailBlob)
-      if (url === '/admin/api/blobs/history-hash/history') return jsonResponse({ events: [event(1, 'encoding', 'all_initial')], nextCursor: '1' })
-      if (url === '/admin/api/blobs/history-hash/history?limit=50&cursor=1') return oldStageMore.promise
-      if (url === '/admin/api/blobs/history-hash/history?stage=encoding') return jsonResponse({ events: [event(2, 'encoding', 'encoding_filtered')], nextCursor: '10' })
-      if (url === '/admin/api/blobs/history-hash/history?stage=encoding&limit=50&cursor=10') return encodingMore.promise
-      if (url === '/admin/api/blobs/history-hash/history?stage=embedding') return jsonResponse({ events: [event(3, 'embedding', 'embedding_filtered')], nextCursor: null })
-      return jsonResponse({ events: [], nextCursor: null })
-    })
-    renderAt('/blobs/history-hash')
-
-    expect(await screen.findByText(/encoding · all_initial/)).toBeTruthy()
-    fireEvent.click(screen.getByRole('button', { name: '다음 기록 더 보기' }))
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/admin/api/blobs/history-hash/history?limit=50&cursor=1', expect.anything()))
-    fireEvent.change(screen.getByRole('combobox', { name: '단계' }), { target: { value: 'encoding' } })
-    expect(await screen.findByText(/encoding · encoding_filtered/)).toBeTruthy()
-
-    await act(async () => {
-      oldStageMore.resolve(jsonResponse({ events: [event(99, 'embedding', 'stale_all_stage_page')], nextCursor: null }))
-      await Promise.resolve()
-    })
-    expect(screen.queryByText(/stale_all_stage_page/)).toBeNull()
-
-    await waitFor(() => expect(screen.getByRole('button', { name: '다음 기록 더 보기' }).hasAttribute('disabled')).toBe(false))
-    fireEvent.click(screen.getByRole('button', { name: '다음 기록 더 보기' }))
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/admin/api/blobs/history-hash/history?stage=encoding&limit=50&cursor=10', expect.anything()))
-    fireEvent.change(screen.getByRole('combobox', { name: '단계' }), { target: { value: 'embedding' } })
-    expect(await screen.findByText(/embedding · embedding_filtered/)).toBeTruthy()
-
-    await act(async () => {
-      encodingMore.reject(new Error('stale encoding page failed'))
-      await Promise.resolve()
-    })
-    await waitFor(() => expect(screen.queryByRole('alert')).toBeNull())
-    expect(screen.queryByText(/stale encoding page failed/)).toBeNull()
+    // One bounded fetch of the newest 20 events: no stage filter and no
+    // load-more machinery anymore.
+    expect(screen.getByText(/최근 20개 이벤트만 표시합니다/)).toBeTruthy()
+    expect(screen.queryByRole('combobox', { name: '단계' })).toBeNull()
     expect(screen.queryByRole('button', { name: '다음 기록 더 보기' })).toBeNull()
   })
 
@@ -247,119 +245,62 @@ describe('admin React UI', () => {
     expect(screen.getByRole('alert').textContent).toContain('second filter failed')
   })
 
-  it('shows append-only extraction runs, outcome filters, and paged per-entry reasons', async () => {
-    const fetchMock = mockFetch((url) => {
-      if (url === '/admin/api/albums/album-1') return jsonResponse(albumDetail)
-      if (url === '/admin/api/albums/album-1/extractions?limit=20') return jsonResponse({ runs: [extractionRun(2), extractionRun(1, 'failed')], nextCursor: 'run-page' })
-      if (url === '/admin/api/albums/album-1/extractions?limit=20&cursor=run-page') return jsonResponse({ runs: [extractionRun(3)], nextCursor: null })
-      if (url === '/admin/api/albums/album-1/entries?limit=50') return jsonResponse({
-        run: extractionRun(2), runSelection: 'latest', entries: [extractionEntry(2, 0, 'cover.png', 'registered')], nextCursor: 'entry-page'
-      })
-      if (url === '/admin/api/albums/album-1/entries?limit=50&runId=2') return jsonResponse({
-        run: extractionRun(2), runSelection: 'explicit', entries: [extractionEntry(2, 0, 'cover.png', 'registered')], nextCursor: 'entry-page'
-      })
-      if (url === '/admin/api/albums/album-1/entries?limit=50&runId=2&cursor=entry-page') return jsonResponse({
-        run: extractionRun(2), runSelection: 'explicit', entries: [extractionEntry(2, 1, 'notes.txt', 'skipped', 'unsupported_extension')], nextCursor: null
-      })
-      if (url === '/admin/api/albums/album-1/entries?limit=50&runId=2&outcome=skipped') return jsonResponse({
-        run: extractionRun(2), runSelection: 'explicit', entries: [extractionEntry(2, 1, 'notes.txt', 'skipped', 'unsupported_extension')], nextCursor: null
-      })
-      if (url === '/admin/api/albums/album-1/entries?limit=50&runId=1&outcome=skipped') return jsonResponse({
-        run: extractionRun(1, 'failed'), runSelection: 'explicit', entries: [extractionEntry(1, 3, 'duplicate.jpg', 'skipped', 'invalid_image')], nextCursor: null
-      })
-      return jsonResponse({ entries: [], nextCursor: null })
-    })
+  it('renders the slim album detail with scoped counts, drilldown links, and the latest extraction run', async () => {
+    const fetchMock = mockFetch((url) => url === '/admin/api/albums/album-1'
+      ? jsonResponse({ ...albumDetail, missingBlobPhotos: 2, error: 'extract failed' })
+      : jsonResponse({ photos: [], nextCursor: null }))
     renderAt('/albums/album-1')
 
-    expect(await screen.findByText('cover.png')).toBeTruthy()
-    expect(screen.getByText(/최신 실행/)).toBeTruthy()
-    expect(screen.getByText(/후보 수는 현재 추출기가 검사하는 이미지 확장자 항목 기준/)).toBeTruthy()
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/admin/api/albums/album-1/entries?limit=50&runId=2', expect.anything()))
-    fireEvent.click(await screen.findByRole('button', { name: '다음 항목 더 보기' }))
-    expect(await screen.findByText('notes.txt')).toBeTruthy()
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/admin/api/albums/album-1/entries?limit=50&runId=2&cursor=entry-page', expect.anything()))
+    expect(await screen.findByText('archive.zip')).toBeTruthy()
+    expect(screen.getByText(/앨범의 사진을 페이지로 보기/)).toBeTruthy()
+    expect(screen.getByRole('link', { name: '앨범의 사진을 페이지로 보기' }).getAttribute('href')).toBe('/photos?albumId=album-1')
+    expect(screen.getByRole('link', { name: '인코딩 실패 사진' }).getAttribute('href')).toBe('/photos?albumId=album-1&encoding=failed')
+    expect(screen.getByRole('link', { name: '임베딩 실패 사진' }).getAttribute('href')).toBe('/photos?albumId=album-1&embedding=failed')
+    expect(screen.getByRole('link', { name: /블롭 없는 사진/ }).getAttribute('href')).toBe('/photos?albumId=album-1&missingBlob=true')
+    expect(screen.getByText('extract failed')).toBeTruthy()
 
-    fireEvent.change(screen.getByRole('combobox', { name: '추출 결과' }), { target: { value: 'skipped' } })
-    expect(await screen.findByText('unsupported_extension')).toBeTruthy()
-    fireEvent.click(screen.getAllByRole('button', { name: '항목 보기' })[0])
-    expect(await screen.findByText('invalid_image')).toBeTruthy()
-    expect(screen.getByText('duplicate.jpg')).toBeTruthy()
-    expect(await screen.findByText('image decode failed')).toBeTruthy()
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/admin/api/albums/album-1/entries?limit=50&runId=1&outcome=skipped', expect.anything()))
-
-    fireEvent.click(screen.getByRole('button', { name: '이전 실행 더 보기' }))
-    expect(await screen.findByText('#3')).toBeTruthy()
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/admin/api/albums/album-1/extractions?limit=20&cursor=run-page', expect.anything()))
+    // The latest run summary: identity, timing, and the three outcome counts.
+    expect(screen.getByText('#2 · succeeded')).toBeTruthy()
+    expect(screen.getByText('등록됨')).toBeTruthy()
+    expect(screen.getByText(/시작 /)).toBeTruthy()
+    expect(screen.getByText(/항목 기록 완료/)).toBeTruthy()
+    expect(screen.queryByRole('button', { name: '이전 실행 더 보기' })).toBeNull()
+    expect(screen.queryByRole('combobox', { name: '추출 결과' })).toBeNull()
+    // No pipeline tables: the photos deep links replaced them.
+    expect(screen.queryByRole('heading', { name: '앨범 인코딩 상태' })).toBeNull()
+    expect(screen.queryByRole('heading', { name: '앨범 임베딩 상태' })).toBeNull()
+    expect(screen.queryByRole('heading', { name: '건너뜀 형식' })).toBeNull()
+    expect(fetchMock.mock.calls.filter(([url]) => String(url).includes('/extractions') || String(url).includes('/entries')).length).toBe(0)
   })
 
-  it('pins the latest response run id before paging when a newer run appears during the initial request', async () => {
-    const defaultLatest = deferred<Response>()
-    const newerRun = extractionRun(3)
-    const fetchMock = mockFetch((url) => {
-      if (url === '/admin/api/albums/album-1') return jsonResponse({ ...albumDetail, latestExtraction: extractionRun(1) })
-      if (url === '/admin/api/albums/album-1/extractions?limit=20') return jsonResponse({ runs: [extractionRun(1)], nextCursor: null })
-      if (url === '/admin/api/albums/album-1/entries?limit=50') return defaultLatest.promise
-      if (url === '/admin/api/albums/album-1/entries?limit=50&runId=3') return jsonResponse({
-        run: newerRun, runSelection: 'explicit', entries: [extractionEntry(3, 0, 'latest-cover.png', 'registered')], nextCursor: 'pinned-cursor'
-      })
-      if (url === '/admin/api/albums/album-1/entries?limit=50&runId=3&cursor=pinned-cursor') return jsonResponse({
-        run: newerRun, runSelection: 'explicit', entries: [extractionEntry(3, 9, 'latest-tail.png', 'skipped', 'invalid_image')], nextCursor: null
-      })
-      return jsonResponse({ entries: [], nextCursor: null })
-    })
+  it('renders the failed latest run reason and provisional counts while it is running', async () => {
+    const failedRun = { ...extractionRun(4, 'failed'), failureReasonCode: 'entry_failed', errorDetail: 'safe failure detail' }
+    mockFetch((url) => url === '/admin/api/albums/album-1'
+      ? jsonResponse({ ...albumDetail, latestExtraction: failedRun })
+      : jsonResponse({}))
     renderAt('/albums/album-1')
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/admin/api/albums/album-1/entries?limit=50', expect.anything()))
+    expect(await screen.findByText('#4 · failed')).toBeTruthy()
+    expect(screen.getByText(/entry_failed · safe failure detail/)).toBeTruthy()
 
-    // A new run finishes while the initial latest-run request is in flight.
-    await act(async () => {
-      defaultLatest.resolve(jsonResponse({
-        run: newerRun, runSelection: 'latest', entries: [extractionEntry(3, 0, 'latest-cover.png', 'registered')], nextCursor: 'first-cursor'
-      }))
-      await Promise.resolve()
-    })
-
-    expect(await screen.findByText('latest-cover.png')).toBeTruthy()
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/admin/api/albums/album-1/entries?limit=50&runId=3', expect.anything()))
-    expect(screen.getByText('#3 · succeeded')).toBeTruthy()
-    const latestRows = screen.getAllByText('최신')
-    expect(latestRows.length).toBeGreaterThan(0)
-    fireEvent.click(screen.getByRole('button', { name: '다음 항목 더 보기' }))
-    expect(await screen.findByText('latest-tail.png')).toBeTruthy()
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/admin/api/albums/album-1/entries?limit=50&runId=3&cursor=pinned-cursor', expect.anything()))
-    expect(fetchMock.mock.calls.some(([url]) => String(url) === '/admin/api/albums/album-1/entries?limit=50&cursor=first-cursor')).toBe(false)
-  })
-
-  it('explains that running entry outcomes are pending and refreshes the matching provisional run summary', async () => {
-    const runningRun = extractionRun(3, 'running')
-    let runListCalls = 0
-    const fetchMock = mockFetch((url) => {
-      if (url === '/admin/api/albums/album-1') return jsonResponse({ ...albumDetail, latestExtraction: extractionRun(1) })
-      if (url === '/admin/api/albums/album-1/extractions?limit=20') {
-        runListCalls++
-        return jsonResponse({ runs: [runListCalls === 1 ? extractionRun(1) : runningRun], nextCursor: null })
-      }
-      if (url === '/admin/api/albums/album-1/entries?limit=50') return jsonResponse({
-        error: { code: 'EXTRACTION_IN_PROGRESS', message: 'Extraction is still running; entry outcomes can be browsed after it reaches a terminal status.' }
-      }, 409)
-      return jsonResponse({ entries: [], nextCursor: null })
-    })
+    cleanup()
+    const runningRun = extractionRun(5, 'running')
+    mockFetch((url) => url === '/admin/api/albums/album-1'
+      ? jsonResponse({ ...albumDetail, latestExtraction: runningRun })
+      : jsonResponse({}))
     renderAt('/albums/album-1')
-
-    expect(await screen.findByText(/항목 페이지는 아직 제공되지 않습니다/)).toBeTruthy()
-    expect(await screen.findByText('#3 · running')).toBeTruthy()
-    expect(screen.getByText(/현재까지 기록된 값이며 계속 바뀔 수 있습니다/)).toBeTruthy()
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(4))
-    expect(screen.getAllByText('최신').length).toBeGreaterThan(0)
+    expect(await screen.findByText('#5 · running')).toBeTruthy()
+    expect(screen.getByText(/등록·건너뜀·실패 수는 현재까지 기록된 값이며 계속 바뀔 수 있습니다/)).toBeTruthy()
+    expect(screen.queryByText(/항목 페이지는 실행 완료 후 확인할 수 있습니다/)).toBeNull()
   })
 
   it('explains that legacy albums have no extraction record instead of showing zero failures', async () => {
     const legacy: AlbumDetail = { ...albumDetail, extractionRecorded: false, latestExtraction: null }
-    const fetchMock = mockFetch((url) => url === '/admin/api/albums/album-1'
+    mockFetch((url) => url === '/admin/api/albums/album-1'
       ? jsonResponse(legacy)
-      : jsonResponse({ runs: [], nextCursor: null }))
+      : jsonResponse({ photos: [], nextCursor: null }))
     renderAt('/albums/album-1')
     expect(await screen.findByText(/기록 기능 도입 전의 기존 앨범이며 실패 항목이 0개라는 뜻은 아닙니다/)).toBeTruthy()
-    expect(fetchMock.mock.calls.some(([url]) => String(url).includes('/entries'))).toBe(false)
+    expect(screen.queryByText(/최신 실행/)).toBeNull()
   })
 
   it('shows current issue groups and drills into the matching paged resource and latest extraction entries', async () => {
@@ -373,11 +314,11 @@ describe('admin React UI', () => {
     }
     const fetchMock = mockFetch((url) => {
       if (url === '/admin/api/issues') return jsonResponse(issues)
-      if (url === '/admin/api/blobs?encoding=failed&encodingErrorCode=invalid_source') return jsonResponse({ blobs: [], nextCursor: null })
+      if (url === '/admin/api/photos?encoding=failed&encodingErrorCode=invalid_source') return jsonResponse({ photos: [], nextCursor: null })
       if (url === '/admin/api/extraction-failures?reasonCode=invalid_image&limit=50') return jsonResponse({
         reasonCode: 'invalid_image', failures: [{ albumId: 'album-2', originalFilename: 'broken.zip', runId: 9, ordinal: 2, name: 'bad.jpg', candidate: true, reasonCode: 'invalid_image' }], nextCursor: null
       })
-      return jsonResponse({ blobs: [], nextCursor: null })
+      return jsonResponse({ photos: [], nextCursor: null })
     })
     renderAt('/issues')
 
@@ -386,13 +327,13 @@ describe('admin React UI', () => {
     expect(screen.getByText('Groups are independent.')).toBeTruthy()
     const encodingRow = screen.getByRole('row', { name: /인코딩 invalid_source/ })
     expect(within(encodingRow).getByText('고유 블롭')).toBeTruthy()
-    expect(screen.queryByRole('columnheader', { name: '사진 행' })).toBeNull()
     expect(screen.getByText('실패 항목')).toBeTruthy()
     expect(screen.getByRole('link', { name: '이슈' })).toBeTruthy()
     const issueCount = screen.getByRole('link', { name: '1' })
-    expect(issueCount.getAttribute('href')).toBe('/blobs?encoding=failed&encodingErrorCode=invalid_source')
+    // The blobs list is retired: pipeline issue groups drill into photo rows.
+    expect(issueCount.getAttribute('href')).toBe('/photos?encoding=failed&encodingErrorCode=invalid_source')
     fireEvent.click(issueCount)
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/admin/api/blobs?encoding=failed&encodingErrorCode=invalid_source', expect.anything()))
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/admin/api/photos?encoding=failed&encodingErrorCode=invalid_source', expect.anything()))
 
     // Navigate through the extraction group, which loads entries only from
     // their albums' latest runs and uses a separately bounded page API.
@@ -693,7 +634,7 @@ describe('admin React UI', () => {
     expect(screen.getByRole('heading', { name: '라이브러리' })).toBeTruthy()
   })
 
-  it('does not render the retired local runs or diagnostics pages or their navigation entries', async () => {
+  it('does not render the retired local runs, diagnostics, or blobs-list pages or their navigation entries', async () => {
     mockFetch((url) => url === '/admin/api/overview'
       ? jsonResponse(overview)
       : url === '/admin/api/automatic/embedding'
@@ -705,10 +646,16 @@ describe('admin React UI', () => {
     expect(screen.queryByRole('region', { name: '로컬 실행 상세' })).toBeNull()
     expect(screen.queryByText(/유한한 대상만 소진한 뒤 종료/)).toBeNull()
     expect(screen.queryByRole('link', { name: '시스템 진단' })).toBeNull()
+    // The blobs LIST page is retired; blob detail stays reachable from photo
+    // rows, so the nav link is gone but the route keeps its splat form.
+    expect(screen.queryByRole('link', { name: '블롭' })).toBeNull()
+    expect(screen.getByRole('link', { name: '사진' })).toBeTruthy()
 
-    cleanup()
-    renderAt('/diagnostics')
-    expect(await screen.findByText('페이지를 찾을 수 없습니다')).toBeTruthy()
+    for (const target of ['/diagnostics', '/blobs']) {
+      cleanup()
+      renderAt(target)
+      expect(await screen.findByText('페이지를 찾을 수 없습니다')).toBeTruthy()
+    }
   })
 
   it('renders the health section with integrity links, flags, and the vector agreement', async () => {
@@ -722,11 +669,12 @@ describe('admin React UI', () => {
     expect(await screen.findByRole('region', { name: '시스템 상태' })).toBeTruthy()
     expect(screen.getByRole('link', { name: /만료된 임베딩 리스/ }).getAttribute('href')).toBe('/photos?embeddingLeaseExpired=true')
     expect(screen.getByRole('link', { name: /만료된 인코딩 리스/ }).getAttribute('href')).toBe('/photos?encodingLeaseExpired=true')
-    expect(screen.getByRole('link', { name: /참조 없는 블롭/ }).getAttribute('href')).toBe('/blobs?unreferenced=true')
-    // 블롭 없는 사진 has no list filter, so its stat stays a plain number.
-    const missingBlobStat = screen.getByText('블롭 없는 사진').closest('.stat') as HTMLElement
-    expect(missingBlobStat.tagName).toBe('DIV')
-    expect(within(missingBlobStat).getByText('4')).toBeTruthy()
+    // 참조 없는 블롭 lost its drilldown with the blobs list: a plain number.
+    const unreferencedStat = screen.getByText('참조 없는 블롭').closest('.stat') as HTMLElement
+    expect(unreferencedStat.tagName).toBe('DIV')
+    expect(within(unreferencedStat).getByText('3')).toBeTruthy()
+    // 블롭 없는 사진 gained one: the photos missingBlob filter.
+    expect(screen.getByRole('link', { name: /블롭 없는 사진/ }).getAttribute('href')).toBe('/photos?missingBlob=true')
     expect(screen.getByText('일치')).toBeTruthy()
     expect(screen.getByText(/기대 5 · 실제 5/)).toBeTruthy()
     expect(screen.getByText(/개수 비교일 뿐 전체 동기화나 포인트 무결성을 검증하지 않습니다/)).toBeTruthy()

@@ -13,14 +13,6 @@ type BlobCounts struct {
 	BlobCount int64 `json:"blobCount"`
 }
 
-// PipelineCounts describes the exact blob and relation counts for a scoped
-// album drilldown. AlbumCount is distinct within each category.
-type PipelineCounts struct {
-	BlobCount  int64 `json:"blobCount"`
-	PhotoCount int64 `json:"photoCount"`
-	AlbumCount int64 `json:"albumCount"`
-}
-
 // AdminOverviewSnapshot is the consistent catalog-only snapshot behind the
 // admin overview: library totals, unique-blob pipeline categories, and the
 // integrity and lease figures the overview's health section renders. Everything

@@ -1,11 +1,4 @@
-export type PipelineCounts = {
-  blobCount: number
-  photoCount: number
-  albumCount: number
-}
-
 export type BlobCounts = { blobCount: number }
-
 // OverviewVectorCount is the health section's vector-store half. status is
 // 'disabled' (no store wired), 'available' (counted), or 'unavailable' (the
 // count failed; the overview itself still succeeds).
@@ -190,16 +183,10 @@ export type Album = {
   photoCount: number
 }
 
+// AlbumDetail is the slim album drilldown: processing state, scoped counts,
+// and the latest extraction run summary. The per-album pipeline breakdown
+// tables moved to the photos list (albumId + category filters).
 export type AlbumDetail = Album & {
-  encoding: {
-    categories: Record<string, PipelineCounts>
-    skippedReasons: Record<string, PipelineCounts>
-    rawStates: Record<string, PipelineCounts>
-  }
-  embedding: {
-    categories: Record<string, PipelineCounts>
-    rawStates: Record<string, PipelineCounts>
-  }
   missingBlobPhotos: number
   extractionRecorded: boolean
   latestExtraction: ExtractionRun | null
@@ -223,30 +210,11 @@ export type ExtractionRun = {
   failedCount: number
 }
 
-export type ExtractionRunsPage = { runs: ExtractionRun[]; nextCursor: string | null }
-
-export type ExtractionEntry = {
-  runId: number
-  ordinal: number
-  name: string
-  candidate: boolean
-  outcome: 'registered' | 'skipped' | 'failed'
-  reasonCode: string
-  errorDetail: string
-  photoIndex: number | null
-  hash: string
-}
-
-export type ExtractionEntriesPage = {
-  run: ExtractionRun
-  runSelection: 'latest' | 'explicit'
-  entries: ExtractionEntry[]
-  nextCursor: string | null
-}
-
+// Page is the shared shape of the two surviving list endpoints: photos and
+// albums. The blobs list retired with the blob-centric browse surface; blob
+// rows stay reachable one hash at a time through the detail endpoint.
 export type Page<T> = { nextCursor: string | null } & (
   | { photos: T[] }
-  | { blobs: T[] }
   | { albums: T[] }
 )
 

@@ -109,6 +109,21 @@ func openTestCatalog(t *testing.T) *catalog.Store {
 	return cat
 }
 
+// latestRun reads an album's newest extraction run through the production
+// read model — the admin album detail — so these tests assert exactly what
+// the dashboard serves, not a test-only accessor.
+func latestRun(t *testing.T, cat *catalog.Store, albumID string) catalog.ExtractionRunSummary {
+	t.Helper()
+	detail, err := cat.AdminAlbumByID(context.Background(), albumID)
+	if err != nil {
+		t.Fatalf("album detail %s: %v", albumID, err)
+	}
+	if detail.LatestExtraction == nil {
+		t.Fatalf("album %s has no recorded extraction run", albumID)
+	}
+	return *detail.LatestExtraction
+}
+
 type zipEntry struct {
 	name string
 	data []byte
@@ -345,10 +360,7 @@ func TestProcessAlbumNoValidImagesMarksFailedAndKeepsSource(t *testing.T) {
 	if !store.has(SourceKey("album-a")) {
 		t.Fatalf("failed extraction must keep the staged zip for retry")
 	}
-	run, found, err := cat.LatestExtractionRun(context.Background(), "album-a")
-	if err != nil || !found {
-		t.Fatalf("latest extraction run=%+v found=%v err=%v", run, found, err)
-	}
+	run := latestRun(t, cat, "album-a")
 	if run.Status != "failed" || run.FailureReasonCode != "no_valid_images" || !run.EntriesComplete || run.TotalEntries == nil || *run.TotalEntries != 2 || run.CandidateEntries == nil || *run.CandidateEntries != 0 || run.SkippedCount != 2 || run.RegisteredCount != 0 {
 		t.Fatalf("no-image extraction outcome=%+v", run)
 	}
@@ -379,44 +391,23 @@ func TestProcessAlbumRecordsAllEntryOutcomesAndKeepsPartialSuccess(t *testing.T)
 	if err != nil || album.Status != catalog.AlbumStatusReady || album.PhotoCount != 3 {
 		t.Fatalf("album after partial extraction=%+v err=%v", album, err)
 	}
-	run, found, err := cat.LatestExtractionRun(context.Background(), "album-outcomes")
-	if err != nil || !found {
-		t.Fatalf("latest extraction run=%+v found=%v err=%v", run, found, err)
-	}
+	run := latestRun(t, cat, "album-outcomes")
 	if run.Status != "succeeded" || !run.EntriesComplete || run.TotalEntries == nil || *run.TotalEntries != 8 || run.CandidateEntries == nil || *run.CandidateEntries != 5 || run.RegisteredCount != 3 || run.SkippedCount != 5 || run.FailedCount != 0 {
 		t.Fatalf("partial-success run summary=%+v", run)
 	}
-	entries, err := cat.ListExtractionEntries(context.Background(), "album-outcomes", run.RunID, "", -1, 20)
-	if err != nil || len(entries) != 8 {
-		t.Fatalf("entry outcomes=%+v err=%v", entries, err)
+	// The three registered outcomes are exactly the album's photo rows; the
+	// five skips (directory, metadata, unsupported extension, read failure,
+	// invalid image) are classified in the counters above.
+	photos, err := cat.PhotosByAlbum(context.Background(), "album-outcomes")
+	if err != nil {
+		t.Fatalf("photos: %v", err)
 	}
-	want := map[int]struct {
-		name, outcome, reason string
-	}{
-		0: {"corrupt.jpg", "skipped", "entry_read_failed"},
-		1: {"folder/", "skipped", "directory_entry"},
-		2: {"notes.txt", "skipped", "unsupported_extension"},
-		3: {"invalid.jpg", "skipped", "invalid_image"},
-		4: {"same.png", "registered", ""},
-		5: {"same.png", "registered", ""},
-		6: {"a.png", "registered", ""},
-		7: {"__MACOSX/._photo", "skipped", "metadata_entry"},
+	registered := map[string]int{}
+	for _, photo := range photos {
+		registered[photo.Name]++
 	}
-	for _, entry := range entries {
-		expected, ok := want[entry.Ordinal]
-		if !ok || entry.Name != expected.name || entry.Outcome != expected.outcome || entry.ReasonCode != expected.reason {
-			t.Errorf("entry outcome=%+v want=%+v", entry, expected)
-		}
-		if entry.Outcome == "registered" {
-			if entry.PhotoIndex == nil {
-				t.Errorf("registered entry %d missing photo index", entry.Ordinal)
-				continue
-			}
-			photo, err := cat.PhotoAt(context.Background(), "album-outcomes", *entry.PhotoIndex)
-			if err != nil || photo.Hash != entry.Hash || photo.Name != entry.Name {
-				t.Errorf("entry %d photo link=%+v photo=%+v err=%v", entry.Ordinal, entry, photo, err)
-			}
-		}
+	if len(photos) != 3 || registered["same.png"] != 2 || registered["a.png"] != 1 {
+		t.Fatalf("registered outcomes should become the album's photos, got %+v", photos)
 	}
 	if !store.has(SourceKey("album-outcomes")) {
 		t.Fatal("successful extraction should retain the staged archive")
@@ -439,9 +430,9 @@ func TestOutcomeRecordingFailureDoesNotChangeAlbumResult(t *testing.T) {
 	if err != nil || album.Status != catalog.AlbumStatusReady || album.PhotoCount != 1 {
 		t.Fatalf("album=%+v err=%v, want ready with one photo", album, err)
 	}
-	run, found, err := cat.LatestExtractionRun(context.Background(), "album-recording-error")
-	if err != nil || !found || run.Status != "incomplete" || run.FailureReasonCode != "outcome_recording_failed" || run.EntriesComplete || run.EntriesRecorded != 0 {
-		t.Fatalf("failed recording run=%+v found=%v err=%v", run, found, err)
+	run := latestRun(t, cat, "album-recording-error")
+	if run.Status != "incomplete" || run.FailureReasonCode != "outcome_recording_failed" || run.EntriesComplete || run.EntriesRecorded != 0 {
+		t.Fatalf("failed recording run=%+v", run)
 	}
 }
 
@@ -459,13 +450,15 @@ func TestFatalEntryFailureIsRecordedAndKeepsAlbumFailureSemantics(t *testing.T) 
 	if err != nil || album.Status != catalog.AlbumStatusFailed {
 		t.Fatalf("album=%+v err=%v, want FAILED", album, err)
 	}
-	run, found, err := cat.LatestExtractionRun(context.Background(), "album-entry-failed")
-	if err != nil || !found || run.Status != "failed" || run.FailedCount != 1 || run.EntriesComplete || run.FailureReasonCode != "extraction_failed" {
-		t.Fatalf("failed run=%+v found=%v err=%v", run, found, err)
+	run := latestRun(t, cat, "album-entry-failed")
+	if run.Status != "failed" || run.FailedCount != 1 || run.EntriesComplete || run.FailureReasonCode != "extraction_failed" {
+		t.Fatalf("failed run=%+v", run)
 	}
-	entries, err := cat.ListExtractionEntries(context.Background(), "album-entry-failed", run.RunID, "failed", -1, 10)
-	if err != nil || len(entries) != 1 || entries[0].ReasonCode != "blob_storage_failed" || entries[0].Name != "a.png" {
-		t.Fatalf("fatal entry outcome=%+v err=%v", entries, err)
+	// The failed entry surfaces through the issues page's failures browser —
+	// the surviving read path for entry outcomes.
+	failures, err := cat.AdminLatestExtractionFailures(context.Background(), "blob_storage_failed", "", -1, 10)
+	if err != nil || len(failures) != 1 || failures[0].AlbumID != "album-entry-failed" || failures[0].RunID != run.RunID || failures[0].Name != "a.png" || !failures[0].Candidate {
+		t.Fatalf("fatal entry outcome=%+v err=%v", failures, err)
 	}
 	if !store.has(SourceKey("album-entry-failed")) {
 		t.Fatal("failed extraction should retain the source archive")
@@ -588,6 +581,7 @@ func TestProcessAlbumReplacesPhotosOnReprocess(t *testing.T) {
 	if err := svc.ProcessAlbum(context.Background(), "album-a"); err != nil {
 		t.Fatalf("process album: %v", err)
 	}
+	firstRun := latestRun(t, cat, "album-a")
 	// Simulate a retry: force the album back to queued and stage a smaller zip.
 	second := buildZip(t, zipEntry{name: "c.png", data: pngBytes(t, 5, 5, 3)})
 	if err := cat.SetAlbumStatus(context.Background(), "album-a", catalog.AlbumStatusQueued, ""); err != nil {
@@ -608,13 +602,11 @@ func TestProcessAlbumReplacesPhotosOnReprocess(t *testing.T) {
 	if len(photos) != 1 || photos[0].Name != "c.png" || photos[0].Index != 0 {
 		t.Fatalf("expected photos to be replaced, got %+v", photos)
 	}
-	runs, err := cat.ListExtractionRuns(context.Background(), "album-a", 0, 10)
-	if err != nil || len(runs) != 2 || runs[0].RunID <= runs[1].RunID {
-		t.Fatalf("reprocessing should append a second run, got runs=%+v err=%v", runs, err)
-	}
-	oldEntries, err := cat.ListExtractionEntries(context.Background(), "album-a", runs[1].RunID, "", -1, 10)
-	if err != nil || len(oldEntries) != 2 {
-		t.Fatalf("old run entry history was overwritten: entries=%+v err=%v", oldEntries, err)
+	// Reprocessing appends a new run rather than mutating the old one; the
+	// old run's entry rows staying intact is pinned catalog-side.
+	secondRun := latestRun(t, cat, "album-a")
+	if secondRun.RunID <= firstRun.RunID {
+		t.Fatalf("reprocessing should append a second run, first=%d second=%d", firstRun.RunID, secondRun.RunID)
 	}
 }
 

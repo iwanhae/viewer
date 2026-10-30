@@ -117,7 +117,8 @@ func (s *Server) Router() http.Handler {
 			r.Get("/assets/*", adminPage.ServeHTTP)
 			r.Get("/photos", adminPage.ServeHTTP)
 			r.Get("/photos/*", adminPage.ServeHTTP)
-			r.Get("/blobs", adminPage.ServeHTTP)
+			// The blobs LIST page is retired; the detail page stays reachable
+			// from photo rows, so only the splat route remains registered.
 			r.Get("/blobs/*", adminPage.ServeHTTP)
 			r.Get("/albums", adminPage.ServeHTTP)
 			r.Get("/albums/*", adminPage.ServeHTTP)
@@ -127,12 +128,9 @@ func (s *Server) Router() http.Handler {
 			r.Get("/api/extraction-failures", s.adminExtractionFailures)
 			r.Get("/api/photos", s.adminPhotos)
 			r.Get("/api/photos/{albumId}/{idx}", s.adminPhoto)
-			r.Get("/api/blobs", s.adminBlobs)
 			r.Get("/api/blobs/{hash}/history", s.adminBlobHistory)
 			r.Get("/api/blobs/{hash}", s.adminBlob)
 			r.Get("/api/albums", s.adminAlbums)
-			r.Get("/api/albums/{id}/extractions", s.adminAlbumExtractions)
-			r.Get("/api/albums/{id}/entries", s.adminAlbumEntries)
 			r.Get("/api/albums/{id}", s.adminAlbum)
 			r.Get("/api/automatic/embedding", s.adminAutomaticEmbedding)
 			r.Post("/api/automatic/embedding", s.adminSetAutomaticEmbedding)

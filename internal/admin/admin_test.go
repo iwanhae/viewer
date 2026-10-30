@@ -214,24 +214,36 @@ func TestAdminBrowseKeysetCursorsAreStableAndFilterBound(t *testing.T) {
 	if err != nil || len(secondAlbumPage.Albums) != 1 || secondAlbumPage.Albums[0].ID != "album-c" || secondAlbumPage.NextCursor != nil {
 		t.Fatalf("second album page=%+v err=%v", secondAlbumPage, err)
 	}
+}
 
-	blobPage, err := service.ListBlobs(ctx, BlobFilters{}, BrowsePageOptions{Limit: 2})
-	if err != nil || len(blobPage.Blobs) != 2 || blobPage.NextCursor == nil {
-		t.Fatalf("first blob page=%+v err=%v", blobPage, err)
+// TestListPhotosMissingBlobFilter pins the photos-side integrity drilldown at
+// the service layer: the filter the overview's missingBlobPhotos stat links
+// to returns exactly the rows whose blob row is gone.
+func TestListPhotosMissingBlobFilter(t *testing.T) {
+	store := openTestCatalog(t)
+	ctx := context.Background()
+	if err := store.CreateAlbum(ctx, catalog.Album{ID: "album-a", OriginalFilename: "a.zip", Status: catalog.AlbumStatusReady}); err != nil {
+		t.Fatalf("create album: %v", err)
 	}
-	secondBlobPage, err := service.ListBlobs(ctx, BlobFilters{}, BrowsePageOptions{Limit: 2, Cursor: *blobPage.NextCursor})
-	if err != nil || len(secondBlobPage.Blobs) != 2 || secondBlobPage.NextCursor != nil {
-		t.Fatalf("second blob page=%+v err=%v", secondBlobPage, err)
+	if err := store.UpsertBlob(ctx, catalog.Blob{Hash: "hash-present", SizeBytes: 1}); err != nil {
+		t.Fatalf("upsert blob: %v", err)
 	}
-	seenHashes := map[string]bool{}
-	for _, blob := range append(blobPage.Blobs, secondBlobPage.Blobs...) {
-		if seenHashes[blob.Hash] {
-			t.Fatalf("blob repeated across pages: %s", blob.Hash)
+	for i, hash := range []string{"hash-present", "hash-present", "hash-gone"} {
+		if err := store.InsertPhoto(ctx, catalog.Photo{AlbumID: "album-a", Index: i, Name: fmt.Sprintf("p-%d.jpg", i), Hash: hash}); err != nil {
+			t.Fatalf("insert photo %d: %v", i, err)
 		}
-		seenHashes[blob.Hash] = true
 	}
-	if len(seenHashes) != 4 {
-		t.Fatalf("blob pages yielded %d unique hashes, want 4: %v", len(seenHashes), seenHashes)
+	service := NewService(store, nil, nil)
+
+	missing := true
+	page, err := service.ListPhotos(ctx, PhotoFilters{MissingBlob: &missing}, BrowsePageOptions{Limit: 10})
+	if err != nil || len(page.Photos) != 1 || page.Photos[0].Hash != "hash-gone" || !page.Photos[0].MissingBlob {
+		t.Fatalf("missing-blob page=%+v err=%v want only the blob-less photo row", page, err)
+	}
+	present := false
+	page, err = service.ListPhotos(ctx, PhotoFilters{MissingBlob: &present}, BrowsePageOptions{Limit: 10})
+	if err != nil || len(page.Photos) != 2 || page.Photos[0].MissingBlob || page.Photos[1].MissingBlob {
+		t.Fatalf("present-blob page=%+v err=%v want the two blob-backed rows", page, err)
 	}
 }
 

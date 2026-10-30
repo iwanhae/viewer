@@ -192,13 +192,11 @@ func TestAdminIssuesGroupsOnlyCurrentFailuresAndPagesLatestExtractionEntries(t *
 		t.Fatalf("resolved failed embedding was reported current: %+v", groups)
 	}
 
-	// Error-code filters use the same legacy fallback as issue grouping and are
-	// usable on both paged photo and blob resources.
+	// Error-code filters use the same legacy fallback as issue grouping; the
+	// photos list is the paged resource they drill into.
 	for _, target := range []string{
 		"/admin/api/photos?encoding=failed&encodingErrorCode=invalid_source",
-		"/admin/api/blobs?encoding=failed&encodingErrorCode=invalid_source",
 		"/admin/api/photos?encoding=failed&encodingErrorCode=legacy_unknown",
-		"/admin/api/blobs?encoding=failed&encodingErrorCode=legacy_unknown",
 	} {
 		rec := doAdminRequest(t, router, http.MethodGet, target, auth)
 		if rec.Code != http.StatusOK {
@@ -230,8 +228,8 @@ func TestAdminIssuesGroupsOnlyCurrentFailuresAndPagesLatestExtractionEntries(t *
 	for _, target := range []string{
 		"/admin/api/issues?stage=embedding",
 		"/admin/api/photos?encodingErrorCode=invalid%21code",
-		"/admin/api/blobs?embeddingLeaseExpired=yes",
-		"/admin/api/blobs?encodingPhase=committing",
+		"/admin/api/photos?missingBlob=yes",
+		"/admin/api/photos?encodingPhase=reconciling",
 		"/admin/api/extraction-failures?reasonCode=INVALID_IMAGE",
 	} {
 		if rec := doAdminRequest(t, router, http.MethodGet, target, auth); rec.Code != http.StatusBadRequest {

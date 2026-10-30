@@ -60,6 +60,11 @@ button:disabled { opacity: .6; cursor: wait; }
 .notice { padding: .7rem .85rem; border-radius: 6px; margin: .8rem 0; }
 .notice.warning { background: #fff8e6; border: 1px solid #edcf7b; color: #715308; }
 .notice.error { background: #fff0f0; border: 1px solid #eab1b1; color: #8a2424; }
+.notice.url-filters { background: #f0f7fa; border: 1px solid #b7d4de; color: #274652; }
+.notice.url-filters p { margin: 0 0 .4rem; }
+.filter-chips { list-style: none; display: flex; flex-wrap: wrap; gap: .4rem; margin: 0 0 .6rem; padding: 0; }
+.filter-chips li { display: inline-flex; align-items: center; gap: .35rem; border: 1px solid #9cc0cd; background: #fff; border-radius: 999px; padding: .18rem .6rem; font-size: .82rem; }
+.filter-chips code { font-size: .78rem; }
 .data-table { width: 100%; border-collapse: collapse; font-size: .92rem; }
 .data-table th, .data-table td { text-align: left; vertical-align: top; border-bottom: 1px solid #e8edef; padding: .58rem .65rem; }
 .data-table thead th { color: #52616b; font-size: .83rem; font-weight: 600; background: #f8fafb; }
@@ -67,9 +72,7 @@ button:disabled { opacity: .6; cursor: wait; }
 .data-table tbody th { font-weight: 500; }
 .data-table td:nth-child(n+2) { font-variant-numeric: tabular-nums; }
 .count-link { font-variant-numeric: tabular-nums; }
-.raw-states { margin-top: 1rem; }
-.raw-states summary, .error-details summary { cursor: pointer; color: #41515d; }
-.raw-states .data-table { margin-top: .5rem; }
+.error-details summary { cursor: pointer; color: #41515d; }
 .filter-panel { display: flex; align-items: end; gap: .65rem; flex-wrap: wrap; }
 .field { display: flex; flex: 1 1 155px; min-width: 145px; flex-direction: column; gap: .3rem; color: #4b5a64; font-size: .84rem; }
 .field input, .field select { min-width: 0; width: 100%; border: 1px solid #c7d1d7; border-radius: 5px; padding: .45rem .5rem; color: #1f2933; background: #fff; }
@@ -93,12 +96,6 @@ button:disabled { opacity: .6; cursor: wait; }
 .metadata dd { margin: 0; overflow-wrap: anywhere; }
 .pipeline-detail .state-detail + .state-detail { border-top: 1px solid #e5eaed; margin-top: 1rem; padding-top: .5rem; }
 .observation-details { font-size: .84rem; }
-.pipeline-history .field { max-width: 240px; margin-bottom: .8rem; }
-.extraction-controls { display: flex; align-items: end; justify-content: space-between; gap: 1rem; flex-wrap: wrap; margin: .8rem 0; }
-.extraction-controls .field { max-width: 240px; }
-.extraction-table { min-width: 860px; }
-.extraction-table .entry-name { max-width: 24rem; overflow-wrap: anywhere; }
-.extraction-table .hash-cell { display: block; max-width: 18rem; }
 .event-list { list-style: none; margin: .8rem 0; padding: 0; }
 .event-list li { display: grid; gap: .2rem; border-top: 1px solid #e5eaed; padding: .7rem 0; font-size: .88rem; }
 .event-list li:first-child { border-top: 0; }

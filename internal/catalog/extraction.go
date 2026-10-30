@@ -3,16 +3,10 @@ package catalog
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"fmt"
 	"regexp"
 	"strings"
 	"unicode/utf8"
-)
-
-var (
-	ErrExtractionRunNotFound   = errors.New("extraction run not found")
-	ErrExtractionRunInProgress = errors.New("extraction run is in progress")
 )
 
 const ExtractionOutcomeBatchSize = 100
@@ -195,119 +189,6 @@ func (s *Store) FinishExtractionRun(ctx context.Context, runID int64, status, re
 		return fmt.Errorf("extraction run %d is not running", runID)
 	}
 	return nil
-}
-
-func (s *Store) LatestExtractionRun(ctx context.Context, albumID string) (ExtractionRunSummary, bool, error) {
-	var exists int
-	if err := s.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM albums WHERE id=?)`, albumID).Scan(&exists); err != nil {
-		return ExtractionRunSummary{}, false, fmt.Errorf("check album for extraction history: %w", err)
-	}
-	if exists == 0 {
-		return ExtractionRunSummary{}, false, fmt.Errorf("%w: %s", ErrAlbumNotFound, albumID)
-	}
-	item, err := scanExtractionRun(s.db.QueryRowContext(ctx, extractionRunSelect+` WHERE r.id=(SELECT id FROM extraction_runs WHERE album_id=? ORDER BY id DESC LIMIT 1)`, albumID))
-	if errors.Is(err, sql.ErrNoRows) {
-		return ExtractionRunSummary{}, false, nil
-	}
-	if err != nil {
-		return ExtractionRunSummary{}, false, fmt.Errorf("read latest extraction run for album %s: %w", albumID, err)
-	}
-	return item, true, nil
-}
-
-func (s *Store) ExtractionRunByID(ctx context.Context, albumID string, runID int64) (ExtractionRunSummary, error) {
-	item, err := scanExtractionRun(s.db.QueryRowContext(ctx, extractionRunSelect+` WHERE r.album_id=? AND r.id=?`, albumID, runID))
-	if errors.Is(err, sql.ErrNoRows) {
-		return ExtractionRunSummary{}, fmt.Errorf("%w: %d", ErrExtractionRunNotFound, runID)
-	}
-	if err != nil {
-		return ExtractionRunSummary{}, fmt.Errorf("read extraction run %d: %w", runID, err)
-	}
-	return item, nil
-}
-
-func (s *Store) ListExtractionRuns(ctx context.Context, albumID string, afterID int64, limit int) ([]ExtractionRunSummary, error) {
-	if limit < 1 || limit > 101 {
-		return nil, fmt.Errorf("extraction run page size must be between 1 and 101")
-	}
-	if afterID < 0 {
-		return nil, fmt.Errorf("extraction run cursor must be non-negative")
-	}
-	var exists int
-	if err := s.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM albums WHERE id=?)`, albumID).Scan(&exists); err != nil {
-		return nil, fmt.Errorf("check album for extraction history: %w", err)
-	}
-	if exists == 0 {
-		return nil, fmt.Errorf("%w: %s", ErrAlbumNotFound, albumID)
-	}
-	rows, err := s.db.QueryContext(ctx, extractionRunSelect+` WHERE r.album_id=? AND (?=0 OR r.id<?) ORDER BY r.id DESC LIMIT ?`, albumID, afterID, afterID, limit)
-	if err != nil {
-		return nil, fmt.Errorf("list extraction runs for album %s: %w", albumID, err)
-	}
-	defer rows.Close()
-	items := make([]ExtractionRunSummary, 0, limit)
-	for rows.Next() {
-		item, err := scanExtractionRun(rows)
-		if err != nil {
-			return nil, fmt.Errorf("scan extraction run: %w", err)
-		}
-		items = append(items, item)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate extraction runs: %w", err)
-	}
-	return items, nil
-}
-
-func (s *Store) ListExtractionEntries(ctx context.Context, albumID string, runID int64, outcome string, afterOrdinal int, limit int) ([]ExtractionEntryOutcome, error) {
-	if limit < 1 || limit > 101 {
-		return nil, fmt.Errorf("extraction entry page size must be between 1 and 101")
-	}
-	if afterOrdinal < -1 {
-		return nil, fmt.Errorf("extraction entry cursor must be at least -1")
-	}
-	if outcome != "" && outcome != "registered" && outcome != "skipped" && outcome != "failed" {
-		return nil, fmt.Errorf("invalid extraction outcome filter %q", outcome)
-	}
-	run, err := s.ExtractionRunByID(ctx, albumID, runID)
-	if err != nil {
-		return nil, err
-	}
-	if run.Status == "running" {
-		return nil, fmt.Errorf("%w: %d", ErrExtractionRunInProgress, runID)
-	}
-	query := `SELECT ordinal, name, candidate, outcome, reason_code, error_detail, photo_index, hash
-		FROM extraction_entry_outcomes WHERE run_id=? AND ordinal>?`
-	args := []any{runID, afterOrdinal}
-	if outcome != "" {
-		query += ` AND outcome=?`
-		args = append(args, outcome)
-	}
-	query += ` ORDER BY ordinal ASC LIMIT ?`
-	args = append(args, limit)
-	rows, err := s.db.QueryContext(ctx, query, args...)
-	if err != nil {
-		return nil, fmt.Errorf("list entry outcomes for run %d: %w", runID, err)
-	}
-	defer rows.Close()
-	items := make([]ExtractionEntryOutcome, 0, limit)
-	for rows.Next() {
-		var item ExtractionEntryOutcome
-		var photoIndex sql.NullInt64
-		item.RunID = runID
-		if err := rows.Scan(&item.Ordinal, &item.Name, &item.Candidate, &item.Outcome, &item.ReasonCode, &item.ErrorDetail, &photoIndex, &item.Hash); err != nil {
-			return nil, fmt.Errorf("scan entry outcome: %w", err)
-		}
-		if photoIndex.Valid {
-			value := int(photoIndex.Int64)
-			item.PhotoIndex = &value
-		}
-		items = append(items, item)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate entry outcomes: %w", err)
-	}
-	return items, nil
 }
 
 const extractionRunSelect = `SELECT r.id, r.status, r.started_at, r.completed_at, r.failure_reason_code, r.error_detail,

@@ -119,13 +119,10 @@ Notes:
 | GET | `/admin/api/issues` | Bounded groups of current pipeline/archive failures and latest-run failed extraction entries. |
 | GET | `/admin/api/photos` | Paged photo rows with album metadata and current encoding/embedding state. |
 | GET | `/admin/api/photos/{albumId}/{idx}` | One photo row with current pipeline state. |
-| GET | `/admin/api/blobs` | Paged blob state and reference counts, including unreferenced blobs. |
 | GET | `/admin/api/blobs/{hash}` | One blob with relation counts and current per-stage observations; fetch references through the paged photo list. |
 | GET | `/admin/api/blobs/{hash}/history` | Bounded, cursor-paged stage attempt and major-transition history. |
 | GET | `/admin/api/albums` | Paged album processing state, error, and actual photo-row count. |
 | GET | `/admin/api/albums/{id}` | Album processing state and exact scoped counts for its referenced blobs/photos. |
-| GET | `/admin/api/albums/{id}/extractions` | Cursor-paged append-only extraction runs, newest first. |
-| GET | `/admin/api/albums/{id}/entries` | Cursor-paged outcomes for the latest run, or a requested `runId`; supports `outcome`. |
 | GET | `/admin/api/extraction-failures` | Cursor-paged failed entries from each album's latest run when terminal, filtered by `reasonCode`. |
 | GET / POST | `/admin/api/automatic/embedding` | Read / change automatic local embedding; POST body `{"enabled":true}` or `{"enabled":false}`. |
 | POST | `/admin/api/encoding/run-local` | Start one background local WebP encoding drain over the pending non-WebP blobs; body `{}`. |

@@ -11,38 +11,21 @@ import (
 
 // AdminPhotoFilters are the fixed filters supported by the admin photo list.
 // Values are always bound as SQL parameters; category expressions are owned by
-// this package and shared with AdminOverview.
+// this package and shared with AdminOverview. MissingBlob selects photos whose
+// hash has no blob row — the photos-side mirror of the integrity count the
+// overview reports, and the only way left to enumerate them now that the blob
+// list (and its unreferenced filter) is gone.
 type AdminPhotoFilters struct {
 	Query                 string
 	AlbumID               string
 	Hash                  string
 	Encoding              string
 	Embedding             string
-	EncodingRaw           string
-	EmbeddingRaw          string
 	EncodingErrorCode     string
 	EmbeddingErrorCode    string
 	EncodingLeaseExpired  *bool
 	EmbeddingLeaseExpired *bool
-	EncodingPhase         string
-	SkippedReason         string
-}
-
-// AdminBlobFilters are the fixed filters supported by the admin blob list.
-type AdminBlobFilters struct {
-	AlbumID               string
-	Hash                  string
-	Encoding              string
-	Embedding             string
-	EncodingRaw           string
-	EmbeddingRaw          string
-	EncodingErrorCode     string
-	EmbeddingErrorCode    string
-	EncodingLeaseExpired  *bool
-	EmbeddingLeaseExpired *bool
-	EncodingPhase         string
-	SkippedReason         string
-	Unreferenced          *bool
+	MissingBlob           *bool
 }
 
 // AdminAlbumFilters are the fixed filters supported by the admin album list.
@@ -111,32 +94,20 @@ type AdminAlbum struct {
 	PhotoCount       int64  `json:"photoCount"`
 }
 
-// AdminEncodingBreakdown exposes relation-aware pipeline counts scoped to one album.
-type AdminEncodingBreakdown struct {
-	Categories     map[string]PipelineCounts `json:"categories"`
-	SkippedReasons map[string]PipelineCounts `json:"skippedReasons"`
-	RawStates      map[string]PipelineCounts `json:"rawStates"`
-}
-
-// AdminEmbeddingBreakdown exposes relation-aware pipeline counts scoped to one album.
-type AdminEmbeddingBreakdown struct {
-	Categories map[string]PipelineCounts `json:"categories"`
-	RawStates  map[string]PipelineCounts `json:"rawStates"`
-}
-
-// AdminAlbumDetail adds exact pipeline breakdowns for blobs and photo rows
-// referenced by one album.
+// AdminAlbumDetail is the album drilldown. The blob-centric pipeline
+// breakdowns moved to the photos list: the operator drills into
+// `photos?albumId=&encoding=failed` instead of reading per-album tables, so
+// this projection carries only the album's own processing state, its scoped
+// integrity count, and the latest extraction summary.
 type AdminAlbumDetail struct {
-	ID                 string                  `json:"id"`
-	OriginalFilename   string                  `json:"originalFilename"`
-	Status             string                  `json:"status"`
-	Error              string                  `json:"error"`
-	PhotoCount         int64                   `json:"photoCount"`
-	Encoding           AdminEncodingBreakdown  `json:"encoding"`
-	Embedding          AdminEmbeddingBreakdown `json:"embedding"`
-	MissingBlobPhotos  int64                   `json:"missingBlobPhotos"`
-	ExtractionRecorded bool                    `json:"extractionRecorded"`
-	LatestExtraction   *ExtractionRunSummary   `json:"latestExtraction"`
+	ID                 string                `json:"id"`
+	OriginalFilename   string                `json:"originalFilename"`
+	Status             string                `json:"status"`
+	Error              string                `json:"error"`
+	PhotoCount         int64                 `json:"photoCount"`
+	MissingBlobPhotos  int64                 `json:"missingBlobPhotos"`
+	ExtractionRecorded bool                  `json:"extractionRecorded"`
+	LatestExtraction   *ExtractionRunSummary `json:"latestExtraction"`
 }
 
 // AdminPhotos reads a keyset page in (album_id, idx) order. Callers request one
@@ -159,8 +130,18 @@ func (s *Store) AdminPhotos(ctx context.Context, filters AdminPhotoFilters, afte
 		where = append(where, `p.hash = ?`)
 		args = append(args, filters.Hash)
 	}
-	appendAdminStateFilters(&where, &args, filters.Encoding, filters.Embedding, filters.EncodingRaw, filters.EmbeddingRaw,
-		filters.EncodingErrorCode, filters.EmbeddingErrorCode, filters.EncodingLeaseExpired, filters.EmbeddingLeaseExpired, filters.EncodingPhase, filters.SkippedReason)
+	appendAdminStateFilters(&where, &args, filters.Encoding, filters.Embedding,
+		filters.EncodingErrorCode, filters.EmbeddingErrorCode,
+		filters.EncodingLeaseExpired, filters.EmbeddingLeaseExpired)
+	if filters.MissingBlob != nil {
+		// The photos query already LEFT JOINs blobs, so presence is the join
+		// column itself — the same predicate the row's missingBlob flag uses.
+		if *filters.MissingBlob {
+			where = append(where, `b.hash IS NULL`)
+		} else {
+			where = append(where, `b.hash IS NOT NULL`)
+		}
+	}
 	if afterAlbumID != "" {
 		where = append(where, `(p.album_id > ? OR (p.album_id = ? AND p.idx > ?))`)
 		args = append(args, afterAlbumID, afterAlbumID, afterIndex)
@@ -235,70 +216,6 @@ func (s *Store) AdminPhotoAt(ctx context.Context, albumID string, index int) (Ad
 		return AdminPhoto{}, fmt.Errorf("finish admin photo detail: %w", err)
 	}
 	return photo, nil
-}
-
-// AdminBlobs reads a keyset page in hash order, including one bounded pair of
-// indexed relation-count subqueries per returned blob.
-func (s *Store) AdminBlobs(ctx context.Context, filters AdminBlobFilters, afterHash string, limit int) ([]AdminBlob, error) {
-	if limit < 1 || limit > 101 {
-		return nil, fmt.Errorf("admin blob page size must be between 1 and 101")
-	}
-	where, args := adminBlobWhere(filters, afterHash)
-	query := `SELECT b.hash, b.size_bytes, b.content_type, b.encoding_status, ` + adminEncodingCategoryExpr + `, b.encoding_error,
-		b.embedding_status, ` + adminEmbeddingCategoryExpr + `, b.embedding_error,
-		CASE WHEN b.encoding_status='failed' THEN COALESCE(NULLIF(eo.error_code,''),'legacy_unknown') ELSE '' END,
-		CASE WHEN b.embedding_status='failed' THEN COALESCE(NULLIF(bo.error_code,''),'legacy_unknown') ELSE '' END,
-		CASE WHEN b.encoding_status = 'skipped' THEN ` + adminEncodingSkippedReasonExpr + ` ELSE '' END,
-		(SELECT COUNT(*) FROM photos p WHERE p.hash = b.hash),
-		(SELECT COUNT(DISTINCT p.album_id) FROM photos p WHERE p.hash = b.hash)
-		FROM blobs b
-		LEFT JOIN blob_stage_observations eo ON eo.blob_hash=b.hash AND eo.stage='encoding'
-		LEFT JOIN blob_stage_observations bo ON bo.blob_hash=b.hash AND bo.stage='embedding'` + adminWhere(where) + ` ORDER BY b.hash ASC LIMIT ?`
-	args = append(args, limit)
-	rows, err := s.db.QueryContext(ctx, query, args...)
-	if err != nil {
-		return nil, fmt.Errorf("list admin blobs: %w", err)
-	}
-	defer rows.Close()
-	blobs := make([]AdminBlob, 0, limit)
-	for rows.Next() {
-		blob, err := scanAdminBlob(rows)
-		if err != nil {
-			return nil, fmt.Errorf("scan admin blob: %w", err)
-		}
-		blobs = append(blobs, blob)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate admin blobs: %w", err)
-	}
-	return blobs, nil
-}
-
-func adminBlobWhere(filters AdminBlobFilters, afterHash string) ([]string, []any) {
-	var where []string
-	args := make([]any, 0, 12)
-	if filters.Hash != "" {
-		where = append(where, `b.hash = ?`)
-		args = append(args, filters.Hash)
-	}
-	if filters.AlbumID != "" {
-		where = append(where, `EXISTS (SELECT 1 FROM photos f WHERE f.hash = b.hash AND f.album_id = ?)`)
-		args = append(args, filters.AlbumID)
-	}
-	if filters.Unreferenced != nil {
-		if *filters.Unreferenced {
-			where = append(where, `NOT EXISTS (SELECT 1 FROM photos f WHERE f.hash = b.hash)`)
-		} else {
-			where = append(where, `EXISTS (SELECT 1 FROM photos f WHERE f.hash = b.hash)`)
-		}
-	}
-	appendAdminStateFilters(&where, &args, filters.Encoding, filters.Embedding, filters.EncodingRaw, filters.EmbeddingRaw,
-		filters.EncodingErrorCode, filters.EmbeddingErrorCode, filters.EncodingLeaseExpired, filters.EmbeddingLeaseExpired, filters.EncodingPhase, filters.SkippedReason)
-	if afterHash != "" {
-		where = append(where, `b.hash > ?`)
-		args = append(args, afterHash)
-	}
-	return where, args
 }
 
 func scanAdminBlob(row interface{ Scan(...any) error }) (AdminBlob, error) {
@@ -395,8 +312,9 @@ func (s *Store) AdminAlbums(ctx context.Context, filters AdminAlbumFilters, afte
 	return albums, nil
 }
 
-// AdminAlbumByID returns processing metadata and exact scoped counts for blobs
-// and photos referenced by the album. All component reads share one snapshot.
+// AdminAlbumByID returns the album's processing metadata, its photo-row and
+// missing-blob-photo counts, and the latest extraction run summary. All
+// component reads share one snapshot.
 func (s *Store) AdminAlbumByID(ctx context.Context, albumID string) (AdminAlbumDetail, error) {
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
@@ -416,10 +334,6 @@ func (s *Store) AdminAlbumByID(ctx context.Context, albumID string) (AdminAlbumD
 	if err != nil {
 		return AdminAlbumDetail{}, fmt.Errorf("read admin album %s: %w", albumID, err)
 	}
-	result.Encoding, result.Embedding, err = queryAlbumPipelineBreakdowns(ctx, tx, albumID)
-	if err != nil {
-		return AdminAlbumDetail{}, fmt.Errorf("read album pipeline breakdowns: %w", err)
-	}
 	latestExtraction, err := scanExtractionRun(tx.QueryRowContext(ctx, extractionRunSelect+
 		` WHERE r.id=(SELECT id FROM extraction_runs WHERE album_id=? ORDER BY id DESC LIMIT 1)`, albumID))
 	if err == nil {
@@ -434,76 +348,13 @@ func (s *Store) AdminAlbumByID(ctx context.Context, albumID string) (AdminAlbumD
 	return result, nil
 }
 
-func queryAlbumPipelineBreakdowns(ctx context.Context, tx *sql.Tx, albumID string) (AdminEncodingBreakdown, AdminEmbeddingBreakdown, error) {
-	encoding := AdminEncodingBreakdown{
-		Categories: make(map[string]PipelineCounts), SkippedReasons: make(map[string]PipelineCounts), RawStates: make(map[string]PipelineCounts),
-	}
-	embedding := AdminEmbeddingBreakdown{
-		Categories: make(map[string]PipelineCounts), RawStates: make(map[string]PipelineCounts),
-	}
-	query := `SELECT ` + adminEncodingCategoryExpr + `,
-		CASE WHEN b.encoding_status = 'skipped' THEN ` + adminEncodingSkippedReasonExpr + ` ELSE '' END,
-		b.encoding_status, ` + adminEmbeddingCategoryExpr + `, b.embedding_status,
-		COUNT(DISTINCT b.hash), COUNT(p.hash), COUNT(DISTINCT p.album_id)
-		FROM photos p JOIN blobs b ON b.hash = p.hash
-		WHERE p.album_id = ? GROUP BY 1, 2, 3, 4, 5 ORDER BY 1, 2, 3, 4, 5`
-	rows, err := tx.QueryContext(ctx, query, albumID)
-	if err != nil {
-		return AdminEncodingBreakdown{}, AdminEmbeddingBreakdown{}, err
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var encodingCategory, skippedReason, encodingRaw, embeddingCategory, embeddingRaw string
-		var counts PipelineCounts
-		if err := rows.Scan(&encodingCategory, &skippedReason, &encodingRaw, &embeddingCategory, &embeddingRaw,
-			&counts.BlobCount, &counts.PhotoCount, &counts.AlbumCount); err != nil {
-			return AdminEncodingBreakdown{}, AdminEmbeddingBreakdown{}, fmt.Errorf("scan album pipeline breakdown: %w", err)
-		}
-		// Grouping by both raw and normalized state can produce several rows
-		// for one category (notably unknown); albumCount is distinct within
-		// each category and therefore remains one while blob/photo counts add.
-		addAlbumPipelineCounts(encoding.Categories, encodingCategory, counts)
-		addAlbumPipelineCounts(encoding.RawStates, encodingRaw, counts)
-		if skippedReason != "" {
-			addAlbumPipelineCounts(encoding.SkippedReasons, skippedReason, counts)
-		}
-		addAlbumPipelineCounts(embedding.Categories, embeddingCategory, counts)
-		addAlbumPipelineCounts(embedding.RawStates, embeddingRaw, counts)
-	}
-	if err := rows.Err(); err != nil {
-		return AdminEncodingBreakdown{}, AdminEmbeddingBreakdown{}, fmt.Errorf("iterate album pipeline breakdowns: %w", err)
-	}
-	for _, category := range []string{"queued", "processing", "validating", "committing", "completed", "skipped", "failed", "unknown"} {
-		if _, ok := encoding.Categories[category]; !ok {
-			encoding.Categories[category] = PipelineCounts{}
-		}
-	}
-	for _, reason := range []string{"webp", "nonWebp"} {
-		if _, ok := encoding.SkippedReasons[reason]; !ok {
-			encoding.SkippedReasons[reason] = PipelineCounts{}
-		}
-	}
-	for _, category := range []string{"queued", "processing", "completed", "failed", "unknown"} {
-		if _, ok := embedding.Categories[category]; !ok {
-			embedding.Categories[category] = PipelineCounts{}
-		}
-	}
-	return encoding, embedding, nil
-}
-
-func addAlbumPipelineCounts(destination map[string]PipelineCounts, key string, counts PipelineCounts) {
-	value := destination[key]
-	value.BlobCount += counts.BlobCount
-	value.PhotoCount += counts.PhotoCount
-	if counts.AlbumCount > 0 {
-		value.AlbumCount = 1
-	}
-	destination[key] = value
-}
-
-func appendAdminStateFilters(where *[]string, args *[]any, encoding, embedding, encodingRaw, embeddingRaw,
-	encodingErrorCode, embeddingErrorCode string, encodingLeaseExpired, embeddingLeaseExpired *bool,
-	encodingPhase, skippedReason string) {
+// appendAdminStateFilters adds the shared normalized-state predicates used by
+// the admin browse queries. Raw-state, phase, and skipped-reason filters were
+// removed with the blobs list: the surviving dimensions are the overview's own
+// categories plus the exact error-code and lease-expiration pinpoints the
+// issues page deep-links into.
+func appendAdminStateFilters(where *[]string, args *[]any, encoding, embedding,
+	encodingErrorCode, embeddingErrorCode string, encodingLeaseExpired, embeddingLeaseExpired *bool) {
 	if encoding != "" {
 		*where = append(*where, `b.hash IS NOT NULL AND `+adminEncodingCategoryExpr+` = ?`)
 		*args = append(*args, encoding)
@@ -511,14 +362,6 @@ func appendAdminStateFilters(where *[]string, args *[]any, encoding, embedding, 
 	if embedding != "" {
 		*where = append(*where, `b.hash IS NOT NULL AND `+adminEmbeddingCategoryExpr+` = ?`)
 		*args = append(*args, embedding)
-	}
-	if encodingRaw != "" {
-		*where = append(*where, `b.encoding_status = ?`)
-		*args = append(*args, encodingRaw)
-	}
-	if embeddingRaw != "" {
-		*where = append(*where, `b.embedding_status = ?`)
-		*args = append(*args, embeddingRaw)
 	}
 	if encodingErrorCode != "" {
 		*where = append(*where, `b.encoding_status='failed' AND COALESCE(NULLIF(eo.error_code,''),'legacy_unknown') = ?`)
@@ -543,14 +386,6 @@ func appendAdminStateFilters(where *[]string, args *[]any, encoding, embedding, 
 		}
 		*where = append(*where, `b.embedding_status='processing' AND b.embedding_lease_until `+operator+` ?`)
 		*args = append(*args, time.Now().UnixMilli())
-	}
-	if encodingPhase != "" {
-		*where = append(*where, `b.encoding_status='committing' AND eo.phase = ?`)
-		*args = append(*args, encodingPhase)
-	}
-	if skippedReason != "" {
-		*where = append(*where, `b.encoding_status = 'skipped' AND `+adminEncodingSkippedReasonExpr+` = ?`)
-		*args = append(*args, skippedReason)
 	}
 }
 

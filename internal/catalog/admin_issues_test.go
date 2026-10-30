@@ -26,36 +26,21 @@ func TestAdminFailureCodeAndLeaseFiltersMatchCurrentRows(t *testing.T) {
 	if _, err := store.db.ExecContext(ctx, `UPDATE blobs SET encoding_status='leased', encoding_lease_until=? WHERE hash='blocked'`, time.Now().Add(-time.Minute).UnixMilli()); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.db.ExecContext(ctx, `UPDATE blobs SET encoding_status='committing' WHERE hash='webp'`); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := store.db.ExecContext(ctx, `UPDATE blob_stage_observations SET phase='reconciling' WHERE blob_hash='webp' AND stage='encoding'`); err != nil {
-		t.Fatal(err)
-	}
 
 	encodingCode := "invalid_source"
 	photos, err := store.AdminPhotos(ctx, AdminPhotoFilters{Encoding: "failed", EncodingErrorCode: encodingCode}, "", 0, 20)
 	if err != nil || len(photos) != 3 || photos[0].EncodingErrorCode != encodingCode {
 		t.Fatalf("encoding code photo filter rows=%+v err=%v", photos, err)
 	}
-	blobs, err := store.AdminBlobs(ctx, AdminBlobFilters{Encoding: "failed", EncodingErrorCode: encodingCode}, "", 20)
-	if err != nil || len(blobs) != 1 || blobs[0].Hash != "shared" || blobs[0].EncodingErrorCode != encodingCode {
-		t.Fatalf("encoding code blob filter rows=%+v err=%v", blobs, err)
-	}
 	embeddingCode := "embedding_failed"
-	blobs, err = store.AdminBlobs(ctx, AdminBlobFilters{EmbeddingErrorCode: embeddingCode}, "", 20)
-	if err != nil || len(blobs) != 1 || blobs[0].EmbeddingErrorCode != embeddingCode {
-		t.Fatalf("embedding code blob filter rows=%+v err=%v", blobs, err)
+	photos, err = store.AdminPhotos(ctx, AdminPhotoFilters{EmbeddingErrorCode: embeddingCode}, "", 0, 20)
+	if err != nil || len(photos) != 3 || photos[0].EmbeddingErrorCode != embeddingCode {
+		t.Fatalf("embedding code photo filter rows=%+v err=%v", photos, err)
 	}
 	expired := true
-	blobs, err = store.AdminBlobs(ctx, AdminBlobFilters{EncodingLeaseExpired: &expired}, "", 20)
-	if err != nil || len(blobs) != 1 || blobs[0].Hash != "blocked" {
-		t.Fatalf("expired lease filter rows=%+v err=%v", blobs, err)
-	}
-	phase := "reconciling"
-	blobs, err = store.AdminBlobs(ctx, AdminBlobFilters{EncodingPhase: phase}, "", 20)
-	if err != nil || len(blobs) != 1 || blobs[0].Hash != "webp" {
-		t.Fatalf("encoding phase filter rows=%+v err=%v", blobs, err)
+	photos, err = store.AdminPhotos(ctx, AdminPhotoFilters{EncodingLeaseExpired: &expired}, "", 0, 20)
+	if err != nil || len(photos) != 1 || photos[0].Hash != "blocked" {
+		t.Fatalf("expired lease filter rows=%+v err=%v", photos, err)
 	}
 }
 
