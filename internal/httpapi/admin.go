@@ -150,10 +150,13 @@ func (s *Server) adminReindex(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, counts)
 }
 
-// maxAdminBodyBytes bounds an admin action body. The biggest one the dashboard
-// ever sends is a single boolean, so a few kilobytes is generous; the tight
-// limit keeps a fat request from reaching the catalog at all.
-const maxAdminBodyBytes = 4 << 10
+// maxAdminBodyBytes bounds an admin action body. The biggest legitimate body
+// is a recover request carrying a full hashes scope: 100 digests at 66 bytes
+// of JSON each (~6.7 KiB), the ceiling the count validation enforces. 8 KiB
+// covers that with margin — the smoke test's finding was that a 4 KiB cap
+// answered 413 before the count check could deliver its clearer 400 — while
+// still keeping a fat request from reaching the catalog at all.
+const maxAdminBodyBytes = 8 << 10
 
 // decodeAdminJSONBody decodes a strict JSON body into out, like jsonBody. A
 // JSON content type is required even when the legacy recovery body is empty;

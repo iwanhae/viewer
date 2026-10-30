@@ -849,13 +849,14 @@ func TestAdminRecoverReleaseClaimsEndpoint(t *testing.T) {
 
 	// A broken body, an unknown field, an empty body (zero target), an
 	// unknown target string, and a malformed hashes scope are caller bugs:
-	// 400 with the shared invalid-request code. The oversized list uses short
-	// placeholder entries because the count rule fires before the per-hash
-	// format check — and keeps the body under the 4 KiB action limit, so the
-	// count rejection itself is what gets exercised rather than the size one.
+	// 400 with the shared invalid-request code. The oversized list uses
+	// full-length digests so the request is a realistic ~6.7 KiB — bigger
+	// than the old 4 KiB cap, which used to shadow the count rule with a
+	// 413 — and proves the count rejection, which fires before the per-hash
+	// format check, is what answers.
 	tooManyHashes := make([]string, maxRecoverHashes+1)
 	for i := range tooManyHashes {
-		tooManyHashes[i] = "x"
+		tooManyHashes[i] = strings.Repeat("a", 64)
 	}
 	oversized, err := json.Marshal(map[string]any{"target": recoverReleaseExpiredClaims, "hashes": tooManyHashes})
 	if err != nil {
