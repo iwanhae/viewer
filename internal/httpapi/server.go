@@ -135,6 +135,7 @@ func (s *Server) Router() http.Handler {
 			r.Post("/api/automatic/embedding", s.adminSetAutomaticEmbedding)
 			r.Post("/api/encoding/run-local", s.adminRunLocalEncoding)
 			r.Post("/api/reindex", s.adminReindex)
+			r.Post("/api/vector-sync", s.adminVectorSync)
 			r.Post("/api/recover", s.adminRecover)
 		})
 	}

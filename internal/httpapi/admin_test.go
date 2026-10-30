@@ -18,6 +18,7 @@ import (
 
 	"viewer/internal/admin"
 	"viewer/internal/catalog"
+	"viewer/internal/qdrant"
 )
 
 // stubAdminVectorCounter stands in for the Qdrant client, letting a test fix
@@ -32,6 +33,16 @@ func (c stubAdminVectorCounter) CountVectors(ctx context.Context) (int, error) {
 		return 0, c.err
 	}
 	return c.points, nil
+}
+
+// stubVectorSyncStore stands in for the Qdrant client's ID scroll, letting a
+// test fix the "actual points" half of the reconciliation the same way.
+type stubVectorSyncStore struct {
+	ids []string
+}
+
+func (s stubVectorSyncStore) ScrollPointIDs(ctx context.Context) ([]string, error) {
+	return s.ids, nil
 }
 
 func openAdminTestCatalog(t *testing.T) *catalog.Store {
@@ -167,6 +178,7 @@ func TestAdminAuthChallenges(t *testing.T) {
 			{http.MethodGet, "/admin/api/albums"},
 			{http.MethodGet, "/admin/api/albums/album-a"},
 			{http.MethodPost, "/admin/api/reindex"},
+			{http.MethodPost, "/admin/api/vector-sync"},
 		} {
 			rec := doAdminRequest(t, router, route.method, route.target, item.authorization)
 			if rec.Code != http.StatusUnauthorized {
@@ -1099,5 +1111,83 @@ func TestAdminRecoverRetryFailedEncodingsEndpoint(t *testing.T) {
 	}
 	if fresh.Pending != 4 || fresh.Failed != 1 {
 		t.Fatalf("catalog encoding counts=%+v want pending=4 failed=1", fresh)
+	}
+}
+
+// TestAdminVectorSyncEndpointUnavailable pins the unwired deployment shape:
+// a service built without WithVectorSync answers the trigger with the same
+// 503 UNAVAILABLE contract the other local controls use, never a 500 or a
+// panic.
+func TestAdminVectorSyncEndpointUnavailable(t *testing.T) {
+	store := openAdminTestCatalog(t)
+	seedEmbeddingFixture(t, store)
+	service := admin.NewService(store, stubAdminVectorCounter{points: 1}, nil).WithEncodingEnabled(true)
+	router := New(nil, nil, nil, nil, "worker-token", service, "sekrit").Router()
+
+	rec := doAdminBodyRequest(t, router, http.MethodPost, "/admin/api/vector-sync", basicAuthHeader("operator", "sekrit"), []byte(`{}`))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d want=503 body=%s", rec.Code, rec.Body.String())
+	}
+	if !jsonBodyHasErrorCode(rec.Body.String(), "UNAVAILABLE") {
+		t.Fatalf("body=%s want UNAVAILABLE error code", rec.Body.String())
+	}
+}
+
+// TestAdminVectorSyncEndpoint drives the trigger end to end against a real
+// catalog: the stub scrolls back exactly the fixture's one ready point, so
+// the pass finds nothing to repair, reports the failed blob's absent point
+// informationally, and answers 200 with started=true plus the fresh counts.
+func TestAdminVectorSyncEndpoint(t *testing.T) {
+	store := openAdminTestCatalog(t)
+	seedEmbeddingFixture(t, store)
+	service := admin.NewService(store, stubAdminVectorCounter{points: 1}, nil).
+		WithEncodingEnabled(true).
+		WithVectorSync(context.Background(), stubVectorSyncStore{ids: []string{qdrant.PointID("album-a", 0)}})
+	router := New(nil, nil, nil, nil, "worker-token", service, "sekrit").Router()
+
+	rec := doAdminBodyRequest(t, router, http.MethodPost, "/admin/api/vector-sync", basicAuthHeader("operator", "sekrit"), []byte(`{}`))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d want=200 body=%s", rec.Code, rec.Body.String())
+	}
+	var payload struct {
+		Started            bool  `json:"started"`
+		MissingPoints      int   `json:"missingPoints"`
+		ResetBlobs         int64 `json:"resetBlobs"`
+		SkippedProcessing  int   `json:"skippedProcessing"`
+		FailedWithoutPoint int   `json:"failedWithoutPoint"`
+		OrphanPoints       int   `json:"orphanPoints"`
+		DurationMs         int64 `json:"durationMs"`
+		Counts             struct {
+			Total      int `json:"total"`
+			Ready      int `json:"ready"`
+			Failed     int `json:"failed"`
+			Processing int `json:"processing"`
+			Pending    int `json:"pending"`
+		} `json:"counts"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode vector-sync response: %v body=%s", err, rec.Body.String())
+	}
+	if !payload.Started || payload.MissingPoints != 0 || payload.ResetBlobs != 0 ||
+		payload.SkippedProcessing != 0 || payload.FailedWithoutPoint != 1 || payload.OrphanPoints != 0 {
+		t.Fatalf("payload=%+v want started=true failedWithoutPoint=1 and zero missing/reset/skipped/orphans", payload)
+	}
+	if payload.DurationMs < 0 {
+		t.Fatalf("durationMs=%d must not be negative", payload.DurationMs)
+	}
+	want := catalog.EmbeddingCounts{Total: 3, Ready: 1, Failed: 1, Pending: 1}
+	if payload.Counts.Total != want.Total || payload.Counts.Ready != want.Ready ||
+		payload.Counts.Failed != want.Failed || payload.Counts.Processing != want.Processing ||
+		payload.Counts.Pending != want.Pending {
+		t.Fatalf("payload counts=%+v want=%+v", payload.Counts, want)
+	}
+	// Nothing was missing, so nothing moved: the catalog still holds the
+	// fixture's statuses.
+	fresh, err := store.EmbeddingCounts(context.Background())
+	if err != nil {
+		t.Fatalf("catalog counts after sync: %v", err)
+	}
+	if fresh != want {
+		t.Fatalf("catalog counts=%+v want the fixture unchanged %+v", fresh, want)
 	}
 }

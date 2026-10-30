@@ -93,8 +93,10 @@ func Run(ctx context.Context) error {
 	// typed nil once it reaches the catalog's and the service's interface
 	// fields, and every nil check downstream would then see a live store.
 	var vectorStore recommend.VectorStore
+	var qdClient *qdrant.Client
 	if cfg.QdrantEnabled() {
-		vectorStore = qdrant.New(cfg.QdrantURL, cfg.QdrantAPIKey, cfg.QdrantCollection, catalog.EmbeddingDim)
+		qdClient = qdrant.New(cfg.QdrantURL, cfg.QdrantAPIKey, cfg.QdrantCollection, catalog.EmbeddingDim)
+		vectorStore = qdClient
 	}
 	cat, err := catalog.Open(cfg.DBPath(), vectorStore)
 	if err != nil {
@@ -168,6 +170,12 @@ func Run(ctx context.Context) error {
 		modelLoad.Wait()
 	}()
 	adminService := admin.NewService(cat, vectorStore, recommendService).WithEncodingEnabled(true).WithLocalEncoding(encodingService)
+	// The vector-sync trigger needs the concrete client's ID scroll. A nil
+	// *qdrant.Client passed as the interface value would be the typed-nil
+	// trap documented above, so the builder runs only when a client exists.
+	if qdClient != nil {
+		adminService = adminService.WithVectorSync(ctx, qdClient)
+	}
 	pipelineService := pipeline.NewService(cat, store, pipeline.Options{
 		OnAlbumReady: func(albumID string) {
 			if err := recommendService.ReloadAlbum(context.Background(), albumID); err != nil {

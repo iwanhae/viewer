@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 
 	"viewer/internal/catalog"
 	"viewer/internal/recommend"
@@ -47,6 +48,13 @@ type Service struct {
 	recommend       *recommend.Service
 	encodingEnabled bool
 	localEncoding   LocalEncodingRunner
+	// The vector-sync reconciliation state (see sync.go): the store to
+	// diff against, the service lifetime its work context derives from,
+	// and the single-flight lock that makes a second concurrent pass a
+	// no-op instead of a queue.
+	syncCtx    context.Context
+	vectorSync VectorSyncStore
+	syncMu     sync.Mutex
 }
 
 // NewService builds the admin service. A nil vectors counter makes the

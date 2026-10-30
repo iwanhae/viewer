@@ -71,7 +71,7 @@ func (s *Server) adminRunLocalEncoding(w http.ResponseWriter, r *http.Request) {
 // and anything else is a genuine server fault.
 func writeAdminLocalError(w http.ResponseWriter, r *http.Request, err error) {
 	switch {
-	case errors.Is(err, admin.ErrAutomaticEmbeddingUnavailable), errors.Is(err, admin.ErrLocalEncodingUnavailable):
+	case errors.Is(err, admin.ErrAutomaticEmbeddingUnavailable), errors.Is(err, admin.ErrLocalEncodingUnavailable), errors.Is(err, admin.ErrVectorSyncUnavailable):
 		writeError(w, r, http.StatusServiceUnavailable, "UNAVAILABLE", err.Error())
 	default:
 		writeError(w, r, http.StatusInternalServerError, "INTERNAL", "local execution request failed")
