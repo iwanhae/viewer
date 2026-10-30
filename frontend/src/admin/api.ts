@@ -230,11 +230,11 @@ export async function adminGet<T>(path: string, signal?: AbortSignal): Promise<T
   try {
     body = await response.json()
   } catch {
-    throw new Error(`서버 응답을 읽을 수 없습니다 (HTTP ${response.status})`)
+    throw new Error(`Could not read the server response (HTTP ${response.status})`)
   }
   if (!response.ok) {
     const error = body as { error?: { message?: string } }
-    throw new AdminAPIError(error.error?.message || `요청 실패 (HTTP ${response.status})`, response.status)
+    throw new AdminAPIError(error.error?.message || `Request failed (HTTP ${response.status})`, response.status)
   }
   return body as T
 }
@@ -261,11 +261,11 @@ export async function adminPost<T>(path: string, body: unknown): Promise<T> {
   try {
     result = await response.json()
   } catch {
-    throw new AdminAPIError(`서버 응답을 읽을 수 없습니다 (HTTP ${response.status})`, response.status)
+    throw new AdminAPIError(`Could not read the server response (HTTP ${response.status})`, response.status)
   }
   if (!response.ok) {
     const error = result as { error?: { message?: string } }
-    throw new AdminAPIError(error.error?.message || `요청 실패 (HTTP ${response.status})`, response.status)
+    throw new AdminAPIError(error.error?.message || `Request failed (HTTP ${response.status})`, response.status)
   }
   return result as T
 }

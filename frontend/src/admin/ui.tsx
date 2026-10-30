@@ -65,7 +65,7 @@ function useAdminData<T>(path: string, refreshKey = 0): LoadState<T> {
 }
 
 function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : '알 수 없는 오류가 발생했습니다'
+  return error instanceof Error ? error.message : 'An unknown error occurred'
 }
 
 function formatTime(value: string): string {
@@ -77,12 +77,12 @@ function AdminApp() {
   return (
     <div className="admin-root">
       <header className="admin-header">
-        <Link className="brand" to="/">관리자</Link>
-        <nav aria-label="관리자 메뉴">
-          <Link to="/">개요</Link>
-          <Link to="/photos">사진</Link>
-          <Link to="/albums">앨범</Link>
-          <Link to="/issues">이슈</Link>
+        <Link className="brand" to="/">Admin</Link>
+        <nav aria-label="Admin navigation">
+          <Link to="/">Overview</Link>
+          <Link to="/photos">Photos</Link>
+          <Link to="/albums">Albums</Link>
+          <Link to="/issues">Issues</Link>
         </nav>
       </header>
       <main className="admin-main">
@@ -150,34 +150,34 @@ function OverviewPage() {
 
   return (
     <>
-      <PageTitle title="개요" description="카탈로그 상태를 확인합니다." />
+      <PageTitle title="Overview" description="Review the catalog's current status." />
       <div className="toolbar">
-        <button type="button" onClick={() => void refresh()} disabled={loading}>새로고침</button>
+        <button type="button" onClick={() => void refresh()} disabled={loading}>Refresh</button>
         <span className="muted">
-          업데이트 {updatedAt || '—'} · 측정 {lastGood ? formatTime(lastGood.measuredAt) : '—'} · 20초마다 갱신
+          Updated {updatedAt || '—'} · Measured {lastGood ? formatTime(lastGood.measuredAt) : '—'} · Refreshes every 20 seconds
         </span>
       </div>
-      {error && <div className="notice warning" role="alert">갱신 실패: {error}{lastGood ? ' · 마지막 정상 데이터를 표시 중입니다.' : ''}</div>}
-      {loading && !lastGood && <p role="status">불러오는 중…</p>}
-      {!lastGood && !loading && <ErrorPanel message={error || '개요를 불러오지 못했습니다.'} />}
+      {error && <div className="notice warning" role="alert">Refresh failed: {error}{lastGood ? ' · Showing the last good data.' : ''}</div>}
+      {loading && !lastGood && <p role="status">Loading…</p>}
+      {!lastGood && !loading && <ErrorPanel message={error || 'Could not load the overview.'} />}
       {lastGood && <>
         <section className="panel">
-          <h2>라이브러리</h2>
+          <h2>Library</h2>
           <div className="summary-grid">
-            <Stat label="앨범" value={lastGood.library.albums} to="/albums" />
-            <Stat label="사진" value={lastGood.library.photos} to="/photos" />
-            <Stat label="고유 블롭" value={lastGood.library.blobs} to="/photos" />
+            <Stat label="Albums" value={lastGood.library.albums} to="/albums" />
+            <Stat label="Photos" value={lastGood.library.photos} to="/photos" />
+            <Stat label="Unique blobs" value={lastGood.library.blobs} to="/photos" />
           </div>
-          <p className="muted">앨범과 사진은 라이브러리 전체 재고 수입니다. 파이프라인 표는 상태별 고유 블롭 수를 표시하며 사진·앨범 참조 수를 상태별로 나누지 않습니다.</p>
+          <p className="muted">Albums and photos are whole-library inventory counts. The pipeline tables show unique blob counts per state and do not split photo or album reference counts by state.</p>
         </section>
-        <CategorySection title="WebP 인코딩" categories={lastGood.encoding.categories} filterKey="encoding" />
-        <CategorySection title="임베딩" categories={lastGood.embedding.categories} filterKey="embedding" />
+        <CategorySection title="WebP encoding" categories={lastGood.encoding.categories} filterKey="encoding" />
+        <CategorySection title="Embedding" categories={lastGood.embedding.categories} filterKey="embedding" />
         <HealthPanel health={lastGood.health} />
       </>}
       <ExecutionControlPanel />
       <SyncRecoveryPanel
-        title="복구 작업"
-        description="전체 범위 복구 동작입니다. 각 동작은 확인 후 즉시 실행되고 대기 상태로 돌아간 행 수를 표시합니다. 유효한 클레임을 강제로 해제하는 동작은 제공하지 않으며, 유효한 리스는 만료를 기다립니다."
+        title="Recovery actions"
+        description="Library-wide recovery actions. Each action runs immediately after confirmation and reports how many rows it returned to the queued state. No action force-releases valid claims; valid leases wait for expiry."
         actions={globalRecoveryActions}
         onDone={() => void refresh()}
       />
@@ -221,33 +221,33 @@ function ExecutionControlPanel() {
   })
 
   const runLocal = () => void act('encoding', async () => {
-    if (!window.confirm('서버의 cwebp로 대기 중인 WebP 변환 대상 전체를 인코딩합니다. CPU를 많이 사용하며 백그라운드에서 실행됩니다. 계속하시겠습니까?')) return
+    if (!window.confirm("Encodes every queued WebP conversion target with the server's cwebp. It is CPU-intensive and runs in the background. Continue?")) return
     const outcome = await runLocalEncoding()
-    setResult(outcome.started ? '로컬 인코딩이 백그라운드에서 시작되었습니다.' : '이미 로컬 인코딩이 실행 중입니다.')
+    setResult(outcome.started ? 'Local encoding started in the background.' : 'Local encoding is already running.')
   })
 
-  return <section className="panel" aria-label="실행 제어">
-    <h2>실행 제어</h2>
-    <p className="muted">서버의 로컬 실행을 제어합니다. 외부 워커는 제어하지 않습니다.</p>
-    {automatic.error && <div className="notice warning" role="alert">상태 조회 실패: {automatic.error}</div>}
-    {automatic.loading && !automatic.data && <p role="status">불러오는 중…</p>}
+  return <section className="panel" aria-label="Run control">
+    <h2>Run control</h2>
+    <p className="muted">Controls the server's local execution. External workers are not controlled.</p>
+    {automatic.error && <div className="notice warning" role="alert">Status read failed: {automatic.error}</div>}
+    {automatic.loading && !automatic.data && <p role="status">Loading…</p>}
     {status && <>
-      <h3>자동 임베딩</h3>
+      <h3>Automatic embedding</h3>
       <dl className="metadata">
-        <dt>자동 설정</dt><dd>{status.enabled ? '활성' : '일시정지'}</dd>
-        <dt>현재 실행</dt><dd>{status.running ? '실행 중' : '실행 중 아님'}</dd>
+        <dt>Automatic</dt><dd>{status.enabled ? 'enabled' : 'paused'}</dd>
+        <dt>Currently</dt><dd>{status.running ? 'running' : 'not running'}</dd>
       </dl>
       <button type="button" disabled={!!pending} onClick={toggleAutomatic}>
-        {pending === 'automatic' ? '자동 설정 변경 중…' : status.enabled ? '자동 임베딩 일시정지' : '자동 임베딩 재개'}
+        {pending === 'automatic' ? 'Updating automatic setting…' : status.enabled ? 'Pause automatic embedding' : 'Resume automatic embedding'}
       </button>
-      <p className="muted">일시정지는 진행 중인 묶음이 끝난 뒤 적용되며, 즉시 되돌릴 수 있어 확인 없이 전환합니다. 설정은 서버를 다시 시작하면 활성으로 돌아갑니다.</p>
-      {!status.running && <p className="muted">실행 중 아님은 워커가 아직 시작되지 않았다는 뜻입니다. 모델 로드 후 자동으로 시작됩니다.</p>}
+      <p className="muted">Pausing takes effect after the in-flight batch finishes and is instantly reversible, so the switch happens without confirmation. The setting returns to enabled when the server restarts.</p>
+      {!status.running && <p className="muted">"Not running" means the worker has not started yet. It starts automatically once the model has loaded.</p>}
     </>}
-    <h3>로컬 인코딩 실행</h3>
+    <h3>Run local encoding</h3>
     <button type="button" disabled={!!pending} onClick={runLocal}>
-      {pending === 'encoding' ? '시작 중…' : '로컬 인코딩 실행'}
+      {pending === 'encoding' ? 'Starting…' : 'Run local encoding'}
     </button>
-    <p className="muted">시작 시점의 대기(pending) 대상만 처리하고 종료합니다. 이후 업로드는 다음 실행까지 기다립니다.</p>
+    <p className="muted">Processes only the targets that are pending at start time and then exits. Later uploads wait for the next run.</p>
     {result && <p className="recovery-result" role="status">{result}</p>}
     {error && <div className="notice error" role="alert">{error}</div>}
   </section>
@@ -258,20 +258,20 @@ function IssuesPage() {
   const [params] = useSearchParams()
   const entryReasonCode = params.get('entryReasonCode') || ''
   return <>
-    <PageTitle title="현재 이슈" description="현재 실패 상태와 앨범별 최신 추출 실행의 실패 항목만 집계합니다." />
+    <PageTitle title="Current issues" description="Aggregates only the current failure states and the failed entries of each album's latest extraction run." />
     {state.error && <ErrorPanel message={state.error} />}
-    {state.loading && !state.data && <p role="status">불러오는 중…</p>}
+    {state.loading && !state.data && <p role="status">Loading…</p>}
     {state.data && <>
-      <p className="muted">측정 {formatTime(state.data.measuredAt)} · 그룹 {state.data.totalGroups.toLocaleString()}개</p>
+      <p className="muted">Measured {formatTime(state.data.measuredAt)} · {state.data.totalGroups.toLocaleString()} group(s)</p>
       <p className="muted">{state.data.countScope}</p>
-      {state.data.truncated && <div className="notice warning">상위 100개 그룹만 표시합니다. 나머지 {state.data.remainingGroups.toLocaleString()}개 그룹은 응답에서 생략되었습니다.</div>}
+      {state.data.truncated && <div className="notice warning">Showing the top 100 groups only. The remaining {state.data.remainingGroups.toLocaleString()} group(s) were omitted from the response.</div>}
       {state.data.groups.length === 0
-        ? <section className="panel"><p>현재 기록된 실패 이슈가 없습니다.</p></section>
-        : <div className="table-wrap"><table className="data-table"><thead><tr><th>단계</th><th>안전한 오류 코드</th><th>실패 수</th><th>개수 단위</th><th>확인</th></tr></thead><tbody>
+        ? <section className="panel"><p>No failure issues are currently recorded.</p></section>
+        : <div className="table-wrap"><table className="data-table"><thead><tr><th>Stage</th><th>Safe error code</th><th>Failures</th><th>Count unit</th><th>View</th></tr></thead><tbody>
           {state.data.groups.map((group) => <IssueRow key={`${group.stage}:${group.errorCode}`} group={group} />)}
         </tbody></table></div>}
       {state.data.groups.some((group) => group.errorCode === 'legacy_unknown') && <div className="notice warning">
-        legacy_unknown은 기존 실패의 세부 메시지를 안전하게 분류할 수 없다는 뜻입니다. 원문 오류나 비밀 값은 이 이슈 목록에 표시하지 않습니다.
+        legacy_unknown means the detail message of a legacy failure cannot be safely classified. Raw errors and secret values are not shown in this issue list.
       </div>}
     </>}
     {entryReasonCode && <ExtractionFailureBrowser reasonCode={entryReasonCode} />}
@@ -290,15 +290,15 @@ function IssueRow({ group }: { group: IssueGroup }) {
     target = `/issues?entryReasonCode=${encodeURIComponent(group.errorCode)}`
   }
   const stageLabel: Record<string, string> = {
-    encoding: '인코딩', embedding: '임베딩', album_extraction: '아카이브 추출', extraction_entry: '추출 항목'
+    encoding: 'Encoding', embedding: 'Embedding', album_extraction: 'Archive extraction', extraction_entry: 'Extraction entries'
   }
-  const unitLabel: Record<string, string> = { blobs: '고유 블롭', albums: '앨범', entries: '실패 항목' }
+  const unitLabel: Record<string, string> = { blobs: 'Unique blobs', albums: 'Albums', entries: 'Failed entries' }
   return <tr>
     <th scope="row">{stageLabel[group.stage] || group.stage}</th>
     <td><code>{group.errorCode}</code></td>
     <td>{target ? <CountLink value={group.failureCount} to={target} /> : group.failureCount.toLocaleString()}</td>
     <td>{unitLabel[group.countUnit] || group.countUnit}</td>
-    <td>{target ? <Link to={target}>페이지 보기</Link> : '—'}</td>
+    <td>{target ? <Link to={target}>View page</Link> : '—'}</td>
   </tr>
 }
 
@@ -309,54 +309,54 @@ function ExtractionFailureBrowser({ reasonCode }: { reasonCode: string }) {
   if (cursor) query.set('cursor', cursor)
   const state = useAdminData<ExtractionFailurePage>(apiPath('extraction-failures', `?${query.toString()}`))
   return <section className="panel">
-    <h2>최신 추출 실행 실패 항목 · {reasonCode}</h2>
-    <p className="muted">앨범마다 가장 최근에 기록된 실행의 실패 항목만 페이지로 표시합니다. 과거 실행에서 해결된 실패는 포함하지 않습니다.</p>
+    <h2>Latest extraction run failures · {reasonCode}</h2>
+    <p className="muted">Shows only the failed entries of each album's most recently recorded run, paged. Failures already resolved in earlier runs are not included.</p>
     {state.error && <ErrorPanel message={state.error} />}
-    {state.loading && !state.data && <p role="status">불러오는 중…</p>}
+    {state.loading && !state.data && <p role="status">Loading…</p>}
     {state.data && <>
-      <div className="table-wrap"><table className="data-table"><thead><tr><th>앨범</th><th>실행</th><th>항목</th><th>코드</th></tr></thead><tbody>
+      <div className="table-wrap"><table className="data-table"><thead><tr><th>Album</th><th>Run</th><th>Entry</th><th>Code</th></tr></thead><tbody>
         {state.data.failures.map((failure) => <tr key={`${failure.albumId}:${failure.ordinal}`}>
           <td><Link to={`/albums/${encodeURIComponent(failure.albumId)}`}>{failure.originalFilename}</Link><small className="subline">{failure.albumId}</small></td>
-          <td>#{failure.runId} · 최신 실행</td><td>{failure.name}<small className="subline">항목 #{failure.ordinal}</small></td><td><code>{failure.reasonCode}</code></td>
+          <td>#{failure.runId} · Latest run</td><td>{failure.name}<small className="subline">Entry #{failure.ordinal}</small></td><td><code>{failure.reasonCode}</code></td>
         </tr>)}
         {state.data.failures.length === 0 && <EmptyRow columns={4} />}
       </tbody></table></div>
       <div className="pagination">
-        {cursor && <button type="button" onClick={() => setCursor('')}>첫 페이지</button>}
-        {state.data.nextCursor && <button type="button" onClick={() => setCursor(state.data!.nextCursor!)}>다음 실패 항목 더 보기</button>}
+        {cursor && <button type="button" onClick={() => setCursor('')}>First page</button>}
+        {state.data.nextCursor && <button type="button" onClick={() => setCursor(state.data!.nextCursor!)}>More failures</button>}
       </div>
     </>}
   </section>
 }
 
-// HealthPanel renders the overview's "시스템 상태" section: the catalog's
+// HealthPanel renders the overview's "System health" section: the catalog's
 // lease and integrity counts with drill-down links, the vector-store count
 // comparison, and a one-line summary of the server's feature wiring. Every
 // number is a measurement from the same snapshot; the flags report
 // configuration, never worker liveness.
 function HealthPanel({ health }: { health: Overview['health'] }) {
   const vector = health.vectorCount
-  return <section className="panel" aria-label="시스템 상태">
-    <h2>시스템 상태</h2>
+  return <section className="panel" aria-label="System health">
+    <h2>System health</h2>
     <div className="summary-grid">
-      <Stat label="만료된 임베딩 리스" value={health.embeddingExpiredLeases} to="/photos?embeddingLeaseExpired=true" />
-      <Stat label="만료된 인코딩 리스" value={health.encodingExpiredLeases} to="/photos?encodingLeaseExpired=true" />
-      {/* 참조 없는 블롭 has no list to drill into anymore: the blobs list is
+      <Stat label="Expired embedding leases" value={health.embeddingExpiredLeases} to="/photos?embeddingLeaseExpired=true" />
+      <Stat label="Expired encoding leases" value={health.encodingExpiredLeases} to="/photos?encodingLeaseExpired=true" />
+      {/* Unreferenced blobs have no list to drill into anymore: the blobs list is
           retired, so the count stays a plain number. */}
-      <Stat label="참조 없는 블롭" value={health.unreferencedBlobs} />
-      <Stat label="블롭 없는 사진" value={health.missingBlobPhotos} to="/photos?missingBlob=true" />
+      <Stat label="Unreferenced blobs" value={health.unreferencedBlobs} />
+      <Stat label="Photos without blobs" value={health.missingBlobPhotos} to="/photos?missingBlob=true" />
     </div>
-    <h3>벡터 스토어</h3>
-    {vector.status === 'disabled' && <p>비활성 — 벡터 저장소가 설정되지 않아 개수는 측정되지 않습니다.</p>}
-    {vector.status === 'unavailable' && <div className="notice warning" role="status">측정 불가 — {vector.message || '벡터 개수를 읽을 수 없습니다.'}</div>}
+    <h3>Vector store</h3>
+    {vector.status === 'disabled' && <p>Inactive — the vector store is not configured, so counts are not measured.</p>}
+    {vector.status === 'unavailable' && <div className="notice warning" role="status">Unavailable — {vector.message || 'Could not read the vector counts.'}</div>}
     {vector.status === 'available' && <>
-      <p>{vector.countAgreement ? '일치' : '불일치'} <span className="muted">(기대 {vector.expectedPoints.toLocaleString()} · 실제 {vector.actualPoints?.toLocaleString()})</span></p>
-      <p className="muted">개수 비교일 뿐 전체 동기화나 포인트 무결성을 검증하지 않습니다.</p>
+      <p>{vector.countAgreement ? 'Match' : 'Mismatch'} <span className="muted">(Expected {vector.expectedPoints.toLocaleString()} · Actual {vector.actualPoints?.toLocaleString()})</span></p>
+      <p className="muted">This is only a count comparison; it does not verify full synchronization or point integrity.</p>
     </>}
     <p className="muted">
-      인코딩 워커 API {health.encodingEnabled ? '사용 가능' : '비활성'} · 임베딩 모델 {health.modelEnabled ? '사용 가능' : '비활성'} · 벡터 스토어 {health.vectorStoreEnabled ? '사용 가능' : '비활성'}
+      Encoding worker API {health.encodingEnabled ? 'enabled' : 'disabled'} · Embedding model {health.modelEnabled ? 'enabled' : 'disabled'} · Vector store {health.vectorStoreEnabled ? 'enabled' : 'disabled'}
     </p>
-    <p className="muted">활성화 여부는 서버 설정을 뜻하며 워커 프로세스의 실행 상태가 아닙니다.</p>
+    <p className="muted">Enabled or disabled refers to server configuration, not whether the worker process is running.</p>
   </section>
 }
 
@@ -375,9 +375,9 @@ function CategorySection({ title, categories, filterKey }: {
   const states = [...new Set([...order, ...Object.keys(categories)])]
   return <section className="panel">
     <h2>{title}</h2>
-    {filterKey === 'embedding' && <p className="muted">대기(queued)는 인코딩 상태와 관계없이 임베딩 작업자가 처리할 수 있는 상태입니다.</p>}
-    <p className="muted">각 블롭은 해당 단계의 정규화 상태 하나에 한 번만 집계됩니다. 표의 수는 고유 블롭 수이며 링크는 해당 상태의 사진 행을 엽니다.</p>
-    <table className="data-table"><thead><tr><th>상태</th><th>고유 블롭</th></tr></thead>
+    {filterKey === 'embedding' && <p className="muted">Queued (queued) is a state the embedding worker can process regardless of the encoding state.</p>}
+    <p className="muted">Each blob is counted once per normalized state of the stage. The table's numbers are unique blob counts, and the links open that state's photo rows.</p>
+    <table className="data-table"><thead><tr><th>Status</th><th>Unique blobs</th></tr></thead>
       <tbody>{states.map((state) => <tr key={state}>
         <th scope="row"><Link to={filterURL('photos', { [filterKey]: state })}>{stateLabel(state)}</Link></th>
         <td><CountLink value={categories[state]?.blobCount || 0} to={filterURL('photos', { [filterKey]: state })} /></td>
@@ -402,10 +402,10 @@ function CountLink({ value, to }: { value: number; to: string }) {
 
 function stateLabel(state: string): string {
   const labels: Record<string, string> = {
-    queued: '대기', processing: '처리 중', validating: '검증 중', committing: '저장 중',
-    completed: '완료', skipped: '건너뜀', failed: '실패', unknown: '알 수 없음'
+    queued: 'Queued', processing: 'Processing', validating: 'Validating', committing: 'Committing',
+    completed: 'Completed', skipped: 'Skipped', failed: 'Failed', unknown: 'Unknown'
   }
-  return labels[state] ? `${labels[state]} (${state})` : `${state} (새 상태)`
+  return labels[state] ? `${labels[state]} (${state})` : `${state} (new state)`
 }
 
 function PageTitle({ title, description }: { title: string; description?: string }) {
@@ -419,11 +419,11 @@ function PhotosPage() {
   const photos = state.data && 'photos' in state.data ? state.data.photos : []
   const nextCursor = state.data?.nextCursor || null
   return <>
-    <PageTitle title="사진" description="사진 행과 연결된 앨범·블롭·파이프라인 상태를 검색합니다." />
+    <PageTitle title="Photos" description="Search photo rows together with their linked albums, blobs, and pipeline states." />
     <PhotoFilters />
     <PhotoURLFilterNotice />
     {state.error && <ErrorPanel message={state.error} />}
-    {state.loading && !state.data && <p role="status">불러오는 중…</p>}
+    {state.loading && !state.data && <p role="status">Loading…</p>}
     {state.data && <>
       <PhotoTable photos={photos} />
       <Pagination nextCursor={nextCursor} />
@@ -457,8 +457,8 @@ function entityRecoveryActions(entity: RecoveryEntity): SyncRecoveryAction[] {
     actions.push({
       id: 'retry_failed_embeddings',
       target: 'retry_failed_embeddings',
-      label: '이 블롭 임베딩 재시도',
-      confirm: '이 블롭의 실패한 임베딩을 대기 상태로 되돌려 다시 시도합니다. 계속하시겠습니까?',
+      label: "Retry this blob's embedding",
+      confirm: "Returns this blob's failed embedding to the queued state and retries it. Continue?",
       hashes: [entity.hash]
     })
   }
@@ -466,8 +466,8 @@ function entityRecoveryActions(entity: RecoveryEntity): SyncRecoveryAction[] {
     actions.push({
       id: 'release_expired_claims',
       target: 'release_expired_claims',
-      label: '이 블롭 임베딩 리스 해제',
-      confirm: '이 블롭의 임베딩 클레임이 실제로 만료된 경우에만 대기 상태로 되돌립니다. 계속하시겠습니까?',
+      label: "Release this blob's embedding lease",
+      confirm: "Returns this blob's embedding claim to the queued state only if it has actually expired. Continue?",
       hashes: [entity.hash]
     })
   }
@@ -475,8 +475,8 @@ function entityRecoveryActions(entity: RecoveryEntity): SyncRecoveryAction[] {
     actions.push({
       id: 'retry_failed_encodings',
       target: 'retry_failed_encodings',
-      label: '이 블롭 인코딩 재시도',
-      confirm: '이 블롭의 실패한 WebP 인코딩을 대기 상태로 되돌려 다시 시도합니다. 계속하시겠습니까?',
+      label: "Retry this blob's encoding",
+      confirm: "Returns this blob's failed WebP encoding to the queued state and retries it. Continue?",
       hashes: [entity.hash]
     })
   }
@@ -484,8 +484,8 @@ function entityRecoveryActions(entity: RecoveryEntity): SyncRecoveryAction[] {
     actions.push({
       id: 'reset_stuck_encoding',
       target: 'reset_stuck_encoding',
-      label: '이 블롭 인코딩 리셋',
-      confirm: '이 블롭의 만료된 인코딩 리스와 커밋되지 않은 결과를 대기 상태로 되돌립니다. 계속하시겠습니까?',
+      label: "Reset this blob's encoding",
+      confirm: "Returns this blob's expired encoding leases and uncommitted results to the queued state. Continue?",
       hashes: [entity.hash]
     })
   }
@@ -496,32 +496,32 @@ const globalRecoveryActions: SyncRecoveryAction[] = [
   {
     id: 'retry_failed_embeddings',
     target: 'retry_failed_embeddings',
-    label: '실패한 임베딩 재시도',
-    confirm: '실패 상태인 임베딩 전체를 대기 상태로 되돌려 다시 시도합니다. 계속하시겠습니까?'
+    label: 'Retry failed embeddings',
+    confirm: 'Returns every failed embedding to the queued state and retries them. Continue?'
   },
   {
     id: 'retry_failed_encodings',
     target: 'retry_failed_encodings',
-    label: '실패한 인코딩 재시도',
-    confirm: '실패 상태인 WebP 인코딩 전체를 대기 상태로 되돌려 다시 시도합니다. 계속하시겠습니까?'
+    label: 'Retry failed encodings',
+    confirm: 'Returns every failed WebP encoding to the queued state and retries them. Continue?'
   },
   {
     id: 'release_expired_claims',
     target: 'release_expired_claims',
-    label: '만료된 임베딩 클레임 해제',
-    confirm: '만료된 임베딩 클레임 전체를 대기 상태로 되돌립니다. 유효한 클레임은 이동하지 않습니다. 계속하시겠습니까?'
+    label: 'Release expired embedding claims',
+    confirm: 'Returns every expired embedding claim to the queued state. Valid claims are not moved. Continue?'
   },
   {
     id: 'reset_stuck_encoding',
     target: 'reset_stuck_encoding',
-    label: '인코딩 큐 리셋',
-    confirm: '만료된 인코딩 리스와 커밋되지 않은 결과 전체를 대기 상태로 되돌립니다. 커밋 중인 행은 건드리지 않습니다. 계속하시겠습니까?'
+    label: 'Reset encoding queue',
+    confirm: 'Returns every expired encoding lease and uncommitted result to the queued state. Rows being committed are untouched. Continue?'
   },
   {
     id: 'reindex',
     target: 'reindex',
-    label: '전체 재임베딩',
-    confirm: '모든 준비(ready) 블롭을 다시 임베딩합니다. 비용이 크고 되돌릴 수 없는 전역 작업입니다. 계속하시겠습니까?',
+    label: 'Re-embed everything',
+    confirm: 'Re-embeds every ready blob. This is a costly, irreversible global operation. Continue?',
     danger: true
   }
 ]
@@ -554,7 +554,7 @@ function useSyncRecovery(onDone: () => void) {
 async function invokeSyncRecovery(action: SyncRecoveryAction): Promise<string> {
   if (action.target === 'reindex') {
     const counts = await reindex()
-    return `전체 재임베딩이 등록되었습니다 · 전체 ${counts.total.toLocaleString()} · 대기 ${counts.pending.toLocaleString()} · 처리 중 ${counts.processing.toLocaleString()} · 실패 ${counts.failed.toLocaleString()} · 완료 ${counts.ready.toLocaleString()}`
+    return `Full re-embedding scheduled · total ${counts.total.toLocaleString()} · queued ${counts.pending.toLocaleString()} · processing ${counts.processing.toLocaleString()} · failed ${counts.failed.toLocaleString()} · ready ${counts.ready.toLocaleString()}`
   }
   return recoverResultLine(await recover(action.target, action.hashes))
 }
@@ -562,16 +562,16 @@ async function invokeSyncRecovery(action: SyncRecoveryAction): Promise<string> {
 // The result line reports the rows the server actually moved, so a no-op (for
 // example an unexpired lease) stays visible instead of ending in silence.
 function recoverResultLine(result: RecoverResult): string {
-  if (result.retry) return `${result.retry.reset.toLocaleString()}행 재시도됨`
-  if (result.encodingRetry) return `${result.encodingRetry.reset.toLocaleString()}행 재시도됨`
+  if (result.retry) return `Retried ${result.retry.reset.toLocaleString()} row(s)`
+  if (result.encodingRetry) return `Retried ${result.encodingRetry.reset.toLocaleString()} row(s)`
   if (result.release) return result.release.released > 0
-    ? `${result.release.released.toLocaleString()}행 해제됨`
-    : '해제된 클레임이 없습니다. 만료된 클레임만 해제 대상입니다.'
+    ? `Released ${result.release.released.toLocaleString()} row(s)`
+    : 'No claims were released. Only expired claims are released.'
   if (result.encoding) {
     const { releasedExpiredLeased, resetReceived } = result.encoding.counts
-    return `${(releasedExpiredLeased + resetReceived).toLocaleString()}행 리셋됨 (만료 리스 ${releasedExpiredLeased.toLocaleString()} · 미커밋 결과 ${resetReceived.toLocaleString()})`
+    return `Reset ${(releasedExpiredLeased + resetReceived).toLocaleString()} row(s) (expired leases ${releasedExpiredLeased.toLocaleString()} · uncommitted results ${resetReceived.toLocaleString()})`
   }
-  return '완료되었지만 서버가 결과 수를 반환하지 않았습니다'
+  return 'Completed, but the server returned no counts'
 }
 
 function SyncRecoveryPanel({ title, description, actions, onDone }: {
@@ -587,10 +587,10 @@ function SyncRecoveryPanel({ title, description, actions, onDone }: {
     {actions.length > 0
       ? <div className="recovery-actions">{actions.map((action) => (
         <button key={action.id} type="button" className={action.danger ? 'danger-button' : undefined} disabled={state.busy} onClick={() => void state.run(action)}>
-          {state.pending === action.id ? '실행 중…' : action.label}
+          {state.pending === action.id ? 'Running…' : action.label}
         </button>
       ))}</div>
-      : <p className="muted">현재 상태에서 실행할 수 있는 복구 동작이 없습니다.</p>}
+      : <p className="muted">No recovery actions are available in the current state.</p>}
     {state.result && <p className="recovery-result" role="status">{state.result}</p>}
     {state.error && <div className="notice error" role="alert">{state.error}</div>}
   </section>
@@ -604,11 +604,11 @@ const photoFormKeys = ['q', 'albumId', 'hash', 'encoding', 'embedding'] as const
 
 // URL-only photo filters, with the label the notice renders for each.
 const photoURLFilters: [key: string, label: string][] = [
-  ['encodingErrorCode', '인코딩 오류 코드'],
-  ['embeddingErrorCode', '임베딩 오류 코드'],
-  ['encodingLeaseExpired', '인코딩 리스 만료'],
-  ['embeddingLeaseExpired', '임베딩 리스 만료'],
-  ['missingBlob', '블롭 없는 사진']
+  ['encodingErrorCode', 'Encoding error code'],
+  ['embeddingErrorCode', 'Embedding error code'],
+  ['encodingLeaseExpired', 'Encoding lease expired'],
+  ['embeddingLeaseExpired', 'Embedding lease expired'],
+  ['missingBlob', 'Photos without blobs']
 ]
 
 function PhotoFilters() {
@@ -636,11 +636,11 @@ function PhotoFilters() {
     navigate(`/photos${query.size ? `?${query}` : ''}`)
   }
   return <FilterPanel onSubmit={submit}>
-    <Field label="이름 검색" value={values.q || ''} onChange={(value) => setValues({ ...values, q: value })} />
-    <Field label="앨범 ID" value={values.albumId || ''} onChange={(value) => setValues({ ...values, albumId: value })} />
-    <Field label="해시" value={values.hash || ''} onChange={(value) => setValues({ ...values, hash: value })} />
-    <SelectField label="인코딩" value={values.encoding || ''} onChange={(value) => setValues({ ...values, encoding: value })} options={encodingOptions} />
-    <SelectField label="임베딩" value={values.embedding || ''} onChange={(value) => setValues({ ...values, embedding: value })} options={embeddingOptions} />
+    <Field label="Name search" value={values.q || ''} onChange={(value) => setValues({ ...values, q: value })} />
+    <Field label="Album ID" value={values.albumId || ''} onChange={(value) => setValues({ ...values, albumId: value })} />
+    <Field label="Hash" value={values.hash || ''} onChange={(value) => setValues({ ...values, hash: value })} />
+    <SelectField label="Encoding" value={values.encoding || ''} onChange={(value) => setValues({ ...values, encoding: value })} options={encodingOptions} />
+    <SelectField label="Embedding" value={values.embedding || ''} onChange={(value) => setValues({ ...values, embedding: value })} options={embeddingOptions} />
   </FilterPanel>
 }
 
@@ -657,11 +657,11 @@ function PhotoURLFilterNotice() {
     if (value) withoutURLFilters.set(key, value)
   }
   return <div className="notice url-filters" role="status">
-    <p>주소로 전달된 필터가 활성 상태입니다:</p>
+    <p>Filters from the URL are active:</p>
     <ul className="filter-chips">
       {active.map(([key, label]) => <li key={key}><span>{label}</span><code>{params.get(key)}</code></li>)}
     </ul>
-    <Link to={`/photos${withoutURLFilters.size ? `?${withoutURLFilters.toString()}` : ''}`}>URL 필터 지우기</Link>
+    <Link to={`/photos${withoutURLFilters.size ? `?${withoutURLFilters.toString()}` : ''}`}>Clear URL filters</Link>
   </div>
 }
 
@@ -670,12 +670,12 @@ function AlbumsPage() {
   const state = useAdminData<Page<Album>>(apiPath('albums', location.search))
   const albums = state.data && 'albums' in state.data ? state.data.albums : []
   return <>
-    <PageTitle title="앨범" description="업로드 아카이브의 처리 상태와 사진 수를 확인합니다." />
+    <PageTitle title="Albums" description="Review the processing status and photo counts of upload archives." />
     <AlbumFilters />
     {state.error && <ErrorPanel message={state.error} />}
-    {state.loading && !state.data && <p role="status">불러오는 중…</p>}
+    {state.loading && !state.data && <p role="status">Loading…</p>}
     {state.data && <>
-      <div className="table-wrap"><table className="data-table"><thead><tr><th>파일명</th><th>ID</th><th>상태</th><th>사진</th></tr></thead><tbody>
+      <div className="table-wrap"><table className="data-table"><thead><tr><th>Filename</th><th>ID</th><th>Status</th><th>Photos</th></tr></thead><tbody>
         {albums.map((album) => <tr key={album.id}>
           <td><Link to={`/albums/${encodeURIComponent(album.id)}`} state={returnState(location)}>{album.originalFilename}</Link></td>
           <td className="hash-cell">{album.id}</td><td>{albumStatus(album.status)}</td>
@@ -702,22 +702,22 @@ function AlbumFilters() {
     navigate(`/albums${query.size ? `?${query}` : ''}`)
   }
   return <FilterPanel onSubmit={submit}>
-    <Field label="파일명 검색" value={q} onChange={setQ} />
-    <SelectField label="앨범 상태" value={status} onChange={setStatus} options={[
-      ['', '전체'], ['QUEUED', '대기'], ['PROCESSING', '처리 중'], ['SUCCEEDED', '완료'], ['FAILED', '실패']
+    <Field label="Filename search" value={q} onChange={setQ} />
+    <SelectField label="Album status" value={status} onChange={setStatus} options={[
+      ['', 'All'], ['QUEUED', 'Queued'], ['PROCESSING', 'Processing'], ['SUCCEEDED', 'Succeeded'], ['FAILED', 'Failed']
     ]} />
   </FilterPanel>
 }
 
 function PhotoTable({ photos }: { photos: Photo[] }) {
   const location = useLocation()
-  return <div className="table-wrap"><table className="data-table photo-table"><thead><tr><th>미리보기</th><th>사진</th><th>앨범</th><th>인코딩</th><th>임베딩</th><th>크기</th></tr></thead><tbody>
+  return <div className="table-wrap"><table className="data-table photo-table"><thead><tr><th>Preview</th><th>Photo</th><th>Album</th><th>Encoding</th><th>Embedding</th><th>Size</th></tr></thead><tbody>
     {photos.map((photo) => <tr key={`${photo.albumId}:${photo.idx}`}>
-      <td>{photo.missingBlob ? <span className="image-fallback">사용 불가</span> : <img className="thumbnail" src={imagePath(photo.hash)} loading="lazy" alt="" onError={(event) => showImageFallback(event.currentTarget)} />}</td>
+      <td>{photo.missingBlob ? <span className="image-fallback">Unavailable</span> : <img className="thumbnail" src={imagePath(photo.hash)} loading="lazy" alt="" onError={(event) => showImageFallback(event.currentTarget)} />}</td>
       <td><Link to={`/photos/${encodeURIComponent(photo.albumId)}/${photo.idx}`} state={returnState(location)}>{photo.name}</Link><small className="subline">{photo.width} × {photo.height} · {photo.hash}</small></td>
       <td><Link to={`/albums/${encodeURIComponent(photo.albumId)}`} state={returnState(location)}>{photo.albumName}</Link></td>
-      <td>{photo.missingBlob ? '블롭 없음' : stateLabel(photo.encoding)}<RawState raw={photo.encodingRaw} /></td>
-      <td>{photo.missingBlob ? '블롭 없음' : stateLabel(photo.embedding)}<RawState raw={photo.embeddingRaw} /></td>
+      <td>{photo.missingBlob ? 'No blob' : stateLabel(photo.encoding)}<RawState raw={photo.encodingRaw} /></td>
+      <td>{photo.missingBlob ? 'No blob' : stateLabel(photo.embedding)}<RawState raw={photo.embeddingRaw} /></td>
       <td>{photo.sizeBytes === null ? '—' : formatBytes(photo.sizeBytes)}</td>
     </tr>)}
     {photos.length === 0 && <EmptyRow columns={6} />}
@@ -733,25 +733,25 @@ function PhotoDetailPage() {
   const photo = state.data
   return <>
     <BackLink fallback="/photos" />
-    <PageTitle title={photo?.name || '사진 상세'} description={photo ? `${photo.albumName} · ${photo.width} × ${photo.height}` : undefined} />
+    <PageTitle title={photo?.name || 'Photo detail'} description={photo ? `${photo.albumName} · ${photo.width} × ${photo.height}` : undefined} />
     {state.error && <ErrorPanel message={state.error} />}
-    {state.loading && !photo && <p role="status">불러오는 중…</p>}
+    {state.loading && !photo && <p role="status">Loading…</p>}
     {photo && <div className="detail-grid">
       <section className="panel image-panel">
-        {photo.missingBlob ? <div className="large-fallback">블롭을 사용할 수 없습니다</div> : <img className="detail-image" src={imagePath(photo.hash)} alt={photo.name} onError={(event) => showImageFallback(event.currentTarget)} />}
+        {photo.missingBlob ? <div className="large-fallback">Blob unavailable</div> : <img className="detail-image" src={imagePath(photo.hash)} alt={photo.name} onError={(event) => showImageFallback(event.currentTarget)} />}
         <dl className="metadata">
-          <dt>앨범</dt><dd><Link to={`/albums/${encodeURIComponent(photo.albumId)}`} state={returnState(location)}>{photo.albumName}</Link> ({photo.albumId})</dd>
-          <dt>블롭</dt><dd>{photo.missingBlob ? '블롭을 사용할 수 없습니다' : <Link to={`/blobs/${encodeURIComponent(photo.hash)}`} state={returnState(location)}>{photo.hash}</Link>}</dd>
-          <dt>파일명</dt><dd>{photo.name}</dd><dt>해상도</dt><dd>{photo.width} × {photo.height}</dd>
-          <dt>크기</dt><dd>{photo.sizeBytes === null ? '—' : formatBytes(photo.sizeBytes)}</dd><dt>콘텐츠 형식</dt><dd>{photo.contentType ?? '—'}</dd>
-          <dt>블롭 존재</dt><dd>{photo.missingBlob ? '아니요' : '예'}</dd>
+          <dt>Album</dt><dd><Link to={`/albums/${encodeURIComponent(photo.albumId)}`} state={returnState(location)}>{photo.albumName}</Link> ({photo.albumId})</dd>
+          <dt>Blob</dt><dd>{photo.missingBlob ? 'Blob unavailable' : <Link to={`/blobs/${encodeURIComponent(photo.hash)}`} state={returnState(location)}>{photo.hash}</Link>}</dd>
+          <dt>Filename</dt><dd>{photo.name}</dd><dt>Resolution</dt><dd>{photo.width} × {photo.height}</dd>
+          <dt>Size</dt><dd>{photo.sizeBytes === null ? '—' : formatBytes(photo.sizeBytes)}</dd><dt>Content type</dt><dd>{photo.contentType ?? '—'}</dd>
+          <dt>Blob present</dt><dd>{photo.missingBlob ? 'No' : 'Yes'}</dd>
         </dl>
       </section>
       <PipelineDetails encoding={{ raw: photo.encodingRaw, state: photo.encoding, error: photo.encodingError, skippedReason: photo.skippedReason, observation: photo.encodingObservation }} embedding={{ raw: photo.embeddingRaw, state: photo.embedding, error: photo.embeddingError, observation: photo.embeddingObservation }} missing={photo.missingBlob} />
     </div>}
     {photo && !photo.missingBlob && <SyncRecoveryPanel
-      title="이 블롭 복구"
-      description="현재 파이프라인 상태에서 실행할 수 있는 동작만 표시합니다. 각 동작은 확인 후 즉시 실행되고 대기 상태로 돌아간 행 수를 표시하며, 리스 해제는 실제로 만료된 클레임만 옮깁니다."
+      title="Recover this blob"
+      description="Shows only the actions that can run in the current pipeline state. Each action runs immediately after confirmation and reports how many rows it returned to the queued state; lease release moves only claims that have actually expired."
       actions={entityRecoveryActions({
         hash: photo.hash,
         contentType: photo.contentType,
@@ -772,23 +772,23 @@ function BlobDetailPage() {
   const blob = state.data
   return <>
     <BackLink fallback="/photos" />
-    <PageTitle title="블롭 상세" description={hash} />
+    <PageTitle title="Blob detail" description={hash} />
     {state.error && <ErrorPanel message={state.error} />}
-    {state.loading && !blob && <p role="status">불러오는 중…</p>}
+    {state.loading && !blob && <p role="status">Loading…</p>}
     {blob && <div className="detail-grid">
       <section className="panel">
-        <h2>콘텐츠</h2>
+        <h2>Content</h2>
         <dl className="metadata">
-          <dt>해시</dt><dd className="hash-cell">{blob.hash}</dd><dt>형식</dt><dd>{blob.contentType}</dd><dt>크기</dt><dd>{formatBytes(blob.sizeBytes)}</dd>
-          <dt>사진 참조</dt><dd><Link to={filterURL('photos', { hash: blob.hash })} state={returnState(location)}>{blob.photoCount}개 사진 보기</Link></dd>
-          <dt>앨범 수</dt><dd>{blob.albumCount}</dd>
+          <dt>Hash</dt><dd className="hash-cell">{blob.hash}</dd><dt>Type</dt><dd>{blob.contentType}</dd><dt>Size</dt><dd>{formatBytes(blob.sizeBytes)}</dd>
+          <dt>Photo references</dt><dd><Link to={filterURL('photos', { hash: blob.hash })} state={returnState(location)}>View {blob.photoCount.toLocaleString()} photo(s)</Link></dd>
+          <dt>Album count</dt><dd>{blob.albumCount}</dd>
         </dl>
       </section>
       <PipelineDetails encoding={{ raw: blob.encodingRaw, state: blob.encoding, error: blob.encodingError, skippedReason: blob.skippedReason, observation: blob.encodingObservation }} embedding={{ raw: blob.embeddingRaw, state: blob.embedding, error: blob.embeddingError, observation: blob.embeddingObservation }} missing={false} />
     </div>}
     {blob && <SyncRecoveryPanel
-      title="이 블롭 복구"
-      description="현재 파이프라인 상태에서 실행할 수 있는 동작만 표시합니다. 각 동작은 확인 후 즉시 실행되고 대기 상태로 돌아간 행 수를 표시하며, 리스 해제는 실제로 만료된 클레임만 옮깁니다."
+      title="Recover this blob"
+      description="Shows only the actions that can run in the current pipeline state. Each action runs immediately after confirmation and reports how many rows it returned to the queued state; lease release moves only claims that have actually expired."
       actions={entityRecoveryActions({
         hash: blob.hash,
         contentType: blob.contentType,
@@ -813,20 +813,20 @@ function AlbumDetailPage() {
   const album = state.data
   return <>
     <BackLink fallback="/albums" />
-    <PageTitle title={album?.originalFilename || '앨범 상세'} description={album?.id || id} />
+    <PageTitle title={album?.originalFilename || 'Album detail'} description={album?.id || id} />
     {state.error && <ErrorPanel message={state.error} />}
-    {state.loading && !album && <p role="status">불러오는 중…</p>}
+    {state.loading && !album && <p role="status">Loading…</p>}
     {album && <>
       <section className="panel">
         <div className="summary-grid compact">
-          <Stat label="앨범 상태" value={albumStatus(album.status)} to={`/albums?status=${encodeURIComponent(album.status)}`} />
-          <Stat label="사진 행" value={album.photoCount} to={filterURL('photos', { albumId: album.id })} />
-          <Stat label="블롭 없는 사진" value={album.missingBlobPhotos} to={filterURL('photos', { albumId: album.id, missingBlob: 'true' })} />
+          <Stat label="Album status" value={albumStatus(album.status)} to={`/albums?status=${encodeURIComponent(album.status)}`} />
+          <Stat label="Photo rows" value={album.photoCount} to={filterURL('photos', { albumId: album.id })} />
+          <Stat label="Photos without blobs" value={album.missingBlobPhotos} to={filterURL('photos', { albumId: album.id, missingBlob: 'true' })} />
         </div>
         <p>
-          <Link to={filterURL('photos', { albumId: album.id })} state={returnState(location)}>앨범의 사진을 페이지로 보기</Link>
-          {' · '}<Link to={filterURL('photos', { albumId: album.id, encoding: 'failed' })} state={returnState(location)}>인코딩 실패 사진</Link>
-          {' · '}<Link to={filterURL('photos', { albumId: album.id, embedding: 'failed' })} state={returnState(location)}>임베딩 실패 사진</Link>
+          <Link to={filterURL('photos', { albumId: album.id })} state={returnState(location)}>Browse this album's photos</Link>
+          {' · '}<Link to={filterURL('photos', { albumId: album.id, encoding: 'failed' })} state={returnState(location)}>Encoding-failed photos</Link>
+          {' · '}<Link to={filterURL('photos', { albumId: album.id, embedding: 'failed' })} state={returnState(location)}>Embedding-failed photos</Link>
         </p>
         <ErrorDetails error={album.error} />
       </section>
@@ -841,23 +841,23 @@ function AlbumDetailPage() {
 function LatestExtractionPanel({ album }: { album: AlbumDetail }) {
   const run = album.latestExtraction
   return <section className="panel">
-    <h2>ZIP 추출</h2>
-    {!album.extractionRecorded && <p className="notice warning">이 앨범에는 추출 기록이 없습니다. 기록 기능 도입 전의 기존 앨범이며 실패 항목이 0개라는 뜻은 아닙니다.</p>}
+    <h2>ZIP extraction</h2>
+    {!album.extractionRecorded && <p className="notice warning">This album has no extraction record. It predates the extraction-recording feature, which does not mean it has zero failed entries.</p>}
     {run && <>
       <div className="summary-grid compact">
-        <Stat label="최신 실행" value={`#${run.runId} · ${run.status}`} />
-        <Stat label="등록됨" value={run.registeredCount} />
-        <Stat label="건너뜀" value={run.skippedCount} />
-        <Stat label="실패" value={run.failedCount} />
+        <Stat label="Latest run" value={`#${run.runId} · ${run.status}`} />
+        <Stat label="Registered" value={run.registeredCount} />
+        <Stat label="Skipped" value={run.skippedCount} />
+        <Stat label="Failed" value={run.failedCount} />
       </div>
       <p className="muted">
-        시작 {formatTime(run.startedAt)} · 완료 {run.completedAt ? formatTime(run.completedAt) : '진행 중/미기록'}
-        {' · '}기록된 항목 {run.entriesRecorded.toLocaleString()}
-        {run.totalEntries === null ? ' (전체 수 미확정)' : ` / 전체 ${run.totalEntries.toLocaleString()}`}
-        {run.candidateEntries === null ? '' : ` · 이미지 확장자 후보 ${run.candidateEntries.toLocaleString()}`}
-        {run.entriesComplete ? ' · 항목 기록 완료' : ' · 항목 기록 불완전'}
+        Started {formatTime(run.startedAt)} · Finished {run.completedAt ? formatTime(run.completedAt) : 'running/not recorded'}
+        {' · '}entries recorded {run.entriesRecorded.toLocaleString()}
+        {run.totalEntries === null ? ' (total unknown)' : ` / total ${run.totalEntries.toLocaleString()}`}
+        {run.candidateEntries === null ? '' : ` · image-extension candidates ${run.candidateEntries.toLocaleString()}`}
+        {run.entriesComplete ? ' · entry recording complete' : ' · entry recording incomplete'}
       </p>
-      {run.countsProvisional && <p className="notice warning" role="status">실행이 진행 중입니다. 등록·건너뜀·실패 수는 현재까지 기록된 값이며 계속 바뀔 수 있습니다.</p>}
+      {run.countsProvisional && <p className="notice warning" role="status">The run is still in progress. The registered, skipped, and failed counts are the values recorded so far and may still change.</p>}
       {run.failureReasonCode && <p className="notice error">{run.failureReasonCode}{run.errorDetail ? ` · ${run.errorDetail}` : ''}</p>}
     </>}
   </section>
@@ -869,12 +869,12 @@ function PipelineDetails({ encoding, embedding, missing }: {
   missing: boolean
 }) {
   return <section className="panel pipeline-detail">
-    <h2>파이프라인 상태</h2>
-    {missing ? <p className="notice warning">연결된 블롭이 없어 인코딩·임베딩 상태가 없습니다.</p> : <>
-      <StateDetail title="인코딩" raw={encoding.raw} state={encoding.state} error={encoding.error} observation={encoding.observation} />
-      {encoding.state === 'skipped' && <p className="muted">건너뜀 분류: 저장된 콘텐츠 형식 기준 {encoding.skippedReason || '확인 불가'} (건너뛴 이유 자체는 제공되지 않습니다).</p>}
-      <StateDetail title="임베딩" raw={embedding.raw} state={embedding.state} error={embedding.error} observation={embedding.observation} />
-      {embedding.state === 'queued' && <p className="muted">인코딩 상태와 관계없이 임베딩 처리 대기 중입니다.</p>}
+    <h2>Pipeline status</h2>
+    {missing ? <p className="notice warning">There is no linked blob, so encoding and embedding states do not exist.</p> : <>
+      <StateDetail title="Encoding" raw={encoding.raw} state={encoding.state} error={encoding.error} observation={encoding.observation} />
+      {encoding.state === 'skipped' && <p className="muted">Skipped classification: {encoding.skippedReason || 'unavailable'} by the stored content type (the reason for skipping itself is not provided).</p>}
+      <StateDetail title="Embedding" raw={embedding.raw} state={embedding.state} error={embedding.error} observation={embedding.observation} />
+      {embedding.state === 'queued' && <p className="muted">Waiting for embedding processing regardless of the encoding state.</p>}
     </>}
   </section>
 }
@@ -884,23 +884,23 @@ function PipelineDetails({ encoding, embedding, missing }: {
 // filters retired with the blobs list, so there is no link to build.
 function StateDetail({ title, raw, state, error, observation }: { title: string; raw: string; state: string; error: string; observation?: import('./api').StageObservation }) {
   return <div className="state-detail">
-    <h3>{title}</h3><p>정규화 상태: <strong>{state || '—'}</strong></p>
-    <p>원본 상태: {raw || '—'}</p>
+    <h3>{title}</h3><p>Normalized state: <strong>{state || '—'}</strong></p>
+    <p>Raw state: {raw || '—'}</p>
     <ObservationDetails observation={observation} />
     <ErrorDetails error={error} />
   </div>
 }
 
 function ObservationDetails({ observation }: { observation?: import('./api').StageObservation }) {
-  if (!observation) return <p className="muted">관측 기록 없음</p>
+  if (!observation) return <p className="muted">No observation recorded</p>
   return <dl className="metadata observation-details">
-    <dt>시작</dt><dd>{observation.startedAt ? formatTime(observation.startedAt) : '—'}</dd>
-    <dt>완료</dt><dd>{observation.finishedAt ? formatTime(observation.finishedAt) : '—'}</dd>
-    <dt>상태 변경</dt><dd>{observation.statusChangedAt ? formatTime(observation.statusChangedAt) : '—'}</dd>
-    <dt>시도 횟수</dt><dd>{observation.attempts}</dd>
-    <dt>하위 단계</dt><dd>{observation.phase || '—'}</dd>
-    <dt>오류 코드</dt><dd>{observation.errorCode || '—'}</dd>
-    <dt>재시도 가능성</dt><dd>{observation.retryability || 'unknown'}</dd>
+    <dt>Started</dt><dd>{observation.startedAt ? formatTime(observation.startedAt) : '—'}</dd>
+    <dt>Finished</dt><dd>{observation.finishedAt ? formatTime(observation.finishedAt) : '—'}</dd>
+    <dt>Last status change</dt><dd>{observation.statusChangedAt ? formatTime(observation.statusChangedAt) : '—'}</dd>
+    <dt>Attempts</dt><dd>{observation.attempts}</dd>
+    <dt>Phase</dt><dd>{observation.phase || '—'}</dd>
+    <dt>Error code</dt><dd>{observation.errorCode || '—'}</dd>
+    <dt>Retryability</dt><dd>{observation.retryability || 'unknown'}</dd>
   </dl>
 }
 
@@ -912,17 +912,17 @@ function PipelineHistory({ hash }: { hash: string }) {
   const state = useAdminData<HistoryPage>(apiPath(`blobs/${encodeURIComponent(hash)}/history`, '?limit=20'))
   const events = state.data?.events || []
   return <section className="panel pipeline-history">
-    <h2>파이프라인 기록</h2>
+    <h2>Pipeline history</h2>
     {state.error && <ErrorPanel message={state.error} />}
-    {state.loading && !state.data && <p role="status">기록 불러오는 중…</p>}
+    {state.loading && !state.data && <p role="status">Loading history…</p>}
     {events.length > 0 && <ol className="event-list">{events.map((event) => <li key={event.id}>
       <time dateTime={event.occurredAt}>{formatTime(event.occurredAt)}</time>
       <strong>{event.stage} · {event.event}</strong>
-      <span>상태 {event.status}{event.phase ? ` · 단계 ${event.phase}` : ''} · 시도 {event.attemptId}</span>
-      {event.errorCode && <span>오류 코드 {event.errorCode}</span>}
+      <span>Status {event.status}{event.phase ? ` · Phase ${event.phase}` : ''} · Attempt {event.attemptId}</span>
+      {event.errorCode && <span>Error code {event.errorCode}</span>}
     </li>)}</ol>}
-    {state.data && events.length === 0 && <p className="muted">마이그레이션 이후 기록된 이벤트가 없습니다.</p>}
-    {state.data?.nextCursor && <p className="muted">최근 20개 이벤트만 표시합니다.</p>}
+    {state.data && events.length === 0 && <p className="muted">No events recorded since the migration.</p>}
+    {state.data?.nextCursor && <p className="muted">Only the latest 20 events are shown.</p>}
   </section>
 }
 
@@ -931,12 +931,12 @@ function PipelineHistory({ hash }: { hash: string }) {
 // subline: the raw filters are gone, so there is nothing to link to.
 function RawState({ raw }: { raw: string }) {
   if (!raw) return null
-  return <small className="subline">원본: {raw}</small>
+  return <small className="subline">Raw: {raw}</small>
 }
 
 function ErrorDetails({ error }: { error: string }) {
-  if (!error) return <p className="muted">현재 오류 없음</p>
-  return <details className="error-details"><summary>현재 오류 전문</summary><pre>{error}</pre></details>
+  if (!error) return <p className="muted">No current error</p>
+  return <details className="error-details"><summary>Current error detail</summary><pre>{error}</pre></details>
 }
 
 function Pagination({ nextCursor }: { nextCursor: string | null }) {
@@ -950,16 +950,16 @@ function Pagination({ nextCursor }: { nextCursor: string | null }) {
     return `${location.pathname}?${params.toString()}`
   }
   return <div className="pagination">
-    {prior ? <Link className="button-link" to={prior} state={(location.state as { adminPreviousPrevious?: string } | null)?.adminPreviousPrevious ? { adminPrevious: (location.state as { adminPreviousPrevious: string }).adminPreviousPrevious } : null}>← 이전</Link> : <span className="muted">이전은 브라우저 기록을 사용할 수 있습니다.</span>}
-    <span className="muted">커서 기반 페이지</span>
-    {nextCursor ? <Link className="button-link" to={next()} state={{ adminPrevious: url, adminPreviousPrevious: prior }}>다음 →</Link> : <span className="muted">마지막 페이지</span>}
+    {prior ? <Link className="button-link" to={prior} state={(location.state as { adminPreviousPrevious?: string } | null)?.adminPreviousPrevious ? { adminPrevious: (location.state as { adminPreviousPrevious: string }).adminPreviousPrevious } : null}>← Previous</Link> : <span className="muted">For previous pages, use the browser history.</span>}
+    <span className="muted">Cursor-based pages</span>
+    {nextCursor ? <Link className="button-link" to={next()} state={{ adminPrevious: url, adminPreviousPrevious: prior }}>Next →</Link> : <span className="muted">Last page</span>}
   </div>
 }
 
 function BackLink({ fallback }: { fallback: string }) {
   const location = useLocation()
   const returnTo = (location.state as { returnTo?: string } | null)?.returnTo
-  return <Link className="back-link" to={returnTo || fallback} state={returnTo ? location.state : null}>← 목록으로</Link>
+  return <Link className="back-link" to={returnTo || fallback} state={returnTo ? location.state : null}>← Back to list</Link>
 }
 
 function returnState(location: ReturnType<typeof useLocation>) {
@@ -969,7 +969,7 @@ function returnState(location: ReturnType<typeof useLocation>) {
 function FilterPanel({ children, onSubmit }: { children: ReactNode; onSubmit: (event: FormEvent) => void }) {
   const location = useLocation()
   return <form className="filter-panel" onSubmit={onSubmit}>
-    {children}<div className="filter-actions"><button type="submit">검색</button><Link to={location.pathname} className="button-link secondary">초기화</Link></div>
+    {children}<div className="filter-actions"><button type="submit">Search</button><Link to={location.pathname} className="button-link secondary">Reset</Link></div>
   </form>
 }
 
@@ -982,27 +982,27 @@ function SelectField({ label, value, options, onChange }: { label: string; value
 }
 
 const encodingOptions: [string, string][] = [
-  ['', '전체'], ['queued', '대기'], ['processing', '처리 중'], ['validating', '검증 중'], ['committing', '저장 중'], ['completed', '완료'], ['skipped', '건너뜀'], ['failed', '실패'], ['unknown', '알 수 없음']
+  ['', 'All'], ['queued', 'Queued'], ['processing', 'Processing'], ['validating', 'Validating'], ['committing', 'Committing'], ['completed', 'Completed'], ['skipped', 'Skipped'], ['failed', 'Failed'], ['unknown', 'Unknown']
 ]
 const embeddingOptions: [string, string][] = [
-  ['', '전체'], ['queued', '대기'], ['processing', '처리 중'], ['completed', '완료'], ['failed', '실패'], ['unknown', '알 수 없음']
+  ['', 'All'], ['queued', 'Queued'], ['processing', 'Processing'], ['completed', 'Completed'], ['failed', 'Failed'], ['unknown', 'Unknown']
 ]
 
 function ErrorPanel({ message }: { message: string }) {
-  return <div className="notice error" role="alert">요청 실패: {message}</div>
+  return <div className="notice error" role="alert">Request failed: {message}</div>
 }
 
 function EmptyRow({ columns }: { columns: number }) {
-  return <tr><td className="empty-row" colSpan={columns}>조건에 맞는 항목이 없습니다.</td></tr>
+  return <tr><td className="empty-row" colSpan={columns}>No items match the filters.</td></tr>
 }
 
 function NotFoundPage() {
-  return <section className="panel"><h1>페이지를 찾을 수 없습니다</h1><Link to="/">개요로 이동</Link></section>
+  return <section className="panel"><h1>Page not found</h1><Link to="/">Go to overview</Link></section>
 }
 
 function albumStatus(status: string): string {
-  const labels: Record<string, string> = { QUEUED: '대기', PROCESSING: '처리 중', SUCCEEDED: '완료', FAILED: '실패' }
-  return labels[status] || `${status} (새 상태)`
+  const labels: Record<string, string> = { QUEUED: 'Queued', PROCESSING: 'Processing', SUCCEEDED: 'Succeeded', FAILED: 'Failed' }
+  return labels[status] || `${status} (new state)`
 }
 
 function formatBytes(value: number): string {
@@ -1017,6 +1017,6 @@ function formatBytes(value: number): string {
 function showImageFallback(image: HTMLImageElement) {
   const fallback = document.createElement('span')
   fallback.className = image.classList.contains('detail-image') ? 'large-fallback' : 'image-fallback'
-  fallback.textContent = '이미지 사용 불가'
+  fallback.textContent = 'Image unavailable'
   image.replaceWith(fallback)
 }

@@ -108,17 +108,17 @@ describe('admin React UI', () => {
         : jsonResponse({ photos: [], nextCursor: null }))
     renderAt('/')
 
-    const section = (await screen.findByRole('heading', { name: 'WebP 인코딩' })).parentElement!
-    const row = await within(section).findByRole('row', { name: /대기 \(queued\)/ })
+    const section = (await screen.findByRole('heading', { name: 'WebP encoding' })).parentElement!
+    const row = await within(section).findByRole('row', { name: /Queued \(queued\)/ })
     const countLink = within(row).getByRole('link', { name: '1' })
     // The counts are unique-blob counts, but the blobs list is retired: the
     // drilldown opens photo rows filtered by the category.
     expect(countLink.getAttribute('href')).toBe('/photos?encoding=queued')
-    expect(screen.getByRole('link', { name: /고유 블롭/ }).getAttribute('href')).toBe('/photos')
-    expect(screen.getByText(/사진·앨범 참조 수를 상태별로 나누지 않습니다/)).toBeTruthy()
-    expect(screen.getByText(/인코딩 상태와 관계없이 임베딩 작업자가 처리할 수 있는 상태/)).toBeTruthy()
-    expect(within(section).getByRole('columnheader', { name: '고유 블롭' })).toBeTruthy()
-    expect(screen.queryByRole('columnheader', { name: '사진 행' })).toBeNull()
+    expect(screen.getByRole('link', { name: /Unique blobs/ }).getAttribute('href')).toBe('/photos')
+    expect(screen.getByText(/do not split photo or album reference counts by state/)).toBeTruthy()
+    expect(screen.getByText(/a state the embedding worker can process regardless of the encoding state/)).toBeTruthy()
+    expect(within(section).getByRole('columnheader', { name: 'Unique blobs' })).toBeTruthy()
+    expect(screen.queryByRole('columnheader', { name: 'Photo rows' })).toBeNull()
     fireEvent.click(countLink)
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/admin/api/photos?encoding=queued', expect.anything()))
   })
@@ -129,12 +129,12 @@ describe('admin React UI', () => {
       : jsonResponse(overview))
     renderAt('/photos?hash=gone')
 
-    expect((await screen.findAllByText('블롭 없음')).length).toBe(2)
-    expect(screen.getByText('사용 불가')).toBeTruthy()
+    expect((await screen.findAllByText('No blob')).length).toBe(2)
+    expect(screen.getByText('Unavailable')).toBeTruthy()
     expect(screen.queryByRole('img')).toBeNull()
     expect(fetchMock).toHaveBeenCalledWith('/admin/api/photos?hash=gone', expect.anything())
-    expect(screen.getByLabelText('해시')).toHaveProperty('value', 'gone')
-    expect(screen.queryByRole('option', { name: '차단됨' })).toBeNull()
+    expect(screen.getByLabelText('Hash')).toHaveProperty('value', 'gone')
+    expect(screen.queryByRole('option', { name: 'Blocked' })).toBeNull()
   })
 
   it('exposes exactly the five form fields on the photos page', async () => {
@@ -145,12 +145,12 @@ describe('admin React UI', () => {
     expect(form).toBeTruthy()
     expect(within(form).getAllByRole('textbox')).toHaveLength(3)
     expect(within(form).getAllByRole('combobox')).toHaveLength(2)
-    for (const label of ['이름 검색', '앨범 ID', '해시', '인코딩', '임베딩']) {
+    for (const label of ['Name search', 'Album ID', 'Hash', 'Encoding', 'Embedding']) {
       expect(within(form).getByLabelText(label)).toBeTruthy()
     }
     // The retired raw-state, error-code, lease, phase, and skipped-reason
     // fields must not come back as hidden inputs.
-    for (const label of ['원본 인코딩 상태', '원본 임베딩 상태', '인코딩 오류 코드', '임베딩 오류 코드', '인코딩 리스 만료', '임베딩 리스 만료', '인코딩 단계', '건너뜀 형식', '참조 여부']) {
+    for (const label of ['Raw encoding state', 'Raw embedding state', 'Encoding error code', 'Embedding error code', 'Encoding lease expired', 'Embedding lease expired', 'Encoding phase', 'Skipped format', 'Referenced']) {
       expect(within(form).queryByLabelText(label)).toBeNull()
     }
   })
@@ -163,27 +163,27 @@ describe('admin React UI', () => {
 
     // The deep link's filters reach the API and the page explains itself.
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/admin/api/photos?hash=gone&missingBlob=true&encodingErrorCode=invalid_source', expect.anything()))
-    const notice = (await screen.findByText('블롭 없는 사진')).closest('.notice') as HTMLElement
+    const notice = (await screen.findByText('Photos without blobs')).closest('.notice') as HTMLElement
     expect(notice).toBeTruthy()
     expect(within(notice).getByText('true')).toBeTruthy()
-    expect(within(notice).getByText('인코딩 오류 코드')).toBeTruthy()
+    expect(within(notice).getByText('Encoding error code')).toBeTruthy()
     expect(within(notice).getByText('invalid_source')).toBeTruthy()
     // The form keeps only its five fields; the URL-only ones are not inputs.
-    expect(screen.getByLabelText('해시')).toHaveProperty('value', 'gone')
-    expect(screen.queryByLabelText('인코딩 오류 코드')).toBeNull()
+    expect(screen.getByLabelText('Hash')).toHaveProperty('value', 'gone')
+    expect(screen.queryByLabelText('Encoding error code')).toBeNull()
 
     // Clearing drops exactly the URL-only filters and keeps the form's.
-    fireEvent.click(within(notice).getByRole('link', { name: 'URL 필터 지우기' }))
+    fireEvent.click(within(notice).getByRole('link', { name: 'Clear URL filters' }))
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/admin/api/photos?hash=gone', expect.anything()))
-    await waitFor(() => expect(screen.queryByText('블롭 없는 사진')).toBeNull())
+    await waitFor(() => expect(screen.queryByText('Photos without blobs')).toBeNull())
 
     // Submitting the form preserves the URL-only filters it did not show.
     cleanup()
     const secondMock = mockFetch((url) => jsonResponse({ photos: [], nextCursor: null }))
     renderAt('/photos?missingBlob=true')
     await waitFor(() => expect(secondMock).toHaveBeenCalledWith('/admin/api/photos?missingBlob=true', expect.anything()))
-    fireEvent.change(screen.getByLabelText('이름 검색'), { target: { value: 'pic' } })
-    fireEvent.click(screen.getByRole('button', { name: '검색' }))
+    fireEvent.change(screen.getByLabelText('Name search'), { target: { value: 'pic' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Search' }))
     await waitFor(() => expect(secondMock).toHaveBeenCalledWith('/admin/api/photos?missingBlob=true&q=pic', expect.anything()))
   })
 
@@ -191,7 +191,7 @@ describe('admin React UI', () => {
     mockFetch(() => jsonResponse({ error: { message: 'catalog unavailable' } }, 500))
     renderAt('/albums?status=FAILED')
     expect((await screen.findByRole('alert')).textContent).toContain('catalog unavailable')
-    expect(screen.getByRole('combobox', { name: '앨범 상태' })).toHaveProperty('value', 'FAILED')
+    expect(screen.getByRole('combobox', { name: 'Album status' })).toHaveProperty('value', 'FAILED')
   })
 
   it('renders nullable observations as unavailable and shows the bounded blob history', async () => {
@@ -209,12 +209,12 @@ describe('admin React UI', () => {
     expect(screen.getAllByText('—').length).toBeGreaterThan(0)
     expect(screen.getAllByText('unknown').length).toBeGreaterThan(0)
     expect(screen.getByText('legacy_unknown')).toBeTruthy()
-    expect(screen.getByText('인코딩 상태와 관계없이 임베딩 처리 대기 중입니다.')).toBeTruthy()
+    expect(screen.getByText('Waiting for embedding processing regardless of the encoding state.')).toBeTruthy()
     // One bounded fetch of the newest 20 events: no stage filter and no
     // load-more machinery anymore.
-    expect(screen.getByText(/최근 20개 이벤트만 표시합니다/)).toBeTruthy()
-    expect(screen.queryByRole('combobox', { name: '단계' })).toBeNull()
-    expect(screen.queryByRole('button', { name: '다음 기록 더 보기' })).toBeNull()
+    expect(screen.getByText(/Only the latest 20 events are shown/)).toBeTruthy()
+    expect(screen.queryByRole('combobox', { name: 'Stage' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'More history' })).toBeNull()
   })
 
   it('does not show stale rows when a changed filter fails and the aborted request resolves late', async () => {
@@ -226,10 +226,10 @@ describe('admin React UI', () => {
     renderAt('/photos?hash=first')
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/admin/api/photos?hash=first', expect.anything()))
 
-    fireEvent.change(await screen.findByLabelText('해시'), { target: { value: 'second' } })
-    fireEvent.click(screen.getByRole('button', { name: '검색' }))
+    fireEvent.change(await screen.findByLabelText('Hash'), { target: { value: 'second' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Search' }))
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/admin/api/photos?hash=second', expect.anything()))
-    expect(screen.getByRole('status').textContent).toContain('불러오는 중')
+    expect(screen.getByRole('status').textContent).toContain('Loading')
 
     await act(async () => {
       secondRequest.reject(new Error('second filter failed'))
@@ -252,24 +252,24 @@ describe('admin React UI', () => {
     renderAt('/albums/album-1')
 
     expect(await screen.findByText('archive.zip')).toBeTruthy()
-    expect(screen.getByText(/앨범의 사진을 페이지로 보기/)).toBeTruthy()
-    expect(screen.getByRole('link', { name: '앨범의 사진을 페이지로 보기' }).getAttribute('href')).toBe('/photos?albumId=album-1')
-    expect(screen.getByRole('link', { name: '인코딩 실패 사진' }).getAttribute('href')).toBe('/photos?albumId=album-1&encoding=failed')
-    expect(screen.getByRole('link', { name: '임베딩 실패 사진' }).getAttribute('href')).toBe('/photos?albumId=album-1&embedding=failed')
-    expect(screen.getByRole('link', { name: /블롭 없는 사진/ }).getAttribute('href')).toBe('/photos?albumId=album-1&missingBlob=true')
+    expect(screen.getByText(/Browse this album's photos/)).toBeTruthy()
+    expect(screen.getByRole('link', { name: "Browse this album's photos" }).getAttribute('href')).toBe('/photos?albumId=album-1')
+    expect(screen.getByRole('link', { name: 'Encoding-failed photos' }).getAttribute('href')).toBe('/photos?albumId=album-1&encoding=failed')
+    expect(screen.getByRole('link', { name: 'Embedding-failed photos' }).getAttribute('href')).toBe('/photos?albumId=album-1&embedding=failed')
+    expect(screen.getByRole('link', { name: /Photos without blobs/ }).getAttribute('href')).toBe('/photos?albumId=album-1&missingBlob=true')
     expect(screen.getByText('extract failed')).toBeTruthy()
 
     // The latest run summary: identity, timing, and the three outcome counts.
     expect(screen.getByText('#2 · succeeded')).toBeTruthy()
-    expect(screen.getByText('등록됨')).toBeTruthy()
-    expect(screen.getByText(/시작 /)).toBeTruthy()
-    expect(screen.getByText(/항목 기록 완료/)).toBeTruthy()
-    expect(screen.queryByRole('button', { name: '이전 실행 더 보기' })).toBeNull()
-    expect(screen.queryByRole('combobox', { name: '추출 결과' })).toBeNull()
+    expect(screen.getByText('Registered')).toBeTruthy()
+    expect(screen.getByText(/Started /)).toBeTruthy()
+    expect(screen.getByText(/entry recording complete/)).toBeTruthy()
+    expect(screen.queryByRole('button', { name: 'More previous runs' })).toBeNull()
+    expect(screen.queryByRole('combobox', { name: 'Extraction results' })).toBeNull()
     // No pipeline tables: the photos deep links replaced them.
-    expect(screen.queryByRole('heading', { name: '앨범 인코딩 상태' })).toBeNull()
-    expect(screen.queryByRole('heading', { name: '앨범 임베딩 상태' })).toBeNull()
-    expect(screen.queryByRole('heading', { name: '건너뜀 형식' })).toBeNull()
+    expect(screen.queryByRole('heading', { name: 'Album encoding status' })).toBeNull()
+    expect(screen.queryByRole('heading', { name: 'Album embedding status' })).toBeNull()
+    expect(screen.queryByRole('heading', { name: 'Skipped format' })).toBeNull()
     expect(fetchMock.mock.calls.filter(([url]) => String(url).includes('/extractions') || String(url).includes('/entries')).length).toBe(0)
   })
 
@@ -289,8 +289,8 @@ describe('admin React UI', () => {
       : jsonResponse({}))
     renderAt('/albums/album-1')
     expect(await screen.findByText('#5 · running')).toBeTruthy()
-    expect(screen.getByText(/등록·건너뜀·실패 수는 현재까지 기록된 값이며 계속 바뀔 수 있습니다/)).toBeTruthy()
-    expect(screen.queryByText(/항목 페이지는 실행 완료 후 확인할 수 있습니다/)).toBeNull()
+    expect(screen.getByText(/recorded so far and may still change/)).toBeTruthy()
+    expect(screen.queryByText(/entries page is available once the run completes/)).toBeNull()
   })
 
   it('explains that legacy albums have no extraction record instead of showing zero failures', async () => {
@@ -299,8 +299,8 @@ describe('admin React UI', () => {
       ? jsonResponse(legacy)
       : jsonResponse({ photos: [], nextCursor: null }))
     renderAt('/albums/album-1')
-    expect(await screen.findByText(/기록 기능 도입 전의 기존 앨범이며 실패 항목이 0개라는 뜻은 아닙니다/)).toBeTruthy()
-    expect(screen.queryByText(/최신 실행/)).toBeNull()
+    expect(await screen.findByText(/which does not mean it has zero failed entries/)).toBeTruthy()
+    expect(screen.queryByText(/Latest run/)).toBeNull()
   })
 
   it('shows current issue groups and drills into the matching paged resource and latest extraction entries', async () => {
@@ -323,12 +323,12 @@ describe('admin React UI', () => {
     renderAt('/issues')
 
     expect(await screen.findByText('invalid_source')).toBeTruthy()
-    expect(screen.getByText(/측정/)).toBeTruthy()
+    expect(screen.getByText(/Measured/)).toBeTruthy()
     expect(screen.getByText('Groups are independent.')).toBeTruthy()
-    const encodingRow = screen.getByRole('row', { name: /인코딩 invalid_source/ })
-    expect(within(encodingRow).getByText('고유 블롭')).toBeTruthy()
-    expect(screen.getByText('실패 항목')).toBeTruthy()
-    expect(screen.getByRole('link', { name: '이슈' })).toBeTruthy()
+    const encodingRow = screen.getByRole('row', { name: /Encoding invalid_source/ })
+    expect(within(encodingRow).getByText('Unique blobs')).toBeTruthy()
+    expect(screen.getByText('Failed entries')).toBeTruthy()
+    expect(screen.getByRole('link', { name: 'Issues' })).toBeTruthy()
     const issueCount = screen.getByRole('link', { name: '1' })
     // The blobs list is retired: pipeline issue groups drill into photo rows.
     expect(issueCount.getAttribute('href')).toBe('/photos?encoding=failed&encodingErrorCode=invalid_source')
@@ -340,18 +340,18 @@ describe('admin React UI', () => {
     cleanup()
     renderAt('/issues?entryReasonCode=invalid_image')
     expect(await screen.findByText('bad.jpg')).toBeTruthy()
-    expect(screen.getByText(/최신 추출 실행 실패 항목/)).toBeTruthy()
+    expect(screen.getByText(/Latest extraction run failures/)).toBeTruthy()
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/admin/api/extraction-failures?reasonCode=invalid_image&limit=50', expect.anything()))
   })
 
   it('offers only the sync recovery actions that match the blob pipeline states', async () => {
     mockFetch((url) => url === '/admin/api/blobs/recover-hash' ? jsonResponse(recoverBlob) : jsonResponse({}))
     renderAt('/blobs/recover-hash')
-    expect(await screen.findByRole('heading', { name: '이 블롭 복구' })).toBeTruthy()
-    expect(screen.getByRole('button', { name: '이 블롭 임베딩 재시도' })).toBeTruthy()
-    expect(screen.getByRole('button', { name: '이 블롭 인코딩 재시도' })).toBeTruthy()
-    expect(screen.queryByRole('button', { name: '이 블롭 임베딩 리스 해제' })).toBeNull()
-    expect(screen.queryByRole('button', { name: '이 블롭 인코딩 리셋' })).toBeNull()
+    expect(await screen.findByRole('heading', { name: 'Recover this blob' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: "Retry this blob's embedding" })).toBeTruthy()
+    expect(screen.getByRole('button', { name: "Retry this blob's encoding" })).toBeTruthy()
+    expect(screen.queryByRole('button', { name: "Release this blob's embedding lease" })).toBeNull()
+    expect(screen.queryByRole('button', { name: "Reset this blob's encoding" })).toBeNull()
 
     cleanup()
     const claimed: Blob = {
@@ -360,18 +360,18 @@ describe('admin React UI', () => {
     }
     mockFetch((url) => url === '/admin/api/blobs/claimed-hash' ? jsonResponse(claimed) : jsonResponse({}))
     renderAt('/blobs/claimed-hash')
-    expect(await screen.findByRole('button', { name: '이 블롭 임베딩 리스 해제' })).toBeTruthy()
-    expect(screen.getByRole('button', { name: '이 블롭 인코딩 리셋' })).toBeTruthy()
-    expect(screen.queryByRole('button', { name: '이 블롭 임베딩 재시도' })).toBeNull()
-    expect(screen.queryByRole('button', { name: '이 블롭 인코딩 재시도' })).toBeNull()
+    expect(await screen.findByRole('button', { name: "Release this blob's embedding lease" })).toBeTruthy()
+    expect(screen.getByRole('button', { name: "Reset this blob's encoding" })).toBeTruthy()
+    expect(screen.queryByRole('button', { name: "Retry this blob's embedding" })).toBeNull()
+    expect(screen.queryByRole('button', { name: "Retry this blob's encoding" })).toBeNull()
 
     cleanup()
     const webp: Blob = { ...recoverBlob, hash: 'webp-hash', contentType: 'image/webp', encoding: 'processing', encodingRaw: 'received' }
     mockFetch((url) => url === '/admin/api/blobs/webp-hash' ? jsonResponse(webp) : jsonResponse({}))
     renderAt('/blobs/webp-hash')
-    expect(await screen.findByRole('button', { name: '이 블롭 임베딩 재시도' })).toBeTruthy()
-    expect(screen.getByRole('button', { name: '이 블롭 인코딩 리셋' })).toBeTruthy()
-    expect(screen.queryByRole('button', { name: '이 블롭 인코딩 재시도' })).toBeNull()
+    expect(await screen.findByRole('button', { name: "Retry this blob's embedding" })).toBeTruthy()
+    expect(screen.getByRole('button', { name: "Reset this blob's encoding" })).toBeTruthy()
+    expect(screen.queryByRole('button', { name: "Retry this blob's encoding" })).toBeNull()
     expect(screen.queryByRole('checkbox')).toBeNull()
   })
 
@@ -382,15 +382,15 @@ describe('admin React UI', () => {
     }
     mockFetch((url) => url === '/admin/api/photos/album-1/0' ? jsonResponse(failedPhoto) : jsonResponse({}))
     renderAt('/photos/album-1/0')
-    expect(await screen.findByRole('heading', { name: '이 블롭 복구' })).toBeTruthy()
-    expect(screen.getByRole('button', { name: '이 블롭 임베딩 재시도' })).toBeTruthy()
-    expect(screen.getByRole('button', { name: '이 블롭 인코딩 재시도' })).toBeTruthy()
+    expect(await screen.findByRole('heading', { name: 'Recover this blob' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: "Retry this blob's embedding" })).toBeTruthy()
+    expect(screen.getByRole('button', { name: "Retry this blob's encoding" })).toBeTruthy()
 
     cleanup()
     mockFetch((url) => url === '/admin/api/photos/album-1/0' ? jsonResponse(missingPhoto) : jsonResponse({}))
     renderAt('/photos/album-1/0')
-    expect((await screen.findAllByText('블롭을 사용할 수 없습니다')).length).toBeGreaterThan(0)
-    expect(screen.queryByRole('heading', { name: '이 블롭 복구' })).toBeNull()
+    expect((await screen.findAllByText('Blob unavailable')).length).toBeGreaterThan(0)
+    expect(screen.queryByRole('heading', { name: 'Recover this blob' })).toBeNull()
   })
 
   it('confirms before posting a hash-scoped recovery and reports the moved rows', async () => {
@@ -401,10 +401,10 @@ describe('admin React UI', () => {
       return jsonResponse({})
     })
     renderAt('/blobs/recover-hash')
-    fireEvent.click(await screen.findByRole('button', { name: '이 블롭 임베딩 재시도' }))
+    fireEvent.click(await screen.findByRole('button', { name: "Retry this blob's embedding" }))
     expect(confirmSpy).toHaveBeenCalledTimes(1)
-    expect(confirmSpy.mock.calls[0][0]).toContain('이 블롭의 실패한 임베딩')
-    expect(await screen.findByText('1행 재시도됨')).toBeTruthy()
+    expect(confirmSpy.mock.calls[0][0]).toContain("this blob's failed embedding")
+    expect(await screen.findByText('Retried 1 row(s)')).toBeTruthy()
     const recoverCall = fetchMock.mock.calls.find(([url]) => String(url) === '/admin/api/recover')
     expect(recoverCall?.[1]?.method).toBe('POST')
     expect(recoverCall?.[1]?.body).toBe(JSON.stringify({ target: 'retry_failed_embeddings', hashes: ['recover-hash'] }))
@@ -418,10 +418,10 @@ describe('admin React UI', () => {
       return jsonResponse({})
     })
     renderAt('/blobs/recover-hash')
-    fireEvent.click(await screen.findByRole('button', { name: '이 블롭 인코딩 재시도' }))
+    fireEvent.click(await screen.findByRole('button', { name: "Retry this blob's encoding" }))
     expect(confirmSpy).toHaveBeenCalledTimes(1)
     expect(fetchMock.mock.calls.some(([url]) => String(url) === '/admin/api/recover')).toBe(false)
-    expect(screen.queryByText(/행 재시도됨/)).toBeNull()
+    expect(screen.queryByText(/Retried \d+ row\(s\)/)).toBeNull()
   })
 
   it('disables sibling actions while a recovery is in flight and ignores double submits', async () => {
@@ -433,18 +433,18 @@ describe('admin React UI', () => {
       return jsonResponse({})
     })
     renderAt('/blobs/recover-hash')
-    const embeddingRetry = await screen.findByRole('button', { name: '이 블롭 임베딩 재시도' })
-    const encodingRetry = screen.getByRole('button', { name: '이 블롭 인코딩 재시도' })
+    const embeddingRetry = await screen.findByRole('button', { name: "Retry this blob's embedding" })
+    const encodingRetry = screen.getByRole('button', { name: "Retry this blob's encoding" })
     fireEvent.click(embeddingRetry)
-    expect(embeddingRetry.textContent).toBe('실행 중…')
+    expect(embeddingRetry.textContent).toBe('Running…')
     expect(encodingRetry.hasAttribute('disabled')).toBe(true)
     fireEvent.click(embeddingRetry)
     await act(async () => {
       inFlight.resolve(jsonResponse({ target: 'retry_failed_embeddings', retry: { reset: 1, counts: embeddingCounts } }))
       await Promise.resolve()
     })
-    expect(await screen.findByText('1행 재시도됨')).toBeTruthy()
-    await waitFor(() => expect(screen.getByRole('button', { name: '이 블롭 인코딩 재시도' }).hasAttribute('disabled')).toBe(false))
+    expect(await screen.findByText('Retried 1 row(s)')).toBeTruthy()
+    await waitFor(() => expect(screen.getByRole('button', { name: "Retry this blob's encoding" }).hasAttribute('disabled')).toBe(false))
     expect(fetchMock.mock.calls.filter(([url]) => String(url) === '/admin/api/recover').length).toBe(1)
   })
 
@@ -456,9 +456,9 @@ describe('admin React UI', () => {
       return jsonResponse({})
     })
     renderAt('/blobs/recover-hash')
-    fireEvent.click(await screen.findByRole('button', { name: '이 블롭 임베딩 재시도' }))
+    fireEvent.click(await screen.findByRole('button', { name: "Retry this blob's embedding" }))
     expect((await screen.findByRole('alert')).textContent).toContain('catalog unavailable')
-    await waitFor(() => expect(screen.getByRole('button', { name: '이 블롭 임베딩 재시도' }).hasAttribute('disabled')).toBe(false))
+    await waitFor(() => expect(screen.getByRole('button', { name: "Retry this blob's embedding" }).hasAttribute('disabled')).toBe(false))
   })
 
   it('runs confirm-gated global recovery actions from the overview and refetches it', async () => {
@@ -470,13 +470,13 @@ describe('admin React UI', () => {
       return jsonResponse({})
     })
     renderAt('/')
-    expect(await screen.findByRole('heading', { name: '복구 작업' })).toBeTruthy()
-    for (const label of ['실패한 임베딩 재시도', '실패한 인코딩 재시도', '만료된 임베딩 클레임 해제', '인코딩 큐 리셋', '전체 재임베딩']) {
+    expect(await screen.findByRole('heading', { name: 'Recovery actions' })).toBeTruthy()
+    for (const label of ['Retry failed embeddings', 'Retry failed encodings', 'Release expired embedding claims', 'Reset encoding queue', 'Re-embed everything']) {
       expect(screen.getByRole('button', { name: label })).toBeTruthy()
     }
-    expect(screen.queryByRole('button', { name: /전체 클레임 해제|모든 클레임 해제/ })).toBeNull()
-    fireEvent.click(screen.getByRole('button', { name: '만료된 임베딩 클레임 해제' }))
-    expect(await screen.findByText('2행 해제됨')).toBeTruthy()
+    expect(screen.queryByRole('button', { name: /Release all claims|Release every claim/ })).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: 'Release expired embedding claims' }))
+    expect(await screen.findByText('Released 2 row(s)')).toBeTruthy()
     const recoverCall = fetchMock.mock.calls.find(([url]) => String(url) === '/admin/api/recover')
     expect(recoverCall?.[1]?.method).toBe('POST')
     expect(recoverCall?.[1]?.body).toBe(JSON.stringify({ target: 'release_expired_claims' }))
@@ -490,9 +490,9 @@ describe('admin React UI', () => {
       ? jsonResponse(overview)
       : url === '/admin/api/automatic/embedding' ? jsonResponse(automaticStatus) : jsonResponse({}))
     renderAt('/')
-    fireEvent.click(await screen.findByRole('button', { name: '전체 재임베딩' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Re-embed everything' }))
     expect(confirmSpy).toHaveBeenCalledTimes(1)
-    expect(confirmSpy.mock.calls[0][0]).toContain('모든 준비(ready) 블롭을 다시 임베딩')
+    expect(confirmSpy.mock.calls[0][0]).toContain('Re-embeds every ready blob')
     expect(declined.mock.calls.some(([url]) => String(url) === '/admin/api/reindex')).toBe(false)
 
     cleanup()
@@ -504,9 +504,9 @@ describe('admin React UI', () => {
       return jsonResponse({})
     })
     renderAt('/')
-    fireEvent.click(await screen.findByRole('button', { name: '전체 재임베딩' }))
-    expect(await screen.findByText(/전체 재임베딩이 등록되었습니다/)).toBeTruthy()
-    expect(screen.getByText(/대기 10/)).toBeTruthy()
+    fireEvent.click(await screen.findByRole('button', { name: 'Re-embed everything' }))
+    expect(await screen.findByText(/Full re-embedding scheduled/)).toBeTruthy()
+    expect(screen.getByText(/queued 10/)).toBeTruthy()
     const reindexCall = fetchMock.mock.calls.find(([url]) => String(url) === '/admin/api/reindex')
     expect(reindexCall?.[1]?.method).toBe('POST')
     expect(reindexCall?.[1]?.body).toBe('{}')
@@ -522,9 +522,9 @@ describe('admin React UI', () => {
       return jsonResponse({})
     })
     renderAt('/')
-    fireEvent.click(await screen.findByRole('button', { name: '인코딩 큐 리셋' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Reset encoding queue' }))
     expect((await screen.findByRole('alert')).textContent).toContain('reset failed')
-    expect(screen.getByRole('heading', { name: '라이브러리' })).toBeTruthy()
+    expect(screen.getByRole('heading', { name: 'Library' })).toBeTruthy()
   })
 
   it('shows the automatic embedding status and pauses/resumes it without confirmation', async () => {
@@ -539,22 +539,22 @@ describe('admin React UI', () => {
       return jsonResponse(status)
     })
     renderAt('/')
-    const panel = screen.getByRole('region', { name: '실행 제어' })
+    const panel = screen.getByRole('region', { name: 'Run control' })
     // Enabled but not running yet: the muted hint explains the model-load lag
     // instead of reading as a broken worker.
-    await within(panel).findByText('실행 중 아님')
-    expect(within(panel).getByText('활성')).toBeTruthy()
-    expect(within(panel).getByText(/모델 로드 후 자동으로 시작됩니다/)).toBeTruthy()
+    await within(panel).findByText('not running')
+    expect(within(panel).getByText('enabled')).toBeTruthy()
+    expect(within(panel).getByText(/starts automatically once the model has loaded/)).toBeTruthy()
     // The toggle is reversible, so no confirm() is consulted.
     const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(false)
-    fireEvent.click(within(panel).getByRole('button', { name: '자동 임베딩 일시정지' }))
-    await within(panel).findByRole('button', { name: '자동 임베딩 재개' })
-    expect(within(panel).getByText('일시정지')).toBeTruthy()
+    fireEvent.click(within(panel).getByRole('button', { name: 'Pause automatic embedding' }))
+    await within(panel).findByRole('button', { name: 'Resume automatic embedding' })
+    expect(within(panel).getByText('paused')).toBeTruthy()
     expect(confirmSpy).not.toHaveBeenCalled()
-    fireEvent.click(within(panel).getByRole('button', { name: '자동 임베딩 재개' }))
-    await within(panel).findByRole('button', { name: '자동 임베딩 일시정지' })
-    expect(within(panel).getByText('실행 중')).toBeTruthy()
-    expect(within(panel).queryByText(/모델 로드 후 자동으로 시작됩니다/)).toBeNull()
+    fireEvent.click(within(panel).getByRole('button', { name: 'Resume automatic embedding' }))
+    await within(panel).findByRole('button', { name: 'Pause automatic embedding' })
+    expect(within(panel).getByText('running')).toBeTruthy()
+    expect(within(panel).queryByText(/starts automatically once the model has loaded/)).toBeNull()
     const posts = fetchMock.mock.calls.filter(([, init]) => init?.method === 'POST')
     expect(posts.map(([url, init]) => [url, init?.body])).toEqual([
       ['/admin/api/automatic/embedding', '{"enabled":false}'],
@@ -569,10 +569,10 @@ describe('admin React UI', () => {
       return jsonResponse({})
     })
     renderAt('/')
-    const panel = screen.getByRole('region', { name: '실행 제어' })
+    const panel = screen.getByRole('region', { name: 'Run control' })
     expect(await within(panel).findByText(/automatic unavailable/)).toBeTruthy()
     // The local encoding trigger stays usable even without the status.
-    expect(within(panel).getByRole('button', { name: '로컬 인코딩 실행' })).toBeTruthy()
+    expect(within(panel).getByRole('button', { name: 'Run local encoding' })).toBeTruthy()
   })
 
   it('starts the local encoding drain only after confirmation and reports the outcome', async () => {
@@ -583,9 +583,9 @@ describe('admin React UI', () => {
       return jsonResponse({})
     })
     renderAt('/')
-    fireEvent.click(await screen.findByRole('button', { name: '로컬 인코딩 실행' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Run local encoding' }))
     expect(confirmSpy).toHaveBeenCalledTimes(1)
-    expect(confirmSpy.mock.calls[0][0]).toContain('대기 중인 WebP 변환 대상 전체를 인코딩')
+    expect(confirmSpy.mock.calls[0][0]).toContain('Encodes every queued WebP conversion target')
     expect(declined.mock.calls.some(([url]) => String(url) === '/admin/api/encoding/run-local')).toBe(false)
 
     cleanup()
@@ -602,16 +602,16 @@ describe('admin React UI', () => {
       return jsonResponse({})
     })
     renderAt('/')
-    fireEvent.click(await screen.findByRole('button', { name: '로컬 인코딩 실행' }))
-    expect(await screen.findByText('로컬 인코딩이 백그라운드에서 시작되었습니다.')).toBeTruthy()
+    fireEvent.click(await screen.findByRole('button', { name: 'Run local encoding' }))
+    expect(await screen.findByText('Local encoding started in the background.')).toBeTruthy()
     const runCall = fetchMock.mock.calls.find(([url]) => String(url) === '/admin/api/encoding/run-local')
     expect(runCall?.[1]?.method).toBe('POST')
     expect(runCall?.[1]?.body).toBe('{}')
 
     // started=false is the already-running answer, surfaced as a result line
     // rather than an error.
-    fireEvent.click(screen.getByRole('button', { name: '로컬 인코딩 실행' }))
-    await screen.findByText('이미 로컬 인코딩이 실행 중입니다.')
+    fireEvent.click(screen.getByRole('button', { name: 'Run local encoding' }))
+    await screen.findByText('Local encoding is already running.')
   })
 
   it('shows local encoding drain errors inline and keeps the panel usable', async () => {
@@ -623,10 +623,10 @@ describe('admin React UI', () => {
       return jsonResponse({})
     })
     renderAt('/')
-    fireEvent.click(await screen.findByRole('button', { name: '로컬 인코딩 실행' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Run local encoding' }))
     expect((await screen.findByRole('alert')).textContent).toContain('cwebp is not on the server PATH')
-    expect(screen.getByRole('button', { name: '로컬 인코딩 실행' }).hasAttribute('disabled')).toBe(false)
-    expect(screen.getByRole('heading', { name: '라이브러리' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Run local encoding' }).hasAttribute('disabled')).toBe(false)
+    expect(screen.getByRole('heading', { name: 'Library' })).toBeTruthy()
   })
 
   it('does not render the retired local runs, diagnostics, or blobs-list pages or their navigation entries', async () => {
@@ -636,20 +636,20 @@ describe('admin React UI', () => {
         ? jsonResponse(automaticStatus)
         : jsonResponse({ photos: [], nextCursor: null }))
     renderAt('/')
-    expect(await screen.findByRole('heading', { name: '실행 제어' })).toBeTruthy()
-    expect(screen.queryByRole('link', { name: '로컬 실행' })).toBeNull()
-    expect(screen.queryByRole('region', { name: '로컬 실행 상세' })).toBeNull()
-    expect(screen.queryByText(/유한한 대상만 소진한 뒤 종료/)).toBeNull()
-    expect(screen.queryByRole('link', { name: '시스템 진단' })).toBeNull()
+    expect(await screen.findByRole('heading', { name: 'Run control' })).toBeTruthy()
+    expect(screen.queryByRole('link', { name: 'Local runs' })).toBeNull()
+    expect(screen.queryByRole('region', { name: 'Local run detail' })).toBeNull()
+    expect(screen.queryByText(/drains a finite set of targets and exits/)).toBeNull()
+    expect(screen.queryByRole('link', { name: 'System diagnostics' })).toBeNull()
     // The blobs LIST page is retired; blob detail stays reachable from photo
     // rows, so the nav link is gone but the route keeps its splat form.
-    expect(screen.queryByRole('link', { name: '블롭' })).toBeNull()
-    expect(screen.getByRole('link', { name: '사진' })).toBeTruthy()
+    expect(screen.queryByRole('link', { name: 'Blobs' })).toBeNull()
+    expect(screen.getByRole('link', { name: 'Photos' })).toBeTruthy()
 
     for (const target of ['/diagnostics', '/blobs']) {
       cleanup()
       renderAt(target)
-      expect(await screen.findByText('페이지를 찾을 수 없습니다')).toBeTruthy()
+      expect(await screen.findByText('Page not found')).toBeTruthy()
     }
   })
 
@@ -661,22 +661,22 @@ describe('admin React UI', () => {
         : jsonResponse({ photos: [], nextCursor: null }))
     renderAt('/')
 
-    expect(await screen.findByRole('region', { name: '시스템 상태' })).toBeTruthy()
-    expect(screen.getByRole('link', { name: /만료된 임베딩 리스/ }).getAttribute('href')).toBe('/photos?embeddingLeaseExpired=true')
-    expect(screen.getByRole('link', { name: /만료된 인코딩 리스/ }).getAttribute('href')).toBe('/photos?encodingLeaseExpired=true')
-    // 참조 없는 블롭 lost its drilldown with the blobs list: a plain number.
-    const unreferencedStat = screen.getByText('참조 없는 블롭').closest('.stat') as HTMLElement
+    expect(await screen.findByRole('region', { name: 'System health' })).toBeTruthy()
+    expect(screen.getByRole('link', { name: /Expired embedding leases/ }).getAttribute('href')).toBe('/photos?embeddingLeaseExpired=true')
+    expect(screen.getByRole('link', { name: /Expired encoding leases/ }).getAttribute('href')).toBe('/photos?encodingLeaseExpired=true')
+    // Unreferenced blobs lost their drilldown with the blobs list: a plain number.
+    const unreferencedStat = screen.getByText('Unreferenced blobs').closest('.stat') as HTMLElement
     expect(unreferencedStat.tagName).toBe('DIV')
     expect(within(unreferencedStat).getByText('3')).toBeTruthy()
-    // 블롭 없는 사진 gained one: the photos missingBlob filter.
-    expect(screen.getByRole('link', { name: /블롭 없는 사진/ }).getAttribute('href')).toBe('/photos?missingBlob=true')
-    expect(screen.getByText('일치')).toBeTruthy()
-    expect(screen.getByText(/기대 5 · 실제 5/)).toBeTruthy()
-    expect(screen.getByText(/개수 비교일 뿐 전체 동기화나 포인트 무결성을 검증하지 않습니다/)).toBeTruthy()
-    expect(screen.getByText(/인코딩 워커 API 사용 가능 · 임베딩 모델 사용 가능 · 벡터 스토어 사용 가능/)).toBeTruthy()
+    // Photos without blobs gained one: the photos missingBlob filter.
+    expect(screen.getByRole('link', { name: /Photos without blobs/ }).getAttribute('href')).toBe('/photos?missingBlob=true')
+    expect(screen.getByText('Match')).toBeTruthy()
+    expect(screen.getByText(/Expected 5 · Actual 5/)).toBeTruthy()
+    expect(screen.getByText(/it does not verify full synchronization or point integrity/)).toBeTruthy()
+    expect(screen.getByText(/Encoding worker API enabled · Embedding model enabled · Vector store enabled/)).toBeTruthy()
     // The retired overview tables stay retired.
-    expect(screen.queryByText(/원본 상태 값/)).toBeNull()
-    expect(screen.queryByRole('heading', { name: /건너뜀/ })).toBeNull()
+    expect(screen.queryByText(/raw state values/)).toBeNull()
+    expect(screen.queryByRole('heading', { name: /Skipped/ })).toBeNull()
   })
 
   it('degrades the vector verdict without failing the overview', async () => {
@@ -695,10 +695,10 @@ describe('admin React UI', () => {
         : jsonResponse({ photos: [], nextCursor: null }))
     renderAt('/')
 
-    expect(await screen.findByText(/측정 불가/)).toBeTruthy()
+    expect(await screen.findByText(/Unavailable/)).toBeTruthy()
     expect(screen.getByText(/Vector-store count is temporarily unavailable/)).toBeTruthy()
     // The catalog measurements still render alongside the degraded verdict.
-    expect(screen.getByRole('heading', { name: '라이브러리' })).toBeTruthy()
+    expect(screen.getByRole('heading', { name: 'Library' })).toBeTruthy()
 
     cleanup()
     const disabled = withStatus({ status: 'disabled', measuredAt: null, expectedPoints: 5, actualPoints: null, countAgreement: null }, false)
@@ -708,8 +708,8 @@ describe('admin React UI', () => {
         ? jsonResponse(automaticStatus)
         : jsonResponse({ photos: [], nextCursor: null }))
     renderAt('/')
-    expect(await screen.findByText(/비활성 — 벡터 저장소가 설정되지 않아 개수는 측정되지 않습니다/)).toBeTruthy()
-    expect(screen.getByText(/인코딩 워커 API 사용 가능 · 임베딩 모델 사용 가능 · 벡터 스토어 비활성/)).toBeTruthy()
+    expect(await screen.findByText(/Inactive — the vector store is not configured, so counts are not measured/)).toBeTruthy()
+    expect(screen.getByText(/Encoding worker API enabled · Embedding model enabled · Vector store disabled/)).toBeTruthy()
 
     cleanup()
     const mismatch = withStatus({ ...overview.health.vectorCount, actualPoints: 6, countAgreement: false })
@@ -719,7 +719,7 @@ describe('admin React UI', () => {
         ? jsonResponse(automaticStatus)
         : jsonResponse({ photos: [], nextCursor: null }))
     renderAt('/')
-    expect(await screen.findByText('불일치')).toBeTruthy()
-    expect(screen.getByText(/기대 5 · 실제 6/)).toBeTruthy()
+    expect(await screen.findByText('Mismatch')).toBeTruthy()
+    expect(screen.getByText(/Expected 5 · Actual 6/)).toBeTruthy()
   })
 })

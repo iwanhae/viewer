@@ -216,7 +216,7 @@ func TestAdminPageServesEmbeddedHTML(t *testing.T) {
 		t.Fatalf("content type=%q want text/html; charset=utf-8", contentType)
 	}
 	body := rec.Body.String()
-	for _, fragment := range []string{"admin-root", "/admin/assets/", "lang=\"ko\""} {
+	for _, fragment := range []string{"admin-root", "/admin/assets/", "lang=\"en\""} {
 		if !strings.Contains(body, fragment) {
 			t.Fatalf("admin page missing %q", fragment)
 		}
