@@ -1517,3 +1517,139 @@ func scanPhotoBlobPairs(rows *sql.Rows) ([]PhotoWithBlob, error) {
 	}
 	return pairs, nil
 }
+
+// PhotoPairState is one photo joined to its blob's embedding state: the
+// reconciliation needs (album, idx) to derive the point ID and the blob
+// status to know whether a point is expected to exist yet.
+type PhotoPairState struct {
+	AlbumID         string
+	Idx             int
+	Hash            string
+	EmbeddingStatus EmbeddingStatus
+}
+
+// photoPairPageSize is how many photo/blob pairs one ForEachPhotoPair query
+// fetches. It matches the chunk size the hash-scoped pair query uses: large
+// enough that a library scan costs only a few round trips, small enough that
+// draining a page holds the connection for a bounded moment.
+const photoPairPageSize = 500
+
+// ForEachPhotoPair walks every photo joined with its blob's embedding state
+// in (album_id, idx) order, invoking fn once per pair. The scan is keyset
+// paged on purpose: the whole app shares one SQLite connection
+// (SetMaxOpenConns(1)), so holding a rows iterator across the entire library
+// would starve the embedding workers of the connection between callbacks.
+// Each page is instead fully materialized and its rows closed before fn runs,
+// leaving the connection free between pages. The scan is therefore NOT a
+// snapshot: rows can be inserted, deleted or flipped between pages, and
+// callers must tolerate that (a photo missed this round reappears the next).
+// fn returning a non-nil error aborts the scan and is returned verbatim —
+// the caller owns that error's meaning.
+func (s *Store) ForEachPhotoPair(ctx context.Context, fn func(pair PhotoPairState) error) error {
+	// ("", 0) sorts before every real (album_id, idx) pair, so the first
+	// page starts at the top of the primary-key order.
+	lastAlbum, lastIdx := "", 0
+	for {
+		page, err := s.fetchPhotoPairPage(ctx, lastAlbum, lastIdx)
+		if err != nil {
+			return err
+		}
+		if len(page) == 0 {
+			return nil
+		}
+		for _, pair := range page {
+			if err := fn(pair); err != nil {
+				return err
+			}
+		}
+		lastAlbum, lastIdx = page[len(page)-1].AlbumID, page[len(page)-1].Idx
+		// A short page means the keyset reached the end of the table.
+		if len(page) < photoPairPageSize {
+			return nil
+		}
+	}
+}
+
+// fetchPhotoPairPage reads one keyset page after (lastAlbum, lastIdx) and
+// closes its rows before returning, guaranteeing the shared connection is
+// released by the time the caller runs any callback.
+func (s *Store) fetchPhotoPairPage(ctx context.Context, lastAlbum string, lastIdx int) ([]PhotoPairState, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT p.album_id, p.idx, p.hash, b.embedding_status
+		FROM photos p JOIN blobs b ON b.hash = p.hash
+		WHERE (p.album_id, p.idx) > (?, ?)
+		ORDER BY p.album_id ASC, p.idx ASC
+		LIMIT ?`, lastAlbum, lastIdx, photoPairPageSize)
+	if err != nil {
+		return nil, fmt.Errorf("query photo pairs: %w", err)
+	}
+	defer rows.Close()
+
+	page := make([]PhotoPairState, 0, photoPairPageSize)
+	for rows.Next() {
+		var pair PhotoPairState
+		var status string
+		if err := rows.Scan(&pair.AlbumID, &pair.Idx, &pair.Hash, &status); err != nil {
+			return nil, fmt.Errorf("scan photo pair: %w", err)
+		}
+		pair.EmbeddingStatus = EmbeddingStatus(status)
+		page = append(page, pair)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate photo pairs: %w", err)
+	}
+	return page, nil
+}
+
+// ResetReadyEmbeddingsByHashes flips the given hashes' blobs from ready back
+// to pending and returns how many rows moved. It is the catalog side of the
+// vector-store reconciliation: the scope is exactly the blobs whose points
+// the sync observed missing, so unlike ResetReadyEmbeddings — the
+// whole-library recovery that resets ready AND failed rows — this one is
+// scoped and ready-only. The ready guard in the WHERE clause is the
+// semantics, not an optimization: processing rows keep their lease (a worker
+// is mid-flight and will write its own result back), failed rows keep their
+// failure (the retry path owns them), and a hash a racing worker already
+// flipped simply matches zero rows.
+func (s *Store) ResetReadyEmbeddingsByHashes(ctx context.Context, hashes []string) (int64, error) {
+	// First line of defense against the empty-scope footgun: the sibling
+	// blobHashScope deliberately treats an empty list as "no narrowing =
+	// whole library" for the recover endpoints, and a machine-computed
+	// scope that accidentally arrives empty must not inherit that blast
+	// radius here. An empty scope resets NOTHING — the whole-library reset
+	// already exists as ResetReadyEmbeddings.
+	if len(hashes) == 0 {
+		return 0, nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("begin scoped embedding reset: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := lockCatalogWriter(ctx, tx); err != nil {
+		return 0, err
+	}
+	now := time.Now()
+	var count int64
+	for _, hash := range hashes {
+		result, err := tx.ExecContext(ctx, `UPDATE blobs SET embedding_status=?, embedding_error='', embedding_lease_until=0
+			WHERE hash=? AND embedding_status=?`, string(EmbeddingStatusPending), hash, string(EmbeddingStatusReady))
+		if err != nil {
+			return 0, err
+		}
+		changed, err := result.RowsAffected()
+		if err != nil {
+			return 0, err
+		}
+		if changed == 1 {
+			count++
+			if _, err := observeStage(ctx, tx, hash, "embedding", "sync_reset", string(EmbeddingStatusPending), "", now, false, true, false, "", "unknown"); err != nil {
+				return 0, err
+			}
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return count, nil
+}
