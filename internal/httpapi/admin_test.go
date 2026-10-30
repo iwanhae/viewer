@@ -1076,14 +1076,28 @@ func TestAdminRecoverReleaseClaimsEndpoint(t *testing.T) {
 		t.Fatalf("catalog counts=%+v want=%+v", after, wantCounts)
 	}
 
-	// A broken body, an unknown field, an empty body (zero target), and an
-	// unknown target string are caller bugs: 400 with the shared
-	// invalid-request code.
+	// A broken body, an unknown field, an empty body (zero target), an
+	// unknown target string, and a malformed hashes scope are caller bugs:
+	// 400 with the shared invalid-request code. The oversized list uses short
+	// placeholder entries because the count rule fires before the per-hash
+	// format check — and keeps the body under the 4 KiB action limit, so the
+	// count rejection itself is what gets exercised rather than the size one.
+	tooManyHashes := make([]string, maxRecoverHashes+1)
+	for i := range tooManyHashes {
+		tooManyHashes[i] = "x"
+	}
+	oversized, err := json.Marshal(map[string]any{"target": recoverReleaseExpiredClaims, "hashes": tooManyHashes})
+	if err != nil {
+		t.Fatalf("marshal oversized hashes body: %v", err)
+	}
 	for name, body := range map[string]string{
-		"not json":       `not json`,
-		"unknown field":  `{"target":"release_all_claims","extra":1}`,
-		"empty body":     ``,
-		"unknown target": `{"target":"nuke_everything"}`,
+		"not json":        `not json`,
+		"unknown field":   `{"target":"release_all_claims","extra":1}`,
+		"empty body":      ``,
+		"unknown target":  `{"target":"nuke_everything"}`,
+		"too many hashes": string(oversized),
+		"non-hex hash":    `{"target":"release_expired_claims","hashes":["not-a-hash"]}`,
+		"uppercase hash":  `{"target":"release_expired_claims","hashes":["` + strings.Repeat("A", 64) + `"]}`,
 	} {
 		rec := doAdminBodyRequest(t, router, http.MethodPost, "/admin/api/recover", basicAuthHeader("operator", "sekrit"), []byte(body))
 		if rec.Code != http.StatusBadRequest {
@@ -1097,7 +1111,9 @@ func TestAdminRecoverReleaseClaimsEndpoint(t *testing.T) {
 
 // TestAdminRetryFailedEndpoint drives the retry-failed endpoint: a bodyless
 // POST resets the fixture's one failed blob and answers with the post-reset
-// counts, which must match the catalog behind it.
+// counts, which must match the catalog behind it. A hashes-scoped POST then
+// moves only the listed blob of two fresh failures, proving the scope reaches
+// the catalog's selection.
 func TestAdminRecoverRetryFailedEndpoint(t *testing.T) {
 	router, store := newAdminTestRouter(t, 1)
 	ctx := context.Background()
@@ -1134,6 +1150,53 @@ func TestAdminRecoverRetryFailedEndpoint(t *testing.T) {
 	after, err := store.EmbeddingCounts(ctx)
 	if err != nil {
 		t.Fatalf("counts after retry: %v", err)
+	}
+	if after != want {
+		t.Fatalf("catalog counts=%+v want=%+v", after, want)
+	}
+
+	// A hashes scope narrows the retry to the listed blobs. The two fresh
+	// failures are seeded with digest-shaped hashes — the endpoint rejects any
+	// other shape — and the claim sweeps the just-reset hash-b and the pending
+	// hash-c along, which is why they read as processing below.
+	scopedHash := strings.Repeat("a", 64)
+	otherHash := strings.Repeat("b", 64)
+	for _, hash := range []string{scopedHash, otherHash} {
+		if err := store.UpsertBlob(ctx, catalog.Blob{Hash: hash, SizeBytes: 1}); err != nil {
+			t.Fatalf("upsert %s: %v", hash, err)
+		}
+	}
+	if _, err := store.ClaimPendingEmbeddings(ctx, 8, time.Now().Add(-time.Minute)); err != nil {
+		t.Fatalf("claim pending blobs: %v", err)
+	}
+	if _, _, err := store.ApplyEmbeddingResults(ctx, []catalog.EmbeddingResult{
+		{Hash: scopedHash, Status: catalog.EmbeddingStatusFailed, Error: "scoped failure"},
+		{Hash: otherHash, Status: catalog.EmbeddingStatusFailed, Error: "outside the scope"},
+	}); err != nil {
+		t.Fatalf("apply failed outcomes: %v", err)
+	}
+	scopedBody, err := json.Marshal(map[string]any{"target": "retry_failed_embeddings", "hashes": []string{scopedHash}})
+	if err != nil {
+		t.Fatalf("marshal scoped retry body: %v", err)
+	}
+	rec = doAdminBodyRequest(t, router, http.MethodPost, "/admin/api/recover", basicAuthHeader("operator", "sekrit"), scopedBody)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("scoped retry status=%d want=200 body=%s", rec.Code, rec.Body.String())
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode scoped retry response: %v", err)
+	}
+	// The listed failure is pending again; the unlisted one stays failed, and
+	// the two swept fixture blobs count as pending (the derived field covers
+	// processing rows).
+	want = catalog.EmbeddingCounts{Total: 5, Ready: 1, Processing: 2, Failed: 1, Pending: 3}
+	if payload.Target != "retry_failed_embeddings" || payload.Retry.Reset != 1 || payload.Retry.Counts != want {
+		t.Fatalf("scoped response={%s %+v} want target=retry_failed_embeddings reset=1 counts=%+v",
+			payload.Target, payload.Retry, want)
+	}
+	after, err = store.EmbeddingCounts(ctx)
+	if err != nil {
+		t.Fatalf("counts after scoped retry: %v", err)
 	}
 	if after != want {
 		t.Fatalf("catalog counts=%+v want=%+v", after, want)
@@ -1216,5 +1279,102 @@ func TestAdminRecoverResetEncodingEndpoint(t *testing.T) {
 	committing, err := store.CommittingEncodings(ctx)
 	if err != nil || len(committing) != 1 || committing[0].Hash != "hash-committing" {
 		t.Fatalf("committing after reset=%v err=%v want hash-committing untouched", committing, err)
+	}
+}
+
+// TestAdminRecoverRetryFailedEncodingsEndpoint drives the encoding retry
+// target: failed non-WebP conversions drain back to pending and the response
+// carries the fresh encoding stats, then a hashes-scoped request moves only
+// the listed blob of two fresh failures.
+func TestAdminRecoverRetryFailedEncodingsEndpoint(t *testing.T) {
+	router, store := newAdminTestRouter(t, 1)
+	ctx := context.Background()
+
+	// Two digest-shaped blobs (the endpoint validates the hashes format) at
+	// sizes above the fixture's, so ClaimEncoding takes them first and leaves
+	// the fixture blobs untouched.
+	scopedHash := strings.Repeat("a", 64)
+	otherHash := strings.Repeat("b", 64)
+	for _, blob := range []catalog.Blob{
+		{Hash: scopedHash, SizeBytes: 100, ContentType: "image/jpeg"},
+		{Hash: otherHash, SizeBytes: 90, ContentType: "image/jpeg"},
+	} {
+		if err := store.UpsertBlob(ctx, blob); err != nil {
+			t.Fatalf("upsert %s: %v", blob.Hash, err)
+		}
+	}
+	failBoth := func() {
+		t.Helper()
+		jobs, err := store.ClaimEncoding(ctx, 2, time.Minute)
+		if err != nil || len(jobs) != 2 {
+			t.Fatalf("claim encoding jobs: jobs=%v err=%v", jobs, err)
+		}
+		for _, job := range jobs {
+			if ok, err := store.SkipEncoding(ctx, job.Hash, job.Token, "failed", "image/jpeg", "conversion failed", job.SizeBytes); err != nil || !ok {
+				t.Fatalf("fail %s: ok=%v err=%v", job.Hash, ok, err)
+			}
+		}
+	}
+	failBoth()
+
+	rec := doAdminBodyRequest(t, router, http.MethodPost, "/admin/api/recover", basicAuthHeader("operator", "sekrit"), []byte(`{"target":"retry_failed_encodings"}`))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d want=200 body=%s", rec.Code, rec.Body.String())
+	}
+	var payload struct {
+		Target        string `json:"target"`
+		EncodingRetry struct {
+			Reset    int64 `json:"reset"`
+			Encoding struct {
+				Enabled bool  `json:"enabled"`
+				Pending int64 `json:"pending"`
+				Failed  int64 `json:"failed"`
+			} `json:"encoding"`
+		} `json:"encodingRetry"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode retry response: %v", err)
+	}
+	// The fixture's three blobs are encoding-pending and both failures drain
+	// back onto that pile: 3 + 2 pending, nothing failed or in flight.
+	if payload.Target != "retry_failed_encodings" || payload.EncodingRetry.Reset != 2 ||
+		!payload.EncodingRetry.Encoding.Enabled || payload.EncodingRetry.Encoding.Pending != 5 || payload.EncodingRetry.Encoding.Failed != 0 {
+		t.Fatalf("response={%s %+v} want target=retry_failed_encodings reset=2 enabled pending=5 failed=0",
+			payload.Target, payload.EncodingRetry)
+	}
+	fresh, err := store.EncodingCounts(ctx)
+	if err != nil {
+		t.Fatalf("encoding counts after retry: %v", err)
+	}
+	if fresh.Pending != 5 || fresh.Failed != 0 {
+		t.Fatalf("catalog encoding counts=%+v want pending=5 failed=0", fresh)
+	}
+
+	// The scoped variant moves only the listed blob; the other failure stays.
+	failBoth()
+	scopedBody, err := json.Marshal(map[string]any{"target": "retry_failed_encodings", "hashes": []string{scopedHash}})
+	if err != nil {
+		t.Fatalf("marshal scoped retry body: %v", err)
+	}
+	rec = doAdminBodyRequest(t, router, http.MethodPost, "/admin/api/recover", basicAuthHeader("operator", "sekrit"), scopedBody)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("scoped status=%d want=200 body=%s", rec.Code, rec.Body.String())
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode scoped retry response: %v", err)
+	}
+	// Three fixture blobs plus the one reset row are pending; the unlisted
+	// failure is the only one left.
+	if payload.Target != "retry_failed_encodings" || payload.EncodingRetry.Reset != 1 ||
+		payload.EncodingRetry.Encoding.Pending != 4 || payload.EncodingRetry.Encoding.Failed != 1 {
+		t.Fatalf("scoped response={%s %+v} want target=retry_failed_encodings reset=1 pending=4 failed=1",
+			payload.Target, payload.EncodingRetry)
+	}
+	fresh, err = store.EncodingCounts(ctx)
+	if err != nil {
+		t.Fatalf("encoding counts after scoped retry: %v", err)
+	}
+	if fresh.Pending != 4 || fresh.Failed != 1 {
+		t.Fatalf("catalog encoding counts=%+v want pending=4 failed=1", fresh)
 	}
 }

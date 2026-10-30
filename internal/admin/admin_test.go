@@ -547,7 +547,7 @@ func TestReleaseStuckEmbeddingsRespectsExpiredOnly(t *testing.T) {
 	}
 
 	service := NewService(store, nil, nil)
-	result, err := service.ReleaseStuckEmbeddings(ctx, true)
+	result, err := service.ReleaseStuckEmbeddings(ctx, true, nil)
 	if err != nil {
 		t.Fatalf("release expired only: %v", err)
 	}
@@ -559,7 +559,7 @@ func TestReleaseStuckEmbeddingsRespectsExpiredOnly(t *testing.T) {
 		t.Fatalf("expired-only result={%d %+v} want released=1 counts=%+v", result.Released, result.Counts, want)
 	}
 
-	forced, err := service.ReleaseStuckEmbeddings(ctx, false)
+	forced, err := service.ReleaseStuckEmbeddings(ctx, false, nil)
 	if err != nil {
 		t.Fatalf("force release: %v", err)
 	}
@@ -601,7 +601,7 @@ func TestRetryFailedEmbeddingsResetsOnlyFailed(t *testing.T) {
 	}
 
 	service := NewService(store, nil, nil)
-	result, err := service.RetryFailedEmbeddings(ctx)
+	result, err := service.RetryFailedEmbeddings(ctx, nil)
 	if err != nil {
 		t.Fatalf("retry failed: %v", err)
 	}
@@ -661,7 +661,7 @@ func TestResetStuckEncodingsLeavesCommittingRowsAlone(t *testing.T) {
 	}
 
 	service := NewService(store, nil, nil).WithEncodingEnabled(true)
-	result, err := service.ResetStuckEncodings(ctx)
+	result, err := service.ResetStuckEncodings(ctx, nil)
 	if err != nil {
 		t.Fatalf("reset stuck encodings: %v", err)
 	}
@@ -681,16 +681,72 @@ func TestResetStuckEncodingsLeavesCommittingRowsAlone(t *testing.T) {
 	}
 }
 
+// TestRetryFailedEncodingsResetsOnlyFailed mirrors the embedding retry test for
+// the WebP queue: the failed conversion goes back to pending while a skipped
+// one (a deliberate not-smaller outcome) stays terminal, and the response
+// carries the fresh encoding stats.
+func TestRetryFailedEncodingsResetsOnlyFailed(t *testing.T) {
+	store := openTestCatalog(t)
+	ctx := context.Background()
+
+	// One failed and one not-smaller conversion through the public claim→skip
+	// path; the retry must move exactly the failed one.
+	for _, blob := range []catalog.Blob{
+		{Hash: "hash-failed", SizeBytes: 100, ContentType: "image/jpeg"},
+		{Hash: "hash-not-smaller", SizeBytes: 90, ContentType: "image/jpeg"},
+	} {
+		if err := store.UpsertBlob(ctx, blob); err != nil {
+			t.Fatalf("upsert %s: %v", blob.Hash, err)
+		}
+	}
+	jobs, err := store.ClaimEncoding(ctx, 2, time.Minute)
+	if err != nil || len(jobs) != 2 {
+		t.Fatalf("claim encodings: jobs=%v err=%v", jobs, err)
+	}
+	byHash := make(map[string]catalog.EncodingJob, len(jobs))
+	for _, job := range jobs {
+		byHash[job.Hash] = job
+	}
+	if ok, err := store.SkipEncoding(ctx, "hash-failed", byHash["hash-failed"].Token, "failed", "image/jpeg", "boom", 100); err != nil || !ok {
+		t.Fatalf("fail hash-failed: ok=%v err=%v", ok, err)
+	}
+	if ok, err := store.SkipEncoding(ctx, "hash-not-smaller", byHash["hash-not-smaller"].Token, "skipped", "image/jpeg", "", 90); err != nil || !ok {
+		t.Fatalf("skip hash-not-smaller: ok=%v err=%v", ok, err)
+	}
+
+	service := NewService(store, nil, nil).WithEncodingEnabled(true)
+	result, err := service.RetryFailedEncodings(ctx, nil)
+	if err != nil {
+		t.Fatalf("retry failed encodings: %v", err)
+	}
+	// Only the failed row returns to the queue; the not-smaller row is a
+	// terminal decision re-encoding would only reproduce.
+	if result.Reset != 1 || !result.Encoding.Enabled || result.Encoding.Pending != 1 || result.Encoding.Failed != 0 || result.Encoding.NotSmaller != 1 {
+		t.Fatalf("result={%d %+v} want reset=1 enabled pending=1 failed=0 notSmaller=1", result.Reset, result.Encoding)
+	}
+
+	fresh, err := store.EncodingCounts(ctx)
+	if err != nil {
+		t.Fatalf("fresh encoding counts: %v", err)
+	}
+	if fresh.Pending != 1 || fresh.Failed != 0 || fresh.NotSmaller != 1 {
+		t.Fatalf("fresh encoding counts=%+v want pending=1 failed=0 notSmaller=1", fresh)
+	}
+}
+
 func TestActionNilCatalogErrors(t *testing.T) {
 	service := NewService(nil, nil, nil)
 	ctx := context.Background()
-	if _, err := service.ReleaseStuckEmbeddings(ctx, true); err == nil {
+	if _, err := service.ReleaseStuckEmbeddings(ctx, true, nil); err == nil {
 		t.Fatalf("expected an error for a nil catalog")
 	}
-	if _, err := service.RetryFailedEmbeddings(ctx); err == nil {
+	if _, err := service.RetryFailedEmbeddings(ctx, nil); err == nil {
 		t.Fatalf("expected an error for a nil catalog")
 	}
-	if _, err := service.ResetStuckEncodings(ctx); err == nil {
+	if _, err := service.ResetStuckEncodings(ctx, nil); err == nil {
+		t.Fatalf("expected an error for a nil catalog")
+	}
+	if _, err := service.RetryFailedEncodings(ctx, nil); err == nil {
 		t.Fatalf("expected an error for a nil catalog")
 	}
 }

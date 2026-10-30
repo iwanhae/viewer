@@ -242,11 +242,13 @@ type ReleaseResult struct {
 // will be rejected as not_claimed and the blob re-embedded. That is harmless
 // but wasteful, which is why the default is the narrow variant. Encoding rows
 // are never touched here; that queue has its own reset (ResetStuckEncodings).
-func (s *Service) ReleaseStuckEmbeddings(ctx context.Context, expiredOnly bool) (ReleaseResult, error) {
+// A non-empty hashes list narrows the release to those blobs, the scope the
+// recover endpoint passes through; an empty one releases every matching row.
+func (s *Service) ReleaseStuckEmbeddings(ctx context.Context, expiredOnly bool, hashes []string) (ReleaseResult, error) {
 	if s == nil || s.cat == nil {
 		return ReleaseResult{}, fmt.Errorf("catalog is not available")
 	}
-	released, err := s.cat.ReleaseStuckEmbeddingClaims(ctx, expiredOnly)
+	released, err := s.cat.ReleaseStuckEmbeddingClaims(ctx, expiredOnly, hashes)
 	if err != nil {
 		return ReleaseResult{}, fmt.Errorf("release stuck embedding claims: %w", err)
 	}
@@ -264,16 +266,17 @@ type RetryFailedResult struct {
 	Counts catalog.EmbeddingCounts `json:"counts"`
 }
 
-// RetryFailedEmbeddings flips every failed embedding back to pending and
-// returns the fresh counts. It is the retry path for transient failures (a bad
+// RetryFailedEmbeddings flips failed embeddings back to pending and returns
+// the fresh counts. It is the retry path for transient failures (a bad
 // model checkpoint, an unavailable encoder); ready rows stay untouched, so no
 // completed work is re-spent, and processing rows are left to their lease for
-// the same reason Reindex leaves them alone.
-func (s *Service) RetryFailedEmbeddings(ctx context.Context) (RetryFailedResult, error) {
+// the same reason Reindex leaves them alone. A non-empty hashes list narrows
+// the retry to those blobs; an empty one retries every failed row.
+func (s *Service) RetryFailedEmbeddings(ctx context.Context, hashes []string) (RetryFailedResult, error) {
 	if s == nil || s.cat == nil {
 		return RetryFailedResult{}, fmt.Errorf("catalog is not available")
 	}
-	reset, err := s.cat.ResetFailedEmbeddings(ctx)
+	reset, err := s.cat.ResetFailedEmbeddings(ctx, hashes)
 	if err != nil {
 		return RetryFailedResult{}, fmt.Errorf("reset failed embeddings: %w", err)
 	}
@@ -292,16 +295,26 @@ type EncodingResetResult struct {
 	Encoding EncodingStats               `json:"encoding"`
 }
 
+// EncodingRetryResult reports how many failed rows RetryFailedEncodings moved
+// back to pending, plus the fresh encoding stats — the same shape
+// RetryFailedResult gives the embedding queue, so the recover endpoint's
+// retry answers read alike across stages.
+type EncodingRetryResult struct {
+	Reset    int64         `json:"reset"`
+	Encoding EncodingStats `json:"encoding"`
+}
+
 // RecoverResult is one recovery target's outcome as the dashboard receives it.
-// Exactly one of the three pointers is set, matching the requested target.
+// Exactly one of the four pointers is set, matching the requested target.
 // The action-specific shapes stay typed instead of collapsing into a single
 // "rows moved" number: the encoding reset flips rows in two passes, and a
 // flat count would hide which pass did the work.
 type RecoverResult struct {
-	Target   string               `json:"target"`
-	Release  *ReleaseResult       `json:"release,omitempty"`
-	Retry    *RetryFailedResult   `json:"retry,omitempty"`
-	Encoding *EncodingResetResult `json:"encoding,omitempty"`
+	Target        string               `json:"target"`
+	Release       *ReleaseResult       `json:"release,omitempty"`
+	Retry         *RetryFailedResult   `json:"retry,omitempty"`
+	Encoding      *EncodingResetResult `json:"encoding,omitempty"`
+	EncodingRetry *EncodingRetryResult `json:"encodingRetry,omitempty"`
 }
 
 // ResetStuckEncodings is the operator's recovery switch for the WebP queue:
@@ -310,12 +323,13 @@ type RecoverResult struct {
 // are deliberately never touched — a committing row means an S3 object
 // replacement may be in flight, and only the encoding server's own Recover
 // path holds the bookkeeping to reconcile that uncertainty; an operator reset
-// here would turn "unknown outcome" into a certain loss.
-func (s *Service) ResetStuckEncodings(ctx context.Context) (EncodingResetResult, error) {
+// here would turn "unknown outcome" into a certain loss. A non-empty hashes
+// list narrows both passes to those blobs; an empty one sweeps the queue.
+func (s *Service) ResetStuckEncodings(ctx context.Context, hashes []string) (EncodingResetResult, error) {
 	if s == nil || s.cat == nil {
 		return EncodingResetResult{}, fmt.Errorf("catalog is not available")
 	}
-	reset, err := s.cat.ResetStuckEncodings(ctx)
+	reset, err := s.cat.ResetStuckEncodings(ctx, hashes)
 	if err != nil {
 		return EncodingResetResult{}, fmt.Errorf("reset stuck encodings: %w", err)
 	}
@@ -327,6 +341,27 @@ func (s *Service) ResetStuckEncodings(ctx context.Context) (EncodingResetResult,
 		Counts:   reset,
 		Encoding: EncodingStats{Enabled: s.encodingEnabled, EncodingCounts: encoding},
 	}, nil
+}
+
+// RetryFailedEncodings flips failed WebP conversions back to pending and
+// returns the fresh encoding stats. It is the encoding counterpart of
+// RetryFailedEmbeddings and exists so the recover endpoint can serve the
+// retry-failed shape for both pipeline stages; already-WebP rows are excluded
+// by the catalog (there is nothing left to convert), and a non-empty hashes
+// list narrows the retry to those blobs.
+func (s *Service) RetryFailedEncodings(ctx context.Context, hashes []string) (EncodingRetryResult, error) {
+	if s == nil || s.cat == nil {
+		return EncodingRetryResult{}, fmt.Errorf("catalog is not available")
+	}
+	reset, err := s.cat.ResetFailedEncodings(ctx, hashes)
+	if err != nil {
+		return EncodingRetryResult{}, fmt.Errorf("reset failed encodings: %w", err)
+	}
+	encoding, err := s.cat.EncodingCounts(ctx)
+	if err != nil {
+		return EncodingRetryResult{}, fmt.Errorf("encoding counts after resetting %d rows: %w", reset, err)
+	}
+	return EncodingRetryResult{Reset: reset, Encoding: EncodingStats{Enabled: s.encodingEnabled, EncodingCounts: encoding}}, nil
 }
 
 func (s *Service) CreateRecoveryPreview(ctx context.Context, actor, action string, selection catalog.RecoverySelection) (catalog.RecoveryPreview, error) {

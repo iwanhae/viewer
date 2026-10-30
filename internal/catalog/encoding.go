@@ -504,7 +504,9 @@ type EncodingResetCounts struct {
 // that uncertainty once the commit's grace lease expires (see
 // internal/encoding/service.go Recover). An operator reset would throw that
 // source size away and turn an "unknown outcome" into a certain loss.
-func (s *Store) ResetStuckEncodings(ctx context.Context) (EncodingResetCounts, error) {
+// A non-empty hashes list narrows both passes to those blobs; an empty one
+// keeps the historical whole-queue sweep.
+func (s *Store) ResetStuckEncodings(ctx context.Context, hashes []string) (EncodingResetCounts, error) {
 	var counts EncodingResetCounts
 	now := time.Now()
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -515,8 +517,10 @@ func (s *Store) ResetStuckEncodings(ctx context.Context) (EncodingResetCounts, e
 	if err := lockCatalogWriter(ctx, tx); err != nil {
 		return counts, err
 	}
+	scopeClause, scopeArgs := blobHashScope(hashes)
+	leasedArgs := append([]any{now.UnixMilli()}, scopeArgs...)
 	for {
-		leasedHashes, err := queryBlobHashes(ctx, tx, `SELECT hash FROM blobs WHERE encoding_owner='external' AND encoding_status='leased' AND encoding_lease_until < ? ORDER BY hash LIMIT 500`, now.UnixMilli())
+		leasedHashes, err := queryBlobHashes(ctx, tx, `SELECT hash FROM blobs WHERE encoding_owner='external' AND encoding_status='leased' AND encoding_lease_until < ?`+scopeClause+` ORDER BY hash LIMIT 500`, leasedArgs...)
 		if err != nil {
 			return EncodingResetCounts{}, fmt.Errorf("read expired encoding leases: %w", err)
 		}
@@ -542,7 +546,7 @@ func (s *Store) ResetStuckEncodings(ctx context.Context) (EncodingResetCounts, e
 		}
 	}
 	for {
-		receivedHashes, err := queryBlobHashes(ctx, tx, `SELECT hash FROM blobs WHERE encoding_owner='external' AND encoding_status='received' ORDER BY hash LIMIT 500`)
+		receivedHashes, err := queryBlobHashes(ctx, tx, `SELECT hash FROM blobs WHERE encoding_owner='external' AND encoding_status='received'`+scopeClause+` ORDER BY hash LIMIT 500`, scopeArgs...)
 		if err != nil {
 			return EncodingResetCounts{}, fmt.Errorf("read received encodings: %w", err)
 		}
@@ -571,4 +575,62 @@ func (s *Store) ResetStuckEncodings(ctx context.Context) (EncodingResetCounts, e
 		return EncodingResetCounts{}, err
 	}
 	return counts, nil
+}
+
+// ResetFailedEncodings flips failed encoding rows back to pending and returns
+// how many rows moved. It is the encoding twin of ResetFailedEmbeddings: the
+// retry path for a blob whose WebP conversion failed for a transient reason
+// (an encoder crash, a truncated download), with the same terminal-state
+// discipline — done, skipped, and not-smaller rows are successes or deliberate
+// outcomes and re-encoding them would only re-spend encoder work. The
+// content_type!='image/webp' guard is carried on both the read and the write
+// for the same reason ClaimEncoding carries it: a row that is already WebP has
+// nothing left to convert, whatever a legacy status column claims. The clear
+// also drops encoding_source_size_bytes and encoding_error, the fields a
+// failure leaves behind; unlike a committing row, a failed row holds no
+// in-flight S3 replacement whose outcome that bookkeeping would reconcile.
+// A non-empty hashes list narrows the retry to those blobs; an empty one
+// retries every failed row.
+func (s *Store) ResetFailedEncodings(ctx context.Context, hashes []string) (int64, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("begin failed encoding retry: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := lockCatalogWriter(ctx, tx); err != nil {
+		return 0, err
+	}
+	now := time.Now()
+	scopeClause, scopeArgs := blobHashScope(hashes)
+	var count int64
+	for {
+		batch, err := queryBlobHashes(ctx, tx, `SELECT hash FROM blobs WHERE encoding_status='failed' AND content_type!='image/webp'`+scopeClause+` ORDER BY hash LIMIT 500`, scopeArgs...)
+		if err != nil {
+			return 0, fmt.Errorf("read failed encodings: %w", err)
+		}
+		if len(batch) == 0 {
+			break
+		}
+		for _, hash := range batch {
+			result, err := tx.ExecContext(ctx, `UPDATE blobs SET encoding_status='pending', encoding_token='', encoding_stage_key='', encoding_lease_until=0, encoding_source_size_bytes=0, encoding_error=''
+				WHERE hash=? AND encoding_status='failed' AND content_type!='image/webp'`, hash)
+			if err != nil {
+				return 0, err
+			}
+			changed, err := result.RowsAffected()
+			if err != nil {
+				return 0, err
+			}
+			if changed == 1 {
+				count++
+				if _, err := observeStage(ctx, tx, hash, "encoding", "manual_retry", "pending", "", now, false, true, false, "", "unknown"); err != nil {
+					return 0, err
+				}
+			}
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return count, nil
 }

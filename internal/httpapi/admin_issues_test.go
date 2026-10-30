@@ -76,7 +76,7 @@ func seedIssueCatalog(t *testing.T, store *catalog.Store) {
 	}}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.ResetFailedEmbeddings(ctx); err != nil {
+	if _, err := store.ResetFailedEmbeddings(ctx, nil); err != nil {
 		t.Fatal(err)
 	}
 	currentRetry, err := store.ClaimPendingEmbeddings(ctx, 8, time.Now().Add(time.Minute))

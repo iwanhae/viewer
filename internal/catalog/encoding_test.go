@@ -193,6 +193,18 @@ func encodingRawState(t *testing.T, store *Store, hash string) (status, token, s
 	return status, token, stageKey, leaseMs, sourceSize
 }
 
+// encodingErrorText reads the raw failure message, the one encoding column
+// encodingRawState leaves out; the retry path must clear it and the guards
+// must leave it be.
+func encodingErrorText(t *testing.T, store *Store, hash string) string {
+	t.Helper()
+	var errText string
+	if err := store.db.QueryRow(`SELECT encoding_error FROM blobs WHERE hash = ?`, hash).Scan(&errText); err != nil {
+		t.Fatalf("read encoding error for %s: %v", hash, err)
+	}
+	return errText
+}
+
 // TestResetStuckEncodings pins the operator recovery switch: expired leased
 // rows and received rows go back to pending with their token/stage key/lease
 // cleared, while a live lease and a committing row (with its source-size
@@ -233,7 +245,7 @@ func TestResetStuckEncodings(t *testing.T) {
 		}
 	}
 
-	counts, err := store.ResetStuckEncodings(ctx)
+	counts, err := store.ResetStuckEncodings(ctx, nil)
 	if err != nil {
 		t.Fatalf("reset stuck encodings: %v", err)
 	}
@@ -261,8 +273,109 @@ func TestResetStuckEncodings(t *testing.T) {
 	}
 
 	// A second reset has nothing left to move.
-	counts, err = store.ResetStuckEncodings(ctx)
+	counts, err = store.ResetStuckEncodings(ctx, nil)
 	if err != nil || counts != (EncodingResetCounts{}) {
 		t.Fatalf("second reset counts=%+v err=%v want zero", counts, err)
+	}
+}
+
+// TestResetFailedEncodings pins the encoding retry path: failed non-WebP rows
+// go back to pending with their token, stage key, lease, source size and error
+// cleared, while a failed-looking WebP row (a finished conversion wearing a
+// legacy status) and rows that are not failed stay untouched. A hash scope
+// selects only the listed blobs; an empty one retries every failed row.
+func TestResetFailedEncodings(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+
+	for _, hash := range []string{"failed-a", "failed-b", "failed-webp", "pending-row", "done-row"} {
+		if err := store.UpsertBlob(ctx, Blob{Hash: hash, SizeBytes: 1, ContentType: "image/jpeg"}); err != nil {
+			t.Fatalf("upsert %s: %v", hash, err)
+		}
+	}
+	// Seeded straight in the database, the same way TestResetStuckEncodings
+	// builds its fixture: the skip path is exercised by its own tests, and a
+	// failed-looking WebP row is exactly the shape no legitimate path produces
+	// today — the reset's guard exists for it.
+	seed := []struct {
+		hash       string
+		status     string
+		token      string
+		stageKey   string
+		lease      int64
+		sourceSize int64
+		errorText  string
+	}{
+		{hash: "failed-a", status: "failed", token: "tok-a", stageKey: "encoding/failed-a_tok-a.webp", lease: 111, errorText: "encoder crash"},
+		{hash: "failed-b", status: "failed", token: "tok-b", errorText: "download truncated"},
+		{hash: "failed-webp", status: "failed", token: "tok-webp", sourceSize: 999, errorText: "legacy status"},
+		{hash: "pending-row", status: "pending"},
+		{hash: "done-row", status: "done", sourceSize: 100},
+	}
+	for _, item := range seed {
+		if _, err := store.db.ExecContext(ctx, `
+			UPDATE blobs SET encoding_status=?, encoding_token=?, encoding_stage_key=?, encoding_lease_until=?, encoding_source_size_bytes=?, encoding_error=? WHERE hash=?`,
+			item.status, item.token, item.stageKey, item.lease, item.sourceSize, item.errorText, item.hash); err != nil {
+			t.Fatalf("seed %s: %v", item.hash, err)
+		}
+	}
+	// The WebP guard is about the row's content type, so it is flipped last,
+	// after the shared seeding above.
+	if _, err := store.db.ExecContext(ctx, `UPDATE blobs SET content_type='image/webp' WHERE hash='failed-webp'`); err != nil {
+		t.Fatalf("flip failed-webp content type: %v", err)
+	}
+
+	// A hash scope moves only the listed failed row; failed-b stays failed.
+	reset, err := store.ResetFailedEncodings(ctx, []string{"failed-a"})
+	if err != nil {
+		t.Fatalf("scoped reset failed encodings: %v", err)
+	}
+	if reset != 1 {
+		t.Fatalf("scoped reset=%d want=1 (only the listed hash)", reset)
+	}
+	status, token, stageKey, lease, sourceSize := encodingRawState(t, store, "failed-a")
+	if status != "pending" || token != "" || stageKey != "" || lease != 0 || sourceSize != 0 {
+		t.Fatalf("failed-a=(%s %q %q %d %d) want pending with cleared token/stage/lease/source size", status, token, stageKey, lease, sourceSize)
+	}
+	if errText := encodingErrorText(t, store, "failed-a"); errText != "" {
+		t.Fatalf("failed-a error text=%q want cleared", errText)
+	}
+
+	// An empty scope retries every failed non-WebP row: failed-b moves, while
+	// the WebP row keeps its legacy status and bookkeeping.
+	reset, err = store.ResetFailedEncodings(ctx, nil)
+	if err != nil {
+		t.Fatalf("reset failed encodings: %v", err)
+	}
+	if reset != 1 {
+		t.Fatalf("reset=%d want=1 (failed-b only; the WebP row is excluded)", reset)
+	}
+	status, token, stageKey, lease, sourceSize = encodingRawState(t, store, "failed-b")
+	if status != "pending" || token != "" || stageKey != "" || lease != 0 || sourceSize != 0 {
+		t.Fatalf("failed-b=(%s %q %q %d %d) want pending with cleared token/stage/lease/source size", status, token, stageKey, lease, sourceSize)
+	}
+	if errText := encodingErrorText(t, store, "failed-b"); errText != "" {
+		t.Fatalf("failed-b error text=%q want cleared", errText)
+	}
+	status, token, stageKey, lease, sourceSize = encodingRawState(t, store, "failed-webp")
+	if status != "failed" || token != "tok-webp" || lease != 0 || sourceSize != 999 {
+		t.Fatalf("failed-webp=(%s %q %q %d %d) want untouched failed-looking WebP row", status, token, stageKey, lease, sourceSize)
+	}
+	if errText := encodingErrorText(t, store, "failed-webp"); errText != "legacy status" {
+		t.Fatalf("failed-webp error text=%q want untouched", errText)
+	}
+
+	// Rows that are not failed never move, and a second retry is a no-op.
+	status, _, _, _, sourceSize = encodingRawState(t, store, "pending-row")
+	if status != "pending" || sourceSize != 0 {
+		t.Fatalf("pending-row=(%s %d) want untouched pending row", status, sourceSize)
+	}
+	status, _, _, _, sourceSize = encodingRawState(t, store, "done-row")
+	if status != "done" || sourceSize != 100 {
+		t.Fatalf("done-row=(%s %d) want untouched done row", status, sourceSize)
+	}
+	reset, err = store.ResetFailedEncodings(ctx, nil)
+	if err != nil || reset != 0 {
+		t.Fatalf("second reset=%d err=%v want 0", reset, err)
 	}
 }

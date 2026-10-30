@@ -1357,6 +1357,19 @@ func (s *Store) ResetReadyEmbeddings(ctx context.Context) (int64, error) {
 	return count, nil
 }
 
+// blobHashScope narrows a blobs scan to an explicit hash set, the SQL half of
+// the recover endpoint's optional hashes scope. An empty list means no
+// narrowing at all — the whole-library behavior these recoveries have always
+// had — so callers that arrive without a scope keep their existing blast
+// radius. The clause is assembled from placeholders only; hash values always
+// travel as bound statement arguments, never as interpolated SQL text.
+func blobHashScope(hashes []string) (string, []any) {
+	if len(hashes) == 0 {
+		return "", nil
+	}
+	return " AND hash IN (" + placeholders(len(hashes)) + ")", stringArgs(hashes)
+}
+
 // ReleaseStuckEmbeddingClaims flips processing rows back to pending and
 // returns how many rows moved. It is the runtime equivalent of the startup
 // reset at the bottom of Open: a lease belongs to the lifetime of one process,
@@ -1373,7 +1386,9 @@ func (s *Store) ResetReadyEmbeddings(ctx context.Context) (int64, error) {
 // cost is wasted work. Only widen to expiredOnly=false once there is no worker
 // left to finish the in-flight batch.
 // Finalizing rows are always excluded, including with expiredOnly=false.
-func (s *Store) ReleaseStuckEmbeddingClaims(ctx context.Context, expiredOnly bool) (int64, error) {
+// A non-empty hashes list narrows the release to those blobs; an empty one
+// keeps the historical whole-library sweep.
+func (s *Store) ReleaseStuckEmbeddingClaims(ctx context.Context, expiredOnly bool, hashes []string) (int64, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, err
@@ -1388,8 +1403,9 @@ func (s *Store) ReleaseStuckEmbeddingClaims(ctx context.Context, expiredOnly boo
 		event = "lease_expired"
 	}
 	var count int64
-	selectQuery := `SELECT hash FROM blobs WHERE embedding_status=? AND embedding_finalizing=''`
-	selectArgs := []any{string(EmbeddingStatusProcessing)}
+	scopeClause, scopeArgs := blobHashScope(hashes)
+	selectQuery := `SELECT hash FROM blobs WHERE embedding_status=? AND embedding_finalizing=''` + scopeClause
+	selectArgs := append([]any{string(EmbeddingStatusProcessing)}, scopeArgs...)
 	updateQuery := `UPDATE blobs SET embedding_status=?, embedding_error='', embedding_lease_until=0, embedding_owner='external', embedding_token=''
 		WHERE hash=? AND embedding_status=? AND embedding_finalizing=''`
 	if expiredOnly {
@@ -1399,14 +1415,14 @@ func (s *Store) ReleaseStuckEmbeddingClaims(ctx context.Context, expiredOnly boo
 	}
 	selectQuery += ` ORDER BY hash LIMIT 500`
 	for {
-		hashes, err := queryBlobHashes(ctx, tx, selectQuery, selectArgs...)
+		batch, err := queryBlobHashes(ctx, tx, selectQuery, selectArgs...)
 		if err != nil {
 			return 0, fmt.Errorf("read stuck embedding claims: %w", err)
 		}
-		if len(hashes) == 0 {
+		if len(batch) == 0 {
 			break
 		}
-		for _, hash := range hashes {
+		for _, hash := range batch {
 			args := []any{string(EmbeddingStatusPending), hash, string(EmbeddingStatusProcessing)}
 			if expiredOnly {
 				args = append(args, now.UnixMilli())
@@ -1442,8 +1458,9 @@ func (s *Store) ReleaseStuckEmbeddingClaims(ctx context.Context, expiredOnly boo
 // them would spend worker capacity reproducing work that is done — and
 // processing rows are excluded for the same reason ResetReadyEmbeddings
 // excludes them: a worker still holds that lease and flipping the row under it
-// would race its in-flight write-back.
-func (s *Store) ResetFailedEmbeddings(ctx context.Context) (int64, error) {
+// would race its in-flight write-back. A non-empty hashes list narrows the
+// retry to those blobs; an empty one retries every failed row.
+func (s *Store) ResetFailedEmbeddings(ctx context.Context, hashes []string) (int64, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, fmt.Errorf("begin failed embedding retry: %w", err)
@@ -1453,16 +1470,18 @@ func (s *Store) ResetFailedEmbeddings(ctx context.Context) (int64, error) {
 		return 0, err
 	}
 	now := time.Now()
+	scopeClause, scopeArgs := blobHashScope(hashes)
+	selectArgs := append([]any{string(EmbeddingStatusFailed)}, scopeArgs...)
 	var count int64
 	for {
-		hashes, err := queryBlobHashes(ctx, tx, `SELECT hash FROM blobs WHERE embedding_status=? ORDER BY hash LIMIT 500`, string(EmbeddingStatusFailed))
+		batch, err := queryBlobHashes(ctx, tx, `SELECT hash FROM blobs WHERE embedding_status=?`+scopeClause+` ORDER BY hash LIMIT 500`, selectArgs...)
 		if err != nil {
 			return 0, fmt.Errorf("read failed embeddings: %w", err)
 		}
-		if len(hashes) == 0 {
+		if len(batch) == 0 {
 			break
 		}
-		for _, hash := range hashes {
+		for _, hash := range batch {
 			result, err := tx.ExecContext(ctx, `UPDATE blobs SET embedding_status=?, embedding_error='', embedding_lease_until=0
 				WHERE hash=? AND embedding_status=?`, string(EmbeddingStatusPending), hash, string(EmbeddingStatusFailed))
 			if err != nil {

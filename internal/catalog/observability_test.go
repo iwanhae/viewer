@@ -24,7 +24,7 @@ func TestEncodingObservationsFenceStaleFinishesAndTrackReconciliation(t *testing
 	if ok, err := store.BeginEncodingCommit(ctx, job.Hash, job.Token, 100, time.Hour); err != nil || !ok {
 		t.Fatalf("begin commit: ok=%v err=%v", ok, err)
 	}
-	if counts, err := store.ResetStuckEncodings(ctx); err != nil || counts != (EncodingResetCounts{}) {
+	if counts, err := store.ResetStuckEncodings(ctx, nil); err != nil || counts != (EncodingResetCounts{}) {
 		t.Fatalf("reset must leave a committing row fenced: counts=%+v err=%v", counts, err)
 	}
 	if ok, err := store.MarkEncodingReconciling(ctx, job.Hash, job.Token); err != nil || !ok {
@@ -235,7 +235,7 @@ func TestEmbeddingRetryRetainsSafePriorErrorAndExpiredClaimIsObserved(t *testing
 	}}); err != nil || len(applied) != 1 || len(rejected) != 0 {
 		t.Fatalf("failed result applied=%v rejected=%v err=%v", applied, rejected, err)
 	}
-	if reset, err := store.ResetFailedEmbeddings(ctx); err != nil || reset != 1 {
+	if reset, err := store.ResetFailedEmbeddings(ctx, nil); err != nil || reset != 1 {
 		t.Fatalf("manual retry reset=%d err=%v", reset, err)
 	}
 	second, err := store.ClaimPendingEmbeddings(ctx, 1, time.Now().Add(time.Minute))

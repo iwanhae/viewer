@@ -1361,7 +1361,8 @@ func TestResetReadyEmbeddings(t *testing.T) {
 // lease already lapsed and leaves live leases (and their error text) strictly
 // alone, while expiredOnly=false does the full startup-style reset. A released
 // row comes back pending with its lease and error text cleared, so the claim
-// loop can pick it up as if it had never been claimed.
+// loop can pick it up as if it had never been claimed. A hash scope selects
+// only the listed blobs, and an absent one keeps the whole-library sweep.
 func TestReleaseStuckEmbeddingClaims(t *testing.T) {
 	store := openTestStore(t)
 	ctx := context.Background()
@@ -1378,7 +1379,7 @@ func TestReleaseStuckEmbeddingClaims(t *testing.T) {
 	seedBlobLease(t, store, "hash-expired", "stale worker error", time.Now().Add(-time.Minute).UnixMilli())
 	seedBlobLease(t, store, "hash-live", "worker still running", time.Now().Add(10*time.Minute).UnixMilli())
 
-	released, err := store.ReleaseStuckEmbeddingClaims(ctx, true)
+	released, err := store.ReleaseStuckEmbeddingClaims(ctx, true, nil)
 	if err != nil {
 		t.Fatalf("release expired: %v", err)
 	}
@@ -1396,7 +1397,7 @@ func TestReleaseStuckEmbeddingClaims(t *testing.T) {
 		t.Fatalf("hash-live=(%s %q %d) want untouched processing row with live lease", status, errText, lease)
 	}
 
-	released, err = store.ReleaseStuckEmbeddingClaims(ctx, false)
+	released, err = store.ReleaseStuckEmbeddingClaims(ctx, false, nil)
 	if err != nil {
 		t.Fatalf("release all: %v", err)
 	}
@@ -1414,16 +1415,42 @@ func TestReleaseStuckEmbeddingClaims(t *testing.T) {
 	if status != EmbeddingStatusPending || lease != 0 {
 		t.Fatalf("hash-pending=(%s %d) want untouched pending row", status, lease)
 	}
-	released, err = store.ReleaseStuckEmbeddingClaims(ctx, false)
+	released, err = store.ReleaseStuckEmbeddingClaims(ctx, false, nil)
 	if err != nil || released != 0 {
 		t.Fatalf("second release=%d err=%v want 0", released, err)
+	}
+
+	// A hash scope narrows the release to the listed blobs: two more expired
+	// processing rows exist, but only the listed one moves.
+	for _, hash := range []string{"hash-scoped", "hash-other"} {
+		if err := store.UpsertBlob(ctx, Blob{Hash: hash, SizeBytes: 1}); err != nil {
+			t.Fatalf("upsert %s: %v", hash, err)
+		}
+		seedBlobStatus(t, store, hash, EmbeddingStatusProcessing)
+		seedBlobLease(t, store, hash, "stale worker error", time.Now().Add(-time.Minute).UnixMilli())
+	}
+	released, err = store.ReleaseStuckEmbeddingClaims(ctx, true, []string{"hash-scoped"})
+	if err != nil {
+		t.Fatalf("scoped release: %v", err)
+	}
+	if released != 1 {
+		t.Fatalf("scoped release=%d want=1 (only the listed hash)", released)
+	}
+	status, errText, lease = blobLeaseRow(t, store, "hash-scoped")
+	if status != EmbeddingStatusPending || errText != "" || lease != 0 {
+		t.Fatalf("hash-scoped=(%s %q %d) want (pending \"\" 0)", status, errText, lease)
+	}
+	status, errText, lease = blobLeaseRow(t, store, "hash-other")
+	if status != EmbeddingStatusProcessing || errText != "stale worker error" || lease >= time.Now().UnixMilli() {
+		t.Fatalf("hash-other=(%s %q %d) want untouched expired processing row outside the scope", status, errText, lease)
 	}
 }
 
 // TestResetFailedEmbeddings pins the retry path: failed rows go back to pending
 // with their error text and lease cleared, while ready rows are untouched —
 // they are terminal successes whose vectors the store already holds, and
-// re-embedding them would only reproduce work that is done.
+// re-embedding them would only reproduce work that is done. A hash scope
+// selects only the listed blobs; an empty one retries every failed row.
 func TestResetFailedEmbeddings(t *testing.T) {
 	store := openTestStore(t)
 	ctx := context.Background()
@@ -1444,7 +1471,7 @@ func TestResetFailedEmbeddings(t *testing.T) {
 	seedBlobLease(t, store, "hash-ready", "must survive", 333)
 	seedBlobLease(t, store, "hash-processing", "worker still running", 444)
 
-	reset, err := store.ResetFailedEmbeddings(ctx)
+	reset, err := store.ResetFailedEmbeddings(ctx, nil)
 	if err != nil {
 		t.Fatalf("reset failed embeddings: %v", err)
 	}
@@ -1467,9 +1494,46 @@ func TestResetFailedEmbeddings(t *testing.T) {
 	}
 
 	// A second reset is a no-op: nothing failed is left to flip.
-	reset, err = store.ResetFailedEmbeddings(ctx)
+	reset, err = store.ResetFailedEmbeddings(ctx, nil)
 	if err != nil || reset != 0 {
 		t.Fatalf("second reset=%d err=%v want 0", reset, err)
+	}
+
+	// A hash scope narrows the retry to the listed blobs: two more failed rows
+	// exist, but only the listed one moves.
+	for _, hash := range []string{"hash-failed-c", "hash-failed-d"} {
+		if err := store.UpsertBlob(ctx, Blob{Hash: hash, SizeBytes: 1}); err != nil {
+			t.Fatalf("upsert %s: %v", hash, err)
+		}
+		seedBlobStatus(t, store, hash, EmbeddingStatusFailed)
+	}
+	seedBlobLease(t, store, "hash-failed-c", "scoped retry target", 555)
+	seedBlobLease(t, store, "hash-failed-d", "outside the scope", 666)
+	reset, err = store.ResetFailedEmbeddings(ctx, []string{"hash-failed-c"})
+	if err != nil {
+		t.Fatalf("scoped reset: %v", err)
+	}
+	if reset != 1 {
+		t.Fatalf("scoped reset=%d want=1 (only the listed hash)", reset)
+	}
+	status, errText, lease = blobLeaseRow(t, store, "hash-failed-c")
+	if status != EmbeddingStatusPending || errText != "" || lease != 0 {
+		t.Fatalf("hash-failed-c=(%s %q %d) want (pending \"\" 0)", status, errText, lease)
+	}
+	status, errText, lease = blobLeaseRow(t, store, "hash-failed-d")
+	if status != EmbeddingStatusFailed || errText != "outside the scope" || lease != 666 {
+		t.Fatalf("hash-failed-d=(%s %q %d) want untouched failed row outside the scope", status, errText, lease)
+	}
+
+	// An empty slice keeps the historical whole-library behavior: the one
+	// remaining failed row moves with no narrowing.
+	reset, err = store.ResetFailedEmbeddings(ctx, []string{})
+	if err != nil || reset != 1 {
+		t.Fatalf("empty-scope reset=%d err=%v want=1 (global behavior)", reset, err)
+	}
+	status, _, _ = blobLeaseRow(t, store, "hash-failed-d")
+	if status != EmbeddingStatusPending {
+		t.Fatalf("hash-failed-d=%s want pending after the empty-scope reset", status)
 	}
 }
 

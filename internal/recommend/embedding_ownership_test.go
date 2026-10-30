@@ -143,7 +143,7 @@ func TestLocalEmbeddingCancellationDuringVectorWrite(t *testing.T) {
 	if released, err := svc.ReleaseLocalClaims(ctx, []catalog.LocalEmbeddingClaim{claim}); err != nil || len(released) != 0 {
 		t.Fatalf("cancellation must not win after reservation: %v %v", released, err)
 	}
-	if n, err := cat.ReleaseStuckEmbeddingClaims(ctx, false); err != nil || n != 0 {
+	if n, err := cat.ReleaseStuckEmbeddingClaims(ctx, false, nil); err != nil || n != 0 {
 		t.Fatalf("recovery bypassed reservation: %d %v", n, err)
 	}
 	if claims, _, err := svc.ClaimExternalEmbeddings(ctx, 1); err != nil || len(claims) != 0 {

@@ -173,7 +173,7 @@ func TestStaleLocalEmbeddingNeverReachesVectorWrite(t *testing.T) {
 					t.Fatalf("reclaim: %v %v", rows, err)
 				}
 			case "admin-release":
-				if n, err := s.ReleaseStuckEmbeddingClaims(ctx, false); err != nil || n != 1 {
+				if n, err := s.ReleaseStuckEmbeddingClaims(ctx, false, nil); err != nil || n != 1 {
 					t.Fatalf("admin release=%d %v", n, err)
 				}
 			}
@@ -228,7 +228,7 @@ func TestEmbeddingFinalizationReservationBlocksOwnershipChanges(t *testing.T) {
 					t.Fatal(err)
 				}
 				for _, expiredOnly := range []bool{true, false} {
-					if n, err := s.ReleaseStuckEmbeddingClaims(ctx, expiredOnly); err != nil || n != 0 {
+					if n, err := s.ReleaseStuckEmbeddingClaims(ctx, expiredOnly, nil); err != nil || n != 0 {
 						t.Fatalf("admin released reservation: %d %v", n, err)
 					}
 				}
@@ -343,7 +343,7 @@ func TestEmbeddingOwnershipUpgradeAndRestart(t *testing.T) {
 		t.Fatalf("external lease lost on upgrade: %+v %v", counts, err)
 	}
 	// Explicit legacy operator recovery, not startup, releases that lease.
-	if _, err := s.ReleaseStuckEmbeddingClaims(ctx, false); err != nil {
+	if _, err := s.ReleaseStuckEmbeddingClaims(ctx, false, nil); err != nil {
 		t.Fatal(err)
 	}
 	claim := localClaim(t, s, time.Now().Add(time.Hour))

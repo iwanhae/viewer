@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
@@ -211,16 +212,17 @@ func decodeAdminJSONBody(w http.ResponseWriter, r *http.Request, out any) error 
 
 // The recovery targets of POST /admin/api/recover, one deliberate flip each.
 // They are separate strings rather than flags on a shared action because the
-// four differ in blast radius, not just in which rows they touch: releasing
+// five differ in blast radius, not just in which rows they touch: releasing
 // expired claims is the safe default, force-releasing live leases cancels
-// in-flight worker work, retrying failed re-runs the model on blobs that may
-// fail deterministically again, and the encoding reset leaves committing rows
-// to the encoding service's own reconciliation. The confirm dialog and the
-// test for each spell that out.
+// in-flight worker work, retrying failed re-runs the model or encoder on blobs
+// that may fail deterministically again, and the encoding resets leave
+// committing rows to the encoding service's own reconciliation. The confirm
+// dialog and the test for each spell that out.
 const (
 	recoverReleaseExpiredClaims  = "release_expired_claims"
 	recoverReleaseAllClaims      = "release_all_claims"
 	recoverRetryFailedEmbeddings = "retry_failed_embeddings"
+	recoverRetryFailedEncodings  = "retry_failed_encodings"
 	recoverResetStuckEncoding    = "reset_stuck_encoding"
 )
 
@@ -229,46 +231,97 @@ const (
 // in the confirmation and the refreshed counts. Accepting a list of targets
 // would invite a "run everything" habit the confirm dialogs exist to prevent,
 // and blur which flip produced which number.
+//
+// Hashes optionally narrows any target to the listed blobs — the scope a later
+// admin stage uses to replace the heavier scoped-recovery subsystem. Absent or
+// empty, it means the historical whole-library behavior, so existing callers
+// are unaffected. Reindex is deliberately not reachable through this endpoint
+// and has no hashes plumbing of its own: it is a separate, global-by-design
+// action.
 type recoverRequest struct {
-	Target string `json:"target"`
+	Target string   `json:"target"`
+	Hashes []string `json:"hashes,omitempty"`
+}
+
+// maxRecoverHashes bounds the optional hashes scope. It matches the scale of a
+// hand-picked selection (the dashboard's "retry these blobs" flow), keeps the
+// catalog's IN clause and its bound-parameter list small, and leaves larger
+// rescues to the whole-library form that already exists.
+const maxRecoverHashes = 100
+
+// validRecoverHash reports whether one hashes entry is the exact identity the
+// catalog keys blobs by: a lowercase, 64-character hex SHA-256 digest. The
+// format check is the whole validation — the catalog treats unknown hashes as
+// rows that simply do not match, so a listed-but-absent blob is a no-op, not
+// an error.
+func validRecoverHash(hash string) bool {
+	if len(hash) != sha256.Size*2 {
+		return false
+	}
+	for _, char := range hash {
+		if (char < '0' || char > '9') && (char < 'a' || char > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 // adminRecover dispatches one recovery target to its admin action and answers
 // with that action's typed result wrapped in the target it served. An unknown
 // target is a caller bug: 400, with the valid values quoted so a stale
-// dashboard build can be fixed from the error alone.
+// dashboard build can be fixed from the error alone. The hashes scope is
+// validated before any dispatch so a malformed list never reaches the catalog.
 func (s *Server) adminRecover(w http.ResponseWriter, r *http.Request) {
 	var req recoverRequest
 	if err := decodeAdminJSONBody(w, r, &req); err != nil {
 		writeBodyError(w, r, err)
 		return
 	}
+	if len(req.Hashes) > maxRecoverHashes {
+		writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST",
+			fmt.Sprintf("hashes must hold at most %d entries", maxRecoverHashes))
+		return
+	}
+	for _, hash := range req.Hashes {
+		if !validRecoverHash(hash) {
+			writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST",
+				fmt.Sprintf("hash %q must be a lowercase 64-character hex SHA-256 digest", hash))
+			return
+		}
+	}
 
 	result := admin.RecoverResult{Target: req.Target}
 	switch req.Target {
 	case recoverReleaseExpiredClaims:
-		res, err := s.admin.ReleaseStuckEmbeddings(r.Context(), true)
+		res, err := s.admin.ReleaseStuckEmbeddings(r.Context(), true, req.Hashes)
 		if err != nil {
 			writeError(w, r, http.StatusInternalServerError, "INTERNAL", err.Error())
 			return
 		}
 		result.Release = &res
 	case recoverReleaseAllClaims:
-		res, err := s.admin.ReleaseStuckEmbeddings(r.Context(), false)
+		res, err := s.admin.ReleaseStuckEmbeddings(r.Context(), false, req.Hashes)
 		if err != nil {
 			writeError(w, r, http.StatusInternalServerError, "INTERNAL", err.Error())
 			return
 		}
 		result.Release = &res
 	case recoverRetryFailedEmbeddings:
-		res, err := s.admin.RetryFailedEmbeddings(r.Context())
+		res, err := s.admin.RetryFailedEmbeddings(r.Context(), req.Hashes)
 		if err != nil {
 			writeError(w, r, http.StatusInternalServerError, "INTERNAL", err.Error())
 			return
 		}
 		result.Retry = &res
+	case recoverRetryFailedEncodings:
+		res, err := s.admin.RetryFailedEncodings(r.Context(), req.Hashes)
+		if err != nil {
+			writeError(w, r, http.StatusInternalServerError, "INTERNAL", err.Error())
+			return
+		}
+		result.EncodingRetry = &res
 	case recoverResetStuckEncoding:
-		res, err := s.admin.ResetStuckEncodings(r.Context())
+		res, err := s.admin.ResetStuckEncodings(r.Context(), req.Hashes)
 		if err != nil {
 			writeError(w, r, http.StatusInternalServerError, "INTERNAL", err.Error())
 			return
@@ -276,9 +329,9 @@ func (s *Server) adminRecover(w http.ResponseWriter, r *http.Request) {
 		result.Encoding = &res
 	default:
 		writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST",
-			fmt.Sprintf("unknown recovery target %q (want one of: %s, %s, %s, %s)",
+			fmt.Sprintf("unknown recovery target %q (want one of: %s, %s, %s, %s, %s)",
 				req.Target, recoverReleaseExpiredClaims, recoverReleaseAllClaims,
-				recoverRetryFailedEmbeddings, recoverResetStuckEncoding))
+				recoverRetryFailedEmbeddings, recoverRetryFailedEncodings, recoverResetStuckEncoding))
 		return
 	}
 	writeJSON(w, http.StatusOK, result)

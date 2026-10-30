@@ -118,7 +118,7 @@ func TestLocalEncodingAcceptedProtectedFromRunAndOperatorReset(t *testing.T) {
 			if _, err := s.db.Exec(`UPDATE blobs SET encoding_status=?,encoding_lease_until=1 WHERE hash='target'`, state); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := s.ResetStuckEncodings(ctx); err != nil {
+			if _, err := s.ResetStuckEncodings(ctx, nil); err != nil {
 				t.Fatal(err)
 			}
 			claimed, err := s.ClaimEncoding(ctx, 1, time.Minute)
