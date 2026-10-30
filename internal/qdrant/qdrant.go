@@ -30,6 +30,12 @@ const (
 	// chunk is cheap to retry and stays well under proxy payload limits.
 	batchSize = 256
 
+	// maxScrollPages bounds how many pages one scroll chunk may request. A
+	// conforming Qdrant stops returning next_page_offset once the filtered
+	// set is exhausted; this cap turns a misbehaving server that always
+	// claims another page into an error instead of an endless request loop.
+	maxScrollPages = 1000
+
 	// maxErrBody caps how much of an error response body lands in an error
 	// message: enough to see Qdrant's explanation, not enough to flood logs.
 	maxErrBody = 512
@@ -397,28 +403,47 @@ func (c *Client) RetrieveVectorsByHashes(ctx context.Context, hashes []string) (
 	return vectors, nil
 }
 
-// scrollChunk fetches one batch of hashes with a single should (OR) filter
-// and adds whatever came back to vectors, keyed by payload hash.
+// scrollChunk fetches every point whose payload hash is in hashes with one
+// should (OR) filter, adding the returned vectors to vectors keyed by payload
+// hash. The filter matches across the whole collection, not just this chunk:
+// one blob hash is typically referenced by several photos (dedup is a core
+// feature) and those photos can live in other albums, so the filtered set can
+// hold many more points than len(hashes). Qdrant therefore pages through it
+// with a cursor — next_page_offset comes back as the next request's offset
+// until the server omits it on the last page — and following it is the only
+// way to fetch every matching point instead of silently dropping the rest.
 func (c *Client) scrollChunk(ctx context.Context, hashes []string, vectors map[string][]float32) error {
 	should := make([]condition, len(hashes))
 	for i, h := range hashes {
 		should[i] = condition{Key: "hash", Match: match{Value: h}}
 	}
-	body := scrollRequest{
-		Filter:     &filter{Should: should},
-		WithVector: true,
-		// The filter matches at most len(hashes) points, so one page of
-		// batchSize always covers the whole chunk without paging.
-		Limit: batchSize,
+	// Point IDs are UUID strings, so the scroll cursor is a string too: nil
+	// starts at the front of the filtered set, a returned ID resumes
+	// strictly after that point.
+	var offset *string
+	for page := 0; page < maxScrollPages; page++ {
+		body := scrollRequest{
+			Filter:     &filter{Should: should},
+			WithVector: true,
+			// Every point carries its full vector (batchSize × dim floats),
+			// so pages stay at batchSize for the same reasons upserts do.
+			Limit:  batchSize,
+			Offset: offset,
+		}
+		var out scrollResponse
+		if err := c.do(ctx, http.MethodPost, c.endpoint("/points/scroll", nil), body, &out); err != nil {
+			return err
+		}
+		for _, p := range out.Result.Points {
+			vectors[p.Payload.Hash] = p.Vector
+		}
+		if out.Result.NextPageOffset == nil {
+			// No cursor means the filtered set is exhausted.
+			return nil
+		}
+		offset = out.Result.NextPageOffset
 	}
-	var out scrollResponse
-	if err := c.do(ctx, http.MethodPost, c.endpoint("/points/scroll", nil), body, &out); err != nil {
-		return err
-	}
-	for _, p := range out.Result.Points {
-		vectors[p.Payload.Hash] = p.Vector
-	}
-	return nil
+	return fmt.Errorf("scroll for %d hash(es) did not terminate after %d pages", len(hashes), maxScrollPages)
 }
 
 // DeleteByAlbum removes every point belonging to albumID, waiting for the
@@ -541,20 +566,26 @@ type groupSearchResponse struct {
 	} `json:"result"`
 }
 
-// scrollRequest is the POST .../points/scroll body.
+// scrollRequest is the POST .../points/scroll body. Offset is the scroll
+// cursor taken from the previous page's next_page_offset; nil starts at the
+// front of the filtered set.
 type scrollRequest struct {
 	Filter     *filter `json:"filter,omitempty"`
 	WithVector bool    `json:"with_vector"`
 	Limit      int     `json:"limit"`
+	Offset     *string `json:"offset,omitempty"`
 }
 
 // scrollResponse is the slice of the scroll reply the client uses.
+// NextPageOffset is the cursor for the following page; Qdrant omits it (and
+// encoding/json leaves the pointer nil) once the last page is served.
 type scrollResponse struct {
 	Result struct {
 		Points []struct {
 			Payload pointPayload `json:"payload"`
 			Vector  []float32    `json:"vector"`
 		} `json:"points"`
+		NextPageOffset *string `json:"next_page_offset"`
 	} `json:"result"`
 }
 

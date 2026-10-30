@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -561,19 +562,57 @@ func TestEnsureCollectionValidatesExisting(t *testing.T) {
 	}
 }
 
-func TestRetrieveVectorsByHashes(t *testing.T) {
-	// Vectors exist for hash-0000..hash-0250 only; the rest come back absent.
-	stored := make(map[string][]float32)
-	for i := 0; i <= 250; i++ {
-		stored[fmt.Sprintf("hash-%04d", i)] = []float32{float32(i), float32(i), 0, 1}
-	}
-	type chunk struct {
-		should     []string
-		limit      int
-		withVector bool
-	}
-	var requests []chunk
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+// scrollPoint is one stored point in a scroll fake. The JSON shape matches
+// Qdrant's scroll reply: a point ID, the payload, and the vector.
+type scrollPoint struct {
+	ID      string `json:"id"`
+	Payload struct {
+		Hash string `json:"hash"`
+	} `json:"payload"`
+	Vector []float32 `json:"vector"`
+}
+
+// newScrollPoint builds a stored point with the given ID, payload hash, and
+// vector.
+func newScrollPoint(id, hash string, vector []float32) scrollPoint {
+	var p scrollPoint
+	p.ID = id
+	p.Payload.Hash = hash
+	p.Vector = vector
+	return p
+}
+
+// scrollFakeRequest records what one scroll request asked for.
+type scrollFakeRequest struct {
+	Hashes     []string
+	Limit      int
+	WithVector bool
+	Offset     *string
+}
+
+// scrollFake is a cursor-honoring stand-in for Qdrant's scroll endpoint. It
+// holds a fixed store of points sorted by point ID (Qdrant scrolls in ID
+// order), serves the subset matching the request's hash should-filter at most
+// limit points per request, resumes strictly after the request's offset when
+// present, and reports next_page_offset — the last served point's ID — only
+// when more matching points remain in that filtered set.
+type scrollFake struct {
+	points   []scrollPoint
+	requests []scrollFakeRequest
+}
+
+// newScrollFake builds a fake whose store is sorted by point ID, like the
+// order a real scroll walks.
+func newScrollFake(points []scrollPoint) *scrollFake {
+	sort.Slice(points, func(i, j int) bool { return points[i].ID < points[j].ID })
+	return &scrollFake{points: points}
+}
+
+// handler serves the fake's scroll endpoint, failing the test on anything but
+// a well-formed scroll POST.
+func (f *scrollFake) handler(t *testing.T) http.Handler {
+	t.Helper()
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost || r.URL.Path != "/collections/"+testCollection+"/points/scroll" {
 			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
 			http.Error(w, "bad request", http.StatusBadRequest)
@@ -588,40 +627,73 @@ func TestRetrieveVectorsByHashes(t *testing.T) {
 					} `json:"match"`
 				} `json:"should"`
 			} `json:"filter"`
-			WithVector bool `json:"with_vector"`
-			Limit      int  `json:"limit"`
+			WithVector bool    `json:"with_vector"`
+			Limit      int     `json:"limit"`
+			Offset     *string `json:"offset"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			t.Errorf("decode body: %v", err)
 			http.Error(w, "bad request", http.StatusBadRequest)
 			return
 		}
+		wanted := make(map[string]bool, len(body.Filter.Should))
 		hashes := make([]string, 0, len(body.Filter.Should))
 		for _, c := range body.Filter.Should {
 			if c.Key != "hash" {
 				t.Errorf("should key = %q, want hash", c.Key)
 			}
+			wanted[c.Match.Value] = true
 			hashes = append(hashes, c.Match.Value)
 		}
-		requests = append(requests, chunk{should: hashes, limit: body.Limit, withVector: body.WithVector})
+		f.requests = append(f.requests, scrollFakeRequest{
+			Hashes:     hashes,
+			Limit:      body.Limit,
+			WithVector: body.WithVector,
+			Offset:     body.Offset,
+		})
 
-		type point struct {
-			Payload struct {
-				Hash string `json:"hash"`
-			} `json:"payload"`
-			Vector []float32 `json:"vector"`
-		}
-		points := make([]point, 0)
-		for _, h := range hashes {
-			if v, ok := stored[h]; ok {
-				points = append(points, point{Payload: struct {
-					Hash string `json:"hash"`
-				}{Hash: h}, Vector: v})
+		// Collect every stored point matching the filter, in ID order,
+		// resuming strictly after the cursor.
+		start := 0
+		if body.Offset != nil {
+			for start < len(f.points) && f.points[start].ID <= *body.Offset {
+				start++
 			}
 		}
+		matching := make([]scrollPoint, 0)
+		for _, p := range f.points[start:] {
+			if wanted[p.Payload.Hash] {
+				matching = append(matching, p)
+			}
+		}
+		served := matching
+		result := map[string]any{"points": served}
+		if len(matching) > body.Limit {
+			served = matching[:body.Limit]
+			result["points"] = served
+			// More matching points remain, so hand back the cursor: the ID
+			// of the last point this page served.
+			next := served[len(served)-1].ID
+			result["next_page_offset"] = next
+		}
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{"result": map[string]any{"points": points}, "status": "ok"})
-	}))
+		_ = json.NewEncoder(w).Encode(map[string]any{"result": result, "status": "ok"})
+	})
+}
+
+func TestRetrieveVectorsByHashes(t *testing.T) {
+	// One point per hash for hash-0000..hash-0250; the remaining requested
+	// hashes have no stored vector and must come back absent.
+	stored := make(map[string][]float32)
+	points := make([]scrollPoint, 0, 251)
+	for i := 0; i <= 250; i++ {
+		h := fmt.Sprintf("hash-%04d", i)
+		v := []float32{float32(i), float32(i), 0, 1}
+		stored[h] = v
+		points = append(points, newScrollPoint(fmt.Sprintf("%08d-0000-0000-0000-000000000000", i), h, v))
+	}
+	fake := newScrollFake(points)
+	srv := httptest.NewServer(fake.handler(t))
 	defer srv.Close()
 
 	var hashes []string
@@ -647,23 +719,26 @@ func TestRetrieveVectorsByHashes(t *testing.T) {
 		t.Error("hash-0299 has no stored vector but is present in the result")
 	}
 
-	if len(requests) != 2 {
-		t.Fatalf("requests = %d, want 2 (256 + 44)", len(requests))
+	// 302 inputs dedupe to 300 unique hashes chunked at batchSize; one point
+	// per hash fits a single page per chunk, so no request carries a cursor.
+	if len(fake.requests) != 2 {
+		t.Fatalf("requests = %d, want 2 (256 + 44)", len(fake.requests))
 	}
-	if len(requests[0].should) != 256 || len(requests[1].should) != 44 {
-		t.Errorf("chunk sizes = %d and %d, want 256 and 44", len(requests[0].should), len(requests[1].should))
-	}
-	for i, req := range requests {
-		if req.limit != batchSize {
-			t.Errorf("request %d limit = %d, want %d (one page must cover the chunk)", i, req.limit, batchSize)
-		}
-		if !req.withVector {
-			t.Errorf("request %d did not ask for with_vector", i)
-		}
+	if len(fake.requests[0].Hashes) != 256 || len(fake.requests[1].Hashes) != 44 {
+		t.Errorf("chunk sizes = %d and %d, want 256 and 44", len(fake.requests[0].Hashes), len(fake.requests[1].Hashes))
 	}
 	seen := map[string]int{}
-	for _, req := range requests {
-		for _, h := range req.should {
+	for i, req := range fake.requests {
+		if req.Limit != batchSize {
+			t.Errorf("request %d limit = %d, want %d", i, req.Limit, batchSize)
+		}
+		if !req.WithVector {
+			t.Errorf("request %d did not ask for with_vector", i)
+		}
+		if req.Offset != nil {
+			t.Errorf("request %d offset = %q, want none: one point per hash fits one page", i, *req.Offset)
+		}
+		for _, h := range req.Hashes {
 			seen[h]++
 		}
 	}
@@ -674,6 +749,118 @@ func TestRetrieveVectorsByHashes(t *testing.T) {
 		if n != 1 {
 			t.Errorf("hash %s was requested %d times, want once", h, n)
 		}
+	}
+}
+
+// TestRetrieveVectorsByHashesPagesSharedHashes is the regression for the
+// truncation bug: a hash filter matches one point per referencing photo, and
+// dedup spreads one blob's photos across albums, so 40 hashes can own 520
+// points — far more than one page of batchSize. The client must follow the
+// cursor until the filtered set is exhausted and return every hash's vector.
+func TestRetrieveVectorsByHashesPagesSharedHashes(t *testing.T) {
+	const (
+		numHashes     = 40
+		photosPerHash = 13 // photos referencing each hash, each its own point
+	)
+	want := make(map[string][]float32, numHashes)
+	points := make([]scrollPoint, 0, numHashes*photosPerHash)
+	n := 0
+	for i := 0; i < numHashes; i++ {
+		h := fmt.Sprintf("hash-%04d", i)
+		v := []float32{float32(i), 1, 2, 3}
+		want[h] = v
+		for j := 0; j < photosPerHash; j++ {
+			// Consecutive sortable UUIDs keep one hash's points adjacent in
+			// the ID-ordered scroll, so page one provably cannot cover every
+			// hash — exactly the shape the old code truncated away.
+			id := fmt.Sprintf("%08d-0000-0000-0000-000000000000", n)
+			points = append(points, newScrollPoint(id, h, v))
+			n++
+		}
+	}
+	fake := newScrollFake(points)
+	srv := httptest.NewServer(fake.handler(t))
+	defer srv.Close()
+
+	input := make([]string, 0, numHashes)
+	for i := 0; i < numHashes; i++ {
+		input = append(input, fmt.Sprintf("hash-%04d", i))
+	}
+	c := newTestClient(srv, "")
+	got, err := c.RetrieveVectorsByHashes(context.Background(), input)
+	if err != nil {
+		t.Fatalf("RetrieveVectorsByHashes: %v", err)
+	}
+
+	// 520 points at limit 256 must be paged as 256 + 256 + 8: at least three
+	// requests, each after the first resuming from the previous cursor.
+	if len(fake.requests) < 3 {
+		t.Fatalf("requests = %d, want at least 3 pages for %d points at limit %d",
+			len(fake.requests), numHashes*photosPerHash, batchSize)
+	}
+	if fake.requests[0].Offset != nil {
+		t.Errorf("first page offset = %q, want none", *fake.requests[0].Offset)
+	}
+	wantCursors := []string{points[255].ID, points[511].ID}
+	for i, cursor := range wantCursors {
+		req := fake.requests[i+1]
+		if req.Offset == nil {
+			t.Errorf("page %d carried no offset, want cursor %q", i+2, cursor)
+			continue
+		}
+		if *req.Offset != cursor {
+			t.Errorf("page %d offset = %q, want the previous page's cursor %q", i+2, *req.Offset, cursor)
+		}
+	}
+
+	// The point of the fix: no hash may be silently dropped.
+	if len(got) != numHashes {
+		t.Fatalf("result has %d vectors, want all %d (silent truncation)", len(got), numHashes)
+	}
+	for h, v := range want {
+		if got := got[h]; !reflect.DeepEqual(got, v) {
+			t.Errorf("%s vector = %v, want %v", h, got, v)
+		}
+	}
+}
+
+// TestRetrieveVectorsByHashesStopsAtPageCap guards against a misbehaving
+// server that always reports another page: the client must give up with the
+// page-cap error after maxScrollPages requests instead of scrolling forever.
+func TestRetrieveVectorsByHashesStopsAtPageCap(t *testing.T) {
+	pages := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/collections/"+testCollection+"/points/scroll" {
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		pages++
+		w.Header().Set("Content-Type", "application/json")
+		// Broken server: a fresh non-null cursor every time, never a last page.
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"result": map[string]any{
+				"points":           []any{},
+				"next_page_offset": fmt.Sprintf("%08d-0000-0000-0000-000000000000", pages),
+			},
+			"status": "ok",
+		})
+	}))
+	defer srv.Close()
+
+	c := newTestClient(srv, "")
+	got, err := c.RetrieveVectorsByHashes(context.Background(), []string{"hash-0000"})
+	if err == nil {
+		t.Fatal("RetrieveVectorsByHashes succeeded against an endless scroll, want the page-cap error")
+	}
+	if !strings.Contains(err.Error(), fmt.Sprintf("did not terminate after %d pages", maxScrollPages)) {
+		t.Fatalf("err = %v, want the page-cap error", err)
+	}
+	if pages != maxScrollPages {
+		t.Errorf("server saw %d requests, want exactly %d before giving up", pages, maxScrollPages)
+	}
+	if len(got) != 0 {
+		t.Errorf("got = %d vectors, want none on error", len(got))
 	}
 }
 
