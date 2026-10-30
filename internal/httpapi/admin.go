@@ -10,7 +10,6 @@ import (
 	"io"
 	"mime"
 	"net/http"
-	"net/url"
 	"strings"
 
 	"viewer/internal/admin"
@@ -54,68 +53,6 @@ func (s *Server) requireAdminToken(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
-}
-
-// requireAdminMutationProtection makes every admin write a non-simple browser
-// request and rejects explicit cross-origin/fetch-metadata indications. Basic
-// auth remains the authorization check; this is a CSRF boundary, not identity.
-func (s *Server) requireAdminMutationProtection(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodGet || r.Method == http.MethodHead || r.Method == http.MethodOptions {
-			next.ServeHTTP(w, r)
-			return
-		}
-		if r.Header.Get("X-Admin-Action") != "1" {
-			writeError(w, r, http.StatusForbidden, "CSRF", "admin action header required")
-			return
-		}
-		if origin := r.Header.Get("Origin"); origin != "" {
-			parsed, err := url.Parse(origin)
-			if err != nil || parsed.Scheme == "" || parsed.Host == "" || parsed.User != nil ||
-				parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" ||
-				!sameAdminOriginHost(parsed.Host, r.Host, parsed.Scheme) || !strings.EqualFold(parsed.Scheme, adminRequestScheme(r)) {
-				writeError(w, r, http.StatusForbidden, "CSRF", "cross-origin admin action rejected")
-				return
-			}
-		}
-		if fetchSite := strings.ToLower(strings.TrimSpace(r.Header.Get("Sec-Fetch-Site"))); fetchSite != "" && fetchSite != "same-origin" && fetchSite != "none" {
-			writeError(w, r, http.StatusForbidden, "CSRF", "cross-origin admin action rejected")
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
-}
-
-func sameAdminOriginHost(originHost, requestHost, scheme string) bool {
-	originURL, err := url.Parse("//" + originHost)
-	if err != nil {
-		return false
-	}
-	requestURL, err := url.Parse("//" + requestHost)
-	if err != nil {
-		return false
-	}
-	defaultPort := "80"
-	if strings.EqualFold(scheme, "https") {
-		defaultPort = "443"
-	}
-	port := func(value string) string {
-		if value == "" {
-			return defaultPort
-		}
-		return value
-	}
-	return strings.EqualFold(originURL.Hostname(), requestURL.Hostname()) && port(originURL.Port()) == port(requestURL.Port())
-}
-
-func adminRequestScheme(r *http.Request) string {
-	if r.TLS != nil {
-		return "https"
-	}
-	if forwarded := strings.TrimSpace(strings.Split(r.Header.Get("X-Forwarded-Proto"), ",")[0]); forwarded != "" {
-		return strings.ToLower(forwarded)
-	}
-	return "http"
 }
 
 // isAdminPath reports whether a path belongs to the protected admin surface.

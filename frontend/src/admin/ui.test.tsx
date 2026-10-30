@@ -408,7 +408,6 @@ describe('admin React UI', () => {
     const recoverCall = fetchMock.mock.calls.find(([url]) => String(url) === '/admin/api/recover')
     expect(recoverCall?.[1]?.method).toBe('POST')
     expect(recoverCall?.[1]?.body).toBe(JSON.stringify({ target: 'retry_failed_embeddings', hashes: ['recover-hash'] }))
-    expect(new Headers(recoverCall?.[1]?.headers).get('X-Admin-Action')).toBe('1')
     await waitFor(() => expect(fetchMock.mock.calls.filter(([url]) => String(url) === '/admin/api/blobs/recover-hash').length).toBe(2))
   })
 
@@ -481,7 +480,6 @@ describe('admin React UI', () => {
     const recoverCall = fetchMock.mock.calls.find(([url]) => String(url) === '/admin/api/recover')
     expect(recoverCall?.[1]?.method).toBe('POST')
     expect(recoverCall?.[1]?.body).toBe(JSON.stringify({ target: 'release_expired_claims' }))
-    expect(new Headers(recoverCall?.[1]?.headers).get('X-Admin-Action')).toBe('1')
     await waitFor(() => expect(fetchMock.mock.calls.filter(([url]) => String(url) === '/admin/api/overview').length).toBe(2))
     expect(confirmSpy).toHaveBeenCalledTimes(1)
   })
@@ -512,7 +510,6 @@ describe('admin React UI', () => {
     const reindexCall = fetchMock.mock.calls.find(([url]) => String(url) === '/admin/api/reindex')
     expect(reindexCall?.[1]?.method).toBe('POST')
     expect(reindexCall?.[1]?.body).toBe('{}')
-    expect(new Headers(reindexCall?.[1]?.headers).get('X-Admin-Action')).toBe('1')
     await waitFor(() => expect(fetchMock.mock.calls.filter(([url]) => String(url) === '/admin/api/overview').length).toBe(2))
   })
 
@@ -563,7 +560,6 @@ describe('admin React UI', () => {
       ['/admin/api/automatic/embedding', '{"enabled":false}'],
       ['/admin/api/automatic/embedding', '{"enabled":true}']
     ])
-    expect(posts.every(([, init]) => new Headers(init?.headers).get('X-Admin-Action') === '1')).toBe(true)
   })
 
   it('keeps serving the execution control panel when the automatic status read fails', async () => {
@@ -611,7 +607,6 @@ describe('admin React UI', () => {
     const runCall = fetchMock.mock.calls.find(([url]) => String(url) === '/admin/api/encoding/run-local')
     expect(runCall?.[1]?.method).toBe('POST')
     expect(runCall?.[1]?.body).toBe('{}')
-    expect(new Headers(runCall?.[1]?.headers).get('X-Admin-Action')).toBe('1')
 
     // started=false is the already-running answer, surfaced as a result line
     // rather than an error.

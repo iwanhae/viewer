@@ -22,7 +22,6 @@ func runRequest(router http.Handler, method, target, body string) *httptest.Resp
 	req := httptest.NewRequest(method, target, strings.NewReader(body))
 	req.SetBasicAuth("operator", "secret")
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Admin-Action", "1")
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
 	return rec
@@ -75,7 +74,7 @@ func newAutomaticTestRouter(t *testing.T, local admin.LocalEncodingRunner) (http
 	return New(nil, nil, nil, nil, "", service, "secret").Router(), recommender
 }
 
-func TestAdminAutomaticJSONValidationAuthAndCSRF(t *testing.T) {
+func TestAdminAutomaticJSONValidationAndAuth(t *testing.T) {
 	router, _ := newAutomaticTestRouter(t, nil)
 	const path = "/admin/api/automatic/embedding"
 	for _, enabled := range []bool{true, false, true} {
@@ -111,26 +110,7 @@ func TestAdminAutomaticJSONValidationAuthAndCSRF(t *testing.T) {
 			t.Errorf("no auth %s=%d", method, rec.Code)
 		}
 	}
-	for _, test := range []struct {
-		header, origin, contentType string
-		status                      int
-	}{
-		{"", "", "application/json", 403},
-		{"1", "https://evil.invalid", "application/json", 403},
-		{"1", "", "text/plain", 400},
-		{"1", "http://example.com", "application/json", 200},
-	} {
-		req := httptest.NewRequest("POST", path, strings.NewReader(`{"enabled":false}`))
-		req.SetBasicAuth("operator", "secret")
-		req.Header.Set("X-Admin-Action", test.header)
-		req.Header.Set("Origin", test.origin)
-		req.Header.Set("Content-Type", test.contentType)
-		rec := httptest.NewRecorder()
-		router.ServeHTTP(rec, req)
-		if rec.Code != test.status {
-			t.Errorf("mutation %+v=%d %s", test, rec.Code, rec.Body.String())
-		}
-	}
+
 	for _, token := range []string{"", "secret"} {
 		var adminService *admin.Service
 		if token == "" {
@@ -207,7 +187,6 @@ func TestLocalEncodingRunLocalEndpointContract(t *testing.T) {
 	}
 	req := httptest.NewRequest("POST", path, strings.NewReader(`{}`))
 	req.SetBasicAuth("operator", "secret")
-	req.Header.Set("X-Admin-Action", "1")
 	req.Header.Set("Content-Type", "text/plain")
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
@@ -233,7 +212,7 @@ func TestLocalEncodingRunLocalEndpointContract(t *testing.T) {
 		t.Fatalf("operator error=%d %s", res.Code, res.Body.String())
 	}
 
-	// Auth and mutation guards match the rest of the admin surface.
+	// Admin authentication is required.
 	for _, method := range []string{"POST"} {
 		req := httptest.NewRequest(method, path, strings.NewReader(`{}`))
 		rec := httptest.NewRecorder()
@@ -241,22 +220,7 @@ func TestLocalEncodingRunLocalEndpointContract(t *testing.T) {
 		if rec.Code != 401 {
 			t.Errorf("no auth %s=%d", method, rec.Code)
 		}
-		req = httptest.NewRequest(method, path, strings.NewReader(`{}`))
-		req.SetBasicAuth("operator", "secret")
-		rec = httptest.NewRecorder()
-		router.ServeHTTP(rec, req)
-		if rec.Code != 403 {
-			t.Errorf("missing CSRF guard=%d", rec.Code)
-		}
-		req = httptest.NewRequest(method, path, strings.NewReader(`{}`))
-		req.SetBasicAuth("operator", "secret")
-		req.Header.Set("X-Admin-Action", "1")
-		req.Header.Set("Origin", "https://evil.invalid")
-		rec = httptest.NewRecorder()
-		router.ServeHTTP(rec, req)
-		if rec.Code != 403 {
-			t.Errorf("cross-origin mutation=%d", rec.Code)
-		}
+
 	}
 
 	// An unwired encoding service answers 503 UNAVAILABLE.
@@ -324,7 +288,6 @@ func TestAdminAutomaticCancelledRequest(t *testing.T) {
 	cancel()
 	req := httptest.NewRequest("POST", "/admin/api/automatic/embedding", strings.NewReader(`{"enabled":false}`)).WithContext(ctx)
 	req.SetBasicAuth("operator", "secret")
-	req.Header.Set("X-Admin-Action", "1")
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)

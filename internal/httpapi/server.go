@@ -111,7 +111,6 @@ func (s *Server) Router() http.Handler {
 	if s.admin != nil && s.adminToken != "" {
 		r.Route("/admin", func(r chi.Router) {
 			r.Use(s.requireAdminToken)
-			r.Use(s.requireAdminMutationProtection)
 			adminPage := web.AdminHandler()
 			r.Get("/", adminPage.ServeHTTP)
 			r.Get("/assets/*", adminPage.ServeHTTP)

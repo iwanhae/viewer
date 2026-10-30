@@ -139,7 +139,7 @@ replacement; if the state volume is lost, missing results are re-queued.
 
 ## Admin
 
-`/admin` is an independent React browser with its own entry, styles, and routes, registered only when `ADMIN_TOKEN` is set. Everything under `/admin` — pages and API alike — requires HTTP Basic auth with the token as the password; without the token the whole surface answers 404. Mutations additionally require the `X-Admin-Action: 1` header and a same-origin request: an explicit cross-origin `Origin` or a non-same-origin `Sec-Fetch-Site` is rejected, and no CORS is configured. This is a CSRF boundary, not identity — the Basic username is only a label. Behind a TLS-terminating proxy the same-origin scheme check honors `X-Forwarded-Proto` and compares `Origin` against the public `Host`, so only use it behind a proxy that overwrites those headers. The bundled JS under `/admin/assets` is static code served without auth; it contains no catalog data or credentials.
+`/admin` is an independent React browser with its own entry, styles, and routes, registered only when `ADMIN_TOKEN` is set. Everything under `/admin` — pages and API alike — requires HTTP Basic auth with the token as the password; without the token the whole surface answers 404. Basic authentication protects admin mutations as well as reads. The bundled JS under `/admin/assets` is static code served without auth; it contains no catalog data or credentials.
 
 ### Pages
 

@@ -253,8 +253,7 @@ export async function adminPost<T>(path: string, body: unknown): Promise<T> {
     cache: 'no-store',
     headers: {
       Accept: 'application/json',
-      'Content-Type': 'application/json',
-      'X-Admin-Action': '1'
+      'Content-Type': 'application/json'
     },
     body: JSON.stringify(body)
   })

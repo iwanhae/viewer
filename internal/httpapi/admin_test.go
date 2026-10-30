@@ -66,9 +66,6 @@ func doAdminBodyRequest(t *testing.T, router http.Handler, method, target, autho
 	if authorization != "" {
 		req.Header.Set("Authorization", authorization)
 	}
-	if method != http.MethodGet && method != http.MethodHead && method != http.MethodOptions {
-		req.Header.Set("X-Admin-Action", "1")
-	}
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
@@ -191,63 +188,17 @@ func TestAdminAuthChallenges(t *testing.T) {
 	}
 }
 
-func TestAdminMutationCSRFProtection(t *testing.T) {
+func TestAdminMutationWithoutCSRFHeaders(t *testing.T) {
 	router, _ := newAdminTestRouter(t, 1)
-	auth := basicAuthHeader("operator", "sekrit")
-	request := func(header, origin, fetchSite string) *httptest.ResponseRecorder {
-		req := httptest.NewRequest(http.MethodPost, "/admin/api/recover", strings.NewReader(`{"target":"unknown"}`))
-		req.Header.Set("Authorization", auth)
-		req.Header.Set("Content-Type", "application/json")
-		if header != "" {
-			req.Header.Set("X-Admin-Action", header)
-		}
-		if origin != "" {
-			req.Header.Set("Origin", origin)
-		}
-		if fetchSite != "" {
-			req.Header.Set("Sec-Fetch-Site", fetchSite)
-		}
-		rec := httptest.NewRecorder()
-		router.ServeHTTP(rec, req)
-		return rec
-	}
-	for name, rec := range map[string]*httptest.ResponseRecorder{
-		"missing custom header":     request("", "", ""),
-		"cross origin":              request("1", "https://evil.example", "cross-site"),
-		"same-site not same-origin": request("1", "", "same-site"),
-	} {
-		if rec.Code != http.StatusForbidden || !jsonBodyHasErrorCode(rec.Body.String(), "CSRF") {
-			t.Fatalf("%s status=%d body=%s want CSRF 403", name, rec.Code, rec.Body.String())
-		}
-	}
-	allowed := request("1", "http://example.com", "same-origin")
-	if allowed.Code != http.StatusBadRequest || !jsonBodyHasErrorCode(allowed.Body.String(), "INVALID_REQUEST") {
-		t.Fatalf("same-origin action status=%d body=%s want handler validation after CSRF", allowed.Code, allowed.Body.String())
-	}
-	proxied := httptest.NewRequest(http.MethodPost, "/admin/api/recover", strings.NewReader(`{"target":"unknown"}`))
-	proxied.Host = "photos.example.com"
-	proxied.Header.Set("Authorization", auth)
-	proxied.Header.Set("Content-Type", "application/json")
-	proxied.Header.Set("X-Admin-Action", "1")
-	proxied.Header.Set("Origin", "https://photos.example.com")
-	proxied.Header.Set("Sec-Fetch-Site", "same-origin")
-	proxied.Header.Set("X-Forwarded-Proto", "https")
-	proxiedRec := httptest.NewRecorder()
-	router.ServeHTTP(proxiedRec, proxied)
-	if proxiedRec.Code != http.StatusBadRequest || !jsonBodyHasErrorCode(proxiedRec.Body.String(), "INVALID_REQUEST") {
-		t.Fatalf("same-origin HTTPS proxy action status=%d body=%s want handler validation after CSRF", proxiedRec.Code, proxiedRec.Body.String())
-	}
-	missingJSONType := httptest.NewRequest(http.MethodPost, "/admin/api/recover", strings.NewReader(`{"target":"unknown"}`))
-	missingJSONType.Header.Set("Authorization", auth)
-	missingJSONType.Header.Set("X-Admin-Action", "1")
-	missingJSONTypeRec := httptest.NewRecorder()
-	router.ServeHTTP(missingJSONTypeRec, missingJSONType)
-	if missingJSONTypeRec.Code != http.StatusBadRequest || !strings.Contains(missingJSONTypeRec.Body.String(), "Content-Type must be application/json") {
-		t.Fatalf("legacy recover without JSON Content-Type status=%d body=%s", missingJSONTypeRec.Code, missingJSONTypeRec.Body.String())
-	}
-	get := doAdminRequest(t, router, http.MethodGet, "/admin/api/overview", auth)
-	if get.Code != http.StatusOK {
-		t.Fatalf("GET status=%d body=%s; reads must not require the action header", get.Code, get.Body.String())
+	req := httptest.NewRequest(http.MethodPost, "/admin/api/recover", strings.NewReader(`{"target":"unknown"}`))
+	req.SetBasicAuth("operator", "sekrit")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Origin", "https://other.example")
+	req.Header.Set("Sec-Fetch-Site", "cross-site")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest || !jsonBodyHasErrorCode(rec.Body.String(), "INVALID_REQUEST") {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 	}
 }
 
