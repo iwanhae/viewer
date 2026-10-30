@@ -160,56 +160,33 @@ export type PipelineEvent = {
 
 export type HistoryPage = { events: PipelineEvent[]; nextCursor: string | null }
 
-export type RecoveryAction = 'retry_failed_encoding' | 'retry_failed_embedding' | 'release_expired_encoding' | 'release_expired_embedding'
-
-export type RecoveryPreview = {
-  previewId: string
-  actor: string
-  actorNote: string
-  action: RecoveryAction
-  createdAt: string
-  expiresAt: string
-  targetCount: number
-  eligibleCount: number
-  skippedCount: number
-  skippedReasons: Record<string, number>
-  selectedPhotos: number
-  affectedPhotos: number
-  affectedAlbums: number
-  sharedBlobWarning: boolean
-}
-
-export type RecoveryOperation = {
-  id: string
-  previewId: string
-  actor: string
-  actorNote: string
-  action: RecoveryAction
-  status: 'queued' | 'running' | 'completed' | 'partially_failed' | 'failed' | string
-  createdAt: string
-  updatedAt: string
+// EmbeddingCounts mirrors catalog.EmbeddingCounts, the snapshot POST
+// /admin/api/reindex answers with.
+export type EmbeddingCounts = {
   total: number
-  eligible: number
-  succeeded: number
-  conflicts: number
-  skipped: number
+  ready: number
   failed: number
-  selectedPhotos: number
-  affectedPhotos: number
-  affectedAlbums: number
-  sharedBlobWarning: boolean
+  processing: number
+  pending: number
 }
 
-export type RecoveryResult = {
-  ordinal: number
-  hash: string
-  status: 'queued' | 'succeeded' | 'applied' | 'conflict' | 'skipped' | 'failed' | string
-  reason?: string
-  updatedAt: string
-}
+export type RecoverTarget =
+  | 'release_expired_claims'
+  | 'release_all_claims'
+  | 'retry_failed_embeddings'
+  | 'retry_failed_encodings'
+  | 'reset_stuck_encoding'
 
-export type RecoveryOperationsPage = { operations: RecoveryOperation[]; nextCursor: string | null }
-export type RecoveryResultsPage = { operation: RecoveryOperation; results: RecoveryResult[]; nextCursor: string | null }
+// One synchronous recovery answer from POST /admin/api/recover: exactly one
+// action payload is set. Only the row counts the dashboard shows are typed;
+// the fresh stats snapshots the server also returns are not rendered.
+export type RecoverResult = {
+  target: string
+  release?: { released: number }
+  retry?: { reset: number }
+  encoding?: { counts: { releasedExpiredLeased: number; resetReceived: number } }
+  encodingRetry?: { reset: number }
+}
 
 export type JobRunStage = 'embedding' | 'encoding'
 export type JobRunCounts = {
@@ -371,6 +348,20 @@ export async function adminPost<T>(path: string, body: unknown, idempotencyKey?:
     throw new AdminAPIError(error.error?.message || `요청 실패 (HTTP ${response.status})`, response.status)
   }
   return result as T
+}
+
+// recover runs one recovery target synchronously. An optional hashes list
+// narrows the target to those blobs; without it the target applies library
+// wide, which is the historical behavior.
+export async function recover(target: RecoverTarget, hashes?: string[]): Promise<RecoverResult> {
+  const body = hashes && hashes.length > 0 ? { target, hashes } : { target }
+  return adminPost<RecoverResult>(apiPath('recover'), body)
+}
+
+// reindex flips every ready embedding back to pending and answers with the
+// fresh embedding counts, so the pending surge is visible immediately.
+export async function reindex(): Promise<EmbeddingCounts> {
+  return adminPost<EmbeddingCounts>(apiPath('reindex'), {})
 }
 
 export function apiPath(resource: string, search = ''): string {
