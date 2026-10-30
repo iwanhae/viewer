@@ -151,6 +151,20 @@ type EmbeddingCounts = {
   pending: number
 }
 
+// VectorSyncResult is the answer of POST /admin/api/vector-sync: the diff's
+// both-sides counts plus the fresh embedding counts. started=false means
+// another pass was already running, so this request did no work.
+export type VectorSyncResult = {
+  started: boolean
+  missingPoints: number
+  resetBlobs: number
+  skippedProcessing: number
+  failedWithoutPoint: number
+  orphanPoints: number
+  durationMs: number
+  counts: EmbeddingCounts
+}
+
 export type RecoverTarget =
   | 'release_expired_claims'
   | 'release_all_claims'
@@ -282,6 +296,13 @@ export async function recover(target: RecoverTarget, hashes?: string[]): Promise
 // fresh embedding counts, so the pending surge is visible immediately.
 export async function reindex(): Promise<EmbeddingCounts> {
   return adminPost<EmbeddingCounts>(apiPath('reindex'), {})
+}
+
+// vector-sync diffs the catalog's expected points against the vector
+// store and re-queues only the blobs whose points are missing; the
+// workers rebuild them. started=false means a pass was already running.
+export async function vectorSync(): Promise<VectorSyncResult> {
+  return adminPost<VectorSyncResult>(apiPath('vector-sync'), {})
 }
 
 // runLocalEncoding starts one background drain over every pending non-WebP

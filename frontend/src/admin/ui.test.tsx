@@ -467,11 +467,12 @@ describe('admin React UI', () => {
       if (url === '/admin/api/overview') return jsonResponse(overview)
       if (url === '/admin/api/automatic/embedding') return jsonResponse(automaticStatus)
       if (url === '/admin/api/recover') return jsonResponse({ target: 'release_expired_claims', release: { released: 2, counts: embeddingCounts } })
+      if (url === '/admin/api/vector-sync') return jsonResponse({ started: true, missingPoints: 0, resetBlobs: 0, skippedProcessing: 0, failedWithoutPoint: 0, orphanPoints: 0, durationMs: 10, counts: embeddingCounts })
       return jsonResponse({})
     })
     renderAt('/')
     expect(await screen.findByRole('heading', { name: 'Recovery actions' })).toBeTruthy()
-    for (const label of ['Retry failed embeddings', 'Retry failed encodings', 'Release expired embedding claims', 'Reset encoding queue', 'Re-embed everything']) {
+    for (const label of ['Retry failed embeddings', 'Retry failed encodings', 'Release expired embedding claims', 'Reset encoding queue', 'Sync vector store', 'Re-embed everything']) {
       expect(screen.getByRole('button', { name: label })).toBeTruthy()
     }
     expect(screen.queryByRole('button', { name: /Release all claims|Release every claim/ })).toBeNull()
@@ -511,6 +512,52 @@ describe('admin React UI', () => {
     expect(reindexCall?.[1]?.method).toBe('POST')
     expect(reindexCall?.[1]?.body).toBe('{}')
     await waitFor(() => expect(fetchMock.mock.calls.filter(([url]) => String(url) === '/admin/api/overview').length).toBe(2))
+  })
+
+  it('syncs the vector store only after confirmation and reports the diff counts', async () => {
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(false)
+    const declined = mockFetchWithInit((url) => url === '/admin/api/overview'
+      ? jsonResponse(overview)
+      : url === '/admin/api/automatic/embedding' ? jsonResponse(automaticStatus) : jsonResponse({}))
+    renderAt('/')
+    fireEvent.click(await screen.findByRole('button', { name: 'Sync vector store' }))
+    expect(confirmSpy).toHaveBeenCalledTimes(1)
+    expect(confirmSpy.mock.calls[0][0]).toContain('re-embeds only those blobs')
+    // Declining the confirmation sends nothing.
+    expect(declined.mock.calls.some(([url]) => String(url) === '/admin/api/vector-sync')).toBe(false)
+    expect(screen.queryByText(/Vector sync finished/)).toBeNull()
+
+    cleanup()
+    confirmSpy.mockReturnValue(true)
+    const fetchMock = mockFetchWithInit((url) => {
+      if (url === '/admin/api/overview') return jsonResponse(overview)
+      if (url === '/admin/api/automatic/embedding') return jsonResponse(automaticStatus)
+      if (url === '/admin/api/vector-sync') return jsonResponse({ started: true, missingPoints: 12, resetBlobs: 11, skippedProcessing: 1, failedWithoutPoint: 0, orphanPoints: 3, durationMs: 41230, counts: embeddingCounts })
+      return jsonResponse({})
+    })
+    renderAt('/')
+    fireEvent.click(await screen.findByRole('button', { name: 'Sync vector store' }))
+    expect(await screen.findByText(/Vector sync finished in 41\.2s/)).toBeTruthy()
+    expect(screen.getByText(/re-queued 11 blob\(s\) for 12 missing photo\(s\)/)).toBeTruthy()
+    expect(screen.getByText(/skipped 1 in-flight/)).toBeTruthy()
+    expect(screen.getByText(/orphan points 3 \(reported, not deleted\)/)).toBeTruthy()
+    const syncCall = fetchMock.mock.calls.find(([url]) => String(url) === '/admin/api/vector-sync')
+    expect(syncCall?.[1]?.method).toBe('POST')
+    expect(syncCall?.[1]?.body).toBe('{}')
+    await waitFor(() => expect(fetchMock.mock.calls.filter(([url]) => String(url) === '/admin/api/overview').length).toBe(2))
+
+    // started=false is the already-running answer, surfaced as a result
+    // line rather than an error.
+    cleanup()
+    mockFetchWithInit((url) => {
+      if (url === '/admin/api/overview') return jsonResponse(overview)
+      if (url === '/admin/api/automatic/embedding') return jsonResponse(automaticStatus)
+      if (url === '/admin/api/vector-sync') return jsonResponse({ started: false, missingPoints: 0, resetBlobs: 0, skippedProcessing: 0, failedWithoutPoint: 0, orphanPoints: 0, durationMs: 0, counts: embeddingCounts })
+      return jsonResponse({})
+    })
+    renderAt('/')
+    fireEvent.click(await screen.findByRole('button', { name: 'Sync vector store' }))
+    expect(await screen.findByText('A vector sync was already running; this request did no work.')).toBeTruthy()
   })
 
   it('shows global recovery errors without dropping the overview', async () => {

@@ -16,6 +16,7 @@ import {
   recover,
   reindex,
   runLocalEncoding,
+  vectorSync,
   type Album,
   type AlbumDetail,
   type Blob,
@@ -29,6 +30,7 @@ import {
   type Photo,
   type RecoverResult,
   type RecoverTarget,
+  type VectorSyncResult,
   type AutomaticEmbedding
 } from './api'
 
@@ -433,7 +435,7 @@ function PhotosPage() {
 
 type SyncRecoveryAction = {
   id: string
-  target: RecoverTarget | 'reindex'
+  target: RecoverTarget | 'reindex' | 'vectorSync'
   label: string
   confirm: string
   hashes?: string[]
@@ -518,6 +520,12 @@ const globalRecoveryActions: SyncRecoveryAction[] = [
     confirm: 'Returns every expired encoding lease and uncommitted result to the queued state. Rows being committed are untouched. Continue?'
   },
   {
+    id: 'vector_sync',
+    target: 'vectorSync',
+    label: 'Sync vector store',
+    confirm: 'Finds photos whose blob is ready but whose point is missing from the vector store, and re-embeds only those blobs. Deletes nothing, takes about a minute, and is safe to re-run. Continue?'
+  },
+  {
     id: 'reindex',
     target: 'reindex',
     label: 'Re-embed everything',
@@ -552,11 +560,24 @@ function useSyncRecovery(onDone: () => void) {
 }
 
 async function invokeSyncRecovery(action: SyncRecoveryAction): Promise<string> {
+  if (action.target === 'vectorSync') {
+    return vectorSyncResultLine(await vectorSync())
+  }
   if (action.target === 'reindex') {
     const counts = await reindex()
     return `Full re-embedding scheduled · total ${counts.total.toLocaleString()} · queued ${counts.pending.toLocaleString()} · processing ${counts.processing.toLocaleString()} · failed ${counts.failed.toLocaleString()} · ready ${counts.ready.toLocaleString()}`
   }
   return recoverResultLine(await recover(action.target, action.hashes))
+}
+
+// The sync line reports both sides of the diff: what was re-queued and
+// what was deliberately left alone, so a no-op pass reads as "nothing
+// was wrong" instead of silence. Orphan counts are reported by the
+// server but never deleted.
+function vectorSyncResultLine(result: VectorSyncResult): string {
+  if (!result.started) return 'A vector sync was already running; this request did no work.'
+  const n = (v: number) => v.toLocaleString()
+  return `Vector sync finished in ${(result.durationMs / 1000).toFixed(1)}s · re-queued ${n(result.resetBlobs)} blob(s) for ${n(result.missingPoints)} missing photo(s) · skipped ${n(result.skippedProcessing)} in-flight · failed ${n(result.failedWithoutPoint)} without points · orphan points ${n(result.orphanPoints)} (reported, not deleted)`
 }
 
 // The result line reports the rows the server actually moved, so a no-op (for
