@@ -582,20 +582,26 @@ func newScrollPoint(id, hash string, vector []float32) scrollPoint {
 	return p
 }
 
-// scrollFakeRequest records what one scroll request asked for.
+// scrollFakeRequest records what one scroll request asked for. NoFilter is
+// true when the request carried no filter at all (the whole-collection ID
+// scan). WithPayload mirrors the request's pointer: nil means the key was
+// omitted, leaving Qdrant's default-true in effect.
 type scrollFakeRequest struct {
-	Hashes     []string
-	Limit      int
-	WithVector bool
-	Offset     *string
+	Hashes      []string
+	NoFilter    bool
+	WithPayload *bool
+	WithVector  bool
+	Limit       int
+	Offset      *string
 }
 
 // scrollFake is a cursor-honoring stand-in for Qdrant's scroll endpoint. It
 // holds a fixed store of points sorted by point ID (Qdrant scrolls in ID
-// order), serves the subset matching the request's hash should-filter at most
-// limit points per request, resumes strictly after the request's offset when
-// present, and reports next_page_offset — the last served point's ID — only
-// when more matching points remain in that filtered set.
+// order), serves the subset matching the request's hash should-filter — or
+// every stored point when the request carries no filter, as the ID scan does
+// — at most limit points per request, resumes strictly after the request's
+// offset when present, and reports next_page_offset — the last served
+// point's ID — only when more matching points remain in that set.
 type scrollFake struct {
 	points   []scrollPoint
 	requests []scrollFakeRequest
@@ -619,7 +625,7 @@ func (f *scrollFake) handler(t *testing.T) http.Handler {
 			return
 		}
 		var body struct {
-			Filter struct {
+			Filter *struct {
 				Should []struct {
 					Key   string `json:"key"`
 					Match struct {
@@ -627,33 +633,39 @@ func (f *scrollFake) handler(t *testing.T) http.Handler {
 					} `json:"match"`
 				} `json:"should"`
 			} `json:"filter"`
-			WithVector bool    `json:"with_vector"`
-			Limit      int     `json:"limit"`
-			Offset     *string `json:"offset"`
+			WithPayload *bool   `json:"with_payload"`
+			WithVector  bool    `json:"with_vector"`
+			Limit       int     `json:"limit"`
+			Offset      *string `json:"offset"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			t.Errorf("decode body: %v", err)
 			http.Error(w, "bad request", http.StatusBadRequest)
 			return
 		}
-		wanted := make(map[string]bool, len(body.Filter.Should))
-		hashes := make([]string, 0, len(body.Filter.Should))
-		for _, c := range body.Filter.Should {
-			if c.Key != "hash" {
-				t.Errorf("should key = %q, want hash", c.Key)
+		wanted := make(map[string]bool)
+		var hashes []string
+		if body.Filter != nil {
+			for _, c := range body.Filter.Should {
+				if c.Key != "hash" {
+					t.Errorf("should key = %q, want hash", c.Key)
+				}
+				wanted[c.Match.Value] = true
+				hashes = append(hashes, c.Match.Value)
 			}
-			wanted[c.Match.Value] = true
-			hashes = append(hashes, c.Match.Value)
 		}
 		f.requests = append(f.requests, scrollFakeRequest{
-			Hashes:     hashes,
-			Limit:      body.Limit,
-			WithVector: body.WithVector,
-			Offset:     body.Offset,
+			Hashes:      hashes,
+			NoFilter:    body.Filter == nil,
+			WithPayload: body.WithPayload,
+			WithVector:  body.WithVector,
+			Limit:       body.Limit,
+			Offset:      body.Offset,
 		})
 
-		// Collect every stored point matching the filter, in ID order,
-		// resuming strictly after the cursor.
+		// Collect every stored point matching the filter — or every point at
+		// all when the request carries no filter — in ID order, resuming
+		// strictly after the cursor.
 		start := 0
 		if body.Offset != nil {
 			for start < len(f.points) && f.points[start].ID <= *body.Offset {
@@ -662,19 +674,34 @@ func (f *scrollFake) handler(t *testing.T) http.Handler {
 		}
 		matching := make([]scrollPoint, 0)
 		for _, p := range f.points[start:] {
-			if wanted[p.Payload.Hash] {
+			if body.Filter == nil || wanted[p.Payload.Hash] {
 				matching = append(matching, p)
 			}
 		}
 		served := matching
-		result := map[string]any{"points": served}
 		if len(matching) > body.Limit {
 			served = matching[:body.Limit]
-			result["points"] = served
+		}
+		// Serve exactly what the request asked for, like a real Qdrant: the
+		// id always, the payload unless with_payload explicitly denied it
+		// (Qdrant's default is true), the vector only when with_vector.
+		includePayload := body.WithPayload == nil || *body.WithPayload
+		servedJSON := make([]map[string]any, len(served))
+		for i, p := range served {
+			point := map[string]any{"id": p.ID}
+			if includePayload {
+				point["payload"] = map[string]any{"hash": p.Payload.Hash}
+			}
+			if body.WithVector {
+				point["vector"] = p.Vector
+			}
+			servedJSON[i] = point
+		}
+		result := map[string]any{"points": servedJSON}
+		if len(matching) > body.Limit {
 			// More matching points remain, so hand back the cursor: the ID
 			// of the last point this page served.
-			next := served[len(served)-1].ID
-			result["next_page_offset"] = next
+			result["next_page_offset"] = served[len(served)-1].ID
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{"result": result, "status": "ok"})
@@ -877,6 +904,161 @@ func TestRetrieveVectorsByHashesEmptyInput(t *testing.T) {
 	}
 	if len(got) != 0 {
 		t.Fatalf("got = %v, want an empty map", got)
+	}
+}
+
+// TestScrollPointIDsPagesWholeCollection pins the ID scan's cursor chain: a
+// 2500-point collection must come back as exactly three pages (1024 + 1024 +
+// 452), every request filterless and asking for neither payload nor vector,
+// the first carrying no offset, and each later one resuming from the previous
+// page's last-point ID. All 2500 IDs come back once, in scroll order.
+func TestScrollPointIDsPagesWholeCollection(t *testing.T) {
+	const total = 2500
+	points := make([]scrollPoint, 0, total)
+	for i := 0; i < total; i++ {
+		// Payload hash and vector are irrelevant to the ID scan; the ID
+		// pattern keeps the store's ID order stable and inspectable.
+		points = append(points, newScrollPoint(fmt.Sprintf("%08d-0000-0000-0000-000000000000", i), "hash-irrelevant", nil))
+	}
+	fake := newScrollFake(points)
+	srv := httptest.NewServer(fake.handler(t))
+	defer srv.Close()
+
+	c := newTestClient(srv, "")
+	got, err := c.ScrollPointIDs(context.Background())
+	if err != nil {
+		t.Fatalf("ScrollPointIDs: %v", err)
+	}
+
+	// 2500 points at limit 1024 page as 1024 + 1024 + 452: three requests.
+	if len(fake.requests) != 3 {
+		t.Fatalf("requests = %d, want 3 (1024 + 1024 + 452)", len(fake.requests))
+	}
+	if fake.requests[0].Offset != nil {
+		t.Errorf("first page offset = %q, want none", *fake.requests[0].Offset)
+	}
+	wantCursors := []string{points[1023].ID, points[2047].ID}
+	for i, cursor := range wantCursors {
+		req := fake.requests[i+1]
+		if req.Offset == nil {
+			t.Errorf("page %d carried no offset, want cursor %q", i+2, cursor)
+			continue
+		}
+		if *req.Offset != cursor {
+			t.Errorf("page %d offset = %q, want the previous page's cursor %q", i+2, *req.Offset, cursor)
+		}
+	}
+	for i, req := range fake.requests {
+		if !req.NoFilter {
+			t.Errorf("request %d carried a filter, want none: the scan covers the whole collection", i)
+		}
+		if req.WithPayload == nil || *req.WithPayload {
+			t.Errorf("request %d with_payload = %v, want an explicit false", i, req.WithPayload)
+		}
+		if req.WithVector {
+			t.Errorf("request %d asked for with_vector, want none", i)
+		}
+		if req.Limit != idScrollPageSize {
+			t.Errorf("request %d limit = %d, want %d", i, req.Limit, idScrollPageSize)
+		}
+	}
+
+	// Every ID exactly once, in the ID order the scroll walked: matching the
+	// full sorted store element-for-element proves both at once.
+	if len(got) != total {
+		t.Fatalf("got %d IDs, want %d", len(got), total)
+	}
+	for i, id := range got {
+		if want := points[i].ID; id != want {
+			t.Errorf("ids[%d] = %q, want %q", i, id, want)
+		}
+	}
+}
+
+// TestScrollPointIDsEmptyCollection checks the empty-collection contract: a
+// single request that returns no points and no cursor yields an empty,
+// non-nil slice and no error.
+func TestScrollPointIDsEmptyCollection(t *testing.T) {
+	fake := newScrollFake(nil)
+	srv := httptest.NewServer(fake.handler(t))
+	defer srv.Close()
+
+	c := newTestClient(srv, "")
+	got, err := c.ScrollPointIDs(context.Background())
+	if err != nil {
+		t.Fatalf("ScrollPointIDs: %v", err)
+	}
+	if got == nil || len(got) != 0 {
+		t.Fatalf("got = %v, want an empty non-nil slice", got)
+	}
+	if len(fake.requests) != 1 {
+		t.Errorf("requests = %d, want exactly 1 for an empty collection", len(fake.requests))
+	}
+}
+
+// TestScrollPointIDsStopsAtPageCap guards against a misbehaving server that
+// always reports another page: the client must give up with the page-cap
+// error after maxScrollPages requests instead of scrolling forever.
+func TestScrollPointIDsStopsAtPageCap(t *testing.T) {
+	pages := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/collections/"+testCollection+"/points/scroll" {
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		pages++
+		w.Header().Set("Content-Type", "application/json")
+		// Broken server: a fresh non-null cursor every time, never a last page.
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"result": map[string]any{
+				"points":           []any{},
+				"next_page_offset": fmt.Sprintf("%08d-0000-0000-0000-000000000000", pages),
+			},
+			"status": "ok",
+		})
+	}))
+	defer srv.Close()
+
+	c := newTestClient(srv, "")
+	got, err := c.ScrollPointIDs(context.Background())
+	if err == nil {
+		t.Fatal("ScrollPointIDs succeeded against an endless scroll, want the page-cap error")
+	}
+	if !strings.Contains(err.Error(), fmt.Sprintf("did not terminate after %d pages", maxScrollPages)) {
+		t.Fatalf("err = %v, want the page-cap error", err)
+	}
+	if pages != maxScrollPages {
+		t.Errorf("server saw %d requests, want exactly %d before giving up", pages, maxScrollPages)
+	}
+	if got != nil {
+		t.Errorf("got = %v IDs, want none on error", got)
+	}
+}
+
+func TestScrollPointIDsFailsOnNon2xx(t *testing.T) {
+	requests := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		w.Header().Set("Content-Type", "text/plain")
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte("boom"))
+	}))
+	defer srv.Close()
+
+	c := newTestClient(srv, "")
+	got, err := c.ScrollPointIDs(context.Background())
+	if err == nil {
+		t.Fatal("ScrollPointIDs succeeded against a 500, want error")
+	}
+	if !strings.Contains(err.Error(), "500") {
+		t.Errorf("error %q does not mention the HTTP status", err)
+	}
+	if got != nil {
+		t.Errorf("got = %v IDs, want none on error", got)
+	}
+	if requests != 1 {
+		t.Errorf("requests = %d, want 1: a non-2xx must abort the scan", requests)
 	}
 }
 

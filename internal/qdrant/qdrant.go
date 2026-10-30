@@ -36,6 +36,14 @@ const (
 	// claims another page into an error instead of an endless request loop.
 	maxScrollPages = 1000
 
+	// idScrollPageSize is the page size for the whole-collection ID scan.
+	// Pages carry no vector or payload bytes — only point-ID UUID strings —
+	// so they are far cheaper than the vector-bearing batchSize pages: at
+	// the ~312k points production holds, 1024 IDs per page keeps a full
+	// scan around ~305 requests instead of the 1200+ that batchSize 256
+	// would need.
+	idScrollPageSize = 1024
+
 	// maxErrBody caps how much of an error response body lands in an error
 	// message: enough to see Qdrant's explanation, not enough to flood logs.
 	maxErrBody = 512
@@ -446,6 +454,44 @@ func (c *Client) scrollChunk(ctx context.Context, hashes []string, vectors map[s
 	return fmt.Errorf("scroll for %d hash(es) did not terminate after %d pages", len(hashes), maxScrollPages)
 }
 
+// ScrollPointIDs returns the IDs of every point in the collection, paging
+// through the whole collection with the scroll cursor. It asks for neither
+// payload nor vector — callers reconcile ID sets and never need the bytes —
+// which keeps each page tiny even though collections hold hundreds of
+// thousands of points.
+func (c *Client) ScrollPointIDs(ctx context.Context) ([]string, error) {
+	ids := make([]string, 0, idScrollPageSize)
+	// No filter: the scan covers the whole collection. Point IDs are UUID
+	// strings, so the scroll cursor is one too — nil starts at the front of
+	// the collection, a returned ID resumes strictly after that point.
+	var offset *string
+	for page := 0; page < maxScrollPages; page++ {
+		noPayload := false
+		body := scrollRequest{
+			// Explicit false, not an omitted key: omitting it would leave
+			// Qdrant's default in place and ship every point's payload.
+			WithPayload: &noPayload,
+			WithVector:  false,
+			Limit:       idScrollPageSize,
+			Offset:      offset,
+		}
+		var out scrollResponse
+		if err := c.do(ctx, http.MethodPost, c.endpoint("/points/scroll", nil), body, &out); err != nil {
+			return nil, fmt.Errorf("scroll point IDs: %w", err)
+		}
+		for _, p := range out.Result.Points {
+			ids = append(ids, p.ID)
+		}
+		if out.Result.NextPageOffset == nil {
+			// No cursor means the collection is exhausted; an empty one
+			// answers the very first page this way.
+			return ids, nil
+		}
+		offset = out.Result.NextPageOffset
+	}
+	return nil, fmt.Errorf("scroll point IDs did not terminate after %d pages", maxScrollPages)
+}
+
 // DeleteByAlbum removes every point belonging to albumID, waiting for the
 // deletion to land so a following Count or re-upload starts from a clean slate.
 func (c *Client) DeleteByAlbum(ctx context.Context, albumID string) error {
@@ -568,20 +614,26 @@ type groupSearchResponse struct {
 
 // scrollRequest is the POST .../points/scroll body. Offset is the scroll
 // cursor taken from the previous page's next_page_offset; nil starts at the
-// front of the filtered set.
+// front of the filtered set. WithPayload is a pointer on purpose: Qdrant's
+// default is payload included, so nil omits the key and keeps that default
+// (what the hash scroll relies on) while an explicit false asks for IDs only.
 type scrollRequest struct {
-	Filter     *filter `json:"filter,omitempty"`
-	WithVector bool    `json:"with_vector"`
-	Limit      int     `json:"limit"`
-	Offset     *string `json:"offset,omitempty"`
+	Filter      *filter `json:"filter,omitempty"`
+	WithPayload *bool   `json:"with_payload,omitempty"`
+	WithVector  bool    `json:"with_vector"`
+	Limit       int     `json:"limit"`
+	Offset      *string `json:"offset,omitempty"`
 }
 
-// scrollResponse is the slice of the scroll reply the client uses.
-// NextPageOffset is the cursor for the following page; Qdrant omits it (and
-// encoding/json leaves the pointer nil) once the last page is served.
+// scrollResponse is the slice of the scroll reply the client uses. Each
+// point carries its ID unconditionally; payload and vector are populated
+// only when the request asked for them. NextPageOffset is the cursor for the
+// following page; Qdrant omits it (and encoding/json leaves the pointer nil)
+// once the last page is served.
 type scrollResponse struct {
 	Result struct {
 		Points []struct {
+			ID      string       `json:"id"`
 			Payload pointPayload `json:"payload"`
 			Vector  []float32    `json:"vector"`
 		} `json:"points"`
