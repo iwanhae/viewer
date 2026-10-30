@@ -107,19 +107,6 @@ type Service struct {
 	runActive    bool
 	runStartedAt time.Time
 	runEmbedded  int
-
-	// lastClaimMs, lastRenewMs and lastResultsMs are the admin dashboard's
-	// liveness stamps: the last time anyone attempted the matching pipeline
-	// entry point, as unix milliseconds (0 = no attempt since process start).
-	// They are written at method entry, before any guard can reject the call,
-	// because the dashboard's question is "is a worker alive and trying" —
-	// which even an always-failing worker (dead catalog, store outage) answers
-	// yes to. Whether the pipeline actually makes progress is diagnosed from
-	// the catalog's embedding counts instead. Atomic so worker goroutines can
-	// stamp while the dashboard reads, with no lock on the hot path.
-	lastClaimMs   atomic.Int64
-	lastRenewMs   atomic.Int64
-	lastResultsMs atomic.Int64
 }
 
 // NewService builds a recommendation service. A nil embedder switches the
@@ -463,11 +450,7 @@ func (s *Service) ClaimEmbeddings(ctx context.Context, limit int) ([]catalog.Blo
 // ClaimExternalEmbeddings works without a local model and preserves external
 // polling limits and deadlines. External workers remain outside local cancellation.
 func (s *Service) ClaimExternalEmbeddings(ctx context.Context, limit int) ([]catalog.Blob, time.Time, error) {
-	if s == nil {
-		return nil, time.Time{}, fmt.Errorf("catalog is not available")
-	}
-	noteActivity(&s.lastClaimMs)
-	if s.catalog == nil {
+	if s == nil || s.catalog == nil {
 		return nil, time.Time{}, fmt.Errorf("catalog is not available")
 	}
 	leaseUntil := time.Now().Add(DefaultLeaseTTL)
@@ -485,11 +468,7 @@ func (s *Service) RenewLeases(ctx context.Context, hashes []string) (time.Time, 
 }
 
 func (s *Service) RenewExternalLeases(ctx context.Context, hashes []string) (time.Time, []string, error) {
-	if s == nil {
-		return time.Time{}, nil, fmt.Errorf("catalog is not available")
-	}
-	noteActivity(&s.lastRenewMs)
-	if s.catalog == nil {
+	if s == nil || s.catalog == nil {
 		return time.Time{}, nil, fmt.Errorf("catalog is not available")
 	}
 	leaseUntil := time.Now().Add(DefaultLeaseTTL)
@@ -531,11 +510,7 @@ func (s *Service) applyEmbeddingResults(ctx context.Context, results []catalog.E
 }
 
 func (s *Service) applyEmbeddingResultsWithCompletion(ctx, completionCtx context.Context, results []catalog.EmbeddingResult, tokens []string) (applied int, rejected []catalog.RejectedEmbedding, err error) {
-	if s == nil {
-		return 0, nil, fmt.Errorf("catalog is not available")
-	}
-	noteActivity(&s.lastResultsMs)
-	if s.catalog == nil {
+	if s == nil || s.catalog == nil {
 		return 0, nil, fmt.Errorf("catalog is not available")
 	}
 

@@ -15,9 +15,9 @@ import (
 	"viewer/internal/recommend"
 )
 
-// VectorCounter is the read-only slice of the vector store the diagnostics
-// snapshot needs. It is satisfied structurally by *qdrant.Client; keeping it
-// an interface lets tests stand in a fake instead of a live Qdrant.
+// VectorCounter is the read-only slice of the vector store the overview's
+// health section needs. It is satisfied structurally by *qdrant.Client;
+// keeping it an interface lets tests stand in a fake instead of a live Qdrant.
 type VectorCounter interface {
 	CountVectors(ctx context.Context) (int, error)
 }
@@ -50,7 +50,7 @@ type Service struct {
 }
 
 // NewService builds the admin service. A nil vectors counter makes the
-// diagnostics snapshot report the vector store as disabled rather than
+// overview's health section report the vector store as disabled rather than
 // counting anything — which is how a deployment without Qdrant runs — and a
 // nil catalog makes every call fail, the same contract the recommend service
 // applies.

@@ -10,16 +10,22 @@ const blobCount = { blobCount: 1 }
 const noBlobs = { blobCount: 0 }
 const overview: Overview = {
   measuredAt: '2026-10-14T12:00:00Z',
-  units: { counts: 'counts', measuredAt: 'RFC3339 UTC' },
   library: { albums: 1, photos: 3, blobs: 1 },
   encoding: {
-    categories: { queued: blobCount, processing: noBlobs, validating: noBlobs, committing: noBlobs, completed: noBlobs, skipped: noBlobs, failed: noBlobs, unknown: noBlobs },
-    skippedReasons: { webp: noBlobs, nonWebp: noBlobs },
-    rawStates: { future_encode_state: blobCount }
+    categories: { queued: blobCount, processing: noBlobs, validating: noBlobs, committing: noBlobs, completed: noBlobs, skipped: noBlobs, failed: noBlobs, unknown: noBlobs }
   },
   embedding: {
-    categories: { queued: blobCount, processing: noBlobs, completed: noBlobs, failed: noBlobs, unknown: noBlobs },
-    rawStates: { future_embed_state: blobCount }
+    categories: { queued: blobCount, processing: noBlobs, completed: noBlobs, failed: noBlobs, unknown: noBlobs }
+  },
+  health: {
+    encodingExpiredLeases: 1,
+    embeddingExpiredLeases: 2,
+    unreferencedBlobs: 3,
+    missingBlobPhotos: 4,
+    encodingEnabled: true,
+    modelEnabled: true,
+    vectorStoreEnabled: true,
+    vectorCount: { status: 'available', measuredAt: '2026-10-14T12:00:02Z', expectedPoints: 5, actualPoints: 5, countAgreement: true }
   }
 }
 
@@ -102,7 +108,7 @@ const automaticStatus = { enabled: true, running: true }
 describe('admin React UI', () => {
   afterEach(() => { cleanup(); vi.unstubAllGlobals(); vi.restoreAllMocks() })
 
-  it('drills overview unique-blob counts into blob filters and preserves unknown raw states', async () => {
+  it('drills overview unique-blob counts into blob filters', async () => {
     const fetchMock = mockFetch((url) => url === '/admin/api/overview'
       ? jsonResponse(overview)
       : url === '/admin/api/automatic/embedding'
@@ -114,15 +120,11 @@ describe('admin React UI', () => {
     const row = await within(section).findByRole('row', { name: /대기 \(queued\)/ })
     const countLink = within(row).getByRole('link', { name: '1' })
     expect(countLink.getAttribute('href')).toBe('/blobs?encoding=queued')
-    const rawLink = screen.getAllByRole('link', { name: '1' }).find((link) => link.getAttribute('href')?.includes('encodingRaw=future_encode_state'))
-    expect(rawLink?.getAttribute('href')).toContain('encodingRaw=future_encode_state')
     expect(screen.getByText(/사진·앨범 참조 수를 상태별로 나누지 않습니다/)).toBeTruthy()
-    expect(screen.queryByText(/블롭이 없는 사진/)).toBeNull()
     expect(screen.getByText(/인코딩 상태와 관계없이 임베딩 작업자가 처리할 수 있는 상태/)).toBeTruthy()
     expect(screen.queryByRole('link', { name: /차단됨/ })).toBeNull()
     fireEvent.click(countLink)
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/admin/api/blobs?encoding=queued', expect.anything()))
-    expect(fetchMock.mock.calls.some(([url]) => String(url) === '/admin/api/diagnostics')).toBe(false)
   })
 
   it('keeps supported list filters in the URL and renders missing-blob nullable fields', async () => {
@@ -691,7 +693,7 @@ describe('admin React UI', () => {
     expect(screen.getByRole('heading', { name: '라이브러리' })).toBeTruthy()
   })
 
-  it('does not render the retired local runs page or its navigation entry', async () => {
+  it('does not render the retired local runs or diagnostics pages or their navigation entries', async () => {
     mockFetch((url) => url === '/admin/api/overview'
       ? jsonResponse(overview)
       : url === '/admin/api/automatic/embedding'
@@ -702,33 +704,79 @@ describe('admin React UI', () => {
     expect(screen.queryByRole('link', { name: '로컬 실행' })).toBeNull()
     expect(screen.queryByRole('region', { name: '로컬 실행 상세' })).toBeNull()
     expect(screen.queryByText(/유한한 대상만 소진한 뒤 종료/)).toBeNull()
+    expect(screen.queryByRole('link', { name: '시스템 진단' })).toBeNull()
+
+    cleanup()
+    renderAt('/diagnostics')
+    expect(await screen.findByText('페이지를 찾을 수 없습니다')).toBeTruthy()
   })
 
-  it('labels diagnostics as measurements rather than worker heartbeats or full vector sync', async () => {
-    const diagnostics = {
-      measuredAt: '2026-10-14T12:00:00Z', encodingEnabled: false, modelEnabled: false, vectorStoreEnabled: true,
-      encodingExpiredLeases: 1, embeddingExpiredLeases: 2,
-      encodingQueue: { queuedCount: 3, oldestStatusChangedAt: null, oldestAgeSeconds: null, unknownAgeCount: 3 },
-      embeddingQueue: { queuedCount: 4, oldestStatusChangedAt: '2026-10-14T10:00:00Z', oldestAgeSeconds: 7200, unknownAgeCount: 1 },
-      encodingCommit: { committingCount: 1, reconcilingCount: 1, oldestKnownStartedAt: '2026-10-14T11:00:00Z', unknownStartCount: 0 },
-      integrity: { unreferencedBlobs: 2, missingBlobPhotos: 3 },
-      workerActivity: { lastClaimUnixMs: 0, lastRenewUnixMs: 0, lastResultsUnixMs: 0 },
-      workerActivityScope: 'Since server restart; attempt stamps are not heartbeats.',
-      vectorCount: { status: 'available', measuredAt: '2026-10-14T12:00:02Z', expectedPoints: 4, actualPoints: 4, countAgreement: true }
-    }
-    const fetchMock = mockFetch((url) => url === '/admin/api/diagnostics' ? jsonResponse(diagnostics) : jsonResponse({ photos: [], nextCursor: null }))
-    renderAt('/diagnostics')
+  it('renders the health section with integrity links, flags, and the vector agreement', async () => {
+    mockFetch((url) => url === '/admin/api/overview'
+      ? jsonResponse(overview)
+      : url === '/admin/api/automatic/embedding'
+        ? jsonResponse(automaticStatus)
+        : jsonResponse({ photos: [], nextCursor: null }))
+    renderAt('/')
 
-    expect(await screen.findByText('개수 일치')).toBeTruthy()
-    expect(screen.getByText(/연령 미상 3/)).toBeTruthy()
-    expect(screen.getByText(/attempt stamps are not heartbeats/)).toBeTruthy()
-    expect(screen.getByText(/전체 동기화나 포인트 무결성을 검증하지 않습니다/)).toBeTruthy()
-    expect(screen.getByRole('link', { name: '시스템 진단' })).toBeTruthy()
-    expect(screen.getByRole('link', { name: '임베딩 대기 항목 보기' }).getAttribute('href')).toBe('/blobs?embedding=queued')
-    expect(screen.queryByRole('link', { name: '임베딩 차단 항목 보기' })).toBeNull()
-    expect(screen.getByRole('link', { name: /인코딩 만료 리스/ }).getAttribute('href')).toBe('/blobs?encodingLeaseExpired=true')
-    expect(screen.getByRole('link', { name: /미참조 블롭/ }).getAttribute('href')).toBe('/blobs?unreferenced=true')
-    expect(screen.getByText('블롭 없는 사진')).toBeTruthy()
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/admin/api/diagnostics', expect.anything()))
+    expect(await screen.findByRole('region', { name: '시스템 상태' })).toBeTruthy()
+    expect(screen.getByRole('link', { name: /만료된 임베딩 리스/ }).getAttribute('href')).toBe('/photos?embeddingLeaseExpired=true')
+    expect(screen.getByRole('link', { name: /만료된 인코딩 리스/ }).getAttribute('href')).toBe('/photos?encodingLeaseExpired=true')
+    expect(screen.getByRole('link', { name: /참조 없는 블롭/ }).getAttribute('href')).toBe('/blobs?unreferenced=true')
+    // 블롭 없는 사진 has no list filter, so its stat stays a plain number.
+    const missingBlobStat = screen.getByText('블롭 없는 사진').closest('.stat') as HTMLElement
+    expect(missingBlobStat.tagName).toBe('DIV')
+    expect(within(missingBlobStat).getByText('4')).toBeTruthy()
+    expect(screen.getByText('일치')).toBeTruthy()
+    expect(screen.getByText(/기대 5 · 실제 5/)).toBeTruthy()
+    expect(screen.getByText(/개수 비교일 뿐 전체 동기화나 포인트 무결성을 검증하지 않습니다/)).toBeTruthy()
+    expect(screen.getByText(/인코딩 워커 API 사용 가능 · 임베딩 모델 사용 가능 · 벡터 스토어 사용 가능/)).toBeTruthy()
+    // The retired overview tables stay retired.
+    expect(screen.queryByText(/원본 상태 값/)).toBeNull()
+    expect(screen.queryByRole('heading', { name: /건너뜀/ })).toBeNull()
+  })
+
+  it('degrades the vector verdict without failing the overview', async () => {
+    const withStatus = (vectorCount: Overview['health']['vectorCount'], vectorStoreEnabled = true): Overview => ({
+      ...overview,
+      health: { ...overview.health, vectorStoreEnabled, vectorCount }
+    })
+    const unavailable = withStatus({
+      status: 'unavailable', measuredAt: null, expectedPoints: 5, actualPoints: null, countAgreement: null,
+      message: 'Vector-store count is temporarily unavailable; the catalog measurements are still current.'
+    })
+    mockFetch((url) => url === '/admin/api/overview'
+      ? jsonResponse(unavailable)
+      : url === '/admin/api/automatic/embedding'
+        ? jsonResponse(automaticStatus)
+        : jsonResponse({ photos: [], nextCursor: null }))
+    renderAt('/')
+
+    expect(await screen.findByText(/측정 불가/)).toBeTruthy()
+    expect(screen.getByText(/Vector-store count is temporarily unavailable/)).toBeTruthy()
+    // The catalog measurements still render alongside the degraded verdict.
+    expect(screen.getByRole('heading', { name: '라이브러리' })).toBeTruthy()
+
+    cleanup()
+    const disabled = withStatus({ status: 'disabled', measuredAt: null, expectedPoints: 5, actualPoints: null, countAgreement: null }, false)
+    mockFetch((url) => url === '/admin/api/overview'
+      ? jsonResponse(disabled)
+      : url === '/admin/api/automatic/embedding'
+        ? jsonResponse(automaticStatus)
+        : jsonResponse({ photos: [], nextCursor: null }))
+    renderAt('/')
+    expect(await screen.findByText(/비활성 — 벡터 저장소가 설정되지 않아 개수는 측정되지 않습니다/)).toBeTruthy()
+    expect(screen.getByText(/인코딩 워커 API 사용 가능 · 임베딩 모델 사용 가능 · 벡터 스토어 비활성/)).toBeTruthy()
+
+    cleanup()
+    const mismatch = withStatus({ ...overview.health.vectorCount, actualPoints: 6, countAgreement: false })
+    mockFetch((url) => url === '/admin/api/overview'
+      ? jsonResponse(mismatch)
+      : url === '/admin/api/automatic/embedding'
+        ? jsonResponse(automaticStatus)
+        : jsonResponse({ photos: [], nextCursor: null }))
+    renderAt('/')
+    expect(await screen.findByText('불일치')).toBeTruthy()
+    expect(screen.getByText(/기대 5 · 실제 6/)).toBeTruthy()
   })
 })

@@ -99,7 +99,6 @@ func TestAdminRoutesRequireBothServiceAndToken(t *testing.T) {
 		{http.MethodGet, "/admin/runs"},
 		{http.MethodGet, "/admin/api/overview"},
 		{http.MethodGet, "/admin/api/issues"},
-		{http.MethodGet, "/admin/api/diagnostics"},
 		{http.MethodGet, "/admin/api/extraction-failures?reasonCode=invalid_image"},
 		{http.MethodGet, "/admin/api/photos"},
 		{http.MethodGet, "/admin/api/photos/a/0"},
@@ -301,7 +300,7 @@ func TestAdminPageServesEmbeddedHTML(t *testing.T) {
 
 func TestAdminSPADirectNavigationAndReload(t *testing.T) {
 	router, _ := newAdminTestRouter(t, 1)
-	for _, target := range []string{"/admin/diagnostics", "/admin/issues", "/admin/blobs/hash-a"} {
+	for _, target := range []string{"/admin/issues", "/admin/blobs/hash-a"} {
 		t.Run(target, func(t *testing.T) {
 			unauthorized := doAdminRequest(t, router, http.MethodGet, target, "")
 			if unauthorized.Code != http.StatusUnauthorized || unauthorized.Header().Get("WWW-Authenticate") == "" {
@@ -315,9 +314,9 @@ func TestAdminSPADirectNavigationAndReload(t *testing.T) {
 			}
 		})
 	}
-	// The retired local-runs page is gone: its old URL must not resurrect the
-	// SPA shell, and unknown admin paths stay JSON 404s.
-	for _, target := range []string{"/admin/unknown", "/admin/runs", "/admin/runs/run-id", "/admin/api/unknown"} {
+	// The retired diagnostics and local-runs pages are gone: their old URLs
+	// must not resurrect the SPA shell, and unknown admin paths stay JSON 404s.
+	for _, target := range []string{"/admin/unknown", "/admin/runs", "/admin/runs/run-id", "/admin/diagnostics", "/admin/api/unknown", "/admin/api/diagnostics"} {
 		page := doAdminRequest(t, router, http.MethodGet, target, basicAuthHeader("operator", "sekrit"))
 		if page.Code != http.StatusNotFound || !strings.HasPrefix(page.Header().Get("Content-Type"), "application/json") || !jsonBodyHasErrorCode(page.Body.String(), "NOT_FOUND") {
 			t.Fatalf("unknown path %s did not return JSON 404: status=%d body=%s", target, page.Code, page.Body.String())
@@ -325,48 +324,66 @@ func TestAdminSPADirectNavigationAndReload(t *testing.T) {
 	}
 }
 
-func TestAdminOverviewRouteJSONContractAndVectorIndependence(t *testing.T) {
+// TestAdminOverviewRouteJSONContractAndVectorDegradation pins the overview
+// endpoint's shape and its graceful-degradation contract: a failing vector
+// counter turns the health section's vectorCount "unavailable" without
+// failing the request or leaking the underlying error, and the catalog
+// measurements stay present and exact.
+func TestAdminOverviewRouteJSONContractAndVectorDegradation(t *testing.T) {
 	store := openAdminTestCatalog(t)
 	seedEmbeddingFixture(t, store)
-	service := admin.NewService(store, stubAdminVectorCounter{err: errors.New("qdrant unavailable")}, nil)
+	service := admin.NewService(store, stubAdminVectorCounter{err: errors.New("qdrant secret endpoint")}, nil)
 	router := New(nil, nil, nil, nil, "worker-token", service, "sekrit").Router()
 
 	rec := doAdminRequest(t, router, http.MethodGet, "/admin/api/overview", basicAuthHeader("operator", "sekrit"))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status=%d want=200 body=%s", rec.Code, rec.Body.String())
 	}
+	body := rec.Body.String()
+	if strings.Contains(body, "qdrant secret endpoint") {
+		t.Fatalf("overview leaked the vector-store error: %s", body)
+	}
+	if strings.Contains(body, "skippedReasons") || strings.Contains(body, "rawStates") || strings.Contains(body, `"units"`) {
+		t.Fatalf("overview still carries the retired prose/raw-state/skipped-reason fields: %s", body)
+	}
 	var payload struct {
-		MeasuredAt string            `json:"measuredAt"`
-		Units      map[string]string `json:"units"`
-		Library    map[string]int64  `json:"library"`
+		MeasuredAt string           `json:"measuredAt"`
+		Library    map[string]int64 `json:"library"`
 		Encoding   struct {
-			Categories     map[string]map[string]int64 `json:"categories"`
-			SkippedReasons map[string]map[string]int64 `json:"skippedReasons"`
-			RawStates      map[string]map[string]int64 `json:"rawStates"`
+			Categories map[string]map[string]int64 `json:"categories"`
 		} `json:"encoding"`
 		Embedding struct {
 			Categories map[string]map[string]int64 `json:"categories"`
-			RawStates  map[string]map[string]int64 `json:"rawStates"`
 		} `json:"embedding"`
+		Health struct {
+			EncodingExpiredLeases  int64 `json:"encodingExpiredLeases"`
+			EmbeddingExpiredLeases int64 `json:"embeddingExpiredLeases"`
+			UnreferencedBlobs      int64 `json:"unreferencedBlobs"`
+			MissingBlobPhotos      int64 `json:"missingBlobPhotos"`
+			EncodingEnabled        bool  `json:"encodingEnabled"`
+			ModelEnabled           bool  `json:"modelEnabled"`
+			VectorStoreEnabled     bool  `json:"vectorStoreEnabled"`
+			VectorCount            struct {
+				Status         string  `json:"status"`
+				MeasuredAt     *string `json:"measuredAt"`
+				ExpectedPoints int64   `json:"expectedPoints"`
+				ActualPoints   *int64  `json:"actualPoints"`
+				CountAgreement *bool   `json:"countAgreement"`
+				Message        string  `json:"message"`
+			} `json:"vectorCount"`
+		} `json:"health"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
-		t.Fatalf("decode overview: %v body=%s", err, rec.Body.String())
+		t.Fatalf("decode overview: %v body=%s", err, body)
 	}
 	if _, err := time.Parse(time.RFC3339Nano, payload.MeasuredAt); err != nil {
 		t.Fatalf("measuredAt=%q is not RFC3339: %v", payload.MeasuredAt, err)
 	}
-	if payload.Units["measuredAt"] != "RFC3339 UTC" || !strings.Contains(payload.Units["counts"], "unique blob") {
-		t.Fatalf("units=%v want explicit timestamp and count units", payload.Units)
-	}
 	if payload.Library["albums"] != 1 || payload.Library["photos"] != 3 || payload.Library["blobs"] != 3 || len(payload.Library) != 3 {
 		t.Fatalf("library=%v want only albums=1 photos=3 blobs=3", payload.Library)
 	}
-	if strings.Contains(rec.Body.String(), "unreferencedBlobs") || strings.Contains(rec.Body.String(), "missingBlobPhotos") {
-		t.Fatalf("overview JSON must omit expensive integrity counts: %s", rec.Body.String())
-	}
 	for _, groups := range []map[string]map[string]int64{
-		payload.Encoding.Categories, payload.Encoding.SkippedReasons, payload.Encoding.RawStates,
-		payload.Embedding.Categories, payload.Embedding.RawStates,
+		payload.Encoding.Categories, payload.Embedding.Categories,
 	} {
 		for label, counts := range groups {
 			if len(counts) != 1 || counts["blobCount"] < 0 {
@@ -383,13 +400,28 @@ func TestAdminOverviewRouteJSONContractAndVectorIndependence(t *testing.T) {
 	if _, ok := payload.Embedding.Categories["blocked"]; ok {
 		t.Fatal("overview still exposes the obsolete blocked embedding category")
 	}
-	assertOverviewJSONCounts(t, "encoding.skippedReasons.webp", payload.Encoding.SkippedReasons["webp"])
-	assertOverviewJSONCounts(t, "encoding.skippedReasons.nonWebp", payload.Encoding.SkippedReasons["nonWebp"])
-	if _, ok := payload.Encoding.RawStates["pending"]; !ok {
-		t.Fatalf("encoding rawStates missing pending: %v", payload.Encoding.RawStates)
+
+	// The health section: the seed fixture has exactly one embedding-ready
+	// blob behind one photo, no unreferenced blobs or dangling photos, and no
+	// expired leases; the counter fails, so the vector verdict is unavailable.
+	health := payload.Health
+	if health.UnreferencedBlobs != 0 || health.MissingBlobPhotos != 0 || health.EncodingExpiredLeases != 0 || health.EmbeddingExpiredLeases != 0 {
+		t.Fatalf("health counts=%+v want the seed fixture's zeros", health)
 	}
-	if _, ok := payload.Embedding.RawStates["ready"]; !ok {
-		t.Fatalf("embedding rawStates missing ready: %v", payload.Embedding.RawStates)
+	if health.VectorCount.ExpectedPoints != 1 {
+		t.Fatalf("expectedPoints=%d want 1 (the one ready blob's photo row)", health.VectorCount.ExpectedPoints)
+	}
+	if health.VectorCount.Status != "unavailable" || health.VectorCount.ActualPoints != nil || health.VectorCount.CountAgreement != nil || health.VectorCount.MeasuredAt != nil {
+		t.Fatalf("unavailable vector count=%+v; unmeasured fields must stay null", health.VectorCount)
+	}
+	if health.VectorCount.Message == "" {
+		t.Fatalf("unavailable vector count needs a sanitized message: %+v", health.VectorCount)
+	}
+	if !health.VectorStoreEnabled {
+		t.Fatalf("a wired vector counter must report vectorStoreEnabled: %+v", health)
+	}
+	if health.EncodingEnabled || health.ModelEnabled {
+		t.Fatalf("feature flags=%+v want encodingEnabled=false modelEnabled=false (nothing wired)", health)
 	}
 }
 
@@ -464,15 +496,11 @@ func TestAdminResourceBrowseRoutesContractAndValidation(t *testing.T) {
 		t.Fatalf("dangling photo detail status=%d body=%s", danglingDetail.Code, danglingDetail.Body.String())
 	}
 	overview := doAdminRequest(t, router, http.MethodGet, "/admin/api/overview", auth)
-	if overview.Code != http.StatusOK || !strings.Contains(overview.Body.String(), `"photos":5`) || strings.Contains(overview.Body.String(), `"missingBlobPhotos"`) {
-		t.Fatalf("overview inventory contract status=%d body=%s", overview.Code, overview.Body.String())
+	if overview.Code != http.StatusOK || !strings.Contains(overview.Body.String(), `"photos":5`) || !strings.Contains(overview.Body.String(), `"unreferencedBlobs":1`) || !strings.Contains(overview.Body.String(), `"missingBlobPhotos":1`) {
+		t.Fatalf("overview inventory and health contract status=%d body=%s", overview.Code, overview.Body.String())
 	}
-	diagnostics := doAdminRequest(t, router, http.MethodGet, "/admin/api/diagnostics", auth)
-	if diagnostics.Code != http.StatusOK || !strings.Contains(diagnostics.Body.String(), `"unreferencedBlobs":1`) || !strings.Contains(diagnostics.Body.String(), `"missingBlobPhotos":1`) {
-		t.Fatalf("diagnostics integrity counts status=%d body=%s", diagnostics.Code, diagnostics.Body.String())
-	}
-	if strings.Contains(diagnostics.Body.String(), `"embeddingBlockedQueue"`) {
-		t.Fatalf("diagnostics still exposes obsolete gate diagnostics: %s", diagnostics.Body.String())
+	if !strings.Contains(overview.Body.String(), `"vectorCount":{"status":"disabled"`) {
+		t.Fatalf("overview without a vector store must report a disabled vectorCount: %s", overview.Body.String())
 	}
 	if rec := doAdminRequest(t, router, http.MethodGet, "/admin/api/photos/album-a/99", auth); rec.Code != http.StatusNotFound {
 		t.Fatalf("missing photo status=%d want=404 body=%s", rec.Code, rec.Body.String())

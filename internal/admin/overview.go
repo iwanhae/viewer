@@ -8,14 +8,6 @@ import (
 	"viewer/internal/catalog"
 )
 
-// OverviewUnits makes the units and timestamp format of the overview explicit.
-// Pipeline breakdowns are unique-blob counts. Library photo and album totals
-// are inventory counts, not pipeline breakdowns.
-type OverviewUnits struct {
-	Counts     string `json:"counts"`
-	MeasuredAt string `json:"measuredAt"`
-}
-
 type OverviewLibraryCounts struct {
 	Albums int64 `json:"albums"`
 	Photos int64 `json:"photos"`
@@ -34,17 +26,8 @@ type EncodingCategories struct {
 	Unknown    catalog.BlobCounts `json:"unknown"`
 }
 
-// EncodingSkippedReasons distinguishes only what stored content_type can
-// reliably establish. It does not infer why a non-WebP blob was skipped.
-type EncodingSkippedReasons struct {
-	WebP    catalog.BlobCounts `json:"webp"`
-	NonWebP catalog.BlobCounts `json:"nonWebp"`
-}
-
 type EncodingOverview struct {
-	Categories     EncodingCategories            `json:"categories"`
-	SkippedReasons EncodingSkippedReasons        `json:"skippedReasons"`
-	RawStates      map[string]catalog.BlobCounts `json:"rawStates"`
+	Categories EncodingCategories `json:"categories"`
 }
 
 // EmbeddingCategories classify blobs independently of their encoding status.
@@ -57,24 +40,55 @@ type EmbeddingCategories struct {
 }
 
 type EmbeddingOverview struct {
-	Categories EmbeddingCategories           `json:"categories"`
-	RawStates  map[string]catalog.BlobCounts `json:"rawStates"`
+	Categories EmbeddingCategories `json:"categories"`
 }
 
-// Overview is a catalog-only view of the ingest pipeline. measuredAt is the
-// UTC RFC3339Nano time recorded after the short catalog snapshot completes.
-// No external vector-store or model/recommendation reads are included.
+// OverviewVectorCount is the vector-store half of the health section's count
+// comparison. Status is "disabled" (no vector store wired), "available"
+// (counted), or "unavailable" (the count failed — the overview itself still
+// succeeds, with a sanitized message). Agreement compares point counts only;
+// it is not a claim of full synchronization or point-by-point integrity.
+type OverviewVectorCount struct {
+	Status         string  `json:"status"`
+	MeasuredAt     *string `json:"measuredAt"`
+	ExpectedPoints int64   `json:"expectedPoints"`
+	ActualPoints   *int64  `json:"actualPoints"`
+	CountAgreement *bool   `json:"countAgreement"`
+	Message        string  `json:"message,omitempty"`
+}
+
+// OverviewHealth carries the five catalog health numbers (expired leases,
+// integrity pair, expected vector points) plus the feature wiring the overview
+// page renders as its "시스템 상태" panel. The flags report configuration —
+// WORKER_TOKEN, a loaded model, a wired vector store — not worker liveness.
+type OverviewHealth struct {
+	EncodingExpiredLeases  int64               `json:"encodingExpiredLeases"`
+	EmbeddingExpiredLeases int64               `json:"embeddingExpiredLeases"`
+	UnreferencedBlobs      int64               `json:"unreferencedBlobs"`
+	MissingBlobPhotos      int64               `json:"missingBlobPhotos"`
+	EncodingEnabled        bool                `json:"encodingEnabled"`
+	ModelEnabled           bool                `json:"modelEnabled"`
+	VectorStoreEnabled     bool                `json:"vectorStoreEnabled"`
+	VectorCount            OverviewVectorCount `json:"vectorCount"`
+}
+
+// Overview is the dashboard's landing snapshot: one consistent catalog read —
+// library totals, unique-blob pipeline categories, health counts — plus
+// best-effort model and vector-store checks. measuredAt is the UTC
+// RFC3339Nano time recorded after the catalog snapshot completes.
 type Overview struct {
 	MeasuredAt string                `json:"measuredAt"`
-	Units      OverviewUnits         `json:"units"`
 	Library    OverviewLibraryCounts `json:"library"`
 	Encoding   EncodingOverview      `json:"encoding"`
 	Embedding  EmbeddingOverview     `json:"embedding"`
+	Health     OverviewHealth        `json:"health"`
 }
 
-// Overview returns one consistent catalog snapshot and intentionally does not
-// consult Qdrant or the recommendation service, so their outages cannot affect
-// this endpoint.
+// Overview returns the catalog snapshot with its health section filled in.
+// The catalog numbers come from one short read transaction; the model and
+// vector-store checks that follow degrade gracefully — an unavailable Qdrant
+// or a failed model load shows up in Health instead of failing the request,
+// so the dashboard's landing page stays renderable during outages.
 func (s *Service) Overview(ctx context.Context) (Overview, error) {
 	if s == nil || s.cat == nil {
 		return Overview{}, fmt.Errorf("catalog is not available")
@@ -87,11 +101,7 @@ func (s *Service) Overview(ctx context.Context) (Overview, error) {
 	measuredAt := time.Now().UTC().Format(time.RFC3339Nano)
 	return Overview{
 		MeasuredAt: measuredAt,
-		Units: OverviewUnits{
-			Counts:     "pipeline categories, skipped reasons, and raw states count each unique blob once; library albums and photos are inventory totals and are not split by pipeline status",
-			MeasuredAt: "RFC3339 UTC",
-		},
-		Library: OverviewLibraryCounts{Albums: snapshot.Albums, Photos: snapshot.Photos, Blobs: snapshot.Blobs},
+		Library:    OverviewLibraryCounts{Albums: snapshot.Albums, Photos: snapshot.Photos, Blobs: snapshot.Blobs},
 		Encoding: EncodingOverview{
 			Categories: EncodingCategories{
 				Queued:     snapshot.EncodingCategories["queued"],
@@ -103,11 +113,6 @@ func (s *Service) Overview(ctx context.Context) (Overview, error) {
 				Failed:     snapshot.EncodingCategories["failed"],
 				Unknown:    snapshot.EncodingCategories["unknown"],
 			},
-			SkippedReasons: EncodingSkippedReasons{
-				WebP:    snapshot.EncodingSkippedReasons["webp"],
-				NonWebP: snapshot.EncodingSkippedReasons["nonWebp"],
-			},
-			RawStates: snapshot.EncodingRawStates,
 		},
 		Embedding: EmbeddingOverview{
 			Categories: EmbeddingCategories{
@@ -117,7 +122,43 @@ func (s *Service) Overview(ctx context.Context) (Overview, error) {
 				Failed:     snapshot.EmbeddingCategories["failed"],
 				Unknown:    snapshot.EmbeddingCategories["unknown"],
 			},
-			RawStates: snapshot.EmbeddingRawStates,
 		},
+		Health: s.overviewHealth(ctx, snapshot),
 	}, nil
+}
+
+// overviewHealth fills the health section from the catalog snapshot plus the
+// process's feature wiring. The vector-count contract: no vector store wired
+// means "disabled" with unmeasured (null) fields; a failing CountVectors means
+// "unavailable" with a sanitized message; only a successful count reports
+// actual points and agreement. None of these states is an error.
+func (s *Service) overviewHealth(ctx context.Context, snapshot catalog.AdminOverviewSnapshot) OverviewHealth {
+	health := OverviewHealth{
+		EncodingExpiredLeases:  snapshot.EncodingExpiredLeases,
+		EmbeddingExpiredLeases: snapshot.EmbeddingExpiredLeases,
+		UnreferencedBlobs:      snapshot.UnreferencedBlobs,
+		MissingBlobPhotos:      snapshot.MissingBlobPhotos,
+		EncodingEnabled:        s.encodingEnabled,
+		ModelEnabled:           s.recommend != nil && s.recommend.Enabled(),
+		VectorCount:            OverviewVectorCount{ExpectedPoints: snapshot.ExpectedVectorPoints},
+	}
+	if s.vectors == nil {
+		health.VectorCount.Status = "disabled"
+		return health
+	}
+	health.VectorStoreEnabled = true
+	vectorMeasuredAt := time.Now().UTC().Format(time.RFC3339Nano)
+	points, err := s.vectors.CountVectors(ctx)
+	if err != nil {
+		health.VectorCount.Status = "unavailable"
+		health.VectorCount.Message = "Vector-store count is temporarily unavailable; the catalog measurements are still current."
+		return health
+	}
+	actual := int64(points)
+	agrees := actual == snapshot.ExpectedVectorPoints
+	health.VectorCount.Status = "available"
+	health.VectorCount.MeasuredAt = &vectorMeasuredAt
+	health.VectorCount.ActualPoints = &actual
+	health.VectorCount.CountAgreement = &agrees
+	return health
 }

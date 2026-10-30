@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"time"
 )
 
 // AdminIssueGroup is one current failure reason. FailureCount's dimension is
@@ -146,95 +145,4 @@ func (s *Store) AdminLatestExtractionFailures(ctx context.Context, reasonCode, a
 		return nil, fmt.Errorf("iterate latest extraction failures: %w", err)
 	}
 	return items, nil
-}
-
-// AdminDiagnosticsSnapshot is catalog-only. Every age is derived exclusively
-// from recorded status_changed_at; absent or mismatched observations count as
-// unknown instead of falling back to blob.created_at.
-type AdminDiagnosticsSnapshot struct {
-	ExpectedVectorPoints   int64
-	UnreferencedBlobs      int64
-	MissingBlobPhotos      int64
-	EncodingExpiredLeases  int64
-	EmbeddingExpiredLeases int64
-	EncodingQueue          AdminQueueDiagnostics
-	EmbeddingQueue         AdminQueueDiagnostics
-	EncodingCommit         AdminEncodingCommitDiagnostics
-}
-
-type AdminQueueDiagnostics struct {
-	Count                 int64
-	OldestStatusChangedAt *string
-	UnknownAgeCount       int64
-}
-
-type AdminEncodingCommitDiagnostics struct {
-	CommittingCount      int64
-	ReconcilingCount     int64
-	OldestKnownStartedAt *string
-	UnknownStartCount    int64
-}
-
-func (s *Store) AdminDiagnostics(ctx context.Context) (AdminDiagnosticsSnapshot, error) {
-	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
-	if err != nil {
-		return AdminDiagnosticsSnapshot{}, fmt.Errorf("begin admin diagnostics snapshot: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-
-	// Freeze lease-expiry comparisons for both stages inside this catalog snapshot.
-	now := time.Now()
-	var result AdminDiagnosticsSnapshot
-	if err := tx.QueryRowContext(ctx, `SELECT
-		(SELECT COUNT(*) FROM photos p JOIN blobs b ON b.hash=p.hash WHERE b.embedding_status='ready'),
-		(SELECT COUNT(*) FROM blobs b WHERE NOT EXISTS (SELECT 1 FROM photos p WHERE p.hash=b.hash)),
-		(SELECT COUNT(*) FROM photos p WHERE NOT EXISTS (SELECT 1 FROM blobs b WHERE b.hash=p.hash)),
-		(SELECT COUNT(*) FROM blobs WHERE encoding_status='leased' AND encoding_lease_until < ?),
-		(SELECT COUNT(*) FROM blobs WHERE embedding_status='processing' AND embedding_lease_until < ?)`,
-		now.UnixMilli(), now.UnixMilli()).Scan(&result.ExpectedVectorPoints, &result.UnreferencedBlobs, &result.MissingBlobPhotos,
-		&result.EncodingExpiredLeases, &result.EmbeddingExpiredLeases); err != nil {
-		return AdminDiagnosticsSnapshot{}, fmt.Errorf("read admin diagnostics counts: %w", err)
-	}
-	result.EncodingQueue, err = queryAdminQueueDiagnostics(ctx, tx, "encoding", adminEncodingCategoryExpr, "queued")
-	if err != nil {
-		return AdminDiagnosticsSnapshot{}, err
-	}
-	result.EmbeddingQueue, err = queryAdminQueueDiagnostics(ctx, tx, "embedding", adminEmbeddingCategoryExpr, "queued")
-	if err != nil {
-		return AdminDiagnosticsSnapshot{}, err
-	}
-	var started sql.NullString
-	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*),
-		COALESCE(SUM(CASE WHEN o.phase='reconciling' THEN 1 ELSE 0 END), 0),
-		(SELECT o2.started_at FROM blobs b2 JOIN blob_stage_observations o2 ON o2.blob_hash=b2.hash AND o2.stage='encoding'
-			WHERE b2.encoding_status='committing' AND o2.started_at IS NOT NULL
-			ORDER BY julianday(o2.started_at) ASC, b2.hash ASC LIMIT 1),
-		COALESCE(SUM(CASE WHEN o.started_at IS NULL THEN 1 ELSE 0 END), 0)
-		FROM blobs b LEFT JOIN blob_stage_observations o ON o.blob_hash=b.hash AND o.stage='encoding'
-		WHERE b.encoding_status='committing'`).Scan(&result.EncodingCommit.CommittingCount,
-		&result.EncodingCommit.ReconcilingCount, &started, &result.EncodingCommit.UnknownStartCount); err != nil {
-		return AdminDiagnosticsSnapshot{}, fmt.Errorf("read encoding commit diagnostics: %w", err)
-	}
-	result.EncodingCommit.OldestKnownStartedAt = nullStringPointer(started)
-	if err := tx.Commit(); err != nil {
-		return AdminDiagnosticsSnapshot{}, fmt.Errorf("finish admin diagnostics snapshot: %w", err)
-	}
-	return result, nil
-}
-
-func queryAdminQueueDiagnostics(ctx context.Context, tx *sql.Tx, stage, categoryExpr, category string) (AdminQueueDiagnostics, error) {
-	var result AdminQueueDiagnostics
-	query := `SELECT COUNT(*),
-		(SELECT o2.status_changed_at FROM blobs b JOIN blob_stage_observations o2 ON o2.blob_hash=b.hash AND o2.stage=?
-			WHERE (` + categoryExpr + `)=? AND o2.status='pending' AND julianday(o2.status_changed_at) IS NOT NULL
-			ORDER BY julianday(o2.status_changed_at) ASC, b.hash ASC LIMIT 1),
-		COALESCE(SUM(CASE WHEN o.status='pending' AND julianday(o.status_changed_at) IS NOT NULL THEN 0 ELSE 1 END), 0)
-		FROM blobs b LEFT JOIN blob_stage_observations o ON o.blob_hash=b.hash AND o.stage=?
-		WHERE (` + categoryExpr + `)=?`
-	var oldest sql.NullString
-	if err := tx.QueryRowContext(ctx, query, stage, category, stage, category).Scan(&result.Count, &oldest, &result.UnknownAgeCount); err != nil {
-		return AdminQueueDiagnostics{}, fmt.Errorf("read %s %s diagnostics: %w", stage, category, err)
-	}
-	result.OldestStatusChangedAt = nullStringPointer(oldest)
-	return result, nil
 }

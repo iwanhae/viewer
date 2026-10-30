@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -89,7 +90,12 @@ func seedLibrary(t *testing.T, store *catalog.Store) {
 	}
 }
 
-func TestOverviewDoesNotConsultVectorCounter(t *testing.T) {
+// TestOverviewHealthDegradesWithoutFailing pins the overview's graceful
+// degradation contract: a wired-but-failing vector counter reports
+// "unavailable" and an unwired one reports "disabled", and neither may fail
+// the request or stop the catalog measurements from rendering. A healthy
+// counter reports agreement against the snapshot's expected points.
+func TestOverviewHealthDegradesWithoutFailing(t *testing.T) {
 	store := openTestCatalog(t)
 	seedLibrary(t, store)
 	if err := store.InsertPhoto(context.Background(), catalog.Photo{AlbumID: "album-a", Index: 2, Name: "dangling.jpg", Hash: "missing-blob"}); err != nil {
@@ -102,14 +108,52 @@ func TestOverviewDoesNotConsultVectorCounter(t *testing.T) {
 	if err != nil {
 		t.Fatalf("overview with unavailable vector store: %v", err)
 	}
-	if counter.calls != 0 {
-		t.Fatalf("overview called CountVectors %d times, want zero", counter.calls)
+	if counter.calls != 1 {
+		t.Fatalf("overview called CountVectors %d times, want one best-effort call", counter.calls)
 	}
 	if overview.Library.Albums != 2 || overview.Library.Photos != 4 || overview.Library.Blobs != 2 {
 		t.Fatalf("overview library=%+v want albums=2 photos=4 blobs=2", overview.Library)
 	}
-	if overview.MeasuredAt == "" || overview.Units.MeasuredAt != "RFC3339 UTC" {
+	if overview.MeasuredAt == "" {
 		t.Fatalf("overview timestamp contract=%+v", overview)
+	}
+	if overview.Health.VectorCount.Status != "unavailable" || overview.Health.VectorCount.ActualPoints != nil || overview.Health.VectorCount.CountAgreement != nil {
+		t.Fatalf("unavailable vector count=%+v; zeros must not look measured", overview.Health.VectorCount)
+	}
+	if overview.Health.VectorCount.Message == "" || strings.Contains(overview.Health.VectorCount.Message, "qdrant down") {
+		t.Fatalf("unavailable vector count message must be present and sanitized: %q", overview.Health.VectorCount.Message)
+	}
+	if !overview.Health.VectorStoreEnabled || overview.Health.ModelEnabled {
+		t.Fatalf("health flags=%+v want vectorStoreEnabled=true modelEnabled=false", overview.Health)
+	}
+	// The catalog health numbers still come through with the vector store down.
+	if overview.Health.MissingBlobPhotos != 1 || overview.Health.UnreferencedBlobs != 0 || overview.Health.VectorCount.ExpectedPoints != 2 {
+		t.Fatalf("health counts=%+v want missingBlobPhotos=1 unreferencedBlobs=0 expectedPoints=2", overview.Health)
+	}
+
+	// A service without a vector counter reports "disabled" — not an error,
+	// and not a zero that could be mistaken for a measured count.
+	disabled := NewService(store, nil, nil)
+	disabledOverview, err := disabled.Overview(context.Background())
+	if err != nil {
+		t.Fatalf("overview without vector store: %v", err)
+	}
+	if disabledOverview.Health.VectorCount.Status != "disabled" || disabledOverview.Health.VectorCount.ActualPoints != nil || disabledOverview.Health.VectorCount.CountAgreement != nil {
+		t.Fatalf("disabled vector count=%+v; unmeasured fields must stay null", disabledOverview.Health.VectorCount)
+	}
+	if disabledOverview.Health.VectorStoreEnabled {
+		t.Fatalf("disabled vector store must not report enabled: %+v", disabledOverview.Health)
+	}
+
+	// A healthy counter reports the agreement verdict against the snapshot.
+	agreeing := &fakeVectorCounter{points: 2}
+	available, err := NewService(store, agreeing, nil).Overview(context.Background())
+	if err != nil {
+		t.Fatalf("overview with healthy vector store: %v", err)
+	}
+	count := available.Health.VectorCount
+	if count.Status != "available" || count.ActualPoints == nil || *count.ActualPoints != 2 || count.CountAgreement == nil || !*count.CountAgreement || count.MeasuredAt == nil {
+		t.Fatalf("available vector count=%+v want measured agreement with expectedPoints=2", count)
 	}
 }
 
@@ -370,10 +414,11 @@ func TestResetStuckEncodingsLeavesCommittingRowsAlone(t *testing.T) {
 			t.Fatalf("upsert %s: %v", blob.Hash, err)
 		}
 	}
-	// Same ordering as the diagnostics fixture: the received row is claimed
-	// and handed off on a live lease, the committing row is claimed and
-	// promoted to committing, and the expired lease is claimed last — any
-	// later ClaimEncoding call would sweep it back to pending.
+	// Steer ClaimEncoding (largest first) at exactly one row per claim: the
+	// received row is claimed and handed off on a live lease, the committing
+	// row is claimed and promoted to committing, and the expired lease is
+	// claimed last — any later ClaimEncoding call would sweep it back to
+	// pending.
 	liveJob, err := store.ClaimEncoding(ctx, 1, time.Minute)
 	if err != nil || len(liveJob) != 1 || liveJob[0].Hash != "hash-received" {
 		t.Fatalf("claim live encoding: jobs=%v err=%v", liveJob, err)

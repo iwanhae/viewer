@@ -115,9 +115,8 @@ Notes:
 | POST | `/api/embedding/claim`, `/renew`, `/results` | External embedding-worker lease API (bearer-token when `WORKER_TOKEN` is set). |
 | POST | `/api/encoding/claim`, `/renew`, `/complete`, `/output` | External WebP encoder lease/result API, enabled when `WORKER_TOKEN` is set. New workers request `outputMode: "api"`; result streams go to `/output`, are spooled under `$STATE_DIR/encoding-spool`, and are asynchronously validated before a conditional S3 write. Claims without that mode retain the legacy presigned-PUT contract during rollout. |
 | GET | `/admin` | Independent React admin browser; enabled only when `ADMIN_TOKEN` is set. |
-| GET | `/admin/api/overview` | Catalog-only inventory totals and unique-blob normalized/raw pipeline breakdowns. |
+| GET | `/admin/api/overview` | Catalog inventory totals, unique-blob pipeline breakdowns, and a health section: expired leases, integrity counts (unreferenced blobs, blob-less photos), feature flags, and a best-effort vector-store count comparison that degrades instead of failing. |
 | GET | `/admin/api/issues` | Bounded groups of current pipeline/archive failures and latest-run failed extraction entries. |
-| GET | `/admin/api/diagnostics` | Read-only lease, queue-age, commit, activity, feature-flag, and optional vector-count snapshot. |
 | GET | `/admin/api/photos` | Paged photo rows with album metadata and current encoding/embedding state. |
 | GET | `/admin/api/photos/{albumId}/{idx}` | One photo row with current pipeline state. |
 | GET | `/admin/api/blobs` | Paged blob state and reference counts, including unreferenced blobs. |

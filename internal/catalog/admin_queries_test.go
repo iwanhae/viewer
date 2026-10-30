@@ -81,8 +81,6 @@ func TestAdminOverviewPipelineBreakdownsAndClaimEligibility(t *testing.T) {
 	// references or albums. The shared blob is present in three photo rows.
 	assertBlobTotals(t, "encoding", snapshot.EncodingCategories, 11)
 	assertBlobTotals(t, "embedding", snapshot.EmbeddingCategories, 11)
-	assertBlobTotals(t, "encoding raw states", snapshot.EncodingRawStates, 11)
-	assertBlobTotals(t, "embedding raw states", snapshot.EmbeddingRawStates, 11)
 
 	assertBlobCount(t, "encoding queued", snapshot.EncodingCategories["queued"], 2)
 	assertBlobCount(t, "encoding processing", snapshot.EncodingCategories["processing"], 1)
@@ -92,19 +90,28 @@ func TestAdminOverviewPipelineBreakdownsAndClaimEligibility(t *testing.T) {
 	assertBlobCount(t, "encoding skipped", snapshot.EncodingCategories["skipped"], 2)
 	assertBlobCount(t, "encoding failed", snapshot.EncodingCategories["failed"], 2)
 	assertBlobCount(t, "encoding unknown includes unreferenced", snapshot.EncodingCategories["unknown"], 1)
-	assertBlobCount(t, "skipped WebP", snapshot.EncodingSkippedReasons["webp"], 1)
-	assertBlobCount(t, "skipped non-WebP", snapshot.EncodingSkippedReasons["nonWebp"], 1)
-	if _, ok := snapshot.EncodingRawStates["future-encoding"]; !ok {
-		t.Fatalf("unknown encoding raw state was lost: %v", snapshot.EncodingRawStates)
-	}
 
 	assertBlobCount(t, "embedding queued", snapshot.EmbeddingCategories["queued"], 6)
 	assertBlobCount(t, "embedding processing", snapshot.EmbeddingCategories["processing"], 1)
 	assertBlobCount(t, "embedding completed", snapshot.EmbeddingCategories["completed"], 2)
 	assertBlobCount(t, "embedding failed", snapshot.EmbeddingCategories["failed"], 1)
 	assertBlobCount(t, "embedding unknown", snapshot.EmbeddingCategories["unknown"], 1)
-	if _, ok := snapshot.EmbeddingRawStates["future-embedding"]; !ok {
-		t.Fatalf("unknown embedding raw state was lost: %v", snapshot.EmbeddingRawStates)
+
+	// The health numbers ride in the same snapshot: "future" is the only
+	// unreferenced blob, the dangling photo has no blob, and the two
+	// embedding-ready blobs (encoding-committing, encoding-failed) back one
+	// photo row each.
+	if snapshot.UnreferencedBlobs != 1 || snapshot.MissingBlobPhotos != 1 || snapshot.ExpectedVectorPoints != 2 {
+		t.Fatalf("health counts unreferenced=%d missingBlobPhotos=%d expectedVectorPoints=%d want 1/1/2",
+			snapshot.UnreferencedBlobs, snapshot.MissingBlobPhotos, snapshot.ExpectedVectorPoints)
+	}
+	// The raw UPDATEs above leave both held rows (encoding-leased,
+	// encoding-received) on the epoch-zero lease default, which the expired
+	// comparison reads as long past — the same verdict the browse filter
+	// gives them.
+	if snapshot.EncodingExpiredLeases != 1 || snapshot.EmbeddingExpiredLeases != 1 {
+		t.Fatalf("expired leases=%d/%d want 1/1 (held rows keep the epoch-zero lease default)",
+			snapshot.EncodingExpiredLeases, snapshot.EmbeddingExpiredLeases)
 	}
 
 	// Every pending embedding is queued regardless of legacy gates or encoding.
@@ -193,6 +200,67 @@ func TestAdminOverviewEmbeddingClaimsIgnoreEncodingAndLegacyGates(t *testing.T) 
 				t.Errorf("claim %s: embedding=%s lease=%d encoding=%s", hash, embeddingStatus, lease, encodingStatus)
 			}
 		}
+	}
+}
+
+// TestAdminOverviewCountsExpiredLeasesPerStage pins the health section's
+// expired-lease figures: each stage counts only rows it currently holds
+// (leased/processing) whose recorded lease deadline has already passed. A
+// never-set deadline is the epoch default 0 — long past, and expired by the
+// same comparison the browse filter and reclaim sweep use — while rows not in
+// a held state never count, whatever their lease column says.
+func TestAdminOverviewCountsExpiredLeasesPerStage(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "catalog.db"), nil)
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	ctx := context.Background()
+
+	for _, blob := range []Blob{
+		{Hash: "expired-encoding", SizeBytes: 10, ContentType: "image/jpeg"},
+		{Hash: "epoch-encoding", SizeBytes: 10, ContentType: "image/jpeg"},
+		{Hash: "live-encoding", SizeBytes: 10, ContentType: "image/jpeg"},
+		{Hash: "expired-embedding", SizeBytes: 10, ContentType: "image/jpeg"},
+		{Hash: "live-embedding", SizeBytes: 10, ContentType: "image/jpeg"},
+		{Hash: "pending-embedding", SizeBytes: 10, ContentType: "image/jpeg"},
+	} {
+		if err := store.UpsertBlob(ctx, blob); err != nil {
+			t.Fatalf("upsert %s: %v", blob.Hash, err)
+		}
+	}
+	expired := time.Now().Add(-time.Minute).UnixMilli()
+	live := time.Now().Add(5 * time.Minute).UnixMilli()
+	updates := []struct {
+		query string
+		args  []any
+	}{
+		{`UPDATE blobs SET encoding_status='leased', encoding_lease_until=? WHERE hash='expired-encoding'`, []any{expired}},
+		// encoding_lease_until keeps its NOT NULL DEFAULT 0: a leased row whose
+		// deadline was never set reads as epoch zero and counts as expired.
+		{`UPDATE blobs SET encoding_status='leased' WHERE hash='epoch-encoding'`, nil},
+		{`UPDATE blobs SET encoding_status='leased', encoding_lease_until=? WHERE hash='live-encoding'`, []any{live}},
+		{`UPDATE blobs SET embedding_status='processing', embedding_lease_until=? WHERE hash='expired-embedding'`, []any{expired}},
+		{`UPDATE blobs SET embedding_status='processing', embedding_lease_until=? WHERE hash='live-embedding'`, []any{live}},
+		// Not held by the stage, so its epoch-zero lease column is irrelevant.
+		{`UPDATE blobs SET embedding_status='pending' WHERE hash='pending-embedding'`, nil},
+	}
+	for _, update := range updates {
+		if _, err := store.db.ExecContext(ctx, update.query, update.args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	snapshot, err := store.AdminOverview(ctx)
+	if err != nil {
+		t.Fatalf("admin overview: %v", err)
+	}
+	if snapshot.EncodingExpiredLeases != 2 || snapshot.EmbeddingExpiredLeases != 1 {
+		t.Fatalf("expired leases=%d/%d want 2/1: only held rows with a passed deadline may count",
+			snapshot.EncodingExpiredLeases, snapshot.EmbeddingExpiredLeases)
+	}
+	if snapshot.Blobs != 6 {
+		t.Fatalf("blob total=%d want 6", snapshot.Blobs)
 	}
 }
 

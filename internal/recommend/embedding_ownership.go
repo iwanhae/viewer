@@ -12,7 +12,6 @@ func (s *Service) ClaimLocalEmbeddings(ctx context.Context, limit int) ([]catalo
 	if s == nil || s.catalog == nil {
 		return nil, time.Time{}, fmt.Errorf("catalog is not available")
 	}
-	noteActivity(&s.lastClaimMs)
 	until := time.Now().Add(DefaultLeaseTTL)
 	claims, err := s.catalog.ClaimLocalEmbeddings(ctx, clampClaimLimit(limit), until)
 	return claims, until, err
@@ -22,7 +21,6 @@ func (s *Service) RenewLocalLeases(ctx context.Context, claims []catalog.LocalEm
 	if s == nil || s.catalog == nil {
 		return time.Time{}, nil, fmt.Errorf("catalog is not available")
 	}
-	noteActivity(&s.lastRenewMs)
 	until := time.Now().Add(DefaultLeaseTTL)
 	renewed, err := s.catalog.RenewLocalEmbeddingLeases(ctx, claims, until)
 	return until, renewed, err

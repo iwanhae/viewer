@@ -17,7 +17,6 @@ import {
   reindex,
   runLocalEncoding,
   AdminAPIError,
-  type Diagnostics,
   type Album,
   type AlbumDetail,
   type Blob,
@@ -92,7 +91,6 @@ function AdminApp() {
           <Link to="/blobs">블롭</Link>
           <Link to="/albums">앨범</Link>
           <Link to="/issues">이슈</Link>
-          <Link to="/diagnostics">시스템 진단</Link>
         </nav>
       </header>
       <main className="admin-main">
@@ -105,7 +103,6 @@ function AdminApp() {
           <Route path="/albums" element={<AlbumsPage />} />
           <Route path="/albums/:id" element={<AlbumDetailPage />} />
           <Route path="/issues" element={<IssuesPage />} />
-          <Route path="/diagnostics" element={<DiagnosticsPage />} />
           <Route path="*" element={<NotFoundPage />} />
         </Routes>
       </main>
@@ -180,15 +177,11 @@ function OverviewPage() {
             <Stat label="사진" value={lastGood.library.photos} to="/photos" />
             <Stat label="고유 블롭" value={lastGood.library.blobs} to="/blobs" />
           </div>
-          <p className="muted">앨범과 사진은 라이브러리 전체 재고 수입니다. 파이프라인 표는 상태별 고유 블롭 수를 표시하며 사진·앨범 참조 수를 상태별로 나누지 않습니다. 무결성 검사는 시스템 진단에서 확인할 수 있습니다.</p>
+          <p className="muted">앨범과 사진은 라이브러리 전체 재고 수입니다. 파이프라인 표는 상태별 고유 블롭 수를 표시하며 사진·앨범 참조 수를 상태별로 나누지 않습니다.</p>
         </section>
-        <CategorySection title="WebP 인코딩" categories={lastGood.encoding.categories} rawStates={lastGood.encoding.rawStates} filterKey="encoding" blobOnly />
-        <section className="panel">
-          <h2>건너뜀: 저장된 콘텐츠 형식 기준</h2>
-          <p className="muted">건너뛴 이유를 추측하지 않습니다. 저장된 콘텐츠 형식이 WebP인지 여부만 표시합니다.</p>
-          <BlobCountTable counts={lastGood.encoding.skippedReasons} filterKey="skippedReason" />
-        </section>
-        <CategorySection title="임베딩" categories={lastGood.embedding.categories} rawStates={lastGood.embedding.rawStates} filterKey="embedding" blobOnly />
+        <CategorySection title="WebP 인코딩" categories={lastGood.encoding.categories} filterKey="encoding" blobOnly />
+        <CategorySection title="임베딩" categories={lastGood.embedding.categories} filterKey="embedding" blobOnly />
+        <HealthPanel health={lastGood.health} />
       </>}
       <ExecutionControlPanel />
       <SyncRecoveryPanel
@@ -345,84 +338,39 @@ function ExtractionFailureBrowser({ reasonCode }: { reasonCode: string }) {
   </section>
 }
 
-function DiagnosticsPage() {
-  const [refreshKey, setRefreshKey] = useState(0)
-  const state = useAdminData<Diagnostics>(apiPath('diagnostics'), refreshKey)
-  const data = state.data
-  return <>
-    <PageTitle title="시스템 진단" description="현재 카탈로그 관측값과 서비스 기능 설정을 구분해 표시합니다." />
-    <div className="toolbar"><button type="button" onClick={() => setRefreshKey((value) => value + 1)} disabled={state.loading}>새로고침</button>
-      <span className="muted">측정 {data ? formatTime(data.measuredAt) : '—'}</span></div>
-    {state.error && <ErrorPanel message={state.error} />}
-    {state.loading && !data && <p role="status">불러오는 중…</p>}
-    {data && <>
-      <section className="panel"><h2>기능 설정</h2><div className="summary-grid">
-        <Stat label="인코딩 API 활성화" value={data.encodingEnabled ? '활성' : '비활성'} />
-        <Stat label="임베딩 모델 활성화" value={data.modelEnabled ? '활성' : '비활성'} />
-        <Stat label="벡터 저장소 연결" value={data.vectorStoreEnabled ? '설정됨' : '비활성'} />
-      </div><p className="muted">활성화 여부는 워커 프로세스의 실행 상태를 뜻하지 않습니다.</p></section>
-      <section className="panel"><h2>카탈로그 무결성</h2><div className="summary-grid">
-        <Stat label="미참조 블롭" value={data.integrity.unreferencedBlobs} to="/blobs?unreferenced=true" />
-        <Stat label="블롭 없는 사진" value={data.integrity.missingBlobPhotos} />
-      </div><p className="muted">개요에서는 무결성 검사를 생략합니다. 미참조 블롭은 정확한 블롭 필터로 볼 수 있으며, 블롭 없는 사진은 별도 목록 필터를 제공하지 않습니다.</p></section>
-      <section className="panel"><h2>만료된 리스</h2><div className="summary-grid">
-        <Stat label="인코딩 만료 리스" value={data.encodingExpiredLeases} to="/blobs?encodingLeaseExpired=true" />
-        <Stat label="임베딩 만료 리스" value={data.embeddingExpiredLeases} to="/blobs?embeddingLeaseExpired=true" />
-      </div></section>
-      <section className="panel"><h2>대기열 연령</h2>
-        <QueueDiagnostic label="인코딩" queue={data.encodingQueue} to="/blobs?encoding=queued" />
-        <QueueDiagnostic label="임베딩 대기" queue={data.embeddingQueue} to="/blobs?embedding=queued" />
-        <p className="muted">연령은 기록된 status_changed_at만 사용합니다. 모르는 연령은 별도로 세며 created_at으로 추정하지 않습니다. 각 링크는 해당 카테고리의 현재 항목 전체이며, 오래된 항목만 거르는 필터는 아닙니다.</p>
-      </section>
-      <section className="panel"><h2>인코딩 커밋</h2><div className="summary-grid">
-        <Stat label="커밋 중" value={data.encodingCommit.committingCount} to="/blobs?encoding=committing" />
-        <Stat label="재조정 중" value={data.encodingCommit.reconcilingCount} to="/blobs?encodingPhase=reconciling" />
-        <Stat label="시작 시각을 모르는 행" value={data.encodingCommit.unknownStartCount} />
-      </div><p>가장 오래 알려진 시작: {data.encodingCommit.oldestKnownStartedAt ? formatTime(data.encodingCommit.oldestKnownStartedAt) : '기록 없음'}</p>
-        <p className="muted">시작 시각은 관측된 claim의 started_at만 표시합니다.</p></section>
-      <section className="panel"><h2>워커 API 활동</h2>
-        <p className="muted">{data.workerActivityScope}</p>
-        <dl className="metadata">
-          <dt>마지막 claim 시도</dt><dd>{formatActivity(data.workerActivity.lastClaimUnixMs)}</dd>
-          <dt>마지막 renew 시도</dt><dd>{formatActivity(data.workerActivity.lastRenewUnixMs)}</dd>
-          <dt>마지막 results 시도</dt><dd>{formatActivity(data.workerActivity.lastResultsUnixMs)}</dd>
-        </dl>
-      </section>
-      <section className="panel"><h2>벡터 개수 비교</h2>
-        {data.vectorCount.status === 'disabled' && <p>벡터 저장소가 비활성화되어 개수는 측정되지 않았습니다.</p>}
-        {data.vectorCount.status === 'unavailable' && <div className="notice warning">{data.vectorCount.message || '벡터 개수를 읽을 수 없습니다.'}</div>}
-        {data.vectorCount.status === 'available' && <>
-          <p>카탈로그 예상 사진 포인트 {data.vectorCount.expectedPoints.toLocaleString()} · 외부 저장소 포인트 {data.vectorCount.actualPoints?.toLocaleString()} · 측정 {data.vectorCount.measuredAt ? formatTime(data.vectorCount.measuredAt) : '—'}</p>
-          <p>{data.vectorCount.countAgreement ? '개수 일치' : '개수 불일치'} <span className="muted">(개수 비교일 뿐 전체 동기화나 포인트 무결성을 검증하지 않습니다.)</span></p>
-        </>}
-      </section>
+// HealthPanel renders the overview's "시스템 상태" section: the catalog's
+// lease and integrity counts with drill-down links, the vector-store count
+// comparison, and a one-line summary of the server's feature wiring. Every
+// number is a measurement from the same snapshot; the flags report
+// configuration, never worker liveness.
+function HealthPanel({ health }: { health: Overview['health'] }) {
+  const vector = health.vectorCount
+  return <section className="panel" aria-label="시스템 상태">
+    <h2>시스템 상태</h2>
+    <div className="summary-grid">
+      <Stat label="만료된 임베딩 리스" value={health.embeddingExpiredLeases} to="/photos?embeddingLeaseExpired=true" />
+      <Stat label="만료된 인코딩 리스" value={health.encodingExpiredLeases} to="/photos?encodingLeaseExpired=true" />
+      <Stat label="참조 없는 블롭" value={health.unreferencedBlobs} to="/blobs?unreferenced=true" />
+      <Stat label="블롭 없는 사진" value={health.missingBlobPhotos} />
+    </div>
+    <h3>벡터 스토어</h3>
+    {vector.status === 'disabled' && <p>비활성 — 벡터 저장소가 설정되지 않아 개수는 측정되지 않습니다.</p>}
+    {vector.status === 'unavailable' && <div className="notice warning" role="status">측정 불가 — {vector.message || '벡터 개수를 읽을 수 없습니다.'}</div>}
+    {vector.status === 'available' && <>
+      <p>{vector.countAgreement ? '일치' : '불일치'} <span className="muted">(기대 {vector.expectedPoints.toLocaleString()} · 실제 {vector.actualPoints?.toLocaleString()})</span></p>
+      <p className="muted">개수 비교일 뿐 전체 동기화나 포인트 무결성을 검증하지 않습니다.</p>
     </>}
-  </>
-}
-
-function QueueDiagnostic({ label, queue, to }: { label: string; queue: Diagnostics['encodingQueue']; to: string }) {
-  return <div className="queue-diagnostic">
-    <h3>{label}</h3><p>대기 {queue.queuedCount.toLocaleString()} · <Link to={to}>{label} 항목 보기</Link></p>
-    <p>가장 오래된 기록 연령 {queue.oldestAgeSeconds === null ? '알 수 없음' : formatDuration(queue.oldestAgeSeconds)} · 상태 변경 {queue.oldestStatusChangedAt ? formatTime(queue.oldestStatusChangedAt) : '기록 없음'}</p>
-    <p>연령 미상 {queue.unknownAgeCount.toLocaleString()}</p>
-  </div>
-}
-
-function formatDuration(seconds: number): string {
-  if (seconds < 60) return `${seconds}초`
-  if (seconds < 3600) return `${Math.floor(seconds / 60)}분`
-  if (seconds < 86400) return `${Math.floor(seconds / 3600)}시간 ${Math.floor((seconds % 3600) / 60)}분`
-  return `${Math.floor(seconds / 86400)}일 ${Math.floor((seconds % 86400) / 3600)}시간`
-}
-
-function formatActivity(unixMs: number): string {
-  return unixMs > 0 ? formatTime(new Date(unixMs).toISOString()) : '프로세스 시작 이후 기록 없음'
+    <p className="muted">
+      인코딩 워커 API {health.encodingEnabled ? '사용 가능' : '비활성'} · 임베딩 모델 {health.modelEnabled ? '사용 가능' : '비활성'} · 벡터 스토어 {health.vectorStoreEnabled ? '사용 가능' : '비활성'}
+    </p>
+    <p className="muted">활성화 여부는 서버 설정을 뜻하며 워커 프로세스의 실행 상태가 아닙니다.</p>
+  </section>
 }
 
 function CategorySection({ title, categories, rawStates, filterKey, albumId, blobOnly = false }: {
   title: string
   categories: Record<string, PipelineCounts | BlobCounts>
-  rawStates: Record<string, PipelineCounts | BlobCounts>
+  rawStates?: Record<string, PipelineCounts | BlobCounts>
   filterKey: 'encoding' | 'embedding'
   albumId?: string
   blobOnly?: boolean
@@ -452,8 +400,12 @@ function CategorySection({ title, categories, rawStates, filterKey, albumId, blo
   </section>
 }
 
-function RawStateTable({ states, filterKey, albumId, blobOnly = false }: { states: Record<string, PipelineCounts | BlobCounts>; filterKey: 'encoding' | 'embedding'; albumId?: string; blobOnly?: boolean }) {
-  const entries = Object.entries(states).sort(([left], [right]) => left.localeCompare(right))
+// RawStateTable is the album drilldown's raw-value safety net: it keeps
+// unrecognized stored states visible and filterable even though the category
+// tables fold them into "unknown". The library-wide overview no longer sends
+// raw states, so the table simply renders nothing without them.
+function RawStateTable({ states, filterKey, albumId, blobOnly = false }: { states?: Record<string, PipelineCounts | BlobCounts>; filterKey: 'encoding' | 'embedding'; albumId?: string; blobOnly?: boolean }) {
+  const entries = Object.entries(states || {}).sort(([left], [right]) => left.localeCompare(right))
   if (entries.length === 0) return null
   return <details className="raw-states">
     <summary>원본 상태 값 ({entries.length})</summary>
@@ -479,15 +431,6 @@ function CountTable({ counts, filterKey, albumId }: { counts: Record<string, Pip
       <td><CountLink value={count.photoCount} to={filterURL('photos', { encoding: 'skipped', [filterKey]: reason, ...(albumId ? { albumId } : {}) })} /></td>
       <td><CountLink value={count.blobCount} to={filterURL('blobs', { encoding: 'skipped', [filterKey]: reason, ...(albumId ? { albumId } : {}) })} /></td>
       <td>{count.albumCount}</td>
-    </tr>)}</tbody>
-  </table>
-}
-
-function BlobCountTable({ counts, filterKey }: { counts: Record<string, BlobCounts>; filterKey: 'skippedReason' }) {
-  return <table className="data-table"><thead><tr><th>콘텐츠 형식</th><th>고유 블롭</th></tr></thead>
-    <tbody>{Object.entries(counts).map(([reason, count]) => <tr key={reason}>
-      <th scope="row">{reason}</th>
-      <td><CountLink value={count.blobCount} to={filterURL('blobs', { encoding: 'skipped', [filterKey]: reason })} /></td>
     </tr>)}</tbody>
   </table>
 }

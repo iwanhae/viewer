@@ -129,19 +129,6 @@ func (s *Server) adminIssues(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, issues)
 }
 
-func (s *Server) adminDiagnostics(w http.ResponseWriter, r *http.Request) {
-	if err := rejectQueryParams(r); err != nil {
-		writeBrowseBadRequest(w, r, err)
-		return
-	}
-	diagnostics, err := s.admin.Diagnostics(r.Context())
-	if err != nil {
-		writeError(w, r, http.StatusInternalServerError, "INTERNAL", "catalog diagnostics are temporarily unavailable")
-		return
-	}
-	writeJSON(w, http.StatusOK, diagnostics)
-}
-
 func (s *Server) adminExtractionFailures(w http.ResponseWriter, r *http.Request) {
 	query, err := adminQuery(r, "reasonCode", "limit", "cursor")
 	if err != nil {

@@ -229,7 +229,6 @@ func TestAdminIssuesGroupsOnlyCurrentFailuresAndPagesLatestExtractionEntries(t *
 
 	for _, target := range []string{
 		"/admin/api/issues?stage=embedding",
-		"/admin/api/diagnostics?extra=1",
 		"/admin/api/photos?encodingErrorCode=invalid%21code",
 		"/admin/api/blobs?embeddingLeaseExpired=yes",
 		"/admin/api/blobs?encodingPhase=committing",
@@ -239,14 +238,14 @@ func TestAdminIssuesGroupsOnlyCurrentFailuresAndPagesLatestExtractionEntries(t *
 			t.Errorf("invalid request %s status=%d body=%s", target, rec.Code, rec.Body.String())
 		}
 	}
-	for _, target := range []string{fmt.Sprintf("/admin/api/issues"), "/admin/api/diagnostics"} {
+	for _, target := range []string{"/admin/api/issues", "/admin/api/overview"} {
 		if rec := doAdminRequest(t, router, http.MethodGet, target, ""); rec.Code != http.StatusUnauthorized {
 			t.Errorf("unauthorized %s status=%d", target, rec.Code)
 		}
 	}
 }
 
-func TestAdminIssuesEmptyCatalogAndDiagnosticsVectorAvailability(t *testing.T) {
+func TestAdminIssuesEmptyCatalogAndOverviewVectorDegradation(t *testing.T) {
 	store := openAdminTestCatalog(t)
 	service := admin.NewService(store, stubAdminVectorCounter{err: fmt.Errorf("qdrant secret endpoint")}, nil).WithEncodingEnabled(false)
 	router := New(nil, nil, nil, nil, "", service, "sekrit").Router()
@@ -256,20 +255,22 @@ func TestAdminIssuesEmptyCatalogAndDiagnosticsVectorAvailability(t *testing.T) {
 	if empty.Code != http.StatusOK || !strings.Contains(empty.Body.String(), `"groups":[]`) || !strings.Contains(empty.Body.String(), `"truncated":false`) {
 		t.Fatalf("empty issues status=%d body=%s", empty.Code, empty.Body.String())
 	}
-	diagnostics := doAdminRequest(t, router, http.MethodGet, "/admin/api/diagnostics", auth)
-	if diagnostics.Code != http.StatusOK {
-		t.Fatalf("diagnostics status=%d body=%s", diagnostics.Code, diagnostics.Body.String())
+	overview := doAdminRequest(t, router, http.MethodGet, "/admin/api/overview", auth)
+	if overview.Code != http.StatusOK {
+		t.Fatalf("overview with failing vector counter status=%d body=%s", overview.Code, overview.Body.String())
 	}
-	if strings.Contains(diagnostics.Body.String(), "qdrant secret") || !strings.Contains(diagnostics.Body.String(), `"status":"unavailable"`) || !strings.Contains(diagnostics.Body.String(), `"countAgreement":null`) {
-		t.Fatalf("unavailable vector count should not fail or leak details: %s", diagnostics.Body.String())
+	if strings.Contains(overview.Body.String(), "qdrant secret") || !strings.Contains(overview.Body.String(), `"status":"unavailable"`) || !strings.Contains(overview.Body.String(), `"countAgreement":null`) {
+		t.Fatalf("unavailable vector count should not fail or leak details: %s", overview.Body.String())
 	}
-	if !strings.Contains(diagnostics.Body.String(), `"encodingEnabled":false`) || !strings.Contains(diagnostics.Body.String(), `"modelEnabled":false`) || !strings.Contains(diagnostics.Body.String(), "not heartbeats") {
-		t.Fatalf("diagnostics feature/activity contract missing: %s", diagnostics.Body.String())
+	if !strings.Contains(overview.Body.String(), `"encodingEnabled":false`) || !strings.Contains(overview.Body.String(), `"modelEnabled":false`) {
+		t.Fatalf("overview feature-flag contract missing: %s", overview.Body.String())
 	}
 
-	disabled := admin.NewService(store, nil, nil)
-	result, err := disabled.Diagnostics(context.Background())
-	if err != nil || result.VectorCount.Status != "disabled" || result.VectorCount.ActualPoints != nil || result.VectorCount.CountAgreement != nil {
-		t.Fatalf("disabled vector diagnostics=%+v err=%v; zeros must not look measured", result.VectorCount, err)
+	// A service without a vector counter answers the same request with a
+	// disabled — not zero-looking-measured — vector count.
+	disabledRouter := New(nil, nil, nil, nil, "", admin.NewService(store, nil, nil), "sekrit").Router()
+	disabled := doAdminRequest(t, disabledRouter, http.MethodGet, "/admin/api/overview", auth)
+	if disabled.Code != http.StatusOK || !strings.Contains(disabled.Body.String(), `"status":"disabled"`) || !strings.Contains(disabled.Body.String(), `"countAgreement":null`) {
+		t.Fatalf("disabled vector count status=%d body=%s", disabled.Code, disabled.Body.String())
 	}
 }

@@ -1173,6 +1173,21 @@ func TestEmbeddingProgressNilDependencies(t *testing.T) {
 	}
 }
 
+// The external entry points must reject a nil service without panicking —
+// the same nil guard every other method carries.
+func TestExternalEmbeddingEntryPointsRejectNilService(t *testing.T) {
+	var nilService *Service
+	if _, _, err := nilService.ClaimEmbeddings(context.Background(), 1); err == nil {
+		t.Fatal("expected ClaimEmbeddings to fail for a nil service")
+	}
+	if _, _, err := nilService.RenewLeases(context.Background(), []string{"hash"}); err == nil {
+		t.Fatal("expected RenewLeases to fail for a nil service")
+	}
+	if _, _, err := nilService.ApplyEmbeddingResults(context.Background(), nil); err == nil {
+		t.Fatal("expected ApplyEmbeddingResults to fail for a nil service")
+	}
+}
+
 func TestIsZeroNorm(t *testing.T) {
 	if !isZeroNorm(vec768()) {
 		t.Fatalf("expected an all-zero vector to report zero norm")

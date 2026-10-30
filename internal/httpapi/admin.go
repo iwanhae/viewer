@@ -124,10 +124,11 @@ func isAdminPath(path string) bool {
 	return path == "/admin" || strings.HasPrefix(path, "/admin/")
 }
 
-// adminOverview serves the catalog-only snapshot behind the React dashboard's
-// overview page. It deliberately reads no vector-store or recommendation/model
-// state, so the page renders even when Qdrant is unwired or the model failed
-// to load.
+// adminOverview serves the snapshot behind the React dashboard's overview
+// page. The catalog numbers come from one read transaction; the health
+// section's vector-store and model checks degrade gracefully inside the
+// service, so the page still renders when Qdrant is unwired or the model
+// failed to load.
 func (s *Server) adminOverview(w http.ResponseWriter, r *http.Request) {
 	overview, err := s.admin.Overview(r.Context())
 	if err != nil {

@@ -6,9 +6,34 @@ export type PipelineCounts = {
 
 export type BlobCounts = { blobCount: number }
 
+// OverviewVectorCount is the health section's vector-store half. status is
+// 'disabled' (no store wired), 'available' (counted), or 'unavailable' (the
+// count failed; the overview itself still succeeds).
+export type OverviewVectorCount = {
+  status: 'disabled' | 'available' | 'unavailable'
+  measuredAt: string | null
+  expectedPoints: number
+  actualPoints: number | null
+  countAgreement: boolean | null
+  message?: string
+}
+
+// OverviewHealth carries the catalog's integrity and lease counts plus the
+// feature wiring (encoding worker API, embedding model, vector store). The
+// flags report configuration, not worker liveness.
+export type OverviewHealth = {
+  encodingExpiredLeases: number
+  embeddingExpiredLeases: number
+  unreferencedBlobs: number
+  missingBlobPhotos: number
+  encodingEnabled: boolean
+  modelEnabled: boolean
+  vectorStoreEnabled: boolean
+  vectorCount: OverviewVectorCount
+}
+
 export type Overview = {
   measuredAt: string
-  units: { counts: string; measuredAt: string }
   library: {
     albums: number
     photos: number
@@ -16,13 +41,11 @@ export type Overview = {
   }
   encoding: {
     categories: Record<string, BlobCounts>
-    skippedReasons: Record<string, BlobCounts>
-    rawStates: Record<string, BlobCounts>
   }
   embedding: {
     categories: Record<string, BlobCounts>
-    rawStates: Record<string, BlobCounts>
   }
+  health: OverviewHealth
 }
 
 export type IssueGroup = {
@@ -55,41 +78,6 @@ export type ExtractionFailurePage = {
   reasonCode: string
   failures: ExtractionFailure[]
   nextCursor: string | null
-}
-
-export type QueueDiagnostics = {
-  queuedCount: number
-  oldestStatusChangedAt: string | null
-  oldestAgeSeconds: number | null
-  unknownAgeCount: number
-}
-
-export type Diagnostics = {
-  measuredAt: string
-  encodingEnabled: boolean
-  modelEnabled: boolean
-  vectorStoreEnabled: boolean
-  encodingExpiredLeases: number
-  embeddingExpiredLeases: number
-  encodingQueue: QueueDiagnostics
-  embeddingQueue: QueueDiagnostics
-  encodingCommit: {
-    committingCount: number
-    reconcilingCount: number
-    oldestKnownStartedAt: string | null
-    unknownStartCount: number
-  }
-  integrity: { unreferencedBlobs: number; missingBlobPhotos: number }
-  workerActivity: { lastClaimUnixMs: number; lastRenewUnixMs: number; lastResultsUnixMs: number }
-  workerActivityScope: string
-  vectorCount: {
-    status: 'disabled' | 'available' | 'unavailable'
-    measuredAt: string | null
-    expectedPoints: number
-    actualPoints: number | null
-    countAgreement: boolean | null
-    message?: string
-  }
 }
 
 export type Photo = {
