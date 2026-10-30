@@ -2,7 +2,7 @@ export type BlobCounts = { blobCount: number }
 // OverviewVectorCount is the health section's vector-store half. status is
 // 'disabled' (no store wired), 'available' (counted), or 'unavailable' (the
 // count failed; the overview itself still succeeds).
-export type OverviewVectorCount = {
+type OverviewVectorCount = {
   status: 'disabled' | 'available' | 'unavailable'
   measuredAt: string | null
   expectedPoints: number
@@ -14,7 +14,7 @@ export type OverviewVectorCount = {
 // OverviewHealth carries the catalog's integrity and lease counts plus the
 // feature wiring (encoding worker API, embedding model, vector store). The
 // flags report configuration, not worker liveness.
-export type OverviewHealth = {
+type OverviewHealth = {
   encodingExpiredLeases: number
   embeddingExpiredLeases: number
   unreferencedBlobs: number
@@ -127,7 +127,7 @@ export type Blob = {
   embeddingObservation?: StageObservation
 }
 
-export type PipelineEvent = {
+type PipelineEvent = {
   id: number
   stage: 'encoding' | 'embedding'
   event: string
@@ -143,7 +143,7 @@ export type HistoryPage = { events: PipelineEvent[]; nextCursor: string | null }
 
 // EmbeddingCounts mirrors catalog.EmbeddingCounts, the snapshot POST
 // /admin/api/reindex answers with.
-export type EmbeddingCounts = {
+type EmbeddingCounts = {
   total: number
   ready: number
   failed: number
@@ -246,20 +246,17 @@ export class AdminAPIError extends Error {
   }
 }
 
-export async function adminPost<T>(path: string, body: unknown, idempotencyKey?: string, signal?: AbortSignal): Promise<T> {
-  const headers: Record<string, string> = {
-    Accept: 'application/json',
-    'Content-Type': 'application/json',
-    'X-Admin-Action': '1'
-  }
-  if (idempotencyKey) headers['Idempotency-Key'] = idempotencyKey
+export async function adminPost<T>(path: string, body: unknown): Promise<T> {
   const response = await fetch(path, {
     method: 'POST',
     credentials: 'same-origin',
     cache: 'no-store',
-    headers,
-    body: JSON.stringify(body),
-    signal
+    headers: {
+      Accept: 'application/json',
+      'Content-Type': 'application/json',
+      'X-Admin-Action': '1'
+    },
+    body: JSON.stringify(body)
   })
   let result: unknown
   try {

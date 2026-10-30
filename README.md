@@ -10,7 +10,7 @@ Self-hosted photo album server. Upload a zip of photos; the server stores each i
 - Admin-controlled local and optional external WebP encoding using `cwebp` Q85, preserving supported EXIF/ICC/XMP metadata and replacing only when smaller.
 - Semantic "similar photos" recommendations across albums (SigLIP2-base, 768-dim vectors in Qdrant).
 - Lease-based HTTP API so external GPU workers can drain the embedding backlog.
-- Protected admin browser for catalog, photo, blob, and album pipeline inspection.
+- Protected admin browser for pipeline inspection, with confirm-gated synchronous recovery and local execution control.
 - SQLite catalog backed up to the bucket and auto-restored on startup.
 - Upload drop zone: zips copied straight into the `uploads/` prefix (e.g. with `mc` or `aws s3 cp`) are picked up without a restart.
 
@@ -122,349 +122,12 @@ Notes:
 | GET | `/admin/api/blobs/{hash}` | One blob with relation counts and current per-stage observations; fetch references through the paged photo list. |
 | GET | `/admin/api/blobs/{hash}/history` | Bounded, cursor-paged stage attempt and major-transition history. |
 | GET | `/admin/api/albums` | Paged album processing state, error, and actual photo-row count. |
-| GET | `/admin/api/albums/{id}` | Album processing state and exact scoped counts for its referenced blobs/photos. |
+| GET | `/admin/api/albums/{id}` | Album processing state, error, photo and missing-blob-photo counts, and the latest extraction run summary. |
 | GET | `/admin/api/extraction-failures` | Cursor-paged failed entries from each album's latest run when terminal, filtered by `reasonCode`. |
 | GET / POST | `/admin/api/automatic/embedding` | Read / change automatic local embedding; POST body `{"enabled":true}` or `{"enabled":false}`. |
 | POST | `/admin/api/encoding/run-local` | Start one background local WebP encoding drain over the pending non-WebP blobs; body `{}`. |
-
-Automatic local embedding is **enabled by default on every server start**; its
-pause preference is process-local, not persisted. Both automatic-control methods
-return `{"enabled":boolean,"running":boolean}` with
-HTTP 200. `running` means the local worker loop exists (model loaded and
-started), not that inference is active this instant. Pausing takes effect
-between batches: an in-flight batch finishes, and no new batch is claimed until
-the switch is flipped back — there are no manual runs left to hand off to, so
-nothing races the pause. Before successful model load the worker does not
-exist (`running:false`); the automatic preference can already be changed.
-Invalid control JSON (including missing/null `enabled` or
-unknown fields) returns 400 `INVALID_REQUEST`; a service that cannot answer
-returns 503 `UNAVAILABLE`. All mutations use the existing Admin auth,
-same-origin and `X-Admin-Action: 1` guards. External workers and their leases are
-unaffected by these local controls.
-
-`POST /admin/api/encoding/run-local` starts one background drain that encodes
-every pending non-WebP blob locally with the server's `cwebp`, answering
-`{"started":boolean}` — `started:false` means a drain is already in flight.
-The target set is the snapshot taken at trigger time, so blobs uploaded
-afterwards wait for the next trigger.
-
-Host deployments need `cwebp` on the server's `PATH` for local encoding (Debian:
-`apt-get install webp`). The Docker runtime includes this package. A missing
-`cwebp` fails the run-local trigger immediately with a clear error instead of
-failing every target. No worker token is
-needed locally; external encoding routes are absent without one. Encoding spool
-recovery always starts on boot, even when external worker routes are disabled.
-
-The admin document, legacy dashboard, and resource APIs require the same HTTP
-Basic password (`ADMIN_TOKEN`), and are absent when the admin service or token
-is disabled. Vite bundles are static code served by the existing asset pipeline
-and may be fetched from `/assets` without authentication; they contain no
-catalog data or credentials. The React admin entry is separate from the viewer
-SPA and uses isolated styles and routes. List
-responses use `{photos|blobs|albums, nextCursor}`; `nextCursor` is `null` at the
-end. `limit` defaults to 50 and accepts 1–100. Cursors are URL-safe opaque
-keyset positions bound to the resource, filters, and limit; send the same
-filters and limit on continuation requests. Pages are ordered by
-`(albumId, idx)`, `hash`, or `id`, respectively. They are separate reads, not a
-snapshot across concurrent catalog updates. Unknown query parameters, repeated
-parameters, invalid categories/statuses, and malformed or mismatched cursors
-return 400. Missing detail resources return 404.
-
-`GET /admin/api/photos` accepts `q`, `albumId`, `hash`, `encoding`, `embedding`,
-`encodingRaw`, `embeddingRaw`, `encodingErrorCode`, `embeddingErrorCode`,
-`encodingLeaseExpired`, `embeddingLeaseExpired`, `encodingPhase`, `skippedReason`,
-`limit`, and `cursor`. `q` is a
-ASCII-case-insensitive literal substring of the album filename or photo name (`%`,
-`_`, and `\` are ordinary characters). `hash` is exact. `encoding` accepts the
-overview categories `queued`, `processing`, `validating`, `committing`,
-`completed`, `skipped`, `failed`, and `unknown`; `embedding` accepts `queued`,
-`processing`, `completed`, `failed`, and `unknown`. The `*Raw`
-filters match exact stored states, including states this version does not
-recognize. `skippedReason` is `webp` or `nonWebp`, based only on stored content
-type. `q` is limited to 256 bytes and either raw-state filter to 128 bytes.
-Multiple filters combine with AND. Photo rows include the current raw and
-normalized states and error text. Pending embeddings are always `queued`,
-regardless of encoding status; encoding does not block embedding claims.
-If `missingBlob` is true, the photo row's hash has no blob row: `sizeBytes` and
-`contentType` are `null`, and pipeline state/error fields are empty rather than
-being classified as an unknown blob.
-
-`GET /admin/api/blobs` accepts `albumId`, exact `hash`, the same encoding,
-embedding, raw-state, error-code, lease-expiration, phase, and skipped-reason filters, plus `unreferenced=true|false`,
-`limit`, and `cursor`. Blob details include `photoCount` and distinct
-`albumCount`, not embedded reference arrays. Use
-`GET /admin/api/photos?hash={hash}` to page through photos for a shared blob.
-Blob and photo detail responses include nullable `encodingObservation` and
-`embeddingObservation` objects with `startedAt`, `finishedAt`,
-`statusChangedAt`, `attempts`, `phase`, `errorCode`, and `retryability`.
-Observations and event history begin when migration 0006 is applied: existing
-rows are backfilled with their current status, zero observed claims, and null
-timestamps. No legacy timing or attempt counts are inferred. Existing failures
-that cannot be safely classified use `errorCode: "legacy_unknown"`; retryability
-is `unknown` unless safe typed evidence is available. An encoding phase of
-`reconciling` appears only after the encoding service explicitly marks an
-ambiguous commit for reconciliation; the worker lease and commit protocol are
-unchanged. The per-blob, per-stage claim sequence is the internal attempt
-correlation ID; no new worker token or lease generation is introduced.
-
-The history endpoint accepts optional `stage=encoding|embedding`, `limit` (1–100,
-default 50), and a numeric monotonic event-ID `cursor`. Pages are ordered by
-increasing event ID; pass `nextCursor` to fetch subsequent events. History reads
-show events from the last 90 days. Physical deletion is opportunistic: bounded
-batches of up to 500 expired rows are attempted periodically during event
-writes, so idle catalogs can retain older rows on disk beyond 90 days. History
-only stores structured event/status/error codes: worker tokens, stage keys,
-signed URLs, and raw error text are not copied into it. The detail UI renders
-null timestamps as unavailable and keeps history paging bounded.
-`GET /admin/api/albums` accepts a literal-substring `q`, `status` (`QUEUED`,
-`PROCESSING`, `SUCCEEDED`, or `FAILED`), `limit`, and `cursor`. The overview's
-library `albums`, `photos`, and `blobs` are inventory totals. Its encoding and
-embedding categories, skipped-content-type reasons, and raw-state maps each
-count every unique blob exactly once in their respective partition; each item
-is `{blobCount}` only. The grouped overview query reads `blobs` without joining
-photos, so shared references, dangling photo rows, and unreferenced blobs do not
-change pipeline counts. Overview links open the corresponding blob filter.
-Library photo/album totals are not apportioned across pipeline states.
-
-Album detail retains the exact scoped `PipelineCounts` contract: `blobCount`
-counts distinct blobs, `photoCount` counts photo rows that have a matching blob,
-and `albumCount` counts distinct referencing albums (within that album scope).
-Its referenced photos are available through `GET /admin/api/photos?albumId={id}`.
-Album detail also retains its scoped `missingBlobPhotos` integrity count. The
-overview omits the expensive unreferenced-blob and missing-blob-photo checks;
-those explicit integrity counts are available on demand in
-`GET /admin/api/diagnostics` under `integrity`. `unreferencedBlobs` links to the
-exact blob-list filter; there is not currently a list filter for dangling
-photo rows.
-
-The admin browser has **이슈** (`/admin/issues`) and **시스템 진단**
-(`/admin/diagnostics`) tabs. `GET /admin/api/issues` is a read-only snapshot:
-encoding and embedding groups include only blobs whose *current* stage status is
-`failed`, and group by the safe observation `errorCode` (missing/legacy codes
-are `legacy_unknown`). Each group reports `failureCount` and an explicit
-`countUnit: "blobs"`; a blob that failed both stages appears in both groups and
-groups are independent. Current `FAILED` album rows form one
-`album_extraction / legacy_unknown` group with `countUnit: "albums"`: raw album
-errors are not classified or returned by this endpoint. Failed extraction
-entries come only from each album's latest run, and only once that run is
-**terminal**, grouped by their validated reason code with `countUnit: "entries"`;
-a running latest run does not fall back to failures from an older run. Issue
-groups contain no photo, album-reference, or related-blob counts.
-Groups are ordered by `failureCount` and capped at 100. `truncated` and
-`remainingGroups` explicitly report omitted reason groups rather than silently
-dropping them. Counts use different units by stage and are not comparable or
-additive across stages. The UI links each count to the matching blob, album, or
-latest-extraction-entry list.
-
-Pipeline issue links use `encodingErrorCode` and `embeddingErrorCode` on both
-`GET /admin/api/photos` and `/admin/api/blobs`. Each filter is exact and only
-matches rows whose current corresponding stage is `failed`; missing legacy
-observations match `legacy_unknown`. The safe code syntax is lowercase ASCII
-letters, digits, and underscores (1–64 characters). The filters combine with
-the existing status and other filters using AND. Raw error messages are not
-used as issue-group keys. The UI links encoder/embedding groups to these
-cursor-paged resource lists, and archive groups to the current `status=FAILED`
-album list.
-
-`GET /admin/api/extraction-failures?reasonCode=...&limit=...&cursor=...` is the
-matching paged target for an extraction-entry group. It returns entry names,
-album identity, run ID, ordinal, and safe reason code; it does not return raw
-error detail. Only the album's latest run is included, and only when it is
-terminal. Pages are ordered by
-`(albumId, ordinal)`, default to 50 rows, and cap at 100; cursors are bound to
-the reason and limit. Per-album history remains available via
-`GET /admin/api/albums/{id}/extractions?limit=&cursor=` and
-`GET /admin/api/albums/{id}/entries?runId=&outcome=&limit=&cursor=`. Without
-`runId`, entries select the latest run and report `runSelection: "latest"`; a
-running run returns 409 because its entries are not stable. A legacy album
-without recorded runs returns 404 rather than implying zero failures. Run
-history is append-only, but only its latest run contributes to current issue
-groups after it becomes terminal; older runs are not substituted while the
-latest run is in progress.
-
-`GET /admin/api/diagnostics` does not mutate queues or start background work.
-This endpoint is loaded only when the diagnostics page is opened. Its catalog
-measurements include the explicit integrity counts `integrity.unreferencedBlobs`
-and `integrity.missingBlobPhotos`, plus stage-specific expired lease counts;
-encoding-queued and embedding-queued counts with their oldest available
-`status_changed_at` ages; and the encoding `committing` and
-`reconciling` counts. Each queue's `unknownAgeCount` counts rows in that exact
-reported category without a matching recorded pending observation timestamp.
-Queue age never falls back to
-`created_at`. The oldest commit start is a recorded observation `started_at`;
-`unknownStartCount` keeps rows without a known start visible. These catalog
-measurements share one short SQLite read transaction. The optional external
-vector count is fetched only after that transaction: its status is `disabled`,
-`available`, or `unavailable`, and a vector-store outage leaves catalog
-diagnostics available with a sanitized message instead of returning 500. A
-disabled store's point count and agreement are null/unmeasured. When available,
-`countAgreement` compares external point count with catalog-ready photo pairs;
-agreement is a count comparison, not a claim of full vector synchronization or
-point-by-point integrity. Model/encoding flags report server feature
-configuration separately from activity. `workerActivity` is the embedding API
-service's last claim/renew/results attempt stamp since this process started; an
-attempt is not a heartbeat and does not prove a worker is alive. Zero means no
-attempt has been recorded since restart.
-
-Embedding queue diagnostics and browse filters classify every pending embedding
-as `queued`, independently of encoding progress. Claims also reclaim expired
-embedding leases without checking encoding status. Legacy encoding gates are
-neutralized on upgrade and ignored by claims.
-
-The diagnostics page links expired embedding/encoding leases to exact
-`embeddingLeaseExpired=true` / `encodingLeaseExpired=true` filters on photo and
-blob lists. `encodingPhase=reconciling` is an exact committing-phase filter.
-Queue-age links open the matching category, but do not isolate only the oldest
-rows; the UI says so explicitly. These filters are bounded by the same
-cursor and 1–100 page limits as other browse APIs.
-
-The browse queries use existing primary-key and hash indexes and add no schema
-migration. Literal substring searches use SQLite `instr(lower(...))` and are
-not indexed; state-filtered photo/blob pages can also examine many rows on a
-large catalog. The current indexes support ordered album/photo/hash traversal,
-but production `EXPLAIN QUERY PLAN` and workload measurements should guide any
-future approved index migration. No list API reports retry counts or invented
-retry/timing estimates.
-
-### Scoped admin recovery (stage 7A backend)
-
-The scoped recovery API currently supports exactly four blob actions:
-
-- `retry_failed_encoding`: only raw `encoding_status=failed` non-WebP blobs.
-- `retry_failed_embedding`: only raw `embedding_status=failed` blobs.
-- `release_expired_encoding`: only expired `encoding_status=leased` blobs.
-- `release_expired_embedding`: only expired `embedding_status=processing` blobs.
-
-Encoding `received` and `committing` work is never reset by these actions;
-`reconciling` observations are ineligible. Live leases, ready rows, `skipped`
-(including not-smaller encodings), pending rows, and all other states are
-reported as skipped. The legacy global `/admin/api/recover` and `/admin/api/reindex`
-policies remain available and retain their existing broader/explicitly
-dangerous behavior; the scoped endpoints do not add whole-library reindexing.
-Album extraction retry is deliberately not offered: the existing extraction
-queue is in-memory and does not provide the durable idempotent enqueue needed
-to safely persist a retry across a crash. No S3 source check is therefore
-performed by this backend.
-
-Create a preview with strict JSON (unknown fields and non-JSON content types are
-rejected). A selection contains exactly one of `hashes`, `photos`, `albumIds`,
-or `filter`. Explicit photo identities use `(albumId, idx)`; albums/photos
-resolve to distinct content hashes. `filter` uses the same exact filters as
-`GET /admin/api/blobs` (for example `encoding`, `embedding`, `albumId`, `hash`,
-error-code, lease-expired, phase, skipped-reason, and `unreferenced` filters).
-There is no `q` substring filter on the blob browse endpoint. Example:
-
-```http
-POST /admin/api/actions/preview
-Content-Type: application/json
-X-Admin-Action: 1
-
-{"action":"retry_failed_embedding","selection":{"albumIds":["album-a"]}}
-```
-
-The response includes `previewId`, `actor`, `actorNote`, `action`, creation and
-expiry timestamps, `targetCount`, `eligibleCount`, `skippedCount`,
-`skippedReasons`, `selectedPhotos`, `affectedPhotos`, `affectedAlbums`, and
-`sharedBlobWarning`. Previews expire after ten minutes. The target cap is 10,000
-distinct blobs and explicit inputs are capped at 10,000 items; an oversized
-filter is rejected, never truncated. The stored target set is immutable: rows
-that begin matching after preview are not added. Preview and GET calls do not
-mutate pipeline state.
-
-For album/photo scopes, `selectedPhotos` counts photo rows in that explicit
-scope while `affectedPhotos`/`affectedAlbums` count every current reference to
-the selected shared blobs. `sharedBlobWarning` is true when global photo impact
-exceeds the selected scope. For hash and blob-filter scopes, selected and global
-photo counts describe the same blob-wide scope. Preview eligibility is only a
-snapshot; execution rechecks each target's generation and uses a transactional
-compare-and-set, recording a `conflict` rather than overwriting changed state.
-The private fingerprint covers raw stage state, observation timestamps/phase,
-attempt and safe error metadata, plus an encoding lease/token digest when
-releasing an encoding lease. Lease tokens themselves are never returned or
-stored in recovery tables.
-
-Queue the preview with a caller-generated idempotency key:
-
-```http
-POST /admin/api/operations
-Content-Type: application/json
-X-Admin-Action: 1
-Idempotency-Key: incident-2026-10-14-1
-
-{"previewId":"<previewId>","action":"retry_failed_embedding"}
-```
-
-The same key and exact preview/action/payload returns the same operation; a
-different binding returns `409`. A preview can be consumed once. Operations
-are durable in SQLite and execute in bounded small batches; startup resumes
-queued or interrupted work, while shutdown returns unfinished work to the
-queue. Operation statuses are `queued`, `running`, `completed`,
-`partially_failed`, or `failed`. Per-target results include `succeeded`,
-`conflict`, `skipped`, and `failed`, with short safe reason codes only. Use
-`GET /admin/api/operations?limit=50&cursor=...` for summaries and
-`GET /admin/api/operations/{id}?limit=50&cursor=...` for results; page sizes
-are 1–100. Result rows are never returned unbounded.
-
-The operation executor starts only when `ADMIN_TOKEN` is nonempty. While the
-admin service is disabled, durable operations stay paused and no targets are
-executed; enabling the admin service at startup requeues interrupted operations
-and resumes queued work.
-
-The **복구 운영** frontend shows a cursor-paged audit list and cursor-paged
-per-blob operation results, with links to blob details. Photo and blob browse
-lists allow row checkboxes and “select visible page” only; selection is cleared
-when URL filters or page paths change. Photos submit explicit `(albumId, idx)`
-identities and the backend deduplicates shared blob hashes. Blob lists also
-offer a separate whole-filter preview using only exact supported blob filters;
-`q`, `cursor`, duplicate, and unknown query parameters disable that action
-rather than being discarded. Filter previews are capped at 10,000 distinct
-blobs and oversized requests are rejected, not truncated.
-
-Every scoped action follows preview → review → explicit confirmation → queued
-operation. The preview shows eligibility, skipped reasons, expiry, and
-photo/album impact including shared-blob impact. Changing the action or
-selection invalidates the preview. A network failure while queueing retains
-that preview's idempotency key so the exact request can safely be retried.
-Queued/running operation details refresh every 20 seconds while visible,
-without overlapping requests. Per-target `succeeded` results are labeled as
-applied; operation completion means recovery execution ended. Applied targets
-were returned to pipeline queues, not that encoding or embedding finished
-successfully. The audit actor is only
-the HTTP Basic username label and does not verify an individual token holder.
-The existing global recovery screen remains separately labeled as a dangerous
-legacy action. Album detail recovery scopes blob pipeline actions to that album;
-archive extraction retry is unavailable and is not implied by this UI.
-
-The operation actor is the username label from HTTP Basic credentials, not a
-verified individual: deployments share an admin token, and the API explicitly
-does not claim to identify which token holder acted. Audit rows store this
-label, action, preview, idempotency binding, state, and safe result reason codes;
-they do not store credentials or raw pipeline errors.
-
-Migration 0008 adds `admin_recovery_previews` (actor/action/scope, timestamps,
-counts and one-time consumption), `admin_recovery_targets` (ordered frozen blob
-IDs, eligibility, safe reason, private generation fingerprint and impact
-counts), `admin_recovery_operations` (idempotency binding and durable status),
-and `admin_recovery_results` (one bounded-pageable result per frozen target).
-Catalog state transition, stage observation/event, and result are committed in
-the same SQLite transaction for each target.
-
-Every mutation under `/admin`, including legacy `/admin/api/recover` and
-`/admin/api/reindex`, requires the custom
-`X-Admin-Action: 1` header; the legacy dashboard adds it to its existing POSTs.
-Legacy `/admin/api/recover` requests and all new POST routes require
-`Content-Type: application/json`; the existing bodyless `/admin/api/reindex`
-request is the exception and does not need a content type. Requests with an
-explicit cross-origin `Origin` or non-same-origin `Sec-Fetch-Site` are rejected.
-No CORS permission is configured, so cross-origin preflight is not enabled.
-Existing GET routes, including authenticated curl reads, do not require the
-custom header.
-
-When TLS terminates at a reverse proxy, the same-origin scheme check uses
-`X-Forwarded-Proto` and compares `Origin` against the public `Host`. Only use
-this behind a known proxy that overwrites/sanitizes the forwarded header; the
-application does not validate trusted proxies, so direct clients must not be
-able to spoof it.
+| POST | `/admin/api/reindex` | Re-embed every ready blob; answers with the fresh embedding counts. |
+| POST | `/admin/api/recover` | Run one synchronous recovery target, optionally narrowed by a `hashes` list. |
 
 For an encoder rollout, deploy the API server before upgrading workers; old
 workers remain supported by the legacy claim mode. Do not roll back to a server
@@ -473,6 +136,34 @@ or `committing`: that version cannot finish those server-owned jobs. The API
 accepts at most 1 GiB per result, and retains a bounded two-result spool on the
 state volume. A `202` confirms a local handoff, not a completed S3
 replacement; if the state volume is lost, missing results are re-queued.
+
+## Admin
+
+`/admin` is an independent React browser with its own entry, styles, and routes, registered only when `ADMIN_TOKEN` is set. Everything under `/admin` — pages and API alike — requires HTTP Basic auth with the token as the password; without the token the whole surface answers 404. Mutations additionally require the `X-Admin-Action: 1` header and a same-origin request: an explicit cross-origin `Origin` or a non-same-origin `Sec-Fetch-Site` is rejected, and no CORS is configured. This is a CSRF boundary, not identity — the Basic username is only a label. Behind a TLS-terminating proxy the same-origin scheme check honors `X-Forwarded-Proto` and compares `Origin` against the public `Host`, so only use it behind a proxy that overwrites those headers. The bundled JS under `/admin/assets` is static code served without auth; it contains no catalog data or credentials.
+
+### Pages
+
+- **개요** (Overview) — library totals (albums, photos, unique blobs); encoding and embedding category counts over unique blobs, each linking into the photo list; the 시스템 상태 health panel (expired encoding/embedding leases, unreferenced blobs, blob-less photos, a best-effort vector-store count comparison that degrades instead of failing, and feature flags that report server configuration, never worker liveness); the 복구 작업 panel of confirm-gated recovery actions; and the 실행 제어 panel.
+- **사진** (Photos) — the list browser for photo rows. The filter form exposes `q`, `albumId`, `hash`, `encoding`, and `embedding`; the URL-only filters below arrive as deep links and are shown as a notice. Photo detail shows per-stage state, observation, and error, plus per-blob recovery buttons.
+- **블롭 상세** (Blob detail) — reachable through hash links only; there is no blob list page. It shows stored content, per-stage state and observation, the newest 20 pipeline events, references, and per-blob recovery buttons.
+- **앨범** (Albums) — the album list plus a slim detail page: status, error, photo and missing-blob-photo counts, the latest extraction run summary, and drill links into the photo list.
+- **이슈** (Issues) — current failure groups by stage and safe error code with drill-downs, plus the extraction-failures browser showing which ZIP entries failed.
+
+### API
+
+List endpoints answer `{photos|albums, nextCursor}`; `nextCursor` is `null` at the end. `limit` defaults to 50 and accepts 1–100. Cursors are URL-safe opaque keyset positions bound to the resource, filters, and limit, so continuation requests must repeat them. Pages are ordered by `(albumId, idx)` or `id` and are independent reads, not snapshots. Unknown or repeated query parameters, invalid categories, and malformed or mismatched cursors return 400; missing detail resources return 404.
+
+- `GET /admin/api/photos` accepts the form filters `q`, `albumId`, `hash`, `encoding`, `embedding` plus the URL-only `encodingErrorCode`, `embeddingErrorCode`, `encodingLeaseExpired`, `embeddingLeaseExpired`, `missingBlob`, and `limit`/`cursor`. `q` is an ASCII-case-insensitive literal substring of the album filename or photo name (`%`, `_`, and `\` are ordinary characters; 256-byte cap; not indexed). `hash` is exact. `encoding` accepts the overview categories `queued`, `processing`, `validating`, `committing`, `completed`, `skipped`, `failed`, `unknown`; `embedding` accepts `queued`, `processing`, `completed`, `failed`, `unknown`. The error-code filters are exact and only match rows whose current corresponding stage is `failed`. Filters combine with AND. Photo rows carry raw and normalized states, error text and code, and the per-stage observation (`startedAt`, `finishedAt`, `statusChangedAt`, `attempts`, `phase`, `errorCode`, `retryability`). A `missingBlob` row has no blob: `sizeBytes` and `contentType` are `null` and the pipeline fields are empty.
+- `GET /admin/api/blobs/{hash}` answers one blob with the same stage fields plus `photoCount` and distinct `albumCount`; page its references through `GET /admin/api/photos?hash=...`. `GET /admin/api/blobs/{hash}/history?limit=&cursor=` pages its pipeline events. Observations and history begin with migration 0006: existing rows are backfilled with their current status and no inferred timings, and failures that cannot be safely classified use `errorCode: "legacy_unknown"`. History keeps the last 90 days of structured event/status/error codes only — worker tokens, stage keys, signed URLs, and raw error text are never copied into it.
+- `GET /admin/api/albums` accepts `q` (same substring rule), `status` (`QUEUED`, `PROCESSING`, `SUCCEEDED`, `FAILED`), `limit`, and `cursor`. Album detail answers status, error, `photoCount`, `missingBlobPhotos`, and the latest extraction run summary; `extractionRecorded: false` marks albums that predate run recording.
+- `GET /admin/api/issues` groups current failures: encoding and embedding groups count unique blobs whose current stage status is `failed`, grouped by safe `errorCode`; current `FAILED` albums form one `album_extraction` group; failed entries from each album's latest terminal extraction run group by validated reason code. Counts use different units per stage (blobs, albums, entries) and are not additive. Groups are capped at 100, with `truncated` and `remainingGroups` reporting omissions. `GET /admin/api/extraction-failures?reasonCode=&limit=&cursor=` pages one group's entries, ordered by `(albumId, ordinal)`: entry names, album identity, run ID, ordinal, and the safe reason code — never raw error detail.
+
+### Recovery and execution control
+
+- `POST /admin/api/recover` runs exactly one synchronous target per request and answers with that action's typed result plus fresh counts. Targets: `release_expired_claims` (expired embedding claims back to pending; valid claims never move), `release_all_claims` (also live embedding leases — API-only, no UI button), `retry_failed_embeddings`, `retry_failed_encodings` (failed non-WebP conversions), and `reset_stuck_encoding` (expired encoding leases and uncommitted `received` results back to pending; `committing` rows are never touched). An optional `hashes` list of lowercase 64-hex SHA-256 digests (at most 100) narrows any target to those blobs; without it the target applies library-wide. Every action is a single synchronous status flip that the existing workers drain — there is no queue or background executor — and the response reports the rows actually moved.
+- `POST /admin/api/reindex` flips every ready embedding back to pending — the costly global action — and answers with the fresh embedding counts.
+- `GET|POST /admin/api/automatic/embedding` reads or flips the automatic local embedding switch. The POST body is `{"enabled":true}` or `{"enabled":false}`; the answer is `{"enabled":...,"running":...}`, where `running` means the worker loop exists (model loaded and started), not that inference is active this instant. Automatic embedding is enabled on every server start; the pause preference is process-local, not persisted, and takes effect between batches — an in-flight batch finishes, and no new batch is claimed until the switch flips back. Invalid control JSON (missing/null `enabled` or unknown fields) returns 400 `INVALID_REQUEST`; a service that cannot answer returns 503 `UNAVAILABLE`.
+- `POST /admin/api/encoding/run-local` starts one background local WebP encoding drain with the strict body `{}`, answering `{"started":bool}` — `false` means a drain is already in flight. The target set is the snapshot taken at trigger time, so blobs uploaded afterwards wait for the next trigger. Host deployments need `cwebp` on the server's `PATH` (Debian: `apt-get install webp`; the Docker runtime includes it); a missing `cwebp` fails the trigger immediately with a clear 503 error instead of failing every target. External workers and their leases are unaffected by these local controls.
 
 ## External embedding workers
 

@@ -18,14 +18,11 @@ import (
 
 // runRequest issues an admin-authenticated request with the mutation headers
 // the admin actions require.
-func runRequest(router http.Handler, method, target, body, key string) *httptest.ResponseRecorder {
+func runRequest(router http.Handler, method, target, body string) *httptest.ResponseRecorder {
 	req := httptest.NewRequest(method, target, strings.NewReader(body))
 	req.SetBasicAuth("operator", "secret")
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Admin-Action", "1")
-	if key != "" {
-		req.Header.Set("Idempotency-Key", key)
-	}
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
 	return rec
@@ -86,7 +83,7 @@ func TestAdminAutomaticJSONValidationAuthAndCSRF(t *testing.T) {
 		if !enabled {
 			body = `{"enabled":false}`
 		}
-		res := runRequest(router, method, path, body, "")
+		res := runRequest(router, method, path, body)
 		if res.Code != 200 {
 			t.Fatalf("control=%d %s", res.Code, res.Body.String())
 		}
@@ -95,13 +92,13 @@ func TestAdminAutomaticJSONValidationAuthAndCSRF(t *testing.T) {
 		if obj["enabled"] != enabled || obj["running"] != false {
 			t.Fatalf("status=%v", obj)
 		}
-		res = runRequest(router, "GET", path, "", "")
+		res = runRequest(router, "GET", path, "")
 		if res.Code != 200 || jsonObject(t, res.Body.Bytes())["enabled"] != enabled {
 			t.Fatalf("read=%d %s", res.Code, res.Body.String())
 		}
 	}
 	for _, body := range []string{``, `{}`, `null`, `[]`, `{"enabled":null}`, `{"enabled":"false"}`, `{"enabled":0}`, `{"enabled":false,"extra":true}`, `{"enabled":false} {}`, `{"enabled":`} {
-		res := runRequest(router, "POST", path, body, "")
+		res := runRequest(router, "POST", path, body)
 		if res.Code != 400 || jsonObject(t, res.Body.Bytes())["error"].(map[string]any)["code"] != "INVALID_REQUEST" {
 			t.Errorf("invalid %q=%d %s", body, res.Code, res.Body.String())
 		}
@@ -143,7 +140,7 @@ func TestAdminAutomaticJSONValidationAuthAndCSRF(t *testing.T) {
 		}
 		disabled := New(nil, nil, nil, nil, "", adminService, token).Router()
 		for _, method := range []string{"GET", "POST"} {
-			res := runRequest(disabled, method, path, `{"enabled":false}`, "")
+			res := runRequest(disabled, method, path, `{"enabled":false}`)
 			if res.Code != 404 {
 				t.Errorf("disabled admin exposed %s: %d", method, res.Code)
 			}
@@ -157,7 +154,7 @@ func TestAdminAutomaticJSONValidationAuthAndCSRF(t *testing.T) {
 func TestAdminAutomaticWithoutRecommendService(t *testing.T) {
 	router := New(nil, nil, nil, nil, "", admin.NewService(openAdminTestCatalog(t), nil, nil), "secret").Router()
 	for _, method := range []string{"GET", "POST"} {
-		res := runRequest(router, method, "/admin/api/automatic/embedding", `{"enabled":false}`, "")
+		res := runRequest(router, method, "/admin/api/automatic/embedding", `{"enabled":false}`)
 		if res.Code != 503 || jsonObject(t, res.Body.Bytes())["error"].(map[string]any)["code"] != "UNAVAILABLE" {
 			t.Errorf("missing recommend %s=%d %s", method, res.Code, res.Body.String())
 		}
@@ -173,7 +170,7 @@ func TestAdminAutomaticRunningReflectsStartedWorkers(t *testing.T) {
 	recommender := recommend.NewService(cat, nil, nil, stubEmbedder{}, nil)
 	router := New(nil, nil, nil, nil, "", admin.NewService(cat, nil, recommender), "secret").Router()
 	const path = "/admin/api/automatic/embedding"
-	res := runRequest(router, "GET", path, "", "")
+	res := runRequest(router, "GET", path, "")
 	obj := jsonObject(t, res.Body.Bytes())
 	if res.Code != 200 || obj["enabled"] != true || obj["running"] != false {
 		t.Fatalf("before start=%d %v", res.Code, obj)
@@ -181,7 +178,7 @@ func TestAdminAutomaticRunningReflectsStartedWorkers(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	recommender.Start(ctx)
-	res = runRequest(router, "GET", path, "", "")
+	res = runRequest(router, "GET", path, "")
 	obj = jsonObject(t, res.Body.Bytes())
 	if res.Code != 200 || obj["running"] != true {
 		t.Fatalf("after start=%d %v", res.Code, obj)
@@ -197,13 +194,13 @@ func TestLocalEncodingRunLocalEndpointContract(t *testing.T) {
 	// trailing content rejected. An empty body is the zero-value request,
 	// the same decode every other admin action applies.
 	for _, body := range []string{``, `{}`} {
-		res := runRequest(router, "POST", path, body, "")
+		res := runRequest(router, "POST", path, body)
 		if res.Code != 200 || jsonObject(t, res.Body.Bytes())["started"] != true {
 			t.Errorf("body %q=%d %s", body, res.Code, res.Body.String())
 		}
 	}
 	for _, body := range []string{`{"started":true}`, `{} {}`, `[]`} {
-		res := runRequest(router, "POST", path, body, "")
+		res := runRequest(router, "POST", path, body)
 		if res.Code != 400 || jsonObject(t, res.Body.Bytes())["error"].(map[string]any)["code"] != "INVALID_REQUEST" {
 			t.Errorf("invalid body %q=%d %s", body, res.Code, res.Body.String())
 		}
@@ -220,7 +217,7 @@ func TestLocalEncodingRunLocalEndpointContract(t *testing.T) {
 
 	// started=false (a drain already in flight) is 200 information, not an error.
 	local.start = false
-	res := runRequest(router, "POST", path, `{}`, "")
+	res := runRequest(router, "POST", path, `{}`)
 	if res.Code != 200 || jsonObject(t, res.Body.Bytes())["started"] != false {
 		t.Fatalf("single-flight=%d %s", res.Code, res.Body.String())
 	}
@@ -231,7 +228,7 @@ func TestLocalEncodingRunLocalEndpointContract(t *testing.T) {
 	// Deployment errors (cwebp missing, service not started) surface as 503
 	// with the operator-facing message; internal ones stay generic 500s.
 	local.err = errors.New("cwebp is not on the server PATH")
-	res = runRequest(router, "POST", path, `{}`, "")
+	res = runRequest(router, "POST", path, `{}`)
 	if res.Code != 503 || !strings.Contains(res.Body.String(), "cwebp") {
 		t.Fatalf("operator error=%d %s", res.Code, res.Body.String())
 	}
@@ -264,14 +261,14 @@ func TestLocalEncodingRunLocalEndpointContract(t *testing.T) {
 
 	// An unwired encoding service answers 503 UNAVAILABLE.
 	unwired, _ := newAutomaticTestRouter(t, nil)
-	res = runRequest(unwired, "POST", path, `{}`, "")
+	res = runRequest(unwired, "POST", path, `{}`)
 	if res.Code != 503 || jsonObject(t, res.Body.Bytes())["error"].(map[string]any)["code"] != "UNAVAILABLE" {
 		t.Fatalf("unwired=%d %s", res.Code, res.Body.String())
 	}
 
 	// Without an admin token the route is absent entirely (404 JSON).
 	absent := New(nil, nil, nil, nil, "", nil, "").Router()
-	res = runRequest(absent, "POST", path, `{}`, "")
+	res = runRequest(absent, "POST", path, `{}`)
 	if res.Code != 404 {
 		t.Fatalf("disabled admin exposed run-local: %d", res.Code)
 	}
@@ -286,7 +283,7 @@ func TestLocalEncodingWithoutTokenDoesNotExposeExternalRoutes(t *testing.T) {
 	recommender := recommend.NewService(cat, nil, nil, nil, nil)
 	local := &stubLocalEncoding{start: true}
 	router := New(nil, nil, images.NewService(cat, claimOnlyStore{}), recommender, "", admin.NewService(cat, nil, recommender).WithLocalEncoding(local), "secret").Router()
-	res := runRequest(router, "POST", "/admin/api/encoding/run-local", `{}`, "")
+	res := runRequest(router, "POST", "/admin/api/encoding/run-local", `{}`)
 	if res.Code != 200 || jsonObject(t, res.Body.Bytes())["started"] != true {
 		t.Fatalf("local unavailable=%d %s", res.Code, res.Body.String())
 	}
