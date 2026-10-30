@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useRef, useState, type FormEvent, type ReactNode, type MutableRefObject } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, type FormEvent, type ReactNode } from 'react'
 import {
   Link,
   Route,
@@ -15,6 +15,7 @@ import {
   imagePath,
   recover,
   reindex,
+  runLocalEncoding,
   AdminAPIError,
   type Diagnostics,
   type Album,
@@ -36,10 +37,6 @@ import {
   type PipelineCounts,
   type RecoverResult,
   type RecoverTarget,
-  type JobRun,
-  type JobRunStage,
-  type JobRunsPage,
-  type JobRunItemsPage,
   type AutomaticEmbedding
 } from './api'
 
@@ -96,7 +93,6 @@ function AdminApp() {
           <Link to="/albums">앨범</Link>
           <Link to="/issues">이슈</Link>
           <Link to="/diagnostics">시스템 진단</Link>
-          <Link to="/runs">로컬 실행</Link>
           <a className="legacy-danger-link" href="/admin/legacy">기존 통계·복구</a>
         </nav>
       </header>
@@ -111,7 +107,6 @@ function AdminApp() {
           <Route path="/albums/:id" element={<AlbumDetailPage />} />
           <Route path="/issues" element={<IssuesPage />} />
           <Route path="/diagnostics" element={<DiagnosticsPage />} />
-          <Route path="/runs" element={<RunsPage />} />
           <Route path="*" element={<NotFoundPage />} />
         </Routes>
       </main>
@@ -120,240 +115,6 @@ function AdminApp() {
 }
 
 export default AdminApp
-
-type RunRequests = { epoch: number; busy: boolean; mounted: boolean }
-
-// Each scope has at most one read in flight. Actions invalidate every older
-// read immediately, even if fetch ignores abort or resolves before effect cleanup.
-function useRunResource<T>(path: string, refreshKey: number, requests: MutableRefObject<RunRequests>, poll: (data: T) => boolean) {
-  const [state, setState] = useState<LoadState<T>>({ path, data: null, error: '', loading: true })
-  useEffect(() => {
-    if (!path) return
-    const controller = new AbortController()
-    let inFlight = false
-    let lastData: T | null = null
-    setState((old) => old.path === path ? old : { path, data: null, error: '', loading: true })
-    const refresh = async (initial = false) => {
-      if (inFlight || requests.current.busy || controller.signal.aborted) return
-      if (!initial && (document.visibilityState !== 'visible' || (lastData && !poll(lastData)))) return
-      inFlight = true
-      const epoch = requests.current.epoch
-      const current = () => !controller.signal.aborted && requests.current.mounted && requests.current.epoch === epoch
-      try {
-        const data = await adminGet<T>(path, controller.signal)
-        if (!current()) return
-        lastData = data
-        setState({ path, data, error: '', loading: false })
-      } catch (cause) {
-        if (current()) setState((old) => ({ ...old, error: errorMessage(cause), loading: false }))
-      } finally {
-        inFlight = false
-      }
-    }
-    void refresh(true)
-    const timer = window.setInterval(() => void refresh(), 5_000)
-    const onVisibility = () => { if (document.visibilityState === 'visible') void refresh() }
-    document.addEventListener('visibilitychange', onVisibility)
-    return () => {
-      controller.abort()
-      window.clearInterval(timer)
-      document.removeEventListener('visibilitychange', onVisibility)
-    }
-  }, [path, refreshKey, requests, poll])
-  return {
-    ...(state.path === path ? state : { path, data: null, error: '', loading: true }),
-    updateData: (update: (data: T) => T) => setState((old) => old.path === path && old.data
-      ? { ...old, data: update(old.data) } : old)
-  }
-}
-
-const pollRuns = () => true
-const activeRun = (run: JobRun) => ['queued', 'running'].includes(run.status)
-const pollRunItems = (page: JobRunItemsPage) => activeRun(page.run)
-const runStageLabel = (stage: JobRunStage) => stage === 'embedding' ? '임베딩' : '인코딩'
-function runStatusLabel(status: string): string {
-  const labels: Record<string, string> = {
-    queued: '대기', pending: '대기', running: '실행 중', completed: '완료', succeeded: '성공',
-    failed: '실패', busy: '다른 작업이 점유', skipped: '건너뜀', cancelled: '취소됨', interrupted: '중단됨'
-  }
-  return `${labels[status] || '알 수 없음'} (${status})`
-}
-
-function runPagePath(resource: string, cursor: string): string {
-  const query = new URLSearchParams({ limit: '50' })
-  if (cursor) query.set('cursor', cursor)
-  return apiPath(resource, `?${query}`)
-}
-
-function RunsPage() {
-  const requests = useRef<RunRequests>({ epoch: 0, busy: false, mounted: false })
-  const actionController = useRef<AbortController | null>(null)
-  const keys = useRef<Partial<Record<JobRunStage, string>>>({})
-  const [refreshKey, setRefreshKey] = useState(0)
-  const [pending, setPending] = useState('')
-  const [actionError, setActionError] = useState('')
-  const [runCursors, setRunCursors] = useState([''])
-  const [selection, setSelection] = useState({ id: '', cursors: [''] })
-  const [cancelConfirmedFor, setCancelConfirmedFor] = useState('')
-  useLayoutEffect(() => {
-    requests.current.mounted = true
-    return () => {
-      requests.current.mounted = false
-      requests.current.epoch++
-      actionController.current?.abort()
-    }
-  }, [])
-  const list = useRunResource<JobRunsPage>(runPagePath('runs', runCursors[runCursors.length - 1] || ''), refreshKey, requests, pollRuns)
-  const automatic = useRunResource<AutomaticEmbedding>(apiPath('automatic/embedding'), refreshKey, requests, pollRuns)
-  const detail = useRunResource<JobRunItemsPage>(selection.id
-    ? runPagePath(`runs/${encodeURIComponent(selection.id)}`, selection.cursors[selection.cursors.length - 1] || '') : '', refreshKey, requests, pollRunItems)
-  const selectedRun = detail.data?.run
-
-  const refresh = () => {
-    requests.current.epoch++
-    setRefreshKey((key) => key + 1)
-  }
-  const act = async (name: string, action: (signal: AbortSignal) => Promise<void>) => {
-    if (requests.current.busy) return
-    requests.current.busy = true
-    requests.current.epoch++
-    const controller = new AbortController()
-    actionController.current = controller
-    setPending(name)
-    setActionError('')
-    try {
-      await action(controller.signal)
-    } catch (cause) {
-      if (!controller.signal.aborted) {
-        const unavailable = (name === 'embedding' || name === 'encoding') && cause instanceof AdminAPIError && cause.status === 503
-        setActionError(unavailable
-          ? `로컬 실행기를 사용할 수 없습니다. 모델 로딩 중이거나 실행기가 설정되지 않았을 수 있습니다. ${errorMessage(cause)}`
-          : errorMessage(cause))
-      }
-    } finally {
-      requests.current.busy = false
-      if (requests.current.mounted) {
-        setPending('')
-        refresh()
-      }
-    }
-  }
-  const start = (stage: JobRunStage) => act(stage, async (signal) => {
-    const key = keys.current[stage] ||= newIdempotencyKey('admin-run')
-    try {
-      const run = await adminPost<JobRun>(apiPath('runs'), { stage }, key, signal)
-      if (signal.aborted) return
-      delete keys.current[stage]
-      setRunCursors([''])
-      setSelection({ id: run.id, cursors: [''] })
-      setCancelConfirmedFor('')
-    } catch (cause) {
-      // Preserve the key for ambiguous network/server failures so retrying cannot
-      // create a second snapshot if the first response was lost.
-      if (cause instanceof AdminAPIError && cause.status >= 400 && cause.status < 500) delete keys.current[stage]
-      throw cause
-    }
-  })
-
-  return <>
-    <PageTitle title="로컬 실행" description="서버의 로컬 실행과 자동 임베딩을 관리하고 저장된 실행 결과를 확인합니다." />
-    <section className="panel">
-      <h2>수동 실행 · 유한한 스냅샷</h2>
-      <p>각 실행은 시작 시점에 처리 가능한 대기(pending) 대상을 스냅샷으로 고정하고, 그 유한한 대상만 소진한 뒤 종료합니다. 이후 추가된 대상은 포함하지 않습니다.</p>
-      <p className="notice warning">이 화면의 실행·취소·자동 일시정지는 로컬 작업에만 적용됩니다. 외부 워커를 제어하거나 취소하지 않습니다. 외부 워커가 먼저 점유한 대상은 건너뛸 수 있습니다.</p>
-      <div className="run-controls">
-        {(['embedding', 'encoding'] as const).map((stage) => <button key={stage} type="button" disabled={!!pending || !!list.data?.runs.some((run) => run.stage === stage && activeRun(run))} onClick={() => void start(stage)}>
-          {pending === stage ? `${runStageLabel(stage)} 등록 중…` : `${runStageLabel(stage)} 수동 실행`}
-        </button>)}
-      </div>
-      <p className="muted">수동 임베딩 시작 시 자동 임베딩은 안전하게 양보하고, 수동 실행이 끝나면 설정에 따라 재개됩니다. 응답을 잃은 요청을 재시도하면 같은 요청 키로 기존 실행을 확인합니다.</p>
-    </section>
-    <section className="panel" aria-label="자동 임베딩 제어">
-      <h2>자동 임베딩</h2>
-      <p className="muted">모델 로드 후 기본 활성화됩니다. 활성 상태여도 모델 로딩 중에는 실행 중이 아닐 수 있습니다.</p>
-      <RunLoadNotice state={automatic} />
-      {automatic.data && <>
-        <dl className="metadata run-auto-status">
-          <dt>자동 설정</dt><dd>{automatic.data.enabled ? '활성' : '일시정지'}</dd>
-          <dt>현재 실행</dt><dd>{automatic.data.running ? '실행 중' : '실행 중 아님'}</dd>
-          <dt>수동 실행에 양보</dt><dd>{automatic.data.pausedByManual ? '수동 실행으로 일시정지 중' : '아니요'}</dd>
-        </dl>
-        <button type="button" disabled={!!pending} onClick={() => void act('automatic', async (signal) => {
-          const status = await adminPost<AutomaticEmbedding>(apiPath('automatic/embedding'), { enabled: !automatic.data!.enabled }, undefined, signal)
-          if (!signal.aborted) automatic.updateData(() => status)
-        })}>{pending === 'automatic' ? '자동 설정 변경 중…' : automatic.data.enabled ? '자동 임베딩 일시정지' : '자동 임베딩 재개'}</button>
-      </>}
-      <p className="muted">일시정지는 자동 작업의 점유가 해제될 때까지 기다립니다. 수동 실행 취소와는 별개입니다.</p>
-    </section>
-    {actionError && <div className="notice error" role="alert">{actionError}</div>}
-    <section className="panel">
-      <h2>최근 로컬 실행 기록</h2>
-      <div className="toolbar"><button type="button" onClick={refresh} disabled={!!pending}>실행 상태 새로고침</button><span className="muted">5초마다 갱신 · 항목 결과는 실행 중일 때 갱신 · 개수 단위: 고유 블롭</span></div>
-      <RunLoadNotice state={list} />
-      {list.data && <>
-        <div className="table-wrap"><table className="data-table runs-table"><thead><tr><th>실행 ID</th><th>단계 / 상태</th><th>대상별 개수</th><th>실행기</th><th>생성 / 시작 / 종료</th><th>안전한 오류 코드</th></tr></thead><tbody>
-          {list.data.runs.map((run) => <tr key={run.id} aria-selected={selection.id === run.id}>
-            <th scope="row"><button className="run-select" type="button" onClick={() => { setSelection({ id: run.id, cursors: [''] }); setCancelConfirmedFor('') }}>{run.id}</button></th>
-            <td>{runStageLabel(run.stage)}<small className="subline">{runStatusLabel(run.status)}{run.cancelRequested && ' · 취소 요청됨'}</small></td>
-            <td><RunCounts run={run} /></td><td>{run.executor}</td><td><RunTimes run={run} /></td><td><code>{run.lastError || '—'}</code></td>
-          </tr>)}
-          {list.data.runs.length === 0 && <EmptyRow columns={6} />}
-        </tbody></table></div>
-        <div className="pagination">
-          {runCursors.length > 1 && <button type="button" onClick={() => setRunCursors((stack) => stack.slice(0, -1))}>← 이전 실행 페이지</button>}
-          {list.data.nextCursor && <button type="button" onClick={() => setRunCursors((stack) => [...stack, list.data!.nextCursor!])}>이전 실행 더 보기 →</button>}
-        </div>
-      </>}
-    </section>
-    {selection.id && <section className="panel run-detail" aria-label="로컬 실행 상세">
-      <h2>로컬 실행 상세 · {selection.id}</h2>
-      <RunLoadNotice state={detail} />
-      {selectedRun && <>
-        <p>{runStageLabel(selectedRun.stage)} · {runStatusLabel(selectedRun.status)} · 실행기 {selectedRun.executor}</p>
-        <RunCounts run={selectedRun} /><RunTimes run={selectedRun} />
-        <p>안전한 오류 코드: <code>{selectedRun.lastError || '—'}</code></p>
-        {activeRun(selectedRun) && <div className="run-cancel">
-          {selectedRun.cancelRequested ? <p role="status">이 로컬 실행의 취소가 요청되었습니다.</p> : <>
-            <label className="confirm-recovery"><input type="checkbox" checked={cancelConfirmedFor === selection.id} onChange={(event) => setCancelConfirmedFor(event.target.checked ? selection.id : '')} />이 로컬 실행만 취소합니다. 완료된 결과는 되돌리지 않으며 외부 워커는 취소하지 않습니다.</label>
-            <button type="button" className="danger-button" disabled={!!pending || cancelConfirmedFor !== selection.id} onClick={() => void act('cancel', async (signal) => {
-              const run = await adminPost<JobRun>(apiPath(`runs/${encodeURIComponent(selection.id)}/cancel`), {}, undefined, signal)
-              if (!signal.aborted) {
-                detail.updateData((page) => ({ ...page, run }))
-                list.updateData((page) => ({ ...page, runs: page.runs.map((old) => old.id === run.id ? run : old) }))
-                setCancelConfirmedFor('')
-              }
-            })}>{pending === 'cancel' ? '취소 요청 중…' : '확인한 로컬 실행 취소'}</button>
-          </>}
-        </div>}
-        <h3>대상별 결과</h3>
-        <div className="table-wrap"><table className="data-table run-items-table"><thead><tr><th>해시</th><th>상태</th><th>안전한 오류 코드</th><th>시작</th><th>종료</th><th>갱신</th></tr></thead><tbody>
-          {detail.data!.items.map((item) => <tr key={item.hash}><th scope="row" className="hash-cell"><Link to={`/blobs/${encodeURIComponent(item.hash)}`}>{item.hash}</Link></th><td>{runStatusLabel(item.status)}</td><td><code>{item.lastError || '—'}</code></td><td>{item.startedAt ? formatTime(item.startedAt) : '—'}</td><td>{item.finishedAt ? formatTime(item.finishedAt) : '—'}</td><td>{formatTime(item.updatedAt)}</td></tr>)}
-          {detail.data!.items.length === 0 && <EmptyRow columns={6} />}
-        </tbody></table></div>
-        <div className="pagination">
-          {selection.cursors.length > 1 && <button type="button" onClick={() => setSelection((old) => ({ ...old, cursors: old.cursors.slice(0, -1) }))}>← 이전 항목 페이지</button>}
-          {detail.data!.nextCursor && <button type="button" onClick={() => setSelection((old) => ({ ...old, cursors: [...old.cursors, detail.data!.nextCursor!] }))}>다음 항목 페이지 →</button>}
-        </div>
-      </>}
-    </section>}
-  </>
-}
-
-function RunLoadNotice({ state }: { state: { error: string; loading: boolean; data: unknown } }) {
-  return <>{state.error && <div className="notice warning" role="alert">갱신 실패: {state.error}{state.data ? ' · 마지막 정상 데이터를 표시 중입니다.' : ''}</div>}
-    {state.loading && !state.data && <p role="status">불러오는 중…</p>}</>
-}
-
-function RunCounts({ run }: { run: JobRun }) {
-  const labels: Record<keyof JobRun['counts'], string> = {
-    total: '전체', pending: '대기', running: '실행 중', succeeded: '성공', failed: '실패', busy: '점유 중', skipped: '건너뜀', cancelled: '취소', interrupted: '중단'
-  }
-  return <div className="run-counts">{(Object.keys(labels) as (keyof JobRun['counts'])[]).map((key) => <span key={key}>{labels[key]} {run.counts[key].toLocaleString()}</span>)}</div>
-}
-
-function RunTimes({ run }: { run: JobRun }) {
-  return <div className="run-times"><span>생성 {formatTime(run.createdAt)}</span><span>시작 {run.startedAt ? formatTime(run.startedAt) : '—'}</span><span>종료 {run.finishedAt ? formatTime(run.finishedAt) : '—'}</span></div>
-}
 
 function OverviewPage() {
   const [lastGood, setLastGood] = useState<Overview | null>(null)
@@ -430,6 +191,7 @@ function OverviewPage() {
         </section>
         <CategorySection title="임베딩" categories={lastGood.embedding.categories} rawStates={lastGood.embedding.rawStates} filterKey="embedding" blobOnly />
       </>}
+      <ExecutionControlPanel />
       <SyncRecoveryPanel
         title="복구 작업"
         description="전체 범위 복구 동작입니다. 각 동작은 확인 후 즉시 실행되고 대기 상태로 돌아간 행 수를 표시합니다. 유효한 클레임을 강제로 해제하는 동작은 제공하지 않으며, 유효한 리스는 만료를 기다립니다."
@@ -438,6 +200,74 @@ function OverviewPage() {
       />
     </>
   )
+}
+
+// ExecutionControlPanel is the successor of the retired local-runs page: the
+// automatic-embedding pause switch and the local encoding drain trigger, both
+// process-local controls over work that continues on its own.
+function ExecutionControlPanel() {
+  const automatic = useAdminData<AutomaticEmbedding>(apiPath('automatic/embedding'))
+  // The most recent toggle's answer wins over the initial read until the
+  // panel remounts: the POST already returns the status it produced, so a
+  // follow-up GET would only add a race window.
+  const [override, setOverride] = useState<AutomaticEmbedding | null>(null)
+  const status = override ?? automatic.data
+  const [pending, setPending] = useState('')
+  const [result, setResult] = useState('')
+  const [error, setError] = useState('')
+  const running = useRef(false)
+
+  const act = async (name: string, action: () => Promise<void>) => {
+    if (running.current) return
+    running.current = true
+    setPending(name)
+    setError('')
+    try {
+      await action()
+    } catch (cause) {
+      setError(errorMessage(cause))
+    } finally {
+      running.current = false
+      setPending('')
+    }
+  }
+
+  const toggleAutomatic = () => void act('automatic', async () => {
+    const next = await adminPost<AutomaticEmbedding>(apiPath('automatic/embedding'), { enabled: !(status?.enabled ?? true) })
+    setOverride(next)
+  })
+
+  const runLocal = () => void act('encoding', async () => {
+    if (!window.confirm('서버의 cwebp로 대기 중인 WebP 변환 대상 전체를 인코딩합니다. CPU를 많이 사용하며 백그라운드에서 실행됩니다. 계속하시겠습니까?')) return
+    const outcome = await runLocalEncoding()
+    setResult(outcome.started ? '로컬 인코딩이 백그라운드에서 시작되었습니다.' : '이미 로컬 인코딩이 실행 중입니다.')
+  })
+
+  return <section className="panel" aria-label="실행 제어">
+    <h2>실행 제어</h2>
+    <p className="muted">서버의 로컬 실행을 제어합니다. 외부 워커는 제어하지 않습니다.</p>
+    {automatic.error && <div className="notice warning" role="alert">상태 조회 실패: {automatic.error}</div>}
+    {automatic.loading && !automatic.data && <p role="status">불러오는 중…</p>}
+    {status && <>
+      <h3>자동 임베딩</h3>
+      <dl className="metadata">
+        <dt>자동 설정</dt><dd>{status.enabled ? '활성' : '일시정지'}</dd>
+        <dt>현재 실행</dt><dd>{status.running ? '실행 중' : '실행 중 아님'}</dd>
+      </dl>
+      <button type="button" disabled={!!pending} onClick={toggleAutomatic}>
+        {pending === 'automatic' ? '자동 설정 변경 중…' : status.enabled ? '자동 임베딩 일시정지' : '자동 임베딩 재개'}
+      </button>
+      <p className="muted">일시정지는 진행 중인 묶음이 끝난 뒤 적용되며, 즉시 되돌릴 수 있어 확인 없이 전환합니다. 설정은 서버를 다시 시작하면 활성으로 돌아갑니다.</p>
+      {!status.running && <p className="muted">실행 중 아님은 워커가 아직 시작되지 않았다는 뜻입니다. 모델 로드 후 자동으로 시작됩니다.</p>}
+    </>}
+    <h3>로컬 인코딩 실행</h3>
+    <button type="button" disabled={!!pending} onClick={runLocal}>
+      {pending === 'encoding' ? '시작 중…' : '로컬 인코딩 실행'}
+    </button>
+    <p className="muted">시작 시점의 대기(pending) 대상만 처리하고 종료합니다. 이후 업로드는 다음 실행까지 기다립니다.</p>
+    {result && <p className="recovery-result" role="status">{result}</p>}
+    {error && <div className="notice error" role="alert">{error}</div>}
+  </section>
 }
 
 function IssuesPage() {
@@ -930,11 +760,6 @@ function BlobsPage() {
   </>
 }
 
-function newIdempotencyKey(prefix = 'admin-recovery'): string {
-  const random = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`
-  return `${prefix}-${random}`
-}
-
 function BlobFilters() {
   const [params] = useSearchParams()
   const navigate = useNavigate()
@@ -1197,7 +1022,7 @@ function ExtractionHistory({ albumID, latest, recorded }: { albumID: string; lat
   const runAppend = olderRuns.key === runsPath ? olderRuns : { key: runsPath, items: [], cursor: null, loaded: false, loading: false, error: '' }
   const entryAppend = moreEntries.key === entriesPath ? moreEntries : { key: entriesPath, items: [], cursor: null, loaded: false, loading: false, error: '' }
   const listedRuns = [...(runsState.data?.runs || []), ...runAppend.items]
-  const runs = pinnedLatestRun && !listedRuns.some((run) => run.runId === pinnedLatestRun.runId)
+  const extractionRuns = pinnedLatestRun && !listedRuns.some((run) => run.runId === pinnedLatestRun.runId)
     ? [pinnedLatestRun, ...listedRuns].sort((left, right) => right.runId - left.runId)
     : listedRuns
   const entries = [...(entriesState.data?.entries || []), ...entryAppend.items]
@@ -1206,7 +1031,7 @@ function ExtractionHistory({ albumID, latest, recorded }: { albumID: string; lat
   const selectedSummary = selectedRunID
     ? (entriesState.data?.run.runId === Number(selectedRunID)
       ? entriesState.data.run
-      : runs.find((run) => run.runId === Number(selectedRunID)) || (pinnedLatestRun?.runId === Number(selectedRunID) ? pinnedLatestRun : null))
+      : extractionRuns.find((run) => run.runId === Number(selectedRunID)) || (pinnedLatestRun?.runId === Number(selectedRunID) ? pinnedLatestRun : null))
     : (entriesState.data?.runSelection === 'latest' ? entriesState.data.run : latestSummary)
 
   const loadOlderRuns = async () => {
@@ -1263,11 +1088,11 @@ function ExtractionHistory({ albumID, latest, recorded }: { albumID: string; lat
     </>}
     {runsState.error && <ErrorPanel message={runsState.error} />}
     {runsState.loading && !runsState.data && <p role="status">추출 실행 기록을 불러오는 중…</p>}
-    {runsState.data && runs.length > 0 && <>
+    {runsState.data && extractionRuns.length > 0 && <>
       <h3>실행 이력</h3>
       <p className="muted">각 재처리는 별도 실행으로 남습니다. 항목 수는 ZIP 전체(폴더·메타데이터·지원하지 않는 확장자 포함) 기준이며, 후보 수는 현재 추출기가 검사하는 이미지 확장자 항목 기준입니다.</p>
       <div className="table-wrap"><table className="data-table extraction-table"><thead><tr><th>실행</th><th>시작</th><th>상태</th><th>등록</th><th>건너뜀</th><th>실패</th><th>항목</th><th></th></tr></thead>
-        <tbody>{runs.map((run) => <tr key={run.runId}>
+        <tbody>{extractionRuns.map((run) => <tr key={run.runId}>
           <th scope="row">#{run.runId}{run.runId === latestRunID && <span className="subline">최신</span>}</th>
           <td>{formatTime(run.startedAt)}</td><td>{run.status}{run.failureReasonCode && <span className="subline">{run.failureReasonCode}</span>}{run.countsProvisional && <span className="subline">현재 기록 기준</span>}</td>
           <td>{run.registeredCount}</td><td>{run.skippedCount}</td><td>{run.failedCount}</td>
@@ -1285,7 +1110,7 @@ function ExtractionHistory({ albumID, latest, recorded }: { albumID: string; lat
       </table></div>
       {(runAppend.loaded ? runAppend.cursor : runsState.data.nextCursor) && <div className="pagination"><button type="button" disabled={runAppend.loading} onClick={loadOlderRuns}>이전 실행 더 보기</button>{runAppend.error && <span role="alert">{runAppend.error}</span>}</div>}
     </>}
-    {runsState.data && runs.length === 0 && recorded && <p className="muted">표시할 추출 실행이 없습니다.</p>}
+    {runsState.data && extractionRuns.length === 0 && recorded && <p className="muted">표시할 추출 실행이 없습니다.</p>}
     {recorded && <>
       <div className="extraction-controls">
         <p>선택 실행: {entriesState.data ? `#${entriesState.data.run.runId}${entriesState.data.runSelection === 'latest' ? ' (최신 기록)' : ''}` : selectedRunID ? `#${selectedRunID}` : '최신 기록'}</p>

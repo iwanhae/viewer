@@ -24,8 +24,8 @@ import (
 // without any session or login plumbing of its own.
 
 // requireAdminToken guards the admin routes with HTTP Basic auth. The username
-// does not affect authorization (job runs record it only as an explicitly
-// unverified audit label) and the password must equal the admin
+// does not affect authorization — it exists only so browsers can prompt and
+// save a credential — and the password must equal the admin
 // token; the comparison is constant time so a wrong guess costs no measurably less than a right one.
 // Every failure — absent header, wrong scheme, malformed base64, wrong
 // password — is the same 401 with a WWW-Authenticate challenge, so an outsider
@@ -116,22 +116,6 @@ func adminRequestScheme(r *http.Request) string {
 		return strings.ToLower(forwarded)
 	}
 	return "http"
-}
-
-func adminActorFromRequest(r *http.Request) string {
-	const prefix = "Basic "
-	header := r.Header.Get("Authorization")
-	if len(header) <= len(prefix) || !strings.EqualFold(header[:len(prefix)], prefix) {
-		return "unknown"
-	}
-	decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(header[len(prefix):]))
-	if err != nil {
-		return "unknown"
-	}
-	if cut := bytes.IndexByte(decoded, ':'); cut >= 0 {
-		return string(decoded[:cut])
-	}
-	return "unknown"
 }
 
 // isAdminPath reports whether a path belongs to the protected admin surface.

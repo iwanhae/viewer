@@ -129,31 +129,34 @@ Notes:
 | GET | `/admin/api/albums/{id}/extractions` | Cursor-paged append-only extraction runs, newest first. |
 | GET | `/admin/api/albums/{id}/entries` | Cursor-paged outcomes for the latest run, or a requested `runId`; supports `outcome`. |
 | GET | `/admin/api/extraction-failures` | Cursor-paged failed entries from each album's latest run when terminal, filtered by `reasonCode`. |
-| POST / GET | `/admin/api/runs` | Start a finite local `embedding` or `encoding` run / list durable runs. POST requires `Idempotency-Key` and `{"stage":"embedding"}` (or `encoding`). |
-| GET | `/admin/api/runs/{id}` | Run summary and paged target outcomes. |
-| POST | `/admin/api/runs/{id}/cancel` | Cancel only this local run; body `{}`. |
 | GET / POST | `/admin/api/automatic/embedding` | Read / change automatic local embedding; POST body `{"enabled":true}` or `{"enabled":false}`. |
+| POST | `/admin/api/encoding/run-local` | Start one background local WebP encoding drain over the pending non-WebP blobs; body `{}`. |
 
 Automatic local embedding is **enabled by default on every server start**; its
 pause preference is process-local, not persisted. Both automatic-control methods
-return `{"enabled":boolean,"running":boolean,"pausedByManual":boolean}` with
-HTTP 200. `running` means the local poller exists (including while releasing
-claims), not that inference is active. `pausedByManual` means enabled automatic
-work is suspended by a manual embedding run or its pre-snapshot handoff. Pause
-waits for the automatic worker to release its claims; it neither cancels manual
-runs nor closes the model. A manual embedding run joins the automatic worker
-before snapshotting pending targets and resumes it afterward only if still
-enabled. Before successful model load, manual embedding returns HTTP 503
-`EXECUTOR_UNAVAILABLE` without creating a run; the automatic preference can
-already be changed. Invalid control JSON (including missing/null `enabled` or
-unknown fields) returns 400 `INVALID_REQUEST`; stopped/interrupted control
+return `{"enabled":boolean,"running":boolean}` with
+HTTP 200. `running` means the local worker loop exists (model loaded and
+started), not that inference is active this instant. Pausing takes effect
+between batches: an in-flight batch finishes, and no new batch is claimed until
+the switch is flipped back — there are no manual runs left to hand off to, so
+nothing races the pause. Before successful model load the worker does not
+exist (`running:false`); the automatic preference can already be changed.
+Invalid control JSON (including missing/null `enabled` or
+unknown fields) returns 400 `INVALID_REQUEST`; a service that cannot answer
 returns 503 `UNAVAILABLE`. All mutations use the existing Admin auth,
 same-origin and `X-Admin-Action: 1` guards. External workers and their leases are
 unaffected by these local controls.
 
+`POST /admin/api/encoding/run-local` starts one background drain that encodes
+every pending non-WebP blob locally with the server's `cwebp`, answering
+`{"started":boolean}` — `started:false` means a drain is already in flight.
+The target set is the snapshot taken at trigger time, so blobs uploaded
+afterwards wait for the next trigger.
+
 Host deployments need `cwebp` on the server's `PATH` for local encoding (Debian:
-`apt-get install webp`). The Docker runtime includes this package. Missing
-`cwebp` is reported as a per-item `cwebp_unavailable` outcome. No worker token is
+`apt-get install webp`). The Docker runtime includes this package. A missing
+`cwebp` fails the run-local trigger immediately with a clear error instead of
+failing every target. No worker token is
 needed locally; external encoding routes are absent without one. Encoding spool
 recovery always starts on boot, even when external worker routes are disabled.
 

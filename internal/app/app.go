@@ -23,7 +23,6 @@ import (
 	"viewer/internal/pipeline"
 	"viewer/internal/qdrant"
 	"viewer/internal/recommend"
-	"viewer/internal/runs"
 	"viewer/internal/storage"
 	"viewer/internal/vision"
 )
@@ -155,23 +154,20 @@ func Run(ctx context.Context) error {
 	defer recommendService.Close()
 
 	// The admin service reads the catalog and vector store, and its re-embed
-	// trigger only flips catalog rows the workers already drain. Local encoding
-	// is always available, regardless of external worker credentials. Creating
-	// it here — before the
-	// HTTP bind, like everything else — means /admin answers from the first
-	// served request on.
-	runManager := newLocalRunManager(ctx, cat, encodingService)
+	// trigger only flips catalog rows the workers already drain. The local
+	// encoding drain trigger is wired here too — local capability is always
+	// available, regardless of external worker credentials. Creating it here
+	// — before the HTTP bind, like everything else — means /admin answers
+	// from the first served request on.
 	var modelLoad sync.WaitGroup
 	defer func() {
 		stop()
-		// Join, rather than timing out and closing SQLite/model under live work.
-		// Executors bound their uncancellable completion/claim cleanup sections.
+		// Join, rather than timing out and closing SQLite/model under live
+		// work: the embedding workers bound their uncancellable
+		// completion/claim cleanup sections.
 		modelLoad.Wait()
-		if err := runManager.Close(context.Background()); err != nil {
-			log.Printf("viewer: local run manager shutdown failed: %v", err)
-		}
 	}()
-	adminService := admin.NewService(cat, vectorStore, recommendService).WithEncodingEnabled(true).WithRunManager(runManager)
+	adminService := admin.NewService(cat, vectorStore, recommendService).WithEncodingEnabled(true).WithLocalEncoding(encodingService)
 	pipelineService := pipeline.NewService(cat, store, pipeline.Options{
 		OnAlbumReady: func(albumID string) {
 			if err := recommendService.ReloadAlbum(context.Background(), albumID); err != nil {
@@ -261,11 +257,12 @@ func Run(ctx context.Context) error {
 			return
 		}
 		log.Printf("viewer: recommendation service enabled (model=%s)", cfgpkg.ModelDir)
-		if err := registerEmbedding(runManager, recommendService); err != nil {
-			log.Printf("viewer: registering local embedding failed: %v", err)
-			return
-		}
-		log.Printf("viewer: managed local embedding available")
+		// Starting the workers is the last step on purpose: Start is
+		// startOnce-guarded and checks Enabled(), so a failed load above
+		// leaves this call a no-op and AutomaticEmbedding reports Running
+		// false — the dashboard's "workers start after the model loads" hint.
+		recommendService.Start(ctx)
+		log.Printf("viewer: automatic embedding workers started")
 	}()
 
 	log.Printf("viewer: startup tasks running in background")
@@ -293,28 +290,11 @@ func Run(ctx context.Context) error {
 // Local capability and spool recovery do not depend on external worker auth.
 func startLocalEncoding(ctx context.Context, cat *catalog.Store, store encoding.Store, stateDir string) (*encoding.Service, error) {
 	service := encoding.New(cat, store, filepath.Join(stateDir, "encoding-spool"))
-	// Accepted local handoffs outlive request/run cancellation. Root shutdown
-	// still stops HTTP and the run manager, but only Close (after that manager
-	// joins) may stop the output processors and recovery scanner.
+	// Accepted local handoffs outlive request/drain cancellation. Root shutdown
+	// still stops HTTP, but only Close (after the drain joins) may stop the
+	// output processors and recovery scanner.
 	if err := service.Start(context.WithoutCancel(ctx)); err != nil {
 		return nil, fmt.Errorf("start WebP encoding: %w", err)
 	}
 	return service, nil
-}
-
-func newLocalRunManager(ctx context.Context, cat *catalog.Store, encoder *encoding.Service) *runs.Manager {
-	return runs.New(ctx, cat, map[string]runs.Registration{
-		"encoding": {Name: "local-cwebp/v1", Executor: encoding.NewEncodingExecutor(encoder)},
-	})
-}
-
-// Called only after successful LoadModel, never while the model is unavailable.
-func registerEmbedding(manager *runs.Manager, service *recommend.Service) error {
-	if !service.Enabled() {
-		return runs.ErrUnavailable
-	}
-	if err := manager.Register("embedding", runs.Registration{Name: "local-siglip2/v1", Executor: recommend.NewEmbeddingExecutor(service)}); err != nil {
-		return err
-	}
-	return manager.RegisterAutomaticEmbedding(service.RunAutomatic)
 }

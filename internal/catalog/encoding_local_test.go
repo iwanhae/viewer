@@ -98,21 +98,23 @@ func TestLocalEncodingBusyMissingAndInvalidTokens(t *testing.T) {
 	}
 }
 
-func TestLocalEncodingAcceptedProtectedFromRunAndOperatorReset(t *testing.T) {
+func TestLocalEncodingAcceptedProtectedFromOperatorReset(t *testing.T) {
 	for _, state := range []string{"received", "committing", "leased"} {
 		t.Run(state, func(t *testing.T) {
 			s := openTestStore(t)
 			ctx := context.Background()
 			seedClaimBlobs(t, s, "target")
-			r := createTestRun(t, s, "encoding", "key")
-			if err := s.StartJobRun(ctx, r.ID); err != nil {
+			// A local drain's claim carries the same fencing shape the
+			// retired run items had: a fresh 128-bit hex token claimed
+			// atomically from pending.
+			token, err := NewEncodingToken()
+			if err != nil {
 				t.Fatal(err)
 			}
-			item := nextTestRunItem(t, s, r.ID)
-			if raw, err := hex.DecodeString(item.ClaimToken); err != nil || len(raw) != 16 {
-				t.Fatalf("item token not safe 128-bit hex: %q", item.ClaimToken)
+			if raw, err := hex.DecodeString(token); err != nil || len(raw) != 16 {
+				t.Fatalf("token not safe 128-bit hex: %q", token)
 			}
-			if _, _, err := s.ClaimLocalEncoding(ctx, item.Hash, item.ClaimToken, time.Now().Add(time.Hour)); err != nil {
+			if _, _, err := s.ClaimLocalEncoding(ctx, "target", token, time.Now().Add(time.Hour)); err != nil {
 				t.Fatal(err)
 			}
 			if _, err := s.db.Exec(`UPDATE blobs SET encoding_status=?,encoding_lease_until=1 WHERE hash='target'`, state); err != nil {
@@ -125,16 +127,26 @@ func TestLocalEncodingAcceptedProtectedFromRunAndOperatorReset(t *testing.T) {
 			if err != nil || len(claimed) != 0 {
 				t.Fatalf("external stole local %s: %+v %v", state, claimed, err)
 			}
-			if err := s.FinishJobRun(ctx, r.ID, "interrupted", "service_stopped"); err != nil {
-				t.Fatal(err)
-			}
-			job, _ := s.GetEncodingJob(ctx, item.Hash)
-			want := state
+			job, _ := s.GetEncodingJob(ctx, "target")
 			if state == "leased" {
-				want = "pending"
+				// A leased-local row is handed back by the drain's own
+				// token-fenced release (its deferred cleanup), not by the
+				// operator reset — that is the successor of the old run
+				// cleanup this case used to exercise.
+				if job.Status != "leased" {
+					t.Fatalf("leased state changed: %+v", job)
+				}
+				if err := s.ReleaseLocalEncoding(ctx, "target", token); err != nil {
+					t.Fatal(err)
+				}
+				job, _ = s.GetEncodingJob(ctx, "target")
+				if job.Status != "pending" || job.Owner != "external" || job.Token != "" {
+					t.Fatalf("drain release=%+v", job)
+				}
+				return
 			}
-			if job.Status != want {
-				t.Fatalf("run cleanup state=%s want=%s", job.Status, want)
+			if job.Status != state {
+				t.Fatalf("operator reset state=%s want=%s", job.Status, state)
 			}
 		})
 	}
@@ -164,26 +176,5 @@ func TestEncodingOwnershipMigrationPreservesExternalClaims(t *testing.T) {
 	job, err := s.GetEncodingJob(context.Background(), "external")
 	if err != nil || job.Token != jobs[0].Token || job.StageKey != jobs[0].StageKey || job.Status != "leased" || job.Owner != "external" || job.LeaseUntil.UnixMilli() != jobs[0].LeaseUntil.UnixMilli() {
 		t.Fatalf("migration changed external claim: %+v %v", job, err)
-	}
-}
-
-func TestEncodingRunCleanupRequiresLocalOwnerEvenWithMatchingToken(t *testing.T) {
-	s := openTestStore(t)
-	ctx := context.Background()
-	seedClaimBlobs(t, s, "target")
-	r := createTestRun(t, s, "encoding", "key")
-	if err := s.StartJobRun(ctx, r.ID); err != nil {
-		t.Fatal(err)
-	}
-	item := nextTestRunItem(t, s, r.ID)
-	if _, err := s.db.Exec(`UPDATE blobs SET encoding_status='leased',encoding_owner='external',encoding_token=?,encoding_lease_until=? WHERE hash=?`, item.ClaimToken, time.Now().Add(time.Hour).UnixMilli(), item.Hash); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.FinishJobRun(ctx, r.ID, "interrupted", "service_stopped"); err != nil {
-		t.Fatal(err)
-	}
-	job, _ := s.GetEncodingJob(ctx, item.Hash)
-	if job.Status != "leased" || job.Owner != "external" || job.Token != item.ClaimToken {
-		t.Fatalf("run cleanup released external owner: %+v", job)
 	}
 }

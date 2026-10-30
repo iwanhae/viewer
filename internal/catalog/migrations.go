@@ -349,6 +349,22 @@ CREATE INDEX IF NOT EXISTS idx_job_run_items_status ON job_run_items(run_id, sta
 			`DROP TABLE IF EXISTS admin_recovery_previews`,
 		},
 	},
+	{
+		version: 14,
+		name:    "drop_local_job_runs",
+		// The durable job-runs subsystem (manual embedding/encoding runs with
+		// snapshot, idempotency and cancel bookkeeping) was removed: the
+		// always-on worker already embeds everything pending, and local
+		// encoding is triggered by an in-memory drain that needs no run rows.
+		// The tables are retired here. Children drop before parents so no
+		// foreign key sees a vanishing parent, and SQLite removes the
+		// idx_job_runs_* / idx_job_run_items_* indexes with their tables, so
+		// no explicit index drops are needed.
+		stmts: []string{
+			`DROP TABLE IF EXISTS job_run_items`,
+			`DROP TABLE IF EXISTS job_runs`,
+		},
+	},
 }
 
 // addBlobLeaseColumnIfMissing adds the external-worker lease column to blobs.

@@ -75,7 +75,22 @@ type Service struct {
 	onEmbeddingDrain func(ctx context.Context) error
 
 	startOnce   sync.Once
-	inferenceMu sync.Mutex // shared by local runs, the poller, and query inference
+	inferenceMu sync.Mutex // shared by local drains, the poller, and query inference
+
+	// automatic is the operator's pause switch for the background embedding
+	// worker. It defaults to true (NewService) and is checked between batches
+	// in workerLoop, so pausing lets an in-flight batch finish instead of
+	// tearing down claims mid-write. Atomic because the admin HTTP handler
+	// flips it while the worker goroutine reads it on every tick.
+	automatic atomic.Bool
+
+	// workersStarted records that Start actually launched the worker loop —
+	// which only happens after a successful model load, because an embed
+	// attempt against an incomplete checkpoint would cache the load failure
+	// permanently. It is written once inside Start's startOnce body and read
+	// by AutomaticEmbedding, both under modelMu, which pairs the startup
+	// goroutine with the admin handler without adding a new lock.
+	workersStarted bool
 
 	// modelMu guards model loading and modelErr. A failed load marks the
 	// embedder unusable so the ingest pipeline keeps blobs pending instead of
@@ -115,13 +130,19 @@ type Service struct {
 // embedding queue drains; a backup hook there is allowed to block, because
 // there is no pending work to delay.
 func NewService(cat *catalog.Store, vectors VectorStore, imagesService *images.Service, embedder EmbeddingProvider, onEmbeddingDrain func(ctx context.Context) error) *Service {
-	return &Service{
+	s := &Service{
 		catalog:          cat,
 		vectors:          vectors,
 		images:           imagesService,
 		embedder:         embedder,
 		onEmbeddingDrain: onEmbeddingDrain,
 	}
+	// Automatic embedding is on unless the operator pauses it: a fresh server
+	// start must drain the pending queue without human action. The preference
+	// stays process-local on purpose — a restart that silently kept a pause
+	// would look like a broken worker.
+	s.automatic.Store(true)
+	return s
 }
 
 // LoadModel resolves the checkpoint and compiles the inference graph. Startup
@@ -192,13 +213,23 @@ func (s *Service) computeEmbedding(ctx context.Context, imageBytes []byte) ([]fl
 	return s.embedder.Embed(embedCtx, imageBytes)
 }
 
-// Start launches standalone background workers. The app instead supplies the
-// restartable RunAutomatic entry point to runs.Manager.
+// Start launches the standalone background embedding workers. The app calls
+// it from the model-load goroutine, only after LoadModel succeeds — starting
+// earlier would embed against an incomplete checkpoint and cache the load
+// failure permanently. Calling Start before the model is loaded is a no-op
+// (and reports Running=false), which is how a deployment without a usable
+// checkpoint degrades: the API serves from stored embeddings, new blobs stay
+// pending, and no worker exists to claim them.
 func (s *Service) Start(ctx context.Context) {
 	s.startOnce.Do(func() {
 		if !s.Enabled() {
 			return
 		}
+		// Published under modelMu so AutomaticEmbedding — called from admin
+		// HTTP handlers — can never read this write half-done or race it.
+		s.modelMu.Lock()
+		s.workersStarted = true
+		s.modelMu.Unlock()
 
 		go func() {
 			<-ctx.Done()
@@ -210,17 +241,6 @@ func (s *Service) Start(ctx context.Context) {
 			go func() { _ = s.workerLoop(ctx) }()
 		}
 	})
-}
-
-// RunAutomatic is the blocking, restartable Manager worker entry point. It
-// retains the existing queue drain/finalizer behavior, releases token-fenced
-// claims before returning, and never closes the shared model. An open drain is
-// retained across pauses so a resumed idle tick still runs its finalizer.
-func (s *Service) RunAutomatic(ctx context.Context) error {
-	if s.Enabled() {
-		return s.workerLoop(ctx)
-	}
-	return nil
 }
 
 func (s *Service) workerLoop(ctx context.Context) (workerErr error) {
@@ -243,6 +263,16 @@ func (s *Service) workerLoop(ctx context.Context) (workerErr error) {
 		case <-idleTicker.C:
 		}
 
+		// The pause gate sits between ticks, never inside a batch: a flip to
+		// paused lets the current batch finish (its write-backs and the
+		// deferred claim release complete normally) and stops the next claim.
+		// Skipping the claim also skips the drain-close check below, so a
+		// drain that was open when the pause landed stays open — the resumed
+		// worker's first empty tick is what closes it and fires the backup
+		// hook. Closing it here instead would silently drop that backup.
+		if !s.automatic.Load() {
+			continue
+		}
 		if s.catalog == nil || s.images == nil || s.embedder == nil {
 			continue
 		}

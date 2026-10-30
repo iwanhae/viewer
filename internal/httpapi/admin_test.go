@@ -97,7 +97,6 @@ func TestAdminRoutesRequireBothServiceAndToken(t *testing.T) {
 		{http.MethodGet, "/admin/assets/nonexistent.js"},
 		{http.MethodGet, "/admin/photos/album-a/0"},
 		{http.MethodGet, "/admin/runs"},
-		{http.MethodGet, "/admin/runs/run-id"},
 		{http.MethodGet, "/admin/legacy"},
 		{http.MethodGet, "/admin/api/stats"},
 		{http.MethodGet, "/admin/api/overview"},
@@ -311,23 +310,25 @@ func TestAdminPageServesEmbeddedHTML(t *testing.T) {
 	}
 }
 
-func TestAdminRunsDirectNavigationAndReload(t *testing.T) {
+func TestAdminSPADirectNavigationAndReload(t *testing.T) {
 	router, _ := newAdminTestRouter(t, 1)
-	for _, target := range []string{"/admin/runs", "/admin/runs/", "/admin/runs/run-id"} {
+	for _, target := range []string{"/admin/diagnostics", "/admin/issues", "/admin/blobs/hash-a"} {
 		t.Run(target, func(t *testing.T) {
 			unauthorized := doAdminRequest(t, router, http.MethodGet, target, "")
 			if unauthorized.Code != http.StatusUnauthorized || unauthorized.Header().Get("WWW-Authenticate") == "" {
-				t.Fatalf("unprotected runs page: status=%d body=%s", unauthorized.Code, unauthorized.Body.String())
+				t.Fatalf("unprotected SPA page: status=%d body=%s", unauthorized.Code, unauthorized.Body.String())
 			}
 			for range 2 { // first navigation and browser reload
 				page := doAdminRequest(t, router, http.MethodGet, target, basicAuthHeader("operator", "sekrit"))
 				if page.Code != http.StatusOK || page.Header().Get("Content-Type") != "text/html; charset=utf-8" || !strings.Contains(page.Body.String(), `<div id="admin-root">`) {
-					t.Fatalf("runs page: status=%d type=%s body=%s", page.Code, page.Header().Get("Content-Type"), page.Body.String())
+					t.Fatalf("SPA page: status=%d type=%s body=%s", page.Code, page.Header().Get("Content-Type"), page.Body.String())
 				}
 			}
 		})
 	}
-	for _, target := range []string{"/admin/unknown", "/admin/not-runs/run-id", "/admin/api/unknown"} {
+	// The retired local-runs page is gone: its old URL must not resurrect the
+	// SPA shell, and unknown admin paths stay JSON 404s.
+	for _, target := range []string{"/admin/unknown", "/admin/runs", "/admin/runs/run-id", "/admin/api/unknown"} {
 		page := doAdminRequest(t, router, http.MethodGet, target, basicAuthHeader("operator", "sekrit"))
 		if page.Code != http.StatusNotFound || !strings.HasPrefix(page.Header().Get("Content-Type"), "application/json") || !jsonBodyHasErrorCode(page.Body.String(), "NOT_FOUND") {
 			t.Fatalf("unknown path %s did not return JSON 404: status=%d body=%s", target, page.Code, page.Body.String())
@@ -664,23 +665,23 @@ func TestAdminExtractionHistoryEndpointsArePagedFilteredAndReadOnly(t *testing.T
 		t.Fatalf("legacy default entries status=%d want=404 body=%s", rec.Code, rec.Body.String())
 	}
 
-	// Run history pages newest first; a cursor is bound to album and limit.
-	runs := doAdminRequest(t, router, http.MethodGet, "/admin/api/albums/history-album/extractions?limit=1", auth)
-	if runs.Code != http.StatusOK || !strings.Contains(runs.Body.String(), `"runId":`+strconv.FormatInt(secondRun, 10)) || !strings.Contains(runs.Body.String(), `"nextCursor":"`) {
-		t.Fatalf("first runs page status=%d body=%s", runs.Code, runs.Body.String())
+	// Extraction run history pages newest first; a cursor is bound to album and limit.
+	extractions := doAdminRequest(t, router, http.MethodGet, "/admin/api/albums/history-album/extractions?limit=1", auth)
+	if extractions.Code != http.StatusOK || !strings.Contains(extractions.Body.String(), `"runId":`+strconv.FormatInt(secondRun, 10)) || !strings.Contains(extractions.Body.String(), `"nextCursor":"`) {
+		t.Fatalf("first extraction page status=%d body=%s", extractions.Code, extractions.Body.String())
 	}
-	var runsPage struct {
+	var extractionsPage struct {
 		NextCursor *string `json:"nextCursor"`
 	}
-	if err := json.Unmarshal(runs.Body.Bytes(), &runsPage); err != nil || runsPage.NextCursor == nil {
-		t.Fatalf("decode run cursor: page=%s err=%v", runs.Body.String(), err)
+	if err := json.Unmarshal(extractions.Body.Bytes(), &extractionsPage); err != nil || extractionsPage.NextCursor == nil {
+		t.Fatalf("decode extraction cursor: page=%s err=%v", extractions.Body.String(), err)
 	}
-	olderRuns := doAdminRequest(t, router, http.MethodGet, "/admin/api/albums/history-album/extractions?limit=1&cursor="+url.QueryEscape(*runsPage.NextCursor), auth)
+	olderRuns := doAdminRequest(t, router, http.MethodGet, "/admin/api/albums/history-album/extractions?limit=1&cursor="+url.QueryEscape(*extractionsPage.NextCursor), auth)
 	if olderRuns.Code != http.StatusOK || !strings.Contains(olderRuns.Body.String(), `"runId":`+strconv.FormatInt(firstRun, 10)) {
-		t.Fatalf("older runs page status=%d body=%s", olderRuns.Code, olderRuns.Body.String())
+		t.Fatalf("older extraction page status=%d body=%s", olderRuns.Code, olderRuns.Body.String())
 	}
-	if rec := doAdminRequest(t, router, http.MethodGet, "/admin/api/albums/history-album/extractions?limit=2&cursor="+url.QueryEscape(*runsPage.NextCursor), auth); rec.Code != http.StatusBadRequest {
-		t.Fatalf("mismatched run cursor status=%d want=400 body=%s", rec.Code, rec.Body.String())
+	if rec := doAdminRequest(t, router, http.MethodGet, "/admin/api/albums/history-album/extractions?limit=2&cursor="+url.QueryEscape(*extractionsPage.NextCursor), auth); rec.Code != http.StatusBadRequest {
+		t.Fatalf("mismatched extraction cursor status=%d want=400 body=%s", rec.Code, rec.Body.String())
 	}
 
 	filtered := doAdminRequest(t, router, http.MethodGet, "/admin/api/albums/history-album/entries?runId="+strconv.FormatInt(firstRun, 10)+"&outcome=skipped&limit=1", auth)

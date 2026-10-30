@@ -76,6 +76,14 @@ func (s *Store) EncodingCounts(ctx context.Context) (EncodingCounts, error) {
 	return counts, nil
 }
 
+// NewEncodingToken returns a fresh 128-bit hex claim token. Local encoding
+// drains mint one per blob as their ownership identity: it fences the claim,
+// the accepted-output spool file name, and every terminal write-back, so a
+// token is never reused across blobs or attempts.
+func NewEncodingToken() (string, error) {
+	return newEncodingToken()
+}
+
 func newEncodingToken() (string, error) {
 	var raw [16]byte
 	if _, err := rand.Read(raw[:]); err != nil {

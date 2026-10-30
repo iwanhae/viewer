@@ -188,43 +188,11 @@ export type RecoverResult = {
   encodingRetry?: { reset: number }
 }
 
-export type JobRunStage = 'embedding' | 'encoding'
-export type JobRunCounts = {
-  total: number
-  pending: number
-  running: number
-  succeeded: number
-  failed: number
-  busy: number
-  skipped: number
-  cancelled: number
-  interrupted: number
-}
-export type JobRun = {
-  id: string
-  stage: JobRunStage
-  actor: string
-  executor: string
-  status: string
-  cancelRequested: boolean
-  createdAt: string
-  updatedAt: string
-  startedAt: string | null
-  finishedAt: string | null
-  lastError: string
-  counts: JobRunCounts
-}
-export type JobRunItem = {
-  hash: string
-  status: string
-  startedAt: string | null
-  finishedAt: string | null
-  updatedAt: string
-  lastError: string
-}
-export type JobRunsPage = { runs: JobRun[]; nextCursor: string | null }
-export type JobRunItemsPage = { run: JobRun; items: JobRunItem[]; nextCursor: string | null }
-export type AutomaticEmbedding = { enabled: boolean; running: boolean; pausedByManual: boolean }
+// AutomaticEmbedding mirrors the recommend service's status for the admin
+// execution-control panel: enabled is the process-local pause switch, running
+// means the worker loop exists (model loaded and started) — not that a batch
+// is in flight this instant.
+export type AutomaticEmbedding = { enabled: boolean; running: boolean }
 
 export type Album = {
   id: string
@@ -362,6 +330,13 @@ export async function recover(target: RecoverTarget, hashes?: string[]): Promise
 // fresh embedding counts, so the pending surge is visible immediately.
 export async function reindex(): Promise<EmbeddingCounts> {
   return adminPost<EmbeddingCounts>(apiPath('reindex'), {})
+}
+
+// runLocalEncoding starts one background drain over every pending non-WebP
+// blob, encoded locally with the server's cwebp. started=false means a drain
+// is already in flight — the panel reports that instead of erroring.
+export async function runLocalEncoding(): Promise<{ started: boolean }> {
+  return adminPost<{ started: boolean }>(apiPath('encoding/run-local'), {})
 }
 
 export function apiPath(resource: string, search = ''): string {

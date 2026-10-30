@@ -175,11 +175,6 @@ func Open(path string, sink VectorSink) (*Store, error) {
 		return nil, fmt.Errorf("lock stale embedding reset: %w", err)
 	}
 	now := time.Now()
-	if err := recoverJobRuns(context.Background(), startupTx); err != nil {
-		_ = startupTx.Rollback()
-		db.Close()
-		return nil, fmt.Errorf("interrupt local job runs: %w", err)
-	}
 	// A finalization reservation belongs to the HTTP server's result-write
 	// call, not to the external worker's lease. That call died with the old
 	// process. Clear only its reservation so the worker can submit again;
@@ -212,6 +207,41 @@ func Open(path string, sink VectorSink) (*Store, error) {
 				_ = startupTx.Rollback()
 				db.Close()
 				return nil, fmt.Errorf("record stale embedding reset: %w", err)
+			}
+		}
+	}
+	// The same reasoning, one stage over: a leased-local encoding row belongs
+	// to this process's drain, and no drain exists at boot. The durable run
+	// rows that used to release those leases on restart are gone, so the
+	// startup hygiene owns the reset now — without it, a crash mid-drain
+	// would strand every claimed target forever (nothing else reclaims a
+	// local lease). Only leased rows move: received and committing rows are
+	// accepted output whose spool file and grace lease the encoding service's
+	// own recovery reconciles, and external leases may still be worked by a
+	// worker that survived this restart.
+	for {
+		staleEncoded, err := queryBlobHashes(context.Background(), startupTx,
+			`SELECT hash FROM blobs WHERE encoding_status='leased' AND encoding_owner='local' ORDER BY hash LIMIT 500`)
+		if err != nil {
+			_ = startupTx.Rollback()
+			db.Close()
+			return nil, fmt.Errorf("read stale local encoding leases: %w", err)
+		}
+		if len(staleEncoded) == 0 {
+			break
+		}
+		for _, hash := range staleEncoded {
+			if _, err := startupTx.ExecContext(context.Background(), `UPDATE blobs SET encoding_status='pending', encoding_lease_until=0,
+				encoding_stage_key='', encoding_owner='external', encoding_token=''
+				WHERE hash=? AND encoding_status='leased' AND encoding_owner='local'`, hash); err != nil {
+				_ = startupTx.Rollback()
+				db.Close()
+				return nil, fmt.Errorf("reset stale local encoding lease: %w", err)
+			}
+			if _, err := observeStage(context.Background(), startupTx, hash, "encoding", "startup_reset", "pending", "", now, false, false, false, "", "unknown"); err != nil {
+				_ = startupTx.Rollback()
+				db.Close()
+				return nil, fmt.Errorf("record stale local encoding reset: %w", err)
 			}
 		}
 	}

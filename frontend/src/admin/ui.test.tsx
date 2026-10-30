@@ -95,13 +95,19 @@ const recoverBlob: Blob = {
 
 const embeddingCounts = { total: 2, ready: 0, failed: 0, processing: 0, pending: 2 }
 
+// The overview's execution-control panel also reads the automatic-embedding
+// status; the default shape every overview test serves.
+const automaticStatus = { enabled: true, running: true }
+
 describe('admin React UI', () => {
   afterEach(() => { cleanup(); vi.unstubAllGlobals(); vi.restoreAllMocks() })
 
   it('drills overview unique-blob counts into blob filters and preserves unknown raw states', async () => {
     const fetchMock = mockFetch((url) => url === '/admin/api/overview'
       ? jsonResponse(overview)
-      : jsonResponse({ photos: [], nextCursor: null }))
+      : url === '/admin/api/automatic/embedding'
+        ? jsonResponse(automaticStatus)
+        : jsonResponse({ photos: [], nextCursor: null }))
     renderAt('/')
 
     const section = (await screen.findByRole('heading', { name: 'WebP 인코딩' })).parentElement!
@@ -517,6 +523,7 @@ describe('admin React UI', () => {
     const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true)
     const fetchMock = mockFetchWithInit((url) => {
       if (url === '/admin/api/overview') return jsonResponse(overview)
+      if (url === '/admin/api/automatic/embedding') return jsonResponse(automaticStatus)
       if (url === '/admin/api/recover') return jsonResponse({ target: 'release_expired_claims', release: { released: 2, counts: embeddingCounts } })
       return jsonResponse({})
     })
@@ -538,7 +545,9 @@ describe('admin React UI', () => {
 
   it('registers the full re-embed only after confirming its cost and reports the fresh counts', async () => {
     const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(false)
-    const declined = mockFetchWithInit((url) => url === '/admin/api/overview' ? jsonResponse(overview) : jsonResponse({}))
+    const declined = mockFetchWithInit((url) => url === '/admin/api/overview'
+      ? jsonResponse(overview)
+      : url === '/admin/api/automatic/embedding' ? jsonResponse(automaticStatus) : jsonResponse({}))
     renderAt('/')
     fireEvent.click(await screen.findByRole('button', { name: '전체 재임베딩' }))
     expect(confirmSpy).toHaveBeenCalledTimes(1)
@@ -549,6 +558,7 @@ describe('admin React UI', () => {
     confirmSpy.mockReturnValue(true)
     const fetchMock = mockFetchWithInit((url) => {
       if (url === '/admin/api/overview') return jsonResponse(overview)
+      if (url === '/admin/api/automatic/embedding') return jsonResponse(automaticStatus)
       if (url === '/admin/api/reindex') return jsonResponse({ total: 12, ready: 0, failed: 2, processing: 0, pending: 10 })
       return jsonResponse({})
     })
@@ -567,6 +577,7 @@ describe('admin React UI', () => {
     vi.spyOn(window, 'confirm').mockReturnValue(true)
     mockFetchWithInit((url) => {
       if (url === '/admin/api/overview') return jsonResponse(overview)
+      if (url === '/admin/api/automatic/embedding') return jsonResponse(automaticStatus)
       if (url === '/admin/api/recover') return jsonResponse({ error: { message: 'reset failed' } }, 500)
       return jsonResponse({})
     })
@@ -574,6 +585,123 @@ describe('admin React UI', () => {
     fireEvent.click(await screen.findByRole('button', { name: '인코딩 큐 리셋' }))
     expect((await screen.findByRole('alert')).textContent).toContain('reset failed')
     expect(screen.getByRole('heading', { name: '라이브러리' })).toBeTruthy()
+  })
+
+  it('shows the automatic embedding status and pauses/resumes it without confirmation', async () => {
+    let status = { enabled: true, running: false }
+    const fetchMock = mockFetchWithInit((url, init) => {
+      if (url !== '/admin/api/automatic/embedding') return jsonResponse(overview)
+      if (init?.method === 'POST') {
+        const { enabled } = JSON.parse(String(init.body)) as { enabled: boolean }
+        status = { enabled, running: enabled }
+        return jsonResponse(status)
+      }
+      return jsonResponse(status)
+    })
+    renderAt('/')
+    const panel = screen.getByRole('region', { name: '실행 제어' })
+    // Enabled but not running yet: the muted hint explains the model-load lag
+    // instead of reading as a broken worker.
+    await within(panel).findByText('실행 중 아님')
+    expect(within(panel).getByText('활성')).toBeTruthy()
+    expect(within(panel).getByText(/모델 로드 후 자동으로 시작됩니다/)).toBeTruthy()
+    // The toggle is reversible, so no confirm() is consulted.
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(false)
+    fireEvent.click(within(panel).getByRole('button', { name: '자동 임베딩 일시정지' }))
+    await within(panel).findByRole('button', { name: '자동 임베딩 재개' })
+    expect(within(panel).getByText('일시정지')).toBeTruthy()
+    expect(confirmSpy).not.toHaveBeenCalled()
+    fireEvent.click(within(panel).getByRole('button', { name: '자동 임베딩 재개' }))
+    await within(panel).findByRole('button', { name: '자동 임베딩 일시정지' })
+    expect(within(panel).getByText('실행 중')).toBeTruthy()
+    expect(within(panel).queryByText(/모델 로드 후 자동으로 시작됩니다/)).toBeNull()
+    const posts = fetchMock.mock.calls.filter(([, init]) => init?.method === 'POST')
+    expect(posts.map(([url, init]) => [url, init?.body])).toEqual([
+      ['/admin/api/automatic/embedding', '{"enabled":false}'],
+      ['/admin/api/automatic/embedding', '{"enabled":true}']
+    ])
+    expect(posts.every(([, init]) => new Headers(init?.headers).get('X-Admin-Action') === '1')).toBe(true)
+  })
+
+  it('keeps serving the execution control panel when the automatic status read fails', async () => {
+    mockFetchWithInit((url) => {
+      if (url === '/admin/api/overview') return jsonResponse(overview)
+      if (url === '/admin/api/automatic/embedding') return jsonResponse({ error: { message: 'automatic unavailable' } }, 500)
+      return jsonResponse({})
+    })
+    renderAt('/')
+    const panel = screen.getByRole('region', { name: '실행 제어' })
+    expect(await within(panel).findByText(/automatic unavailable/)).toBeTruthy()
+    // The local encoding trigger stays usable even without the status.
+    expect(within(panel).getByRole('button', { name: '로컬 인코딩 실행' })).toBeTruthy()
+  })
+
+  it('starts the local encoding drain only after confirmation and reports the outcome', async () => {
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(false)
+    const declined = mockFetchWithInit((url) => {
+      if (url === '/admin/api/overview') return jsonResponse(overview)
+      if (url === '/admin/api/automatic/embedding') return jsonResponse(automaticStatus)
+      return jsonResponse({})
+    })
+    renderAt('/')
+    fireEvent.click(await screen.findByRole('button', { name: '로컬 인코딩 실행' }))
+    expect(confirmSpy).toHaveBeenCalledTimes(1)
+    expect(confirmSpy.mock.calls[0][0]).toContain('대기 중인 WebP 변환 대상 전체를 인코딩')
+    expect(declined.mock.calls.some(([url]) => String(url) === '/admin/api/encoding/run-local')).toBe(false)
+
+    cleanup()
+    confirmSpy.mockReturnValue(true)
+    let runs = 0
+    const fetchMock = mockFetchWithInit((url) => {
+      if (url === '/admin/api/overview') return jsonResponse(overview)
+      if (url === '/admin/api/automatic/embedding') return jsonResponse(automaticStatus)
+      if (url === '/admin/api/encoding/run-local') {
+        runs++
+        // The second trigger arrives while the first drain is still running.
+        return jsonResponse({ started: runs === 1 })
+      }
+      return jsonResponse({})
+    })
+    renderAt('/')
+    fireEvent.click(await screen.findByRole('button', { name: '로컬 인코딩 실행' }))
+    expect(await screen.findByText('로컬 인코딩이 백그라운드에서 시작되었습니다.')).toBeTruthy()
+    const runCall = fetchMock.mock.calls.find(([url]) => String(url) === '/admin/api/encoding/run-local')
+    expect(runCall?.[1]?.method).toBe('POST')
+    expect(runCall?.[1]?.body).toBe('{}')
+    expect(new Headers(runCall?.[1]?.headers).get('X-Admin-Action')).toBe('1')
+
+    // started=false is the already-running answer, surfaced as a result line
+    // rather than an error.
+    fireEvent.click(screen.getByRole('button', { name: '로컬 인코딩 실행' }))
+    await screen.findByText('이미 로컬 인코딩이 실행 중입니다.')
+  })
+
+  it('shows local encoding drain errors inline and keeps the panel usable', async () => {
+    vi.spyOn(window, 'confirm').mockReturnValue(true)
+    mockFetchWithInit((url) => {
+      if (url === '/admin/api/overview') return jsonResponse(overview)
+      if (url === '/admin/api/automatic/embedding') return jsonResponse(automaticStatus)
+      if (url === '/admin/api/encoding/run-local') return jsonResponse({ error: { message: 'cwebp is not on the server PATH' } }, 503)
+      return jsonResponse({})
+    })
+    renderAt('/')
+    fireEvent.click(await screen.findByRole('button', { name: '로컬 인코딩 실행' }))
+    expect((await screen.findByRole('alert')).textContent).toContain('cwebp is not on the server PATH')
+    expect(screen.getByRole('button', { name: '로컬 인코딩 실행' }).hasAttribute('disabled')).toBe(false)
+    expect(screen.getByRole('heading', { name: '라이브러리' })).toBeTruthy()
+  })
+
+  it('does not render the retired local runs page or its navigation entry', async () => {
+    mockFetch((url) => url === '/admin/api/overview'
+      ? jsonResponse(overview)
+      : url === '/admin/api/automatic/embedding'
+        ? jsonResponse(automaticStatus)
+        : jsonResponse({ photos: [], nextCursor: null }))
+    renderAt('/')
+    expect(await screen.findByRole('heading', { name: '실행 제어' })).toBeTruthy()
+    expect(screen.queryByRole('link', { name: '로컬 실행' })).toBeNull()
+    expect(screen.queryByRole('region', { name: '로컬 실행 상세' })).toBeNull()
+    expect(screen.queryByText(/유한한 대상만 소진한 뒤 종료/)).toBeNull()
   })
 
   it('labels diagnostics as measurements rather than worker heartbeats or full vector sync', async () => {

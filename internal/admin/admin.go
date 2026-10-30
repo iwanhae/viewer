@@ -9,12 +9,12 @@ package admin
 import (
 	"context"
 	_ "embed"
+	"errors"
 	"fmt"
 	"net/http"
 
 	"viewer/internal/catalog"
 	"viewer/internal/recommend"
-	"viewer/internal/runs"
 )
 
 //go:embed static/admin.html
@@ -36,6 +36,14 @@ func LegacyPage() http.Handler {
 // tests stand in a fake instead of a live Qdrant.
 type VectorCounter interface {
 	CountVectors(ctx context.Context) (int, error)
+}
+
+// LocalEncodingRunner is the slice of the encoding service the admin
+// run-local trigger needs: start one background drain over the pending
+// non-WebP blobs. *encoding.Service satisfies it structurally, and tests can
+// stand in a fake — the same pattern VectorCounter uses.
+type LocalEncodingRunner interface {
+	StartLocalDrain() (bool, error)
 }
 
 // Stats is one snapshot of the whole system for the admin page. The embedding
@@ -97,7 +105,7 @@ type Service struct {
 	vectors         VectorCounter
 	recommend       *recommend.Service
 	encodingEnabled bool
-	runs            *runs.Manager
+	localEncoding   LocalEncodingRunner
 }
 
 // NewService builds the admin service. A nil vectors counter reports the
@@ -116,6 +124,70 @@ func (s *Service) WithEncodingEnabled(enabled bool) *Service {
 		s.encodingEnabled = enabled
 	}
 	return s
+}
+
+// WithLocalEncoding supplies the local encoding drain trigger. Like
+// WithEncodingEnabled it is a builder wired before serving; a service built
+// without one answers RunLocalEncoding with ErrLocalEncodingUnavailable,
+// which is how a test (or a future deployment) without the encoding service
+// gets an explicit 503 instead of a nil-pointer panic.
+func (s *Service) WithLocalEncoding(runner LocalEncodingRunner) *Service {
+	if s != nil {
+		s.localEncoding = runner
+	}
+	return s
+}
+
+// ErrAutomaticEmbeddingUnavailable marks admin automatic-embedding requests
+// made against a service with no recommendation service wired up — a shape
+// only tests produce in practice, but one the HTTP layer must answer with a
+// clean 503 rather than a 500.
+var ErrAutomaticEmbeddingUnavailable = errors.New("automatic embedding control is unavailable")
+
+// ErrLocalEncodingUnavailable marks the local encoding trigger when no
+// encoding service is wired up. It is deliberately distinct from the drain's
+// own errors (cwebp missing, service not started), which the encoding
+// package already words for operators.
+var ErrLocalEncodingUnavailable = errors.New("local encoding is unavailable")
+
+// AutomaticEmbedding reports the recommendation service's pause switch and
+// worker presence for the dashboard.
+func (s *Service) AutomaticEmbedding() (recommend.AutomaticStatus, error) {
+	if s == nil || s.recommend == nil {
+		return recommend.AutomaticStatus{}, ErrAutomaticEmbeddingUnavailable
+	}
+	return s.recommend.AutomaticEmbedding(), nil
+}
+
+// SetAutomaticEmbedding flips the pause switch and returns the status the
+// toggle produced, so the dashboard's next paint comes from the response
+// itself rather than a second read that could race another toggle. The flip
+// takes effect between batches; see recommend.Service.SetAutomaticEmbedding
+// for why that is the whole story now that manual runs are gone.
+func (s *Service) SetAutomaticEmbedding(enabled bool) (recommend.AutomaticStatus, error) {
+	if s == nil || s.recommend == nil {
+		return recommend.AutomaticStatus{}, ErrAutomaticEmbeddingUnavailable
+	}
+	s.recommend.SetAutomaticEmbedding(enabled)
+	return s.recommend.AutomaticEmbedding(), nil
+}
+
+// RunLocalEncoding starts one background drain over every pending non-WebP
+// blob, encoded locally with cwebp. started=false means a drain is already in
+// flight — the caller surfaces that as information, not an error.
+func (s *Service) RunLocalEncoding() (bool, error) {
+	if s == nil || s.localEncoding == nil {
+		return false, ErrLocalEncodingUnavailable
+	}
+	started, err := s.localEncoding.StartLocalDrain()
+	if err != nil {
+		// StartLocalDrain's failures are deployment states worded for
+		// operators — cwebp missing from PATH, the service not started, an
+		// unreadable queue — so the message is surfaced verbatim behind the
+		// sentinel the HTTP layer maps to a 503.
+		return false, fmt.Errorf("%w: %v", ErrLocalEncodingUnavailable, err)
+	}
+	return started, nil
 }
 
 // Stats gathers one snapshot across the catalog and the vector store. It

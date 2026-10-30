@@ -16,6 +16,17 @@ const (
 	LocalEncodingMissing LocalEncodingClaimStatus = "missing"
 )
 
+// PendingLocalEncodingHashes snapshots the exact target set a local encoding
+// drain will work through: pending, non-WebP blobs in deterministic hash
+// order — the same eligibility the retired run snapshot used. The list is
+// finite on purpose: it is what makes a drain terminate, at the cost that
+// blobs uploaded after the snapshot wait for the next trigger. Read outside
+// any transaction: it is a starting point, and ClaimLocalEncoding re-checks
+// each row atomically before any work happens.
+func (s *Store) PendingLocalEncodingHashes(ctx context.Context) ([]string, error) {
+	return queryBlobHashes(ctx, s.db, `SELECT hash FROM blobs WHERE encoding_status='pending' AND content_type!='image/webp' ORDER BY hash`)
+}
+
 // ClaimLocalEncoding claims exactly one pending non-WebP blob. In particular,
 // an expired external lease is still busy: only external recovery may reclaim it.
 func (s *Store) ClaimLocalEncoding(ctx context.Context, hash, token string, until time.Time) (EncodingJob, LocalEncodingClaimStatus, error) {

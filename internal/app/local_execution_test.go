@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"image"
+	"image/color"
 	"image/png"
 	"io"
 	"os"
@@ -20,7 +21,6 @@ import (
 	"viewer/internal/catalog"
 	"viewer/internal/encoding"
 	"viewer/internal/recommend"
-	"viewer/internal/runs"
 	"viewer/internal/storage"
 )
 
@@ -49,7 +49,13 @@ func localTestCatalog(t *testing.T) *catalog.Store {
 	return cat
 }
 
-func TestLocalEncodingBootRecoveryAndRegistrationWithoutWorkerToken(t *testing.T) {
+// TestLocalEncodingBootRecoveryAndDrainWithoutWorkerToken pins the boot-time
+// half of the wiring: the encoding service (and its spool recovery) starts
+// without WORKER_TOKEN, and the local drain runs the real per-blob pipeline
+// against the test store without cwebp, a model, or object storage. The
+// invalid source makes every target fail terminally, which is the observable
+// "drain really ran" signal.
+func TestLocalEncodingBootRecoveryAndDrainWithoutWorkerToken(t *testing.T) {
 	t.Setenv("WORKER_TOKEN", "")
 	cat := localTestCatalog(t)
 	state := t.TempDir()
@@ -73,34 +79,47 @@ func TestLocalEncodingBootRecoveryAndRegistrationWithoutWorkerToken(t *testing.T
 	if store.lists.Load() != 1 {
 		t.Fatalf("startup did not run output cleanup: %d", store.lists.Load())
 	}
-	manager := newLocalRunManager(context.Background(), cat, encoder)
-	defer manager.Close(context.Background())
-	if _, _, err := manager.Create(context.Background(), "admin", "embedding", "not-loaded"); !errors.Is(err, runs.ErrUnavailable) {
-		t.Fatalf("embedding registered before load: %v", err)
+	// The local drain needs a cwebp binary on PATH; a harmless fake satisfies
+	// the fail-fast check, and the invalid source fails before any invocation.
+	fakeBin := t.TempDir()
+	if err := os.WriteFile(filepath.Join(fakeBin, "cwebp"), []byte("#!/bin/sh\nexit 0\n"), 0700); err != nil {
+		t.Fatal(err)
 	}
-	// An invalid source exercises the real local executor against the test store
-	// without invoking cwebp, downloading a model, or accessing object storage.
+	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
 	if err := cat.UpsertBlob(context.Background(), catalog.Blob{Hash: strings.Repeat("a", 64), SizeBytes: 0, ContentType: "image/png"}); err != nil {
 		t.Fatal(err)
 	}
-	run, _, err := manager.Create(context.Background(), "admin", "encoding", "local")
-	if err != nil || run.Executor != "local-cwebp/v1" || run.Counts.Total != 1 {
-		t.Fatalf("local encoding unavailable: %+v %v", run, err)
+	started, err := encoder.StartLocalDrain()
+	if err != nil || !started {
+		t.Fatalf("local encoding unavailable: started=%v err=%v", started, err)
 	}
 	deadline := time.Now().Add(5 * time.Second)
 	for {
-		got, err := cat.JobRun(context.Background(), run.ID)
+		job, err := cat.GetEncodingJob(context.Background(), strings.Repeat("a", 64))
 		if err != nil {
 			t.Fatal(err)
 		}
-		if got.Status == "failed" {
-			if got.Counts.Failed != 1 || got.LastError != "processing_failed" {
-				t.Fatalf("real executor outcome=%+v", got)
-			}
+		if job.Status == "failed" {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("local executor never completed: %+v", got)
+			t.Fatalf("local drain never completed: %+v", job)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	// A second trigger after the drain finished is accepted again (the
+	// single-flight guard only covers a drain that is still running).
+	deadline = time.Now().Add(5 * time.Second)
+	for {
+		started, err := encoder.StartLocalDrain()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if started {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("drain never became idle again")
 		}
 		time.Sleep(time.Millisecond)
 	}
@@ -117,58 +136,62 @@ func (*localTestEmbedder) Embed(context.Context, []byte) ([]float32, error) {
 }
 func (e *localTestEmbedder) Close() error { e.closed.Add(1); return nil }
 
-func TestEmbeddingWiringOnlyAfterSuccessfulLoadAndSharedLifetime(t *testing.T) {
+// TestEmbeddingWorkersStartOnlyAfterSuccessfulLoad pins the app wiring that
+// replaced the run-manager registration: the model-load goroutine's success
+// path is what starts the workers, so a failed load leaves Running false (no
+// worker exists to claim anything), a successful one flips it true, and the
+// operator's pause switch survives across both. The shared model is closed
+// exactly once, by the application's own defer — never by the worker control.
+func TestEmbeddingWorkersStartOnlyAfterSuccessfulLoadAndSharedLifetime(t *testing.T) {
 	for _, fail := range []bool{false, true} {
 		t.Run(map[bool]string{false: "loaded", true: "unavailable"}[fail], func(t *testing.T) {
 			cat := localTestCatalog(t)
-			manager := runs.New(context.Background(), cat, nil)
-			defer manager.Close(context.Background())
 			provider := &localTestEmbedder{}
 			if fail {
 				provider.loadErr = errors.New("no checkpoint")
 			}
 			service := recommend.NewService(cat, nil, nil, provider, nil)
-			if _, _, err := manager.Create(context.Background(), "admin", "embedding", "before-load"); !errors.Is(err, runs.ErrUnavailable) {
-				t.Fatal(err)
+			if status := service.AutomaticEmbedding(); !status.Enabled || status.Running {
+				t.Fatalf("default status=%+v want enabled and not running", status)
 			}
-			// An Admin pause made during startup must survive registration.
-			if _, err := manager.SetAutomaticEmbedding(context.Background(), false); err != nil {
-				t.Fatal(err)
-			}
+			// An Admin pause made during startup must survive the later
+			// Start — the switch is a preference, not a worker handle.
+			service.SetAutomaticEmbedding(false)
+
 			loadErr := service.LoadModel(context.Background())
-			err := registerEmbedding(manager, service)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			service.Start(ctx)
 			if fail {
-				if loadErr == nil || !errors.Is(err, runs.ErrUnavailable) {
-					t.Fatalf("failed model registered: %v %v", loadErr, err)
+				if loadErr == nil {
+					t.Fatalf("failed model reported a successful load")
 				}
-				if _, _, err := manager.Create(context.Background(), "admin", "embedding", "after-load"); !errors.Is(err, runs.ErrUnavailable) {
-					t.Fatal(err)
-				}
-				page, err := manager.List(context.Background(), 10, "")
-				if err != nil || len(page.Runs) != 0 {
-					t.Fatalf("unavailable created run: %+v %v", page, err)
+				status := service.AutomaticEmbedding()
+				if status.Enabled || status.Running {
+					t.Fatalf("failed model started workers: %+v", status)
 				}
 			} else {
-				if loadErr != nil || err != nil {
-					t.Fatalf("register=%v %v", loadErr, err)
+				if loadErr != nil {
+					t.Fatalf("load=%v", loadErr)
 				}
-				status, err := manager.AutomaticEmbedding()
-				if err != nil || status.Enabled || status.Running {
-					t.Fatalf("startup pause lost: %+v %v", status, err)
+				status := service.AutomaticEmbedding()
+				// The workers exist even while paused — the switch gates
+				// claiming, not the loop — and the startup pause survives.
+				if !status.Running {
+					t.Fatalf("loaded model did not start workers: %+v", status)
 				}
-				run, _, err := manager.Create(context.Background(), "admin", "embedding", "after-load")
-				if err != nil || run.Executor != "local-siglip2/v1" {
-					t.Fatalf("loaded executor unavailable: %+v %v", run, err)
-				}
-				if _, err := manager.SetAutomaticEmbedding(context.Background(), true); err != nil {
-					t.Fatal(err)
-				}
-				if _, err := manager.SetAutomaticEmbedding(context.Background(), false); err != nil {
-					t.Fatal(err)
+				if status.Enabled {
+					t.Fatalf("startup pause lost: %+v", status)
 				}
 			}
-			if err := manager.Close(context.Background()); err != nil {
-				t.Fatal(err)
+			// The toggle keeps working after Start, in both directions.
+			service.SetAutomaticEmbedding(true)
+			if status := service.AutomaticEmbedding(); !status.Enabled {
+				t.Fatalf("resume lost: %+v", status)
+			}
+			service.SetAutomaticEmbedding(false)
+			if status := service.AutomaticEmbedding(); status.Enabled {
+				t.Fatalf("pause lost: %+v", status)
 			}
 			if provider.closed.Load() != 0 {
 				t.Fatal("worker control/shutdown closed the shared model")
@@ -188,23 +211,107 @@ func TestLocalEncodingBootRecoveryFailureIsActionable(t *testing.T) {
 	}
 }
 
-type lifecycleEncodingStore struct {
-	localTestStore
-	source      []byte
-	processing  chan context.Context
-	release     chan struct{}
-	processingN atomic.Int32
-	puts        atomic.Int32
+// TestEncodingServiceCloseJoinsDrainAndKeepsAcceptedOutputAlive pins the
+// shutdown ordering the run manager used to own: cancelling the root context
+// does not stop accepted-output processors (they run on the service
+// lifetime), and Close stops the drain between blobs before the processors
+// exit. The real service, accepted handoff, and processors run below; only
+// cwebp is replaced by a seam.
+func TestEncodingServiceCloseJoinsDrainAndKeepsAcceptedOutputAlive(t *testing.T) {
+	cat := localTestCatalog(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// A valid PNG source padded well past the tiny WebP, so the encoded result
+	// is strictly smaller and the commit path runs for real.
+	source := sourcePNGWithPadding(t, 200)
+	sum := sha256.Sum256(source)
+	hash := hex.EncodeToString(sum[:])
+	if err := cat.UpsertBlob(ctx, catalog.Blob{Hash: hash, SizeBytes: int64(len(source)), ContentType: "image/png"}); err != nil {
+		t.Fatal(err)
+	}
+	store := &lifecycleEncodingStore{source: source, processing: make(chan context.Context, 1)}
+	state := t.TempDir()
+	encoder, err := startLocalEncoding(ctx, cat, store, state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The drain needs a cwebp binary on PATH. A script that cats the WebP
+	// fixture exercises the REAL command runner (deadline, stdout capture)
+	// without needing libwebp installed; the runCommand seam stays package-private.
+	fakeBin := t.TempDir()
+	fixture := filepath.Join(fakeBin, "fixture.webp")
+	if err := os.WriteFile(fixture, tinyWebPFixture, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(fakeBin, "cwebp"), []byte("#!/bin/sh\ncat '"+fixture+"'\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	started, err := encoder.StartLocalDrain()
+	if err != nil || !started {
+		t.Fatalf("drain=%v err=%v", started, err)
+	}
+	var processorCtx context.Context
+	select {
+	case processorCtx = <-store.processing:
+	case <-time.After(5 * time.Second):
+		t.Fatal("accepted output never reached its processor")
+	}
+	// Root shutdown alone must not stop the accepted output's processor: the
+	// encoding service deliberately runs on a lifetime independent of it.
+	cancel()
+	if processorCtx.Err() != nil {
+		t.Fatalf("root shutdown stopped accepted output processing: %v", processorCtx.Err())
+	}
+	// Close stops the drain between blobs and joins it, then stops the
+	// processors; the accepted handoff is already durable, so the job lands
+	// in the terminal state either way.
+	closed := make(chan struct{})
+	go func() { encoder.Close(); close(closed) }()
+	select {
+	case <-closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("encoding Close stalled on the drain")
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		job, err := cat.GetEncodingJob(context.Background(), hash)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if job.Status == "done" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("accepted output did not finish after shutdown: %+v", job)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if store.puts.Load() != 1 {
+		t.Fatalf("accepted output writes=%d want=1", store.puts.Load())
+	}
 }
 
+type lifecycleEncodingStore struct {
+	encoding.Store
+	source     []byte
+	processing chan context.Context
+	puts       atomic.Int32
+}
+
+func (s *lifecycleEncodingStore) ListObjects(context.Context, string) ([]storage.Object, error) {
+	return nil, nil
+}
+
+func (*lifecycleEncodingStore) DeleteObjects(context.Context, []string) error { return nil }
+
 func (s *lifecycleEncodingStore) StatObject(ctx context.Context, key string) (storage.Object, bool, error) {
-	if s.processingN.Add(1) == 1 {
-		s.processing <- ctx
-	}
+	// Hand the processor's context to the test exactly once so it can assert
+	// the shutdown ordering against it.
 	select {
-	case <-ctx.Done():
-		return storage.Object{}, false, ctx.Err()
-	case <-s.release:
+	case s.processing <- ctx:
+	default:
 	}
 	return storage.Object{Key: key, Size: int64(len(s.source)), ETag: "original"}, true, nil
 }
@@ -213,152 +320,32 @@ func (s *lifecycleEncodingStore) GetObject(context.Context, string) (io.ReadClos
 	return io.NopCloser(bytes.NewReader(s.source)), "image/png", nil
 }
 
-func (s *lifecycleEncodingStore) PutObject(context.Context, string, io.Reader, string) error {
+func (s *lifecycleEncodingStore) PutObject(_ context.Context, _ string, _ io.Reader, _ string) error {
 	s.puts.Add(1)
 	return nil
 }
 
-type lifecycleExecutor func(context.Context, catalog.JobRun, catalog.JobRunItem) (runs.Outcome, error)
+// writeTinyWebP fixture: the same valid 1x1 WebP bytes the encoding package's
+// own tests use, emitted by the fake cwebp script the PATH installs.
+var tinyWebPFixture = mustDecodeWebP("UklGRkAAAABXRUJQVlA4IDQAAADwAQCdASoBAAEAAQAcJaACdLoB+AAETAAA/vW4f/6aR40jxpHxcP/ugT90CfugT/3NoAAA")
 
-func (f lifecycleExecutor) Execute(ctx context.Context, run catalog.JobRun, item catalog.JobRunItem) (runs.Outcome, error) {
-	return f(ctx, run, item)
+func mustDecodeWebP(encoded string) []byte {
+	data, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		panic(err)
+	}
+	return data
 }
 
-func TestEncodingShutdownKeepsAcceptedOutputProcessorsAlive(t *testing.T) {
-	for _, timeout := range []bool{false, true} {
-		t.Run(map[bool]string{false: "settled", true: "completion-timeout-recovery"}[timeout], func(t *testing.T) {
-			cat := localTestCatalog(t)
-			ctx, cancel := context.WithCancel(context.Background())
-			defer cancel()
-			var source bytes.Buffer
-			if err := png.Encode(&source, image.NewNRGBA(image.Rect(0, 0, 1, 1))); err != nil {
-				t.Fatal(err)
-			}
-			// Padding makes the original strictly larger than the 1x1 WebP.
-			source.Write(make([]byte, 200))
-			encoded, err := base64.StdEncoding.DecodeString("UklGRkAAAABXRUJQVlA4IDQAAADwAQCdASoBAAEAAQAcJaACdLoB+AAETAAA/vW4f/6aR40jxpHxcP/ugT90CfugT/3NoAAA")
-			if err != nil {
-				t.Fatal(err)
-			}
-			sum := sha256.Sum256(source.Bytes())
-			hash := hex.EncodeToString(sum[:])
-			if err := cat.UpsertBlob(ctx, catalog.Blob{Hash: hash, SizeBytes: int64(source.Len()), ContentType: "image/png"}); err != nil {
-				t.Fatal(err)
-			}
-			store := &lifecycleEncodingStore{source: source.Bytes(), processing: make(chan context.Context, 1), release: make(chan struct{})}
-			state := t.TempDir()
-			encoder, err := startLocalEncoding(ctx, cat, store, state)
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer encoder.Close()
-			// A lifecycle seam replaces only cwebp and its 21-minute completion
-			// wait. The real manager, accepted handoff, and processors run below.
-			runCancelled := make(chan struct{})
-			executor := lifecycleExecutor(func(work context.Context, _ catalog.JobRun, item catalog.JobRunItem) (runs.Outcome, error) {
-				if _, _, err := cat.ClaimLocalEncoding(work, item.Hash, item.ClaimToken, time.Now().Add(time.Minute)); err != nil {
-					return runs.Outcome{}, err
-				}
-				if err := encoder.ReceiveOutput(work, item.Hash, item.ClaimToken, bytes.NewReader(encoded)); err != nil {
-					return runs.Outcome{}, err
-				}
-				<-work.Done()
-				close(runCancelled)
-				completion, stop := context.WithTimeout(context.WithoutCancel(work), 2*time.Second)
-				defer stop()
-				if timeout {
-					// Deterministically expire the injected completion wait while
-					// output is still received, without waiting for production TTLs.
-					return runs.Outcome{Status: "failed", ErrorCode: "executor_failed"}, nil
-				}
-				ticker := time.NewTicker(time.Millisecond)
-				defer ticker.Stop()
-				for {
-					job, err := cat.GetEncodingJob(completion, hash)
-					if err == nil && job.Status == "done" {
-						return runs.Outcome{Status: "succeeded"}, nil
-					}
-					select {
-					case <-completion.Done():
-						return runs.Outcome{}, completion.Err()
-					case <-ticker.C:
-					}
-				}
-			})
-			manager := runs.New(ctx, cat, map[string]runs.Registration{"encoding": {Name: "lifecycle-test", Executor: executor}})
-			defer manager.Close(context.Background())
-			run, _, err := manager.Create(ctx, "admin", "encoding", "shutdown")
-			if err != nil {
-				t.Fatal(err)
-			}
-			var processorCtx context.Context
-			select {
-			case processorCtx = <-store.processing:
-			case <-time.After(5 * time.Second):
-				t.Fatal("accepted output never reached its processor")
-			}
-			cancel()
-			closed := make(chan error, 1)
-			go func() { closed <- manager.Close(context.Background()) }()
-			select {
-			case <-runCancelled:
-			case <-time.After(5 * time.Second):
-				t.Fatal("root shutdown did not cancel local requests")
-			}
-			if processorCtx.Err() != nil {
-				t.Fatalf("root shutdown stopped accepted output processing: %v", processorCtx.Err())
-			}
-			if !timeout {
-				select {
-				case err := <-closed:
-					t.Fatalf("manager abandoned blocked accepted output: %v", err)
-				default:
-				}
-				close(store.release)
-			}
-			select {
-			case err := <-closed:
-				if err != nil {
-					t.Fatal(err)
-				}
-			case <-time.After(5 * time.Second):
-				t.Fatal("manager shutdown stalled")
-			}
-			encoder.Close()
-			if processorCtx.Err() == nil {
-				t.Fatal("encoding Close did not stop/join its processors")
-			}
-			if timeout {
-				job, err := cat.GetEncodingJob(context.Background(), hash)
-				if err != nil || job.Status != "received" {
-					t.Fatalf("forced shutdown lost accepted handoff: %+v %v", job, err)
-				}
-				close(store.release)
-				restarted, err := startLocalEncoding(context.Background(), cat, store, state)
-				if err != nil {
-					t.Fatal(err)
-				}
-				defer restarted.Close()
-				deadline := time.Now().Add(5 * time.Second)
-				for {
-					job, err := cat.GetEncodingJob(context.Background(), hash)
-					if err == nil && job.Status == "done" {
-						break
-					}
-					if time.Now().After(deadline) {
-						t.Fatalf("accepted output did not recover: %+v %v", job, err)
-					}
-					time.Sleep(time.Millisecond)
-				}
-			} else {
-				page, err := cat.JobRunItems(context.Background(), run.ID, 10, "")
-				if err != nil || len(page.Items) != 1 || page.Items[0].Status != "succeeded" {
-					t.Fatalf("shutdown lost settled run item: %+v %v", page, err)
-				}
-			}
-			if store.puts.Load() != 1 {
-				t.Fatalf("accepted output writes=%d want=1", store.puts.Load())
-			}
-		})
+// sourcePNGWithPadding encodes a 1x1 PNG and appends enough ancillary bytes
+// that the tiny WebP fixture is strictly smaller than it.
+func sourcePNGWithPadding(t *testing.T, padding int) []byte {
+	t.Helper()
+	img := image.NewNRGBA(image.Rect(0, 0, 1, 1))
+	img.Set(0, 0, color.NRGBA{R: 255, A: 255})
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		t.Fatal(err)
 	}
+	return append(buf.Bytes(), bytes.Repeat([]byte{0}, padding)...)
 }

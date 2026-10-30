@@ -807,9 +807,89 @@ func TestDropScopedAdminRecoveryMigrationRemovesTablesAndIndexes(t *testing.T) {
 		t.Fatalf("migration 0013 left %d scoped admin recovery object(s) behind", leftovers)
 	}
 	// The drop is surgical: the schema the live catalog uses is untouched.
-	for _, table := range []string{"albums", "blobs", "photos", "job_runs", "job_run_items", "extraction_runs"} {
+	for _, table := range []string{"albums", "blobs", "photos", "extraction_runs"} {
 		if !tableExists(t, migrated.db, table) {
 			t.Fatalf("%s missing after migration 0013; the drop must not widen beyond the retired subsystem", table)
+		}
+	}
+}
+
+func TestDropLocalJobRunsMigrationRemovesTablesAndIndexes(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "catalog.db")
+	store, err := Open(path, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The current chain creates the 0011 tables and drops them again in 0014,
+	// so a fresh file has none to remove. Recreate the v11 shape by hand —
+	// both tables plus their indexes and a seeded run/item pair — and rewind
+	// the pragma, so the reopen below exercises the real v13→v14 drop instead
+	// of a no-op.
+	if _, err := store.db.Exec(`
+		CREATE TABLE IF NOT EXISTS job_runs (
+		 id TEXT PRIMARY KEY,
+		 stage TEXT NOT NULL CHECK (stage IN ('embedding','encoding')),
+		 actor TEXT NOT NULL,
+		 idempotency_key TEXT NOT NULL,
+		 executor TEXT NOT NULL,
+		 status TEXT NOT NULL CHECK (status IN ('queued','running','completed','failed','cancelled','interrupted')),
+		 cancel_requested INTEGER NOT NULL DEFAULT 0,
+		 created_at TEXT NOT NULL,
+		 updated_at TEXT NOT NULL,
+		 started_at TEXT,
+		 finished_at TEXT,
+		 last_error TEXT NOT NULL DEFAULT '',
+		 UNIQUE(actor, idempotency_key)
+		);
+		CREATE UNIQUE INDEX IF NOT EXISTS idx_job_runs_active_stage ON job_runs(stage) WHERE status IN ('queued','running');
+		CREATE INDEX IF NOT EXISTS idx_job_runs_created ON job_runs(created_at DESC, id DESC);
+		CREATE TABLE IF NOT EXISTS job_run_items (
+		 run_id TEXT NOT NULL REFERENCES job_runs(id) ON DELETE CASCADE,
+		 hash TEXT NOT NULL,
+		 status TEXT NOT NULL CHECK (status IN ('pending','running','succeeded','failed','busy','skipped','cancelled','interrupted')),
+		 claim_token TEXT NOT NULL DEFAULT '',
+		 started_at TEXT,
+		 finished_at TEXT,
+		 updated_at TEXT NOT NULL,
+		 last_error TEXT NOT NULL DEFAULT '',
+		 PRIMARY KEY(run_id, hash)
+		);
+		CREATE INDEX IF NOT EXISTS idx_job_run_items_status ON job_run_items(run_id, status, hash);
+		INSERT INTO job_runs(id,stage,actor,idempotency_key,executor,status,created_at,updated_at)
+		 VALUES('run-1','encoding','operator','key','local-cwebp/v1','running','2026-10-01T00:00:00Z','2026-10-01T00:00:00Z');
+		INSERT INTO job_run_items(run_id,hash,status,updated_at) VALUES('run-1','a','pending','2026-10-01T00:00:00Z');
+	`); err != nil {
+		t.Fatalf("seed v11 job run schema: %v", err)
+	}
+	if _, err := store.db.Exec(`PRAGMA user_version=13`); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	migrated, err := Open(path, nil)
+	if err != nil {
+		t.Fatalf("reopen through migration 0014: %v", err)
+	}
+	defer migrated.Close()
+	if got := fileVersion(t, path); got != len(migrations) {
+		t.Fatalf("user_version=%d want %d", got, len(migrations))
+	}
+	// Nothing of the subsystem survives — both tables and, because SQLite
+	// drops attached indexes with their tables, the idx_job_run* indexes too.
+	var leftovers int
+	if err := migrated.db.QueryRow(`
+		SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'job_run%'`).Scan(&leftovers); err != nil {
+		t.Fatal(err)
+	}
+	if leftovers != 0 {
+		t.Fatalf("migration 0014 left %d local job run object(s) behind", leftovers)
+	}
+	// The drop is surgical: the schema the live catalog uses is untouched.
+	for _, table := range []string{"albums", "blobs", "photos", "extraction_runs", "blob_stage_observations"} {
+		if !tableExists(t, migrated.db, table) {
+			t.Fatalf("%s missing after migration 0014; the drop must not widen beyond the retired subsystem", table)
 		}
 	}
 }

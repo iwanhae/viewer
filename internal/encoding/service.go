@@ -78,20 +78,48 @@ type Service struct {
 	queued   map[string]struct{}
 	uploadMu sync.Mutex
 	uploads  map[string]struct{}
+
+	// drainCtx is a child of the service lifetime, cancelled by Close before
+	// the output processors stop: it is what halts a local encoding drain
+	// between blobs. It is written under startMu in Start and read under
+	// startMu by StartLocalDrain.
+	drainCtx context.Context
+	// drainCancel stops the drain loop; see drainCtx.
+	drainCancel context.CancelFunc
+	// drainWG joins the drain goroutine(s) separately from the processors.
+	// Close waits on it before cancelling the service lifetime because an
+	// in-flight blob may be inside its post-acceptance completion wait, and
+	// only the processors can produce the terminal state it polls for.
+	drainWG sync.WaitGroup
+	// drainRunning single-flights StartLocalDrain: at most one drain may
+	// snapshot and encode at a time, so a double click (or a racing pair of
+	// admin requests) cannot fork two cwebp pipelines over the same queue.
+	// Guarded by startMu like the rest of the started state.
+	drainRunning bool
+	// runCommand is the cwebp invocation seam. Production uses
+	// runEncoderCommand; tests override it to fake the encoder without
+	// spawning processes.
+	runCommand func(context.Context, string, []string, io.Writer) error
+	// completionTimeout bounds the post-acceptance wait for the spool
+	// processor's terminal state. A field (not the constant) so tests can
+	// shrink it.
+	completionTimeout time.Duration
 }
 
 // New takes a private spool directory. The app places it on the catalog's
 // persistent volume so accepted output survives a container restart.
 func New(cat *catalog.Store, store Store, spoolDir string) *Service {
 	return &Service{
-		cat:         cat,
-		store:       store,
-		commitSlots: make(chan struct{}, outputProcessors),
-		spoolDir:    spoolDir,
-		spoolSlots:  make(chan struct{}, outputQueueSize),
-		outputQueue: make(chan catalog.EncodingJob, outputQueueSize),
-		queued:      make(map[string]struct{}),
-		uploads:     make(map[string]struct{}),
+		cat:               cat,
+		store:             store,
+		commitSlots:       make(chan struct{}, outputProcessors),
+		spoolDir:          spoolDir,
+		spoolSlots:        make(chan struct{}, outputQueueSize),
+		outputQueue:       make(chan catalog.EncodingJob, outputQueueSize),
+		queued:            make(map[string]struct{}),
+		uploads:           make(map[string]struct{}),
+		runCommand:        runEncoderCommand,
+		completionTimeout: localCompletionTimeout,
 	}
 }
 
@@ -225,6 +253,7 @@ func (s *Service) Start(ctx context.Context) error {
 
 	s.started = true
 	ctx, s.stop = context.WithCancel(ctx)
+	s.drainCtx, s.drainCancel = context.WithCancel(ctx)
 	for i := 0; i < outputProcessors; i++ {
 		s.wg.Add(1)
 		go func() { defer s.wg.Done(); s.runOutputProcessor(ctx) }()
@@ -234,9 +263,23 @@ func (s *Service) Start(ctx context.Context) error {
 	return nil
 }
 
-// Close stops and joins recovery/output processing before catalog shutdown.
-// Call after the HTTP server and local run manager have stopped accepting work.
+// Close stops and joins the local encoding drain, then the recovery/output
+// processors, before catalog shutdown. The order matters: a drain blob that
+// has already handed its output to the spool waits (bounded by the completion
+// timeout) for the processors to reach a terminal state — the same guarantee
+// the retired run manager's Close gave — so cancelling the processors first
+// would turn a wait into a 21-minute stall on a row startup recovery owns
+// anyway. Call after the HTTP server has stopped accepting work.
 func (s *Service) Close() {
+	if s == nil {
+		return
+	}
+	s.startMu.Lock()
+	if s.drainCancel != nil {
+		s.drainCancel() // stop claiming more blobs; in-flight work winds down
+	}
+	s.startMu.Unlock()
+	s.drainWG.Wait()
 	s.startMu.Lock()
 	if s.stop != nil {
 		s.stop()
