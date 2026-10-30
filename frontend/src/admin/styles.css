@@ -36,7 +36,6 @@ button:disabled { opacity: .6; cursor: wait; }
 .brand { color: #17212b; font-weight: 700; font-size: 1.1rem; text-decoration: none; white-space: nowrap; }
 .admin-header nav { display: flex; align-items: center; gap: clamp(.7rem, 2vw, 1.6rem); flex-wrap: wrap; }
 .admin-header nav a { color: #344450; text-decoration: none; font-size: .94rem; }
-.admin-header nav a.legacy-danger-link { color: #8a2424; border-left: 1px solid #eab1b1; padding-left: .8rem; }
 .admin-main { width: min(1180px, calc(100% - 2rem)); margin: 1.5rem auto 4rem; }
 .page-title { margin: 0 0 1rem; }
 .page-title h1 { margin: 0; font-size: clamp(1.4rem, 3vw, 1.9rem); }

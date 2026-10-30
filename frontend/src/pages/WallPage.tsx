@@ -315,8 +315,8 @@ export function WallPage() {
           // Every destination lives here — the sub-pages only know the way back
           // to the wall. They share one popover so the island stays narrow on
           // phones, and Admin stays out of it on purpose: the only way to
-          // detect it is probing /admin/api/stats, an admin-only query that
-          // takes seconds, and that probe would fire on every wall load.
+          // detect it is probing an admin-only route, and that probe would
+          // fire on every wall load.
           {
             id: 'wall-nav',
             icon: <ShortcutIcon />,

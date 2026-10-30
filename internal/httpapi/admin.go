@@ -16,9 +16,9 @@ import (
 	"viewer/internal/admin"
 )
 
-// The handlers in this file are the operator surface: a dashboard over the
-// catalog and vector-store state, and the re-embed trigger that is the
-// recovery path for a lost vector store. They sit behind HTTP Basic auth with
+// The handlers in this file are the operator surface: the catalog overview
+// snapshot the dashboard renders, and the re-embed and recovery triggers
+// behind its execution controls. They sit behind HTTP Basic auth with
 // the deployment's ADMIN_TOKEN as the password, which is what lets the page
 // work from a plain browser — the 401 challenge doubles as the login prompt —
 // without any session or login plumbing of its own.
@@ -124,18 +124,10 @@ func isAdminPath(path string) bool {
 	return path == "/admin" || strings.HasPrefix(path, "/admin/")
 }
 
-// adminStats answers with one snapshot of the catalog and vector-store state.
-func (s *Server) adminStats(w http.ResponseWriter, r *http.Request) {
-	stats, err := s.admin.Stats(r.Context())
-	if err != nil {
-		writeError(w, r, http.StatusInternalServerError, "INTERNAL", err.Error())
-		return
-	}
-	writeJSON(w, http.StatusOK, stats)
-}
-
-// adminOverview serves the catalog-only snapshot. Unlike /stats it has no
-// dependency on Qdrant or recommendation/model services.
+// adminOverview serves the catalog-only snapshot behind the React dashboard's
+// overview page. It deliberately reads no vector-store or recommendation/model
+// state, so the page renders even when Qdrant is unwired or the model failed
+// to load.
 func (s *Server) adminOverview(w http.ResponseWriter, r *http.Request) {
 	overview, err := s.admin.Overview(r.Context())
 	if err != nil {

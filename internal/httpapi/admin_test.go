@@ -97,8 +97,6 @@ func TestAdminRoutesRequireBothServiceAndToken(t *testing.T) {
 		{http.MethodGet, "/admin/assets/nonexistent.js"},
 		{http.MethodGet, "/admin/photos/album-a/0"},
 		{http.MethodGet, "/admin/runs"},
-		{http.MethodGet, "/admin/legacy"},
-		{http.MethodGet, "/admin/api/stats"},
 		{http.MethodGet, "/admin/api/overview"},
 		{http.MethodGet, "/admin/api/issues"},
 		{http.MethodGet, "/admin/api/diagnostics"},
@@ -166,7 +164,6 @@ func TestAdminAuthChallenges(t *testing.T) {
 	}
 	for _, item := range unauthorized {
 		for _, route := range []struct{ method, target string }{
-			{http.MethodGet, "/admin/api/stats"},
 			{http.MethodGet, "/admin/api/overview"},
 			{http.MethodGet, "/admin/api/photos"},
 			{http.MethodGet, "/admin/api/photos/album-a/0"},
@@ -190,7 +187,7 @@ func TestAdminAuthChallenges(t *testing.T) {
 	}
 
 	// The correct password gets through; the username carries no meaning.
-	rec := doAdminRequest(t, router, http.MethodGet, "/admin/api/stats", basicAuthHeader("operator", "sekrit"))
+	rec := doAdminRequest(t, router, http.MethodGet, "/admin/api/overview", basicAuthHeader("operator", "sekrit"))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("correct password status=%d want=200 body=%s", rec.Code, rec.Body.String())
 	}
@@ -294,14 +291,6 @@ func TestAdminPageServesEmbeddedHTML(t *testing.T) {
 		t.Fatalf("nested admin route status=%d body=%s", refresh.Code, refresh.Body.String())
 	}
 
-	legacy := doAdminRequest(t, router, http.MethodGet, "/admin/legacy", basicAuthHeader("operator", "sekrit"))
-	if legacy.Code != http.StatusOK || !strings.Contains(legacy.Body.String(), "Re-embed everything") || !strings.Contains(legacy.Body.String(), "/admin/api/recover") {
-		t.Fatalf("legacy dashboard status=%d body missing existing recovery UI", legacy.Code)
-	}
-	if !strings.Contains(legacy.Body.String(), "X-Admin-Action") {
-		t.Fatalf("legacy dashboard does not attach the required mutation header")
-	}
-
 	for _, target := range []string{"/admin/photos/album-a/0", "/admin/blobs/hash", "/admin/albums/album-a"} {
 		protected := doAdminRequest(t, router, http.MethodGet, target, "")
 		if protected.Code != http.StatusUnauthorized {
@@ -333,62 +322,6 @@ func TestAdminSPADirectNavigationAndReload(t *testing.T) {
 		if page.Code != http.StatusNotFound || !strings.HasPrefix(page.Header().Get("Content-Type"), "application/json") || !jsonBodyHasErrorCode(page.Body.String(), "NOT_FOUND") {
 			t.Fatalf("unknown path %s did not return JSON 404: status=%d body=%s", target, page.Code, page.Body.String())
 		}
-	}
-}
-
-// TestAdminStatsShape pins the JSON contract the page renders: camelCase keys,
-// the embedding block nested as an object, and the drift derived from the two
-// point counts. seedEmbeddingFixture leaves one ready blob (one ready photo
-// pair), one failed and one pending; the stub reports 3 Qdrant points.
-func TestAdminStatsShape(t *testing.T) {
-	router, _ := newAdminTestRouter(t, 3)
-
-	rec := doAdminRequest(t, router, http.MethodGet, "/admin/api/stats", basicAuthHeader("operator", "sekrit"))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status=%d want=200 body=%s", rec.Code, rec.Body.String())
-	}
-
-	var payload map[string]any
-	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
-		t.Fatalf("decode stats: %v", err)
-	}
-	for _, key := range []string{"albums", "albumsByStatus", "photos", "blobs", "embedding", "encoding", "expectedPoints", "qdrantPoints", "drift", "vectorStoreEnabled", "modelEnabled"} {
-		if _, ok := payload[key]; !ok {
-			t.Fatalf("stats JSON missing key %q in %v", key, payload)
-		}
-	}
-	if payload["albums"] != float64(1) || payload["photos"] != float64(3) || payload["blobs"] != float64(3) {
-		t.Fatalf("library counts=%v want albums=1 photos=3 blobs=3", payload)
-	}
-	byStatus, ok := payload["albumsByStatus"].(map[string]any)
-	if !ok || byStatus["SUCCEEDED"] != float64(1) {
-		t.Fatalf("albumsByStatus=%v want {SUCCEEDED:1}", payload["albumsByStatus"])
-	}
-	embedding, ok := payload["embedding"].(map[string]any)
-	if !ok {
-		t.Fatalf("embedding=%v want an object", payload["embedding"])
-	}
-	wantEmbedding := map[string]any{"total": float64(3), "ready": float64(1), "failed": float64(1), "processing": float64(0), "pending": float64(1)}
-	for key, want := range wantEmbedding {
-		if embedding[key] != want {
-			t.Fatalf("embedding.%s=%v want=%v", key, embedding[key], want)
-		}
-	}
-	if payload["expectedPoints"] != float64(1) || payload["qdrantPoints"] != float64(3) || payload["drift"] != float64(2) {
-		t.Fatalf("point counts=%v want expected=1 qdrant=3 drift=2", payload)
-	}
-	if payload["modelEnabled"] != false {
-		t.Fatalf("modelEnabled=%v want=false", payload["modelEnabled"])
-	}
-	encoding, ok := payload["encoding"].(map[string]any)
-	if !ok {
-		t.Fatalf("encoding=%v want an object", payload["encoding"])
-	}
-	if encoding["enabled"] != true || encoding["candidates"] != float64(3) || encoding["pending"] != float64(3) || encoding["remainingBytes"] != float64(3) {
-		t.Fatalf("encoding stats=%v want enabled with three pending one-byte candidates", encoding)
-	}
-	if payload["vectorStoreEnabled"] != true {
-		t.Fatalf("vectorStoreEnabled=%v want=true (a vector counter is wired)", payload["vectorStoreEnabled"])
 	}
 }
 
@@ -806,47 +739,6 @@ func assertOverviewJSONCounts(t *testing.T, name string, counts map[string]int64
 	}
 	if _, ok := counts["blobCount"]; !ok {
 		t.Errorf("%s missing blobCount: %v", name, counts)
-	}
-}
-
-// TestAdminStatsShapeWithDisabledVectorStore pins the JSON shape when no
-// vector store is wired up — the deployment without Qdrant: the flag says so
-// explicitly, the point figures degrade to unmeasured zeros instead of a
-// fabricated drift, and expectedPoints keeps its real catalog value.
-func TestAdminStatsShapeWithDisabledVectorStore(t *testing.T) {
-	store := openAdminTestCatalog(t)
-	seedEmbeddingFixture(t, store)
-	adminService := admin.NewService(store, nil, nil)
-	router := New(nil, nil, nil, nil, "", adminService, "sekrit").Router()
-
-	rec := doAdminRequest(t, router, http.MethodGet, "/admin/api/stats", basicAuthHeader("operator", "sekrit"))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status=%d want=200 body=%s", rec.Code, rec.Body.String())
-	}
-
-	var payload struct {
-		ExpectedPoints     int64 `json:"expectedPoints"`
-		QdrantPoints       int64 `json:"qdrantPoints"`
-		Drift              int64 `json:"drift"`
-		VectorStoreEnabled bool  `json:"vectorStoreEnabled"`
-		Encoding           struct {
-			Enabled bool `json:"enabled"`
-		} `json:"encoding"`
-	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
-		t.Fatalf("decode stats: %v", err)
-	}
-	if payload.VectorStoreEnabled {
-		t.Fatalf("vectorStoreEnabled=true want=false (nil vector store)")
-	}
-	if payload.QdrantPoints != 0 || payload.Drift != 0 {
-		t.Fatalf("points=%+v want qdrant=0 drift=0", payload)
-	}
-	if payload.ExpectedPoints != 1 {
-		t.Fatalf("expectedPoints=%d want=1 (the fixture's one ready photo pair)", payload.ExpectedPoints)
-	}
-	if payload.Encoding.Enabled {
-		t.Fatal("encoding.enabled=true want=false without WORKER_TOKEN")
 	}
 }
 

@@ -10,7 +10,7 @@ Self-hosted photo album server. Upload a zip of photos; the server stores each i
 - Admin-controlled local and optional external WebP encoding using `cwebp` Q85, preserving supported EXIF/ICC/XMP metadata and replacing only when smaller.
 - Semantic "similar photos" recommendations across albums (SigLIP2-base, 768-dim vectors in Qdrant).
 - Lease-based HTTP API so external GPU workers can drain the embedding backlog.
-- Protected admin browser for catalog, photo, blob, and album pipeline inspection; existing stats and recovery actions remain at `/admin/legacy`.
+- Protected admin browser for catalog, photo, blob, and album pipeline inspection.
 - SQLite catalog backed up to the bucket and auto-restored on startup.
 - Upload drop zone: zips copied straight into the `uploads/` prefix (e.g. with `mc` or `aws s3 cp`) are picked up without a restart.
 
@@ -115,7 +115,6 @@ Notes:
 | POST | `/api/embedding/claim`, `/renew`, `/results` | External embedding-worker lease API (bearer-token when `WORKER_TOKEN` is set). |
 | POST | `/api/encoding/claim`, `/renew`, `/complete`, `/output` | External WebP encoder lease/result API, enabled when `WORKER_TOKEN` is set. New workers request `outputMode: "api"`; result streams go to `/output`, are spooled under `$STATE_DIR/encoding-spool`, and are asynchronously validated before a conditional S3 write. Claims without that mode retain the legacy presigned-PUT contract during rollout. |
 | GET | `/admin` | Independent React admin browser; enabled only when `ADMIN_TOKEN` is set. |
-| GET | `/admin/legacy` | Existing operational stats and embedding/encoding recovery dashboard, preserved during the admin UI rollout. |
 | GET | `/admin/api/overview` | Catalog-only inventory totals and unique-blob normalized/raw pipeline breakdowns. |
 | GET | `/admin/api/issues` | Bounded groups of current pipeline/archive failures and latest-run failed extraction entries. |
 | GET | `/admin/api/diagnostics` | Read-only lease, queue-age, commit, activity, feature-flag, and optional vector-count snapshot. |

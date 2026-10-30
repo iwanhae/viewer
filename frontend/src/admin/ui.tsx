@@ -93,7 +93,6 @@ function AdminApp() {
           <Link to="/albums">앨범</Link>
           <Link to="/issues">이슈</Link>
           <Link to="/diagnostics">시스템 진단</Link>
-          <a className="legacy-danger-link" href="/admin/legacy">기존 통계·복구</a>
         </nav>
       </header>
       <main className="admin-main">

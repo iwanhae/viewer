@@ -8,32 +8,16 @@ package admin
 
 import (
 	"context"
-	_ "embed"
 	"errors"
 	"fmt"
-	"net/http"
 
 	"viewer/internal/catalog"
 	"viewer/internal/recommend"
 )
 
-//go:embed static/admin.html
-var pageHTML []byte
-
-// LegacyPage serves the original stats and recovery dashboard. Keep it
-// available while the replacement browse UI is rolled out; its write actions
-// remain useful until a later admin stage replaces them.
-func LegacyPage() http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.Header().Set("Cache-Control", "no-store")
-		_, _ = w.Write(pageHTML)
-	})
-}
-
-// VectorCounter is the read-only slice of the vector store the stats need.
-// It is satisfied structurally by *qdrant.Client; keeping it an interface lets
-// tests stand in a fake instead of a live Qdrant.
+// VectorCounter is the read-only slice of the vector store the diagnostics
+// snapshot needs. It is satisfied structurally by *qdrant.Client; keeping it
+// an interface lets tests stand in a fake instead of a live Qdrant.
 type VectorCounter interface {
 	CountVectors(ctx context.Context) (int, error)
 }
@@ -44,49 +28,6 @@ type VectorCounter interface {
 // stand in a fake — the same pattern VectorCounter uses.
 type LocalEncodingRunner interface {
 	StartLocalDrain() (bool, error)
-}
-
-// Stats is one snapshot of the whole system for the admin page. The embedding
-// counts are per blob — the unit the pipeline leases and tracks — while
-// ExpectedPoints and QdrantPoints are per photo, the unit the vector store
-// holds; the two units are never added together, only Drift compares them.
-type Stats struct {
-	Albums         int64                   `json:"albums"`
-	AlbumsByStatus map[string]int64        `json:"albumsByStatus"`
-	Photos         int64                   `json:"photos"`
-	Blobs          int64                   `json:"blobs"`
-	Embedding      catalog.EmbeddingCounts `json:"embedding"`
-	Encoding       EncodingStats           `json:"encoding"`
-	// The three fields below diagnose *why* the embedding counts above look
-	// wrong, one layer down each:
-	//   - EmbeddingLease reads the processing rows' leases: processing blobs
-	//     whose lease has expired mean no worker is claiming anything, while
-	//     live leases that never finish point at a stuck write-back.
-	//   - Failures groups the failed blobs by error text (top reasons only),
-	//     turning "N failed" into "what to fix first".
-	//   - WorkerActivity is the recommend service's last-attempt stamps at the
-	//     pipeline entry points; zeros mean nobody has tried since process
-	//     start. The recommend type is used directly — its JSON tags are the
-	//     dashboard contract, and a re-declared copy in this package could
-	//     silently drift from the stamps the service actually records.
-	EmbeddingLease catalog.EmbeddingLeaseHealth `json:"embeddingLease"`
-	Failures       []catalog.EmbeddingFailure   `json:"failures"`
-	WorkerActivity recommend.WorkerActivity     `json:"workerActivity"`
-	// ExpectedPoints is how many points the vector store should hold: one per
-	// photo whose blob embedding is ready. QdrantPoints is how many it
-	// actually holds, and Drift is the difference — non-zero means the two
-	// stores disagree, most commonly because the collection was wiped (or a
-	// catalog backup was restored under it). Drift answers "which way" by its
-	// sign: negative is missing points, positive is stale ones.
-	ExpectedPoints int64 `json:"expectedPoints"`
-	QdrantPoints   int64 `json:"qdrantPoints"`
-	Drift          int64 `json:"drift"`
-	// VectorStoreEnabled says a vector store is wired up at all. When it is
-	// false, the point figures above are unmeasured zeros — not readings of
-	// an empty store — and the dashboard must render them as disabled rather
-	// than as a green "in sync".
-	VectorStoreEnabled bool `json:"vectorStoreEnabled"`
-	ModelEnabled       bool `json:"modelEnabled"`
 }
 
 // EncodingStats combines queue and savings counts with the server-side
@@ -108,9 +49,9 @@ type Service struct {
 	localEncoding   LocalEncodingRunner
 }
 
-// NewService builds the admin service. A nil vectors counter reports the
-// store as disabled — VectorStoreEnabled false, with zero points and drift as
-// unmeasured values, which is how a deployment without Qdrant runs — and a
+// NewService builds the admin service. A nil vectors counter makes the
+// diagnostics snapshot report the vector store as disabled rather than
+// counting anything — which is how a deployment without Qdrant runs — and a
 // nil catalog makes every call fail, the same contract the recommend service
 // applies.
 func NewService(cat *catalog.Store, vectors VectorCounter, recommend *recommend.Service) *Service {
@@ -188,86 +129,6 @@ func (s *Service) RunLocalEncoding() (bool, error) {
 		return false, fmt.Errorf("%w: %v", ErrLocalEncodingUnavailable, err)
 	}
 	return started, nil
-}
-
-// Stats gathers one snapshot across the catalog and the vector store. It
-// issues several independent reads without a transaction on purpose: the page
-// is a dashboard, not a consistency check, and the counts are seconds apart at
-// worst on a quiet catalog.
-func (s *Service) Stats(ctx context.Context) (Stats, error) {
-	if s == nil || s.cat == nil {
-		return Stats{}, fmt.Errorf("catalog is not available")
-	}
-
-	albums, byStatus, err := s.cat.AlbumCounts(ctx)
-	if err != nil {
-		return Stats{}, fmt.Errorf("album counts: %w", err)
-	}
-	photos, err := s.cat.PhotoCount(ctx)
-	if err != nil {
-		return Stats{}, fmt.Errorf("photo count: %w", err)
-	}
-	blobs, err := s.cat.BlobCount(ctx)
-	if err != nil {
-		return Stats{}, fmt.Errorf("blob count: %w", err)
-	}
-	embedding, err := s.cat.EmbeddingCounts(ctx)
-	if err != nil {
-		return Stats{}, fmt.Errorf("embedding counts: %w", err)
-	}
-	expected, err := s.cat.ReadyPairCount(ctx)
-	if err != nil {
-		return Stats{}, fmt.Errorf("ready pair count: %w", err)
-	}
-	encoding, err := s.cat.EncodingCounts(ctx)
-	if err != nil {
-		return Stats{}, fmt.Errorf("encoding counts: %w", err)
-	}
-	lease, err := s.cat.EmbeddingLeaseHealth(ctx)
-	if err != nil {
-		return Stats{}, fmt.Errorf("embedding lease health: %w", err)
-	}
-	// Five reasons: the dashboard renders a fixed handful of rows, and a
-	// failure list longer than that is noise an operator works through one
-	// fix at a time rather than a page to scroll. The store clamps the limit
-	// regardless, so this is a rendering choice, not a safety one.
-	failures, err := s.cat.EmbeddingFailureReasons(ctx, 5)
-	if err != nil {
-		return Stats{}, fmt.Errorf("embedding failure reasons: %w", err)
-	}
-
-	stats := Stats{
-		Albums:         albums,
-		AlbumsByStatus: byStatus,
-		Photos:         photos,
-		Blobs:          blobs,
-		Embedding:      embedding,
-		Encoding:       EncodingStats{Enabled: s.encodingEnabled, EncodingCounts: encoding},
-		EmbeddingLease: lease,
-		Failures:       failures,
-		ExpectedPoints: expected,
-	}
-	if s.vectors != nil {
-		points, err := s.vectors.CountVectors(ctx)
-		if err != nil {
-			return Stats{}, fmt.Errorf("count vector store points: %w", err)
-		}
-		stats.QdrantPoints = int64(points)
-		// Drift is only meaningful against a real reading. Computed with no
-		// store wired up it would always read -expected and render as a red
-		// "missing everything" that is really just "Qdrant is off".
-		stats.Drift = stats.QdrantPoints - stats.ExpectedPoints
-		stats.VectorStoreEnabled = true
-	}
-	// The recommend service is nil in setups without an embedding model; its
-	// WorkerActivity is nil-safe and would report zeros anyway, but the guard
-	// keeps that contract visible here — zeros mean "no attempts recorded",
-	// never "the model answered instantly".
-	if s.recommend != nil {
-		stats.WorkerActivity = s.recommend.WorkerActivity()
-	}
-	stats.ModelEnabled = s.recommend != nil && s.recommend.Enabled()
-	return stats, nil
 }
 
 // Reindex flips every ready or failed blob back to pending and returns the
